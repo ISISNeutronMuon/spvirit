@@ -479,6 +479,30 @@ impl Pv<i32> {
             ScalarValue::I32(initial),
         ))
     }
+    /// `mbbi` — multi-bit binary input (enum, read-only). Value = choice index.
+    pub fn mbbi(name: impl Into<String>, choices: Vec<String>, initial: i32) -> Self {
+        Self::from_enum_record(name.into(), choices, initial, RecordType::Mbbi)
+    }
+    /// `mbbo` — multi-bit binary output (enum, writable). Value = choice index.
+    pub fn mbbo(name: impl Into<String>, choices: Vec<String>, initial: i32) -> Self {
+        Self::from_enum_record(name.into(), choices, initial, RecordType::Mbbo)
+    }
+    fn from_enum_record(name: String, choices: Vec<String>, initial: i32, rt: RecordType) -> Self {
+        // Mirror PvaServerBuilder::mbbi's record shape (pva_server.rs:360-378).
+        let data = crate::types::RecordData::NtEnum {
+            nt: spvirit_types::NtEnum::new(initial, choices),
+            inp: None,
+            out: None,
+            omsl: crate::types::OutputMode::Supervisory,
+        };
+        Self::from_record(RecordInstance {
+            name: name.clone(),
+            record_type: rt,
+            common: crate::types::DbCommonState::default(),
+            data,
+            raw_fields: std::collections::HashMap::new(),
+        })
+    }
 }
 
 impl<T: PvScalar> Pv<T> {
@@ -715,6 +739,51 @@ mod tests {
         any.bind(&store);
         pv.set(99).await.unwrap();
         assert_eq!(pv.get().await, Ok(99));
+    }
+
+    #[test]
+    fn mbbi_mbbo_constructors() {
+        let m = Pv::mbbi("M:I", vec!["Off".into(), "On".into(), "Auto".into()], 1);
+        let rec = m.pending_record().unwrap();
+        assert_eq!(rec.record_type, crate::types::RecordType::Mbbi);
+        assert_eq!(rec.current_value(), ScalarValue::I32(1));
+
+        let o = Pv::mbbo("M:O", vec!["A".into(), "B".into()], 0);
+        assert!(o.pending_record().unwrap().writable());
+    }
+
+    #[tokio::test]
+    async fn mbbo_set_get_index_with_bounds() {
+        let store = empty_store();
+        let pv = Pv::mbbo("M:RT", vec!["Stop".into(), "Run".into(), "Fault".into()], 0);
+        let any: AnyPv = pv.clone().into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+        any.bind(&store);
+
+        pv.set(2).await.unwrap();
+        assert_eq!(pv.get().await, Ok(2));
+        // out-of-range index is rejected (value unchanged); set() maps the
+        // store's `false` to Ok-if-exists, so verify via get()
+        let _ = pv.set(7).await;
+        assert_eq!(pv.get().await, Ok(2));
+    }
+
+    #[test]
+    fn set_scalar_value_on_raw_nt_enum_record() {
+        let mut rec = Pv::mbbo("M:RAW", vec!["Off".into(), "On".into(), "Auto".into()], 0)
+            .pending_record()
+            .unwrap();
+        // In-range change succeeds.
+        assert!(rec.set_scalar_value(ScalarValue::I32(2), true));
+        assert_eq!(rec.current_value(), ScalarValue::I32(2));
+        // Same-index is a no-op.
+        assert!(!rec.set_scalar_value(ScalarValue::I32(2), true));
+        // Out-of-range index is rejected; value unchanged.
+        assert!(!rec.set_scalar_value(ScalarValue::I32(7), true));
+        assert_eq!(rec.current_value(), ScalarValue::I32(2));
+        assert!(!rec.set_scalar_value(ScalarValue::I32(-1), true));
+        assert_eq!(rec.current_value(), ScalarValue::I32(2));
     }
 
     fn empty_store() -> Arc<SimplePvStore> {

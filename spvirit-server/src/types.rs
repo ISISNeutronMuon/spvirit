@@ -368,6 +368,24 @@ impl RecordInstance {
     }
 
     pub fn set_scalar_value(&mut self, value: ScalarValue, compute_alarms: bool) -> bool {
+        if let RecordData::NtEnum { nt, .. } = &mut self.data {
+            let idx = match &value {
+                ScalarValue::I32(i) => *i,
+                ScalarValue::I16(i) => *i as i32,
+                ScalarValue::I8(i) => *i as i32,
+                ScalarValue::I64(i) => *i as i32,
+                _ => return false,
+            };
+            if idx < 0 || (idx as usize) >= nt.choices.len() {
+                return false; // out-of-range index — reject, keep value
+            }
+            if nt.index == idx {
+                return false;
+            }
+            nt.index = idx;
+            return true;
+        }
+
         let nt = match &mut self.data {
             RecordData::Ai { nt, .. }
             | RecordData::Ao { nt, .. }
