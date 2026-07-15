@@ -42,6 +42,10 @@ pub(crate) struct LinkDef {
 struct PvEntry {
     record: RecordInstance,
     subscribers: Vec<mpsc::Sender<NtPayload>>,
+    /// Value carried by the last update posted to subscribers/monitors —
+    /// the reference point for the MDEL monitor deadband. `None` until the
+    /// first post (so the first change always posts).
+    last_posted: Option<f64>,
 }
 
 /// A simple in-memory PV store.
@@ -63,11 +67,13 @@ impl SimplePvStore {
         let pvs = records
             .into_iter()
             .map(|(name, record)| {
+                let last_posted = initial_posted(&record);
                 (
                     name,
                     PvEntry {
                         record,
                         subscribers: Vec::new(),
+                        last_posted,
                     },
                 )
             })
@@ -90,11 +96,13 @@ impl SimplePvStore {
     /// Insert or replace a PV record at runtime.
     pub async fn insert(&self, name: String, record: RecordInstance) {
         let mut pvs = self.pvs.write().await;
+        let last_posted = initial_posted(&record);
         pvs.insert(
             name,
             PvEntry {
                 record,
                 subscribers: Vec::new(),
+                last_posted,
             },
         );
     }
@@ -156,8 +164,15 @@ impl SimplePvStore {
         let payload = {
             let mut pvs = self.pvs.write().await;
             if let Some(entry) = pvs.get_mut(name) {
+                let prev_severity = entry.record.to_ntscalar().alarm_severity;
                 let changed = entry.record.set_scalar_value(value, self.compute_alarms);
                 if changed {
+                    if !should_post_update(entry, prev_severity) {
+                        // Changed, but within the MDEL monitor deadband:
+                        // the record holds the new value (GETs see it), just
+                        // no update is posted to subscribers/monitors.
+                        return true;
+                    }
                     let payload = entry.record.to_ntpayload();
                     entry
                         .subscribers
@@ -334,17 +349,22 @@ impl Source for SimplePvStore {
                     return Err(format!("PV '{}' is not writable", name));
                 }
 
+                let prev_severity = entry.record.to_ntscalar().alarm_severity;
                 let changed = apply_put_to_record(&mut entry.record, &value, self.compute_alarms);
                 if !changed {
                     return Ok(vec![]);
                 }
 
-                let payload = entry.record.to_ntpayload();
-                entry
-                    .subscribers
-                    .retain(|tx| tx.try_send(payload.clone()).is_ok());
-
-                (name.clone(), payload)
+                if should_post_update(entry, prev_severity) {
+                    let payload = entry.record.to_ntpayload();
+                    entry
+                        .subscribers
+                        .retain(|tx| tx.try_send(payload.clone()).is_ok());
+                    Some((name.clone(), payload))
+                } else {
+                    // Within the MDEL monitor deadband — value applied, no post.
+                    None
+                }
             }; // pvs lock dropped
 
             // Fire on_put callback (non-blocking).
@@ -358,7 +378,7 @@ impl Source for SimplePvStore {
             // Propagate linked PV updates.
             self.evaluate_links(&name).await;
 
-            Ok(vec![result])
+            Ok(result.into_iter().collect())
         })
     }
 
@@ -385,6 +405,62 @@ impl Source for SimplePvStore {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+/// Numeric view of a scalar value, for deadband arithmetic.
+fn scalar_as_f64(v: &ScalarValue) -> Option<f64> {
+    Some(match v {
+        ScalarValue::I8(x) => *x as f64,
+        ScalarValue::I16(x) => *x as f64,
+        ScalarValue::I32(x) => *x as f64,
+        ScalarValue::I64(x) => *x as f64,
+        ScalarValue::U8(x) => *x as f64,
+        ScalarValue::U16(x) => *x as f64,
+        ScalarValue::U32(x) => *x as f64,
+        ScalarValue::U64(x) => *x as f64,
+        ScalarValue::F32(x) => *x as f64,
+        ScalarValue::F64(x) => *x,
+        ScalarValue::Bool(_) | ScalarValue::Str(_) => return None,
+    })
+}
+
+/// Initial MDEL deadband reference: the record's starting value (EPICS
+/// initialises MLST from the initial VAL, so the first small change is
+/// already subject to the deadband).
+fn initial_posted(record: &RecordInstance) -> Option<f64> {
+    match record.to_ntpayload() {
+        NtPayload::Scalar(nt) => scalar_as_f64(&nt.value),
+        _ => None,
+    }
+}
+
+/// MDEL monitor-deadband gate, called after a record changed.
+///
+/// Returns `true` when the update must be posted to subscribers/monitors
+/// (and records it as the new deadband reference point). An update is
+/// suppressed only when the record is a numeric scalar with MDEL > 0, the
+/// alarm severity did not change, and the value moved less than MDEL from
+/// the last *posted* value — EPICS monitor-deadband semantics.
+fn should_post_update(entry: &mut PvEntry, prev_severity: i32) -> bool {
+    let new_f = match entry.record.to_ntpayload() {
+        NtPayload::Scalar(nt) => match scalar_as_f64(&nt.value) {
+            Some(f) => f,
+            None => return true,
+        },
+        _ => return true,
+    };
+    let mdel = crate::record_fields::mdel_of(&entry.record);
+    let severity_changed = entry.record.to_ntscalar().alarm_severity != prev_severity;
+    let within_deadband = mdel > 0.0
+        && !severity_changed
+        && entry
+            .last_posted
+            .is_some_and(|last| (new_f - last).abs() < mdel);
+    if within_deadband {
+        return false;
+    }
+    entry.last_posted = Some(new_f);
+    true
+}
 
 /// Apply a decoded PUT value to a RecordInstance, returning whether it changed.
 fn apply_put_to_record(
@@ -772,6 +848,37 @@ mod tests {
             },
             raw_fields: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn mdel_deadband_suppresses_small_monitor_updates() {
+        let recs = crate::db::parse_db(
+            r#"
+record(ao, "DB:AO") {
+    field(VAL, "0.0")
+    field(MDEL, "0.5")
+}"#,
+        )
+        .expect("parse");
+        let store = SimplePvStore::new(recs, HashMap::new(), Vec::new(), false);
+        let mut rx = Source::subscribe(&store, "DB:AO").await.expect("subscribed");
+
+        // |Δ| = 0.2 < MDEL 0.5 → value updates but no monitor post.
+        assert!(store.set_value("DB:AO", ScalarValue::F64(0.2)).await);
+        // |Δ| = 0.9 ≥ MDEL 0.5 → posted.
+        assert!(store.set_value("DB:AO", ScalarValue::F64(0.9)).await);
+
+        match rx.recv().await.expect("posted update") {
+            NtPayload::Scalar(nt) => assert_eq!(nt.value, ScalarValue::F64(0.9)),
+            other => panic!("expected scalar, got {other:?}"),
+        }
+        // The suppressed 0.2 update must not be queued behind it.
+        assert!(rx.try_recv().is_err());
+        // GETs always see the latest value regardless of the deadband.
+        assert_eq!(
+            store.get_value("DB:AO").await,
+            Some(ScalarValue::F64(0.9))
+        );
     }
 
     fn make_waveform(name: &str, value: ScalarArrayValue) -> RecordInstance {

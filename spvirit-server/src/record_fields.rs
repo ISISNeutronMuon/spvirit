@@ -123,6 +123,15 @@ pub fn record_type_name(rt: &RecordType) -> &'static str {
     }
 }
 
+/// The record's MDEL monitor deadband (0.0 when absent or unparsable).
+pub(crate) fn mdel_of(record: &RecordInstance) -> f64 {
+    record
+        .raw_fields
+        .get("MDEL")
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
 /// Parse a raw field string as `kind`, falling back to `Str` on parse failure.
 fn typed_value(kind: FieldKind, raw: &str) -> ScalarValue {
     match kind {
