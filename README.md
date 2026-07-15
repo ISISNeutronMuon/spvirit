@@ -57,12 +57,12 @@ record(ao, "SIM:SETPOINT") {
 }
 ```
 
-In Spvirit, a `RecordInstance` holds all of this — the record type, the current value (as a Normative Type), and the common fields. You can either build records in code with `PvaServer::builder().ai(...)` or load them from `.db` files with `.db_file("path.db")`.
+In Spvirit, a `RecordInstance` holds all of this — the record type, the current value (as a Normative Type), and the common fields. You can build records in code with typed PV handles (`Pv::ai(...)`, recommended), with the classic builder (`PvaServer::builder().ai(...)`), or load them from `.db` files with `.db_file("path.db")`.
 
 ```mermaid
 flowchart LR
     DB[".db file"] -->|parse_db| RI["RecordInstance"]
-    Code["builder.ai(...)"] --> RI
+    Code["Pv::ai(...) handles / builder.ai(...)"] --> RI
     RI --> Store["SimplePvStore"]
     Store --> Server["PvaServer"]
     Server -->|PVAccess protocol| Client["PvaClient"]
@@ -148,6 +148,8 @@ When a client reads this PV, the NTScalar's value is the integer index (0 or 1),
 flowchart TD
     subgraph Server Side
         DB[".db file"] -->|load_db / parse_db| Records["HashMap&lt;String, RecordInstance&gt;"]
+        Handles["Pv::ai() .units() .on_put() ...
+        typed handles (recommended)"] --> Records
         Builder["PvaServer::builder()
         .ai() .ao() .bo() ..."] --> Records
         Records --> Store["SimplePvStore
@@ -266,7 +268,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo run -p spvirit-client --example pvmonitor
 ```
 
-#### Running a PVAccess server
+#### Running a PVAccess server (typed PV handles — recommended)
+
+A `Pv<T>` is a typed handle you create, configure, and keep. Behavior attaches
+to the PV itself, and after the server starts you read/write through the
+handle — no string lookups, no untyped values:
+
+```rust
+use spvirit_server::{AnyPv, Pv, PvaServer};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = Pv::ai("SIM:TEMPERATURE", 22.5).units("degC").prec(2);
+    let setpoint = Pv::ao("SIM:SETPOINT", 25.0)
+        .drive_limits(0.0, 100.0)
+        .on_put(|_pv, v: f64| {
+            if v.is_finite() { Ok(()) } else { Err("not a number".into()) } // Err rejects the PUT
+        });
+
+    let server = PvaServer::serve([AnyPv::from(temp.clone()), AnyPv::from(setpoint)])
+        .start()
+        .await;
+
+    temp.set(23.1).await?;          // posts to monitors, stamps time, honors MDEL
+    let t: f64 = temp.get().await?; // typed read
+    println!("temperature: {t}");
+
+    // handles work for .db-loaded records too: server.pv::<f64>("SOME:PV").await?
+    server.store(); // deep-end access is still there
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+```
+
+Handles are cheap clones, so bulk creation is just a loop:
+
+```rust
+let bpms: Vec<Pv<f64>> = (0..100)
+    .map(|i| Pv::ai(format!("BPM:{i:03}:X"), 0.0).units("mm"))
+    .collect();
+let server = PvaServer::serve(bpms.iter().cloned()).start().await;
+bpms[42].set(1.23).await?;
+```
+
+Every handle-built PV is a real record, so IOC-style field access
+(`SIM:TEMPERATURE.RTYP`, `.DESC$`) and MDEL/ADEL deadbands work automatically —
+including for the EPICS Archiver Appliance.
+
+#### Running a PVAccess server (classic builder)
 ```rust
 use spvirit_server::PvaServer;
 
