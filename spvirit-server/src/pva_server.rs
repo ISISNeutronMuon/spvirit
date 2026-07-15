@@ -701,6 +701,18 @@ impl PvaServer {
         let sources = Arc::new(SourceRegistry::new());
         sources.add("builtin", 0, self.store.clone()).await;
 
+        // IOC/QSRV-style record field access (<name>.<FIELD>, <FIELD>$) so
+        // tools like the EPICS Archiver Appliance can fetch record metadata.
+        sources
+            .add(
+                "record-fields",
+                10,
+                Arc::new(crate::record_fields::RecordFieldSource::new(
+                    self.store.clone(),
+                )),
+            )
+            .await;
+
         // Register any extra sources provided via .source().
         for (label, order, source) in &self.extra_sources {
             sources.add(label.clone(), *order, source.clone()).await;

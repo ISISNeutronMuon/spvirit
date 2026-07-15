@@ -2119,7 +2119,10 @@ mod tests {
         for is_be in [false, true] {
             let nt = NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1_234_567_890, 42);
             let (secs, nanos) = timestamp_fields(&decode_nt_full(&nt, is_be));
-            assert_eq!(secs, 1_234_567_890, "stored seconds must be encoded verbatim");
+            assert_eq!(
+                secs, 1_234_567_890,
+                "stored seconds must be encoded verbatim"
+            );
             assert_eq!(nanos, 42, "stored nanoseconds must be encoded verbatim");
         }
     }
@@ -2138,20 +2141,22 @@ mod tests {
     fn distinct_stored_timestamps_flag_seconds_changed() {
         // Two same-value snapshots one second apart must produce a delta whose
         // secondsPastEpoch differs — i.e. the seconds are reported as changed.
-        let prev = NtPayload::Scalar(
-            NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1000, 0),
-        );
-        let next = NtPayload::Scalar(
-            NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1001, 0),
-        );
+        let prev =
+            NtPayload::Scalar(NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1000, 0));
+        let next =
+            NtPayload::Scalar(NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1001, 0));
         let desc = nt_scalar_desc(&ScalarValue::F64(1.0));
         let (_bitset, values) =
             encode_nt_payload_delta(&prev, &next, &desc, false).expect("delta present");
         // The changed values must carry the new seconds (1001), not be empty.
         assert!(!values.is_empty(), "delta must carry changed field values");
         // Full-encode sanity: prev and next decode to different seconds.
-        let NtPayload::Scalar(prev_nt) = &prev else { unreachable!() };
-        let NtPayload::Scalar(next_nt) = &next else { unreachable!() };
+        let NtPayload::Scalar(prev_nt) = &prev else {
+            unreachable!()
+        };
+        let NtPayload::Scalar(next_nt) = &next else {
+            unreachable!()
+        };
         assert_eq!(timestamp_fields(&decode_nt_full(prev_nt, false)).0, 1000);
         assert_eq!(timestamp_fields(&decode_nt_full(next_nt, false)).0, 1001);
     }
