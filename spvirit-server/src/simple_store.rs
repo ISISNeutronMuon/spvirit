@@ -861,7 +861,9 @@ record(ao, "DB:AO") {
         )
         .expect("parse");
         let store = SimplePvStore::new(recs, HashMap::new(), Vec::new(), false);
-        let mut rx = Source::subscribe(&store, "DB:AO").await.expect("subscribed");
+        let mut rx = Source::subscribe(&store, "DB:AO")
+            .await
+            .expect("subscribed");
 
         // |Δ| = 0.2 < MDEL 0.5 → value updates but no monitor post.
         assert!(store.set_value("DB:AO", ScalarValue::F64(0.2)).await);
@@ -875,10 +877,7 @@ record(ao, "DB:AO") {
         // The suppressed 0.2 update must not be queued behind it.
         assert!(rx.try_recv().is_err());
         // GETs always see the latest value regardless of the deadband.
-        assert_eq!(
-            store.get_value("DB:AO").await,
-            Some(ScalarValue::F64(0.9))
-        );
+        assert_eq!(store.get_value("DB:AO").await, Some(ScalarValue::F64(0.9)));
     }
 
     fn make_waveform(name: &str, value: ScalarArrayValue) -> RecordInstance {

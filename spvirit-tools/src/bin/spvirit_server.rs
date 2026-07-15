@@ -2321,11 +2321,9 @@ async fn should_post_update(state: &Arc<ServerState>, name: &str, payload: &NtPa
     };
     let mut last_posted = state.last_posted.lock().await;
     let within_deadband = mdel > 0.0
-        && last_posted
-            .get(name)
-            .is_some_and(|(last_f, last_sevr)| {
-                *last_sevr == nt.alarm_severity && (new_f - last_f).abs() < mdel
-            });
+        && last_posted.get(name).is_some_and(|(last_f, last_sevr)| {
+            *last_sevr == nt.alarm_severity && (new_f - last_f).abs() < mdel
+        });
     if within_deadband {
         return false;
     }

@@ -53,7 +53,11 @@ pub fn parse_field_ref(name: &str) -> Option<FieldRef> {
         Some(stripped) => (stripped, true),
         None => (field_part, false),
     };
-    if field.is_empty() || !field.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
+    if field.is_empty()
+        || !field
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
         return None;
     }
     Some(FieldRef {
@@ -314,8 +318,14 @@ mod tests {
             dbcommon_default("SCAN"),
             Some((FieldKind::Str, "Passive"))
         ));
-        assert!(matches!(dbcommon_default("PINI"), Some((FieldKind::Str, "NO"))));
-        assert!(matches!(dbcommon_default("PHAS"), Some((FieldKind::Int, "0"))));
+        assert!(matches!(
+            dbcommon_default("PINI"),
+            Some((FieldKind::Str, "NO"))
+        ));
+        assert!(matches!(
+            dbcommon_default("PHAS"),
+            Some((FieldKind::Int, "0"))
+        ));
         assert!(matches!(
             dbcommon_default("MDEL"),
             Some((FieldKind::Double, "0"))

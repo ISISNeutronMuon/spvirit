@@ -160,10 +160,7 @@ async fn ioc_field_access_integration() {
         .stderr(Stdio::null())
         .status()
         .expect("run spput");
-    assert!(
-        !status.success(),
-        "spput to a read-only field PV must fail"
-    );
+    assert!(!status.success(), "spput to a read-only field PV must fail");
 
     let _ = child.kill();
     let _ = child.wait();
