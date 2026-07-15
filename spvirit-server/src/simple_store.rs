@@ -349,8 +349,16 @@ impl Source for SimplePvStore {
         let name = name.to_string();
         let value = value.clone();
         Box::pin(async move {
-            if let Some(validator) = self.validators.read().await.get(&name).cloned() {
-                validator(&name, &value)?;
+            // Clone the validator out inside a tight scope so the read guard
+            // drops before the user callback runs — otherwise temporary
+            // lifetime extension holds the lock across the call, blocking
+            // concurrent set_validator for the duration of every PUT.
+            let validator = {
+                let guard = self.validators.read().await;
+                guard.get(&name).cloned()
+            };
+            if let Some(v) = validator {
+                v(&name, &value)?;
             }
 
             let result = {
