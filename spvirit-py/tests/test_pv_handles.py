@@ -208,6 +208,19 @@ def test_set_alarm():
     t.set_alarm(2, 3, "broken")
 
 
+def test_async_aget_aset():
+    import asyncio
+
+    t = spvirit.ao("PYAS:T", 1.0)
+    spvirit.Server(pvs=[t], port=15165, udp_port=15166, listen_ip="127.0.0.1")
+
+    async def flow():
+        await t.aset(6.28)
+        return await t.aget()
+
+    assert asyncio.run(flow()) == 6.28
+
+
 def main():
     for fn in sorted(k for k in globals() if k.startswith("test_")):
         globals()[fn]()

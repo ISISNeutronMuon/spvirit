@@ -32,6 +32,13 @@ power = spvirit.calc("DEMO:POWER", [temp, setpoint],
 server = spvirit.Server(pvs=[temp, setpoint, power])
 server.start()
 print("serving DEMO:TEMP / DEMO:SP / DEMO:POWER — Ctrl+C to stop")
+
+# Every handle also has async aset/aget for use inside asyncio code, e.g.:
+#     async def bump():
+#         await setpoint.aset(30.0)
+#         print(await temp.aget())
+#     asyncio.run(bump())
+
 while True:
     time.sleep(5)
     print(f"T={temp.get():.2f} SP={setpoint.get():.2f} P={power.get():.2f}")

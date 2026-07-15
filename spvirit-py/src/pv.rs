@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use spvirit_server::pv::{AnyPv, Pv, PvArray, PvError};
 
 use crate::convert::{py_to_scalar_array, scalar_array_to_py};
-use crate::runtime::block_on_py;
+use crate::runtime::{block_on_py, future_into_py};
 
 pub(crate) fn pv_err(e: PvError) -> PyErr {
     match e {
@@ -121,6 +121,93 @@ impl PyPv {
             PvKind::Array(p) => {
                 let v = block_on_py(py, p.get()).map_err(pv_err)?;
                 Ok(scalar_array_to_py(py, &v))
+            }
+        }
+    }
+
+    /// Write a value through the full posting pipeline (async).
+    fn aset<'py>(&self, py: Python<'py>, value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.kind {
+            PvKind::F64(p) => {
+                let v: f64 = value.extract()?;
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    handle.set(v).await.map_err(pv_err)?;
+                    Python::with_gil(|py| py.None().into_py_any(py))
+                })
+            }
+            PvKind::Bool(p) => {
+                let v: bool = value.extract()?;
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    handle.set(v).await.map_err(pv_err)?;
+                    Python::with_gil(|py| py.None().into_py_any(py))
+                })
+            }
+            PvKind::I32(p) => {
+                let v: i32 = value.extract()?;
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    handle.set(v).await.map_err(pv_err)?;
+                    Python::with_gil(|py| py.None().into_py_any(py))
+                })
+            }
+            PvKind::Str(p) => {
+                let v: String = value.extract()?;
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    handle.set(v).await.map_err(pv_err)?;
+                    Python::with_gil(|py| py.None().into_py_any(py))
+                })
+            }
+            PvKind::Array(p) => {
+                let v = py_to_scalar_array(value)?;
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    handle.set(v).await.map_err(pv_err)?;
+                    Python::with_gil(|py| py.None().into_py_any(py))
+                })
+            }
+        }
+    }
+
+    /// Read the current value, typed (async).
+    fn aget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.kind {
+            PvKind::F64(p) => {
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    let v = handle.get().await.map_err(pv_err)?;
+                    Python::with_gil(|py| v.into_py_any(py))
+                })
+            }
+            PvKind::Bool(p) => {
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    let v = handle.get().await.map_err(pv_err)?;
+                    Python::with_gil(|py| v.into_py_any(py))
+                })
+            }
+            PvKind::I32(p) => {
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    let v = handle.get().await.map_err(pv_err)?;
+                    Python::with_gil(|py| v.into_py_any(py))
+                })
+            }
+            PvKind::Str(p) => {
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    let v = handle.get().await.map_err(pv_err)?;
+                    Python::with_gil(|py| v.into_py_any(py))
+                })
+            }
+            PvKind::Array(p) => {
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    let v = handle.get().await.map_err(pv_err)?;
+                    Ok(Python::with_gil(|py| scalar_array_to_py(py, &v)))
+                })
             }
         }
     }

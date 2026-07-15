@@ -316,6 +316,13 @@ Every handle-built PV is a real record, so IOC-style field access
 (`SIM:TEMPERATURE.RTYP`, `.DESC$`) and MDEL/ADEL deadbands work automatically —
 including for the EPICS Archiver Appliance.
 
+Beyond `Pv::ai`/`ao`/`bi`/`bo`/`string_in`/`string_out`, there are `Pv<i32>`
+constructors for 32-bit integers (`Pv::longin`/`Pv::longout`) and enums
+(`Pv::mbbi`/`Pv::mbbo`, backed by a choice list with the index as the value),
+plus `PvArray::waveform`/`PvArray::aai`/`PvArray::aao` for array records
+(`ScalarArrayValue`-typed). Every handle also has an async `set_alarm(severity,
+status, message)` to set alarm state independent of the value.
+
 #### Running a PVAccess server (classic builder)
 ```rust
 use spvirit_server::PvaServer;
@@ -588,10 +595,34 @@ print(temp.get())       # typed read
 h = server.pv("SIM:TEMPERATURE")
 ```
 
+Besides `ai`/`ao`/`bi`/`bo`/`string_in`/`string_out`, there are constructors
+for 32-bit integers (`longin`/`longout`), enums (`mbbi`/`mbbo`, which take a
+`choices: list[str]` and store the choice index as an `int`; out-of-range
+writes are rejected), and arrays (`waveform`/`aai`/`aao`). Array constructors
+and `.set()` take a Python `list` of `bool`/`int`/`float`/`str`, or `bytes`
+for a `U8` array; if you have a numpy array, call `.tolist()` first. Every
+handle also has `set_alarm(severity, status, message="")` to set alarm state
+independent of the value. `on_put`/`scan` are scalar-only — attaching either
+to an array handle raises `TypeError`.
+
+`set`/`get` block (releasing the GIL); `aset`/`aget` are `async` equivalents
+for use inside `asyncio` code:
+
+```python
+import asyncio
+
+async def main():
+    await setpoint.aset(30.0)
+    value = await temp.aget()
+    print(value)
+
+asyncio.run(main())
+```
+
 `spvirit.pv(name, initial, ...)` infers the record type from `initial`'s
-Python type instead of naming a constructor: `bool` -> `bo`, `float` -> `ao`,
-`str` -> `string_out`. Plain `int` raises `TypeError` (longin/longout aren't
-implemented yet — use a float).
+Python type instead of naming a constructor: `bool` -> `bo`, `int` -> `longout`,
+`float` -> `ao`, `str` -> `string_out`, `list`/`bytes` -> `waveform`. Any other
+type raises `TypeError`.
 
 See `spvirit-py/examples/demo_pv_handles.py` for a complete runnable demo.
 
