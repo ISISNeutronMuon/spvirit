@@ -28,6 +28,7 @@ pub mod handler;
 pub mod monitor;
 pub mod pva_server;
 pub mod pvstore;
+pub mod record_fields;
 pub mod server;
 pub mod simple_store;
 pub mod state;
