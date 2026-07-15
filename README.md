@@ -574,6 +574,8 @@ def _simulate(pv):
     return pv.get() + 0.1 * (setpoint.get() - pv.get())  # relax toward setpoint
 
 power = spvirit.calc("SIM:POWER", [temp, setpoint], lambda v: max(0.0, v[1] - v[0]))
+# calc callbacks that raise (or return a non-float) post 0.0, not the last
+# value — asymmetric with .scan(), which re-posts its own cache instead.
 
 # Attach on_put/scan/calc BEFORE this — attaching afterwards is a no-op.
 server = spvirit.Server(pvs=[temp, setpoint, power])

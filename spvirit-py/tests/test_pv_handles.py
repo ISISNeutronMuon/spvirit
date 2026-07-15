@@ -134,6 +134,22 @@ def test_scan_decorator():
     assert tick.get() >= 2.0
 
 
+def test_scan_direct_method():
+    import time
+    tick = spvirit.ai("PYT:TICK2", 0.0)
+
+    def _(pv):
+        return (pv.get() or 0.0) + 1.0
+
+    tick.scan(0.05, _)
+
+    server = spvirit.Server(pvs=[tick], port=15135, udp_port=15136,
+                            listen_ip="127.0.0.1")
+    server.start()
+    time.sleep(0.5)
+    assert tick.get() >= 2.0
+
+
 def test_calc():
     import time
     a = spvirit.ai("PYK:A", 1.0)

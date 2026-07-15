@@ -51,7 +51,6 @@ fn spvirit(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Typed PV handles
     m.add_class::<pv::PyPv>()?;
-    m.add_class::<pv::ScanDecorator>()?;
     m.add_function(wrap_pyfunction!(pv::ai, m)?)?;
     m.add_function(wrap_pyfunction!(pv::ao, m)?)?;
     m.add_function(wrap_pyfunction!(pv::bi, m)?)?;

@@ -156,10 +156,13 @@ impl PyPv {
 
     /// Periodic scan: `pv.scan(period, fn)` or `@pv.scan(period=0.1)`.
     ///
-    /// `fn(pv)` returns the new value, or `None` to leave the PV at its
-    /// current value (e.g. the callback called `pv.set(...)`/other PVs
-    /// itself). Must be attached BEFORE the PV is served (`Server(...)`);
-    /// attaching afterwards is a silent no-op (core logs a warning).
+    /// `fn(pv)` returns the new value. Returning `None` re-posts the last
+    /// value this scan produced (the type default — 0.0/false/0/"" — before
+    /// the first scanned value); it does not read whatever the PV's current
+    /// value happens to be (e.g. from `pv.set(...)` called elsewhere). Prefer
+    /// returning a value from the callback, or calling `pv.set()` explicitly.
+    /// Must be attached BEFORE the PV is served (`Server(...)`); attaching
+    /// afterwards is a silent no-op (core logs a warning).
     #[pyo3(signature = (period, callback=None))]
     fn scan(&self, py: Python<'_>, period: f64, callback: Option<PyObject>) -> PyResult<PyObject> {
         match callback {

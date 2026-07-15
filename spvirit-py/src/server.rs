@@ -13,7 +13,7 @@ use spvirit_types::{ScalarArrayValue, ScalarValue};
 
 use crate::convert::{decoded_to_py, py_to_scalar, py_to_scalar_array, scalar_to_py};
 use crate::nt::{nt_payload_to_py, py_to_nt_payload};
-use crate::runtime::RUNTIME;
+use crate::runtime::{RUNTIME, block_on_py};
 use crate::source::{PyNotifier, PySourceAdapter};
 
 // ─── ServerBuilder ───────────────────────────────────────────────────────────
@@ -428,7 +428,7 @@ impl PyServer {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("server already consumed"))?;
         let store = server.store().clone();
-        let sniff = py.allow_threads(|| RUNTIME.block_on(store.get_value(&name)));
+        let sniff = block_on_py(py, store.get_value(&name));
         let kind = match sniff {
             None => {
                 return Err(pyo3::exceptions::PyKeyError::new_err(format!(
@@ -436,27 +436,19 @@ impl PyServer {
                 )));
             }
             Some(ScalarValue::F64(_)) | Some(ScalarValue::F32(_)) => {
-                let h = py
-                    .allow_threads(|| RUNTIME.block_on(server.pv::<f64>(&name)))
-                    .map_err(pv_err)?;
+                let h = block_on_py(py, server.pv::<f64>(&name)).map_err(pv_err)?;
                 PvKind::F64(h)
             }
             Some(ScalarValue::Bool(_)) => {
-                let h = py
-                    .allow_threads(|| RUNTIME.block_on(server.pv::<bool>(&name)))
-                    .map_err(pv_err)?;
+                let h = block_on_py(py, server.pv::<bool>(&name)).map_err(pv_err)?;
                 PvKind::Bool(h)
             }
             Some(ScalarValue::I8(_)) | Some(ScalarValue::I16(_)) | Some(ScalarValue::I32(_)) => {
-                let h = py
-                    .allow_threads(|| RUNTIME.block_on(server.pv::<i32>(&name)))
-                    .map_err(pv_err)?;
+                let h = block_on_py(py, server.pv::<i32>(&name)).map_err(pv_err)?;
                 PvKind::I32(h)
             }
             Some(ScalarValue::Str(_)) => {
-                let h = py
-                    .allow_threads(|| RUNTIME.block_on(server.pv::<String>(&name)))
-                    .map_err(pv_err)?;
+                let h = block_on_py(py, server.pv::<String>(&name)).map_err(pv_err)?;
                 PvKind::Str(h)
             }
             Some(other) => {
@@ -549,7 +541,7 @@ impl PyStore {
     /// Get the current scalar value of a PV (returns None if not found).
     fn get_value(&self, py: Python<'_>, name: String) -> PyResult<PyObject> {
         let store = self.inner.clone();
-        let val = py.allow_threads(|| RUNTIME.block_on(store.get_value(&name)));
+        let val = block_on_py(py, store.get_value(&name));
         Ok(match val {
             Some(v) => scalar_to_py(py, &v),
             None => py.None(),
@@ -559,7 +551,7 @@ impl PyStore {
     /// Get the full NT payload for a PV (returns NtScalar, NtScalarArray, etc.).
     fn get_nt(&self, py: Python<'_>, name: String) -> PyResult<PyObject> {
         let store = self.inner.clone();
-        let val = py.allow_threads(|| RUNTIME.block_on(store.get_nt(&name)));
+        let val = block_on_py(py, store.get_nt(&name));
         Ok(match val {
             Some(payload) => nt_payload_to_py(py, payload),
             None => py.None(),
@@ -570,7 +562,7 @@ impl PyStore {
     fn set_value(&self, py: Python<'_>, name: String, value: &Bound<'_, PyAny>) -> PyResult<bool> {
         let sv = py_to_scalar(value)?;
         let store = self.inner.clone();
-        Ok(py.allow_threads(|| RUNTIME.block_on(store.set_value(&name, sv))))
+        Ok(block_on_py(py, store.set_value(&name, sv)))
     }
 
     /// Set an array value on a PV. Returns True if the PV exists.
@@ -582,7 +574,7 @@ impl PyStore {
     ) -> PyResult<bool> {
         let arr = py_to_scalar_array(value)?;
         let store = self.inner.clone();
-        Ok(py.allow_threads(|| RUNTIME.block_on(store.set_array_value(&name, arr))))
+        Ok(block_on_py(py, store.set_array_value(&name, arr)))
     }
 
     /// Write a full NT payload (NtScalar, NtScalarArray, etc.) to a PV.
@@ -590,13 +582,13 @@ impl PyStore {
     fn put_nt(&self, py: Python<'_>, name: String, nt: &Bound<'_, PyAny>) -> PyResult<bool> {
         let payload = py_to_nt_payload(nt)?;
         let store = self.inner.clone();
-        Ok(py.allow_threads(|| RUNTIME.block_on(store.put_nt(&name, payload))))
+        Ok(block_on_py(py, store.put_nt(&name, payload)))
     }
 
     /// List all PV names in the store.
     fn pv_names(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let store = self.inner.clone();
-        Ok(py.allow_threads(|| RUNTIME.block_on(store.pv_names())))
+        Ok(block_on_py(py, store.pv_names()))
     }
 }
 
