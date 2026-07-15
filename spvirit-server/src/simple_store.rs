@@ -105,6 +105,15 @@ impl SimplePvStore {
         pvs.get(name).map(|e| e.record.current_value())
     }
 
+    /// Read a clone of the full [`RecordInstance`] backing a PV.
+    ///
+    /// Used by [`RecordFieldSource`](crate::record_fields::RecordFieldSource)
+    /// to serve `<name>.<FIELD>` channels.
+    pub async fn get_record(&self, name: &str) -> Option<RecordInstance> {
+        let pvs = self.pvs.read().await;
+        pvs.get(name).map(|e| e.record.clone())
+    }
+
     /// Read the full [`NtPayload`] of a PV.
     pub async fn get_nt(&self, name: &str) -> Option<NtPayload> {
         let pvs = self.pvs.read().await;

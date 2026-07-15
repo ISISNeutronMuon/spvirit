@@ -8,6 +8,17 @@
 //! Ported from the p4pillon `RecordProvider` / `DynamicRecordFields` design
 //! (branch `50-access-to-ioc-fields`).
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use tokio::sync::{Mutex, mpsc};
+
+use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue};
+
+use crate::pvstore::{PvInfo, Source};
+use crate::simple_store::{SimplePvStore, descriptor_for_payload};
 use crate::types::{RecordInstance, RecordType, ScalarValue};
 
 /// A parsed `<base>.<FIELD>[$]` channel-name reference.
@@ -164,6 +175,102 @@ pub fn field_value(record: &RecordInstance, field: &str) -> Option<ScalarValue> 
     dbcommon_default(field).map(|(kind, default)| typed_value(kind, default))
 }
 
+/// Build the wire payload for a resolved field reference.
+///
+/// Regular fields are served as an NTScalar; the `$` long-string form is
+/// served as an NTScalarArray of Int8 holding the UTF-8 bytes (QSRV
+/// long-string semantics). `$` on a non-string field resolves to `None`.
+pub fn payload_for(record: &RecordInstance, field_ref: &FieldRef) -> Option<NtPayload> {
+    let value = field_value(record, &field_ref.field)?;
+    if field_ref.long_string {
+        let ScalarValue::Str(s) = value else {
+            return None;
+        };
+        let bytes: Vec<i8> = s.into_bytes().into_iter().map(|b| b as i8).collect();
+        return Some(NtPayload::ScalarArray(NtScalarArray::from_value(
+            ScalarArrayValue::I8(bytes),
+        )));
+    }
+    let mut nt = NtScalar::from_value(value);
+    nt.display_description = record.common.desc.clone();
+    Some(NtPayload::Scalar(nt))
+}
+
+/// A read-only [`Source`] serving `<pvname>.<FIELD>` channels derived from
+/// the records in a [`SimplePvStore`].
+///
+/// Registered by `PvaServer::run` after the builtin store; the builtin only
+/// claims exact record names, so the two never compete.
+pub struct RecordFieldSource {
+    store: Arc<SimplePvStore>,
+    /// Senders for open field-PV subscriptions. Field values are static, so
+    /// each channel only ever carries the initial snapshot; the senders are
+    /// retained here purely to keep the channels open.
+    open_subs: Mutex<Vec<mpsc::Sender<NtPayload>>>,
+}
+
+impl RecordFieldSource {
+    pub fn new(store: Arc<SimplePvStore>) -> Self {
+        Self {
+            store,
+            open_subs: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn resolve(&self, name: &str) -> Option<NtPayload> {
+        let field_ref = parse_field_ref(name)?;
+        let record = self.store.get_record(&field_ref.base).await?;
+        payload_for(&record, &field_ref)
+    }
+}
+
+impl Source for RecordFieldSource {
+    fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let payload = self.resolve(&name).await?;
+            Some(PvInfo {
+                descriptor: descriptor_for_payload(&payload),
+                writable: false,
+            })
+        })
+    }
+
+    fn get(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move { self.resolve(&name).await })
+    }
+
+    fn put(
+        &self,
+        name: &str,
+        _value: &DecodedValue,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move { Err(format!("field PV '{}' is read-only", name)) })
+    }
+
+    fn subscribe(
+        &self,
+        name: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            let initial = self.resolve(&name).await?;
+            let (tx, rx) = mpsc::channel(4);
+            let _ = tx.try_send(initial);
+            self.open_subs.lock().await.push(tx);
+            Some(rx)
+        })
+    }
+
+    fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+        // Field PVs are derived on demand; enumerating every possible
+        // <record>.<FIELD> combination would flood name listings.
+        Box::pin(async move { Vec::new() })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +370,76 @@ record(ao, "SIM:AO") {
         assert_eq!(field_value(&r, "PHAS"), Some(ScalarValue::I32(0)));
         assert_eq!(field_value(&r, "ADEL"), Some(ScalarValue::F64(0.0)));
         assert_eq!(field_value(&r, "NOTAFIELD"), None);
+    }
+
+    fn test_source() -> RecordFieldSource {
+        let recs = crate::db::parse_db(
+            r#"
+record(ao, "SIM:AO") {
+    field(VAL, "2.34")
+    field(DESC, "A test output")
+    field(MDEL, "0.5")
+}"#,
+        )
+        .expect("parse");
+        let store = SimplePvStore::new(recs, std::collections::HashMap::new(), Vec::new(), false);
+        RecordFieldSource::new(Arc::new(store))
+    }
+
+    #[tokio::test]
+    async fn claims_field_pvs_read_only() {
+        let src = test_source();
+        let info = src.claim("SIM:AO.RTYP").await.expect("claimed");
+        assert!(!info.writable);
+        match src.get("SIM:AO.RTYP").await.expect("payload") {
+            NtPayload::Scalar(nt) => assert_eq!(nt.value, ScalarValue::Str("ao".into())),
+            other => panic!("expected scalar, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn does_not_claim_non_field_names() {
+        let src = test_source();
+        assert!(src.claim("SIM:AO").await.is_none()); // base PV: builtin's job
+        assert!(src.claim("SIM:AO.NOTAFIELD").await.is_none());
+        assert!(src.claim("SIM:MISSING.RTYP").await.is_none());
+        assert!(src.claim("SIM:AO.MDEL$").await.is_none()); // $ on non-string
+    }
+
+    #[tokio::test]
+    async fn put_is_rejected() {
+        let src = test_source();
+        let err = src
+            .put("SIM:AO.DESC", &DecodedValue::Int32(1))
+            .await
+            .expect_err("put must fail");
+        assert!(err.contains("read-only"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn long_string_serves_utf8_bytes() {
+        let src = test_source();
+        match src.get("SIM:AO.DESC$").await.expect("payload") {
+            NtPayload::ScalarArray(arr) => {
+                let ScalarArrayValue::I8(bytes) = arr.value else {
+                    panic!("expected Int8 array, got {:?}", arr.value);
+                };
+                let expected: Vec<i8> = "A test output".bytes().map(|b| b as i8).collect();
+                assert_eq!(bytes, expected);
+            }
+            other => panic!("expected scalar array, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subscribe_delivers_initial_snapshot() {
+        let src = test_source();
+        let mut rx = src.subscribe("SIM:AO.RTYP").await.expect("subscribed");
+        match rx.recv().await.expect("initial value") {
+            NtPayload::Scalar(nt) => assert_eq!(nt.value, ScalarValue::Str("ao".into())),
+            other => panic!("expected scalar, got {other:?}"),
+        }
+        // Channel stays open (sender retained) — no immediate close.
+        assert!(rx.try_recv().is_err());
     }
 }
