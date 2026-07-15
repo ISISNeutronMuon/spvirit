@@ -4,6 +4,38 @@
 //! callbacks) and becomes *bound* to a store when passed to
 //! `PvaServer::serve(...)`. Handles are cheap clones; all clones observe and
 //! drive the same record.
+//!
+//! # Hello world
+//!
+//! ```rust,ignore
+//! use spvirit_server::{AnyPv, Pv, PvaServer};
+//!
+//! let temp = Pv::ai("SIM:TEMP", 22.5).units("C").prec(2);
+//! let sp = Pv::ao("SIM:SETPOINT", 25.0)
+//!     .on_put(|_pv, v: f64| if v.is_finite() { Ok(()) } else { Err("NaN".into()) });
+//!
+//! let server = PvaServer::serve([AnyPv::from(temp.clone()), AnyPv::from(sp)])
+//!     .start()
+//!     .await;
+//! temp.set(23.1).await?;
+//! ```
+//!
+//! # Bulk creation
+//!
+//! Handles are ordinary values, so a whole bank of PVs can be built with an
+//! iterator and handed to `serve` as a `Vec<AnyPv>`:
+//!
+//! ```rust,ignore
+//! use spvirit_server::{AnyPv, Pv, PvaServer};
+//!
+//! let channels: Vec<Pv<f64>> = (0..8)
+//!     .map(|i| Pv::ai(format!("SIM:CH{i}"), 0.0).units("C"))
+//!     .collect();
+//! let pvs: Vec<AnyPv> = channels.iter().cloned().map(AnyPv::from).collect();
+//!
+//! let server = PvaServer::serve(pvs).start().await;
+//! channels[0].set(21.3).await?;
+//! ```
 
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -189,8 +221,10 @@ impl<T: PvScalar> Pv<T> {
         &self.shared.name
     }
 
-    /// Clone of the pending record template; `None` once bound. Test/serve use.
-    pub(crate) fn pending_record(&self) -> Option<RecordInstance> {
+    /// Clone of the pending record template; `None` once bound. Test-only —
+    /// `ServeBuilder` reads the pending record via `AnyPv::take_record`.
+    #[cfg(test)]
+    fn pending_record(&self) -> Option<RecordInstance> {
         match &*self.shared.state.lock().unwrap() {
             PvState::Pending(def) => Some(def.record.clone()),
             PvState::Bound(_) => None,
@@ -231,8 +265,7 @@ impl<T: PvScalar> Pv<T> {
     pub fn desc(self, desc: impl Into<String>) -> Self {
         let d = desc.into();
         self.with_record(|r| {
-            let d2 = d.clone();
-            r.common.desc = d2;
+            r.common.desc = d.clone();
             if let Some(nt) = r.nt_scalar_mut() {
                 nt.display_description = d;
             }
@@ -445,7 +478,10 @@ impl<T: PvScalar> Pv<T> {
         {
             Ok(())
         } else if store.get_value(&self.shared.name).await.is_some() {
-            // Record exists — the write was a no-op (value unchanged).
+            // Record exists — the write was a no-op (value unchanged). This
+            // existence check is a benign TOCTOU: records are never removed
+            // from SimplePvStore, so a `Some` here can't go stale by the time
+            // we return `Ok`.
             Ok(())
         } else {
             Err(PvError::NotFound(self.shared.name.clone()))

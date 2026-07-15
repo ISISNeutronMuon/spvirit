@@ -7,8 +7,18 @@
 //! # High-level API
 //!
 //! ```rust,ignore
-//! use spvirit_server::PvaServer;
+//! use spvirit_server::{AnyPv, Pv, PvaServer};
 //!
+//! let temp = Pv::ai("SIM:TEMP", 22.5).units("C").prec(2);
+//! let sp = Pv::ao("SIM:SETPOINT", 25.0)
+//!     .on_put(|_pv, v: f64| if v.is_finite() { Ok(()) } else { Err("NaN".into()) });
+//!
+//! let server = PvaServer::serve([AnyPv::from(temp.clone()), AnyPv::from(sp)])
+//!     .start()
+//!     .await;
+//! temp.set(23.1).await?;
+//!
+//! // Classic builder (still supported):
 //! let server = PvaServer::builder()
 //!     .ai("SIM:TEMP", 22.5)
 //!     .ao("SIM:SETPOINT", 25.0)
