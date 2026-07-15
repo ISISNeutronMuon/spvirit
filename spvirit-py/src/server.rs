@@ -348,6 +348,126 @@ pub struct PyServer {
 
 #[pymethods]
 impl PyServer {
+    /// Build a server from typed PV handles (`spvirit.ai(...)` etc.).
+    ///
+    /// `pvs` — list of `Pv` handles; `sources` — list of `(label, order, obj)`
+    /// tuples of Python `Source` objects; remaining kwargs mirror
+    /// `ServerBuilder` configuration.
+    #[new]
+    #[pyo3(signature = (*, pvs=None, db_file=None, db_string=None, sources=None,
+                        port=None, udp_port=None, listen_ip=None, compute_alarms=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        pvs: Option<Vec<crate::pv::PyPv>>,
+        db_file: Option<String>,
+        db_string: Option<String>,
+        sources: Option<Vec<(String, i32, PyObject)>>,
+        port: Option<u16>,
+        udp_port: Option<u16>,
+        listen_ip: Option<String>,
+        compute_alarms: Option<bool>,
+    ) -> PyResult<Self> {
+        let handles: Vec<spvirit_server::pv::AnyPv> =
+            pvs.unwrap_or_default().iter().map(|p| p.any()).collect();
+        let mut sb = PvaServer::serve(handles);
+        if let Some(p) = db_file {
+            sb = sb.db_file(p);
+        }
+        if let Some(s) = db_string {
+            sb = sb.db_string(&s);
+        }
+        if let Some(p) = port {
+            sb = sb.port(p);
+        }
+        if let Some(p) = udp_port {
+            sb = sb.udp_port(p);
+        }
+        if let Some(ip) = listen_ip {
+            let addr: IpAddr = ip
+                .parse()
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid IP: {e}")))?;
+            sb = sb.listen_ip(addr);
+        }
+        if let Some(c) = compute_alarms {
+            sb = sb.compute_alarms(c);
+        }
+        let mut python_sources: Vec<(String, i32, Arc<PySourceAdapter>)> = Vec::new();
+        for (label, order, obj) in sources.unwrap_or_default() {
+            let adapter = Arc::new(PySourceAdapter::new(obj));
+            python_sources.push((label.clone(), order, adapter.clone()));
+            let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter;
+            sb = sb.source(label, order, as_dyn);
+        }
+        let mut server = py.allow_threads(|| RUNTIME.block_on(sb.build()));
+        let store = server.store().clone();
+        let registry = server.monitor_registry();
+        let notifier = PyNotifier::new(registry);
+        for (_, _, adapter) in &python_sources {
+            adapter.invoke_on_start(notifier.clone());
+        }
+        Ok(PyServer {
+            server: Some(server),
+            store: Some(store),
+            notifier: Some(notifier),
+            post_build_sources: python_sources,
+        })
+    }
+
+    /// Start serving on a background thread (returns immediately).
+    fn start(&mut self) -> PyResult<()> {
+        self.start_background().map(|_| ())
+    }
+
+    /// Mint a typed handle to any served record (handle-built or .db-loaded).
+    fn pv(&self, py: Python<'_>, name: String) -> PyResult<crate::pv::PyPv> {
+        use crate::pv::{PvKind, PyPv, pv_err};
+        use spvirit_types::ScalarValue;
+        let server = self
+            .server
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("server already consumed"))?;
+        let store = server.store().clone();
+        let sniff = py.allow_threads(|| RUNTIME.block_on(store.get_value(&name)));
+        let kind = match sniff {
+            None => {
+                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                    "PV '{name}' not found"
+                )));
+            }
+            Some(ScalarValue::F64(_)) | Some(ScalarValue::F32(_)) => {
+                let h = py
+                    .allow_threads(|| RUNTIME.block_on(server.pv::<f64>(&name)))
+                    .map_err(pv_err)?;
+                PvKind::F64(h)
+            }
+            Some(ScalarValue::Bool(_)) => {
+                let h = py
+                    .allow_threads(|| RUNTIME.block_on(server.pv::<bool>(&name)))
+                    .map_err(pv_err)?;
+                PvKind::Bool(h)
+            }
+            Some(ScalarValue::I8(_)) | Some(ScalarValue::I16(_)) | Some(ScalarValue::I32(_)) => {
+                let h = py
+                    .allow_threads(|| RUNTIME.block_on(server.pv::<i32>(&name)))
+                    .map_err(pv_err)?;
+                PvKind::I32(h)
+            }
+            Some(ScalarValue::Str(_)) => {
+                let h = py
+                    .allow_threads(|| RUNTIME.block_on(server.pv::<String>(&name)))
+                    .map_err(pv_err)?;
+                PvKind::Str(h)
+            }
+            Some(other) => {
+                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                    "PV '{name}' has unsupported value type {other:?} for typed handles"
+                )));
+            }
+        };
+        Ok(PyPv { kind })
+    }
+
     /// Get a handle to the PV store for runtime get/set.
     fn store(&self) -> PyResult<PyStore> {
         let store = self

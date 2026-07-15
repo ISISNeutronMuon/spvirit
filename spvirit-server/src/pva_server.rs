@@ -651,6 +651,15 @@ impl PvaServer {
         &self.store
     }
 
+    /// Mint a typed handle to any record in this server's store — the
+    /// pre-`run()` counterpart of [`RunningServer::pv`].
+    pub async fn pv<T: crate::pv::PvScalar>(
+        &self,
+        name: &str,
+    ) -> Result<crate::pv::Pv<T>, crate::pv::PvError> {
+        crate::pv::Pv::attach(&self.store, name).await
+    }
+
     /// Register an additional [`Source`] after building the server.
     ///
     /// This is useful when the source needs a reference to the store
@@ -1179,5 +1188,18 @@ mod tests {
         assert_eq!(server.store().pv_names().await.len(), 100);
         bpms[42].set(1.23).await.unwrap();
         assert_eq!(bpms[42].get().await, Ok(1.23));
+    }
+
+    #[tokio::test]
+    async fn pva_server_mints_typed_handles_pre_run() {
+        let server = PvaServer::serve([AnyPv::from(Pv::ai("PRE:X", 5.0))])
+            .build()
+            .await;
+        let h: crate::pv::Pv<f64> = server.pv("PRE:X").await.unwrap();
+        assert_eq!(h.get().await, Ok(5.0));
+        assert!(matches!(
+            server.pv::<bool>("PRE:X").await,
+            Err(crate::pv::PvError::TypeMismatch { .. })
+        ));
     }
 }
