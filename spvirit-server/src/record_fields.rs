@@ -8,7 +8,7 @@
 //! Ported from the p4pillon `RecordProvider` / `DynamicRecordFields` design
 //! (branch `50-access-to-ioc-fields`).
 
-use crate::types::RecordType;
+use crate::types::{RecordInstance, RecordType, ScalarValue};
 
 /// A parsed `<base>.<FIELD>[$]` channel-name reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +112,58 @@ pub fn record_type_name(rt: &RecordType) -> &'static str {
     }
 }
 
+/// Parse a raw field string as `kind`, falling back to `Str` on parse failure.
+fn typed_value(kind: FieldKind, raw: &str) -> ScalarValue {
+    match kind {
+        FieldKind::Int => raw
+            .trim()
+            .parse::<i32>()
+            .map(ScalarValue::I32)
+            .unwrap_or_else(|_| ScalarValue::Str(raw.to_string())),
+        FieldKind::Double => raw
+            .trim()
+            .parse::<f64>()
+            .map(ScalarValue::F64)
+            .unwrap_or_else(|_| ScalarValue::Str(raw.to_string())),
+        FieldKind::Str => ScalarValue::Str(raw.to_string()),
+    }
+}
+
+/// Resolve the value of `field` for `record`.
+///
+/// Lookup order: computed fields (`RTYP`, `NAME`, `DTYP`), then any field
+/// literally present in the parsed `.db` (`raw_fields`), then dbCommon
+/// defaults. Returns `None` for fields an IOC would not serve either.
+pub fn field_value(record: &RecordInstance, field: &str) -> Option<ScalarValue> {
+    match field {
+        "RTYP" => {
+            return Some(ScalarValue::Str(
+                record_type_name(&record.record_type).to_string(),
+            ));
+        }
+        "NAME" => return Some(ScalarValue::Str(record.name.clone())),
+        "VAL" => return Some(record.current_value()),
+        "DTYP" => {
+            let dtyp = record
+                .raw_fields
+                .get("DTYP")
+                .cloned()
+                .unwrap_or_else(|| "Soft Channel".to_string());
+            return Some(ScalarValue::Str(dtyp));
+        }
+        _ => {}
+    }
+
+    let kind = dbcommon_default(field).map(|(kind, _)| kind);
+    if let Some(raw) = record.raw_fields.get(field) {
+        return Some(typed_value(kind.unwrap_or(FieldKind::Str), raw));
+    }
+    if field == "DESC" {
+        return Some(ScalarValue::Str(record.common.desc.clone()));
+    }
+    dbcommon_default(field).map(|(kind, default)| typed_value(kind, default))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +211,57 @@ mod tests {
     fn record_type_names_match_db_names() {
         assert_eq!(record_type_name(&RecordType::Ao), "ao");
         assert_eq!(record_type_name(&RecordType::StringIn), "stringin");
+    }
+
+    fn test_record() -> RecordInstance {
+        let recs = crate::db::parse_db(
+            r#"
+record(ao, "SIM:AO") {
+    field(VAL, "2.34")
+    field(DESC, "A test output")
+    field(EGU, "V")
+    field(MDEL, "0.5")
+}"#,
+        )
+        .expect("parse");
+        recs.get("SIM:AO").expect("record present").clone()
+    }
+
+    #[test]
+    fn computed_fields_resolve() {
+        let r = test_record();
+        assert_eq!(field_value(&r, "RTYP"), Some(ScalarValue::Str("ao".into())));
+        assert_eq!(
+            field_value(&r, "NAME"),
+            Some(ScalarValue::Str("SIM:AO".into()))
+        );
+        assert_eq!(
+            field_value(&r, "DTYP"),
+            Some(ScalarValue::Str("Soft Channel".into()))
+        );
+        assert_eq!(field_value(&r, "VAL"), Some(ScalarValue::F64(2.34)));
+    }
+
+    #[test]
+    fn raw_db_fields_take_precedence_over_defaults() {
+        let r = test_record();
+        assert_eq!(
+            field_value(&r, "DESC"),
+            Some(ScalarValue::Str("A test output".into()))
+        );
+        assert_eq!(field_value(&r, "EGU"), Some(ScalarValue::Str("V".into())));
+        assert_eq!(field_value(&r, "MDEL"), Some(ScalarValue::F64(0.5)));
+    }
+
+    #[test]
+    fn dbcommon_defaults_fill_absent_fields() {
+        let r = test_record();
+        assert_eq!(
+            field_value(&r, "SCAN"),
+            Some(ScalarValue::Str("Passive".into()))
+        );
+        assert_eq!(field_value(&r, "PHAS"), Some(ScalarValue::I32(0)));
+        assert_eq!(field_value(&r, "ADEL"), Some(ScalarValue::F64(0.0)));
+        assert_eq!(field_value(&r, "NOTAFIELD"), None);
     }
 }
