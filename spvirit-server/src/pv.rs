@@ -140,6 +140,22 @@ impl<T: PvScalar> Clone for Pv<T> {
     }
 }
 
+impl<T: PvScalar> std::fmt::Debug for Pv<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pv")
+            .field("name", &self.shared.name)
+            .finish()
+    }
+}
+
+/// Identity equality: two handles are equal iff they share the same
+/// underlying state (e.g. clones of one another).
+impl<T: PvScalar> PartialEq for Pv<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+}
+
 impl<T: PvScalar> Pv<T> {
     fn from_record(record: RecordInstance) -> Self {
         Self {
@@ -307,6 +323,96 @@ impl Pv<String> {
     }
 }
 
+impl<T: PvScalar> Pv<T> {
+    fn store(&self) -> Result<Arc<SimplePvStore>, PvError> {
+        match &*self.shared.state.lock().unwrap() {
+            PvState::Bound(store) => Ok(store.clone()),
+            PvState::Pending(_) => Err(PvError::Unbound),
+        }
+    }
+
+    /// Write a value through the full posting pipeline (timestamp, alarms,
+    /// MDEL gating, monitors, links).
+    pub async fn set(&self, value: T) -> Result<(), PvError> {
+        let store = self.store()?;
+        if store
+            .set_value(&self.shared.name, value.into_scalar())
+            .await
+        {
+            Ok(())
+        } else {
+            Err(PvError::NotFound(self.shared.name.clone()))
+        }
+    }
+
+    /// Read the current value, typed.
+    pub async fn get(&self) -> Result<T, PvError> {
+        let store = self.store()?;
+        let v = store
+            .get_value(&self.shared.name)
+            .await
+            .ok_or_else(|| PvError::NotFound(self.shared.name.clone()))?;
+        let actual = format!("{v:?}");
+        T::from_scalar(v).ok_or(PvError::TypeMismatch {
+            expected: T::TYPE_NAME,
+            actual,
+        })
+    }
+
+    /// Mint a bound handle to an existing record (e.g. loaded from a `.db`).
+    pub(crate) async fn attach(store: &Arc<SimplePvStore>, name: &str) -> Result<Self, PvError> {
+        let v = store
+            .get_value(name)
+            .await
+            .ok_or_else(|| PvError::NotFound(name.to_string()))?;
+        let actual = format!("{v:?}");
+        if T::from_scalar(v).is_none() {
+            return Err(PvError::TypeMismatch {
+                expected: T::TYPE_NAME,
+                actual,
+            });
+        }
+        Ok(Self {
+            shared: Arc::new(PvShared {
+                name: name.to_string(),
+                state: Mutex::new(PvState::Bound(store.clone())),
+            }),
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// Type-erased PV, as accepted by `PvaServer::serve` / `.pvs(...)`.
+pub struct AnyPv {
+    pub(crate) shared: Arc<PvShared>,
+}
+
+impl<T: PvScalar> From<Pv<T>> for AnyPv {
+    fn from(pv: Pv<T>) -> Self {
+        Self { shared: pv.shared }
+    }
+}
+
+impl AnyPv {
+    /// Clone the pending record template. Returns `None` if already bound.
+    pub(crate) fn take_record(&self) -> Option<RecordInstance> {
+        let state = self.shared.state.lock().unwrap();
+        match &*state {
+            PvState::Pending(def) => Some(def.record.clone()),
+            PvState::Bound(_) => None,
+        }
+    }
+
+    /// Flip the handle (and every clone sharing this state) to bound.
+    pub(crate) fn bind(&self, store: &Arc<SimplePvStore>) {
+        *self.shared.state.lock().unwrap() = PvState::Bound(store.clone());
+    }
+
+    pub fn name(&self) -> &str {
+        &self.shared.name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +496,54 @@ mod tests {
         assert!(!Pv::bi("B2", false).pending_record().unwrap().writable());
         let s = Pv::string_in("S", "hello").pending_record().unwrap();
         assert_eq!(s.to_ntscalar().value, ScalarValue::Str("hello".into()));
+    }
+
+    fn empty_store() -> Arc<SimplePvStore> {
+        Arc::new(SimplePvStore::new(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            Vec::new(),
+            false,
+        ))
+    }
+
+    #[tokio::test]
+    async fn set_get_before_bind_errors() {
+        let pv = Pv::ai("SIM:X", 1.0);
+        assert_eq!(pv.set(2.0).await, Err(PvError::Unbound));
+        assert_eq!(pv.get().await, Err(PvError::Unbound));
+    }
+
+    #[tokio::test]
+    async fn bind_then_set_get_roundtrip() {
+        let store = empty_store();
+        let pv = Pv::ai("SIM:X", 1.0).units("mm");
+        let any: AnyPv = pv.clone().into();
+        let rec = any.take_record().expect("pending record");
+        store.insert(rec.name.clone(), rec).await;
+        any.bind(&store);
+
+        assert_eq!(pv.get().await, Ok(1.0));
+        pv.set(2.5).await.unwrap();
+        assert_eq!(pv.get().await, Ok(2.5));
+        // clone sees the same record
+        assert_eq!(pv.clone().get().await, Ok(2.5));
+    }
+
+    #[tokio::test]
+    async fn attach_mints_typed_handle_and_checks_type() {
+        let store = empty_store();
+        let src = Pv::ai("SIM:Y", 3.0);
+        let any: AnyPv = src.into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+
+        let h: Pv<f64> = Pv::attach(&store, "SIM:Y").await.unwrap();
+        assert_eq!(h.get().await, Ok(3.0));
+
+        let bad = Pv::<bool>::attach(&store, "SIM:Y").await;
+        assert!(matches!(bad, Err(PvError::TypeMismatch { .. })));
+        let missing = Pv::<f64>::attach(&store, "NOPE").await;
+        assert_eq!(missing, Err(PvError::NotFound("NOPE".into())));
     }
 }
