@@ -51,12 +51,15 @@ fn spvirit(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Typed PV handles
     m.add_class::<pv::PyPv>()?;
+    m.add_class::<pv::ScanDecorator>()?;
     m.add_function(wrap_pyfunction!(pv::ai, m)?)?;
     m.add_function(wrap_pyfunction!(pv::ao, m)?)?;
     m.add_function(wrap_pyfunction!(pv::bi, m)?)?;
     m.add_function(wrap_pyfunction!(pv::bo, m)?)?;
     m.add_function(wrap_pyfunction!(pv::string_in, m)?)?;
     m.add_function(wrap_pyfunction!(pv::string_out, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::calc, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::pv, m)?)?;
 
     // Module-level functions
     m.add_function(wrap_pyfunction!(client::py_discover_servers, m)?)?;

@@ -119,6 +119,44 @@ def test_on_put_can_set_other_pvs():
     assert b.get() == 42.0
 
 
+def test_scan_decorator():
+    import time
+    tick = spvirit.ai("PYT:TICK", 0.0)
+
+    @tick.scan(period=0.05)
+    def _(pv):
+        return (pv.get() or 0.0) + 1.0
+
+    server = spvirit.Server(pvs=[tick], port=15115, udp_port=15116,
+                            listen_ip="127.0.0.1")
+    server.start()
+    time.sleep(0.5)
+    assert tick.get() >= 2.0
+
+
+def test_calc():
+    import time
+    a = spvirit.ai("PYK:A", 1.0)
+    b = spvirit.ai("PYK:B", 2.0)
+    s = spvirit.calc("PYK:SUM", [a, b], lambda vals: sum(vals))
+    server = spvirit.Server(pvs=[a, b, s], port=15125, udp_port=15126,
+                            listen_ip="127.0.0.1")
+    a.set(10.0)
+    time.sleep(0.1)
+    assert s.get() == 12.0
+
+
+def test_pv_inference():
+    assert "float" in repr(spvirit.pv("PYI:F", 1.5))
+    assert "bool" in repr(spvirit.pv("PYI:B", True))
+    assert "str" in repr(spvirit.pv("PYI:S", "x"))
+    try:
+        spvirit.pv("PYI:I", 3)
+        raise AssertionError("int must raise TypeError")
+    except TypeError:
+        pass
+
+
 def main():
     for fn in sorted(k for k in globals() if k.startswith("test_")):
         globals()[fn]()

@@ -548,7 +548,53 @@ pip install maturin
 maturin develop --release
 ```
 
-After `maturin develop` the `spvirit` module is importable from the venv:
+After `maturin develop` the `spvirit` module is importable from the venv.
+
+#### Typed PV handles (recommended)
+
+A `spvirit.Pv` is a typed handle you create, configure, and keep — mirroring
+the Rust `Pv<T>` handle API above. Attach `on_put`/`scan`/`calc` to it, *then*
+hand it to `Server(pvs=[...])`; attaching any of these **after** the PV is
+served is a silent no-op (the core only logs a tracing warning, it does not
+raise):
+
+```python
+import spvirit
+
+temp = spvirit.ai("SIM:TEMPERATURE", 22.5, units="degC", prec=2)
+setpoint = spvirit.ao("SIM:SETPOINT", 25.0, drive_limits=(0.0, 100.0))
+
+@setpoint.on_put
+def _on_setpoint(pv, value):
+    if value > 100.0:
+        return False  # reject the PUT on the wire
+
+@temp.scan(period=1.0)
+def _simulate(pv):
+    return pv.get() + 0.1 * (setpoint.get() - pv.get())  # relax toward setpoint
+
+power = spvirit.calc("SIM:POWER", [temp, setpoint], lambda v: max(0.0, v[1] - v[0]))
+
+# Attach on_put/scan/calc BEFORE this — attaching afterwards is a no-op.
+server = spvirit.Server(pvs=[temp, setpoint, power])
+server.start()  # background thread; server.run() blocks instead
+
+temp.set(23.1)          # posts to monitors, stamps time, honors MDEL
+print(temp.get())       # typed read
+
+# server.pv(name) mints a handle to any served record, including .db-loaded ones
+h = server.pv("SIM:TEMPERATURE")
+```
+
+`spvirit.pv(name, initial, ...)` infers the record type from `initial`'s
+Python type instead of naming a constructor: `bool` -> `bo`, `float` -> `ao`,
+`str` -> `string_out`. Plain `int` raises `TypeError` (longin/longout aren't
+implemented yet — use a float).
+
+See `spvirit-py/examples/demo_pv_handles.py` for a complete runnable demo.
+
+#### Classic builder
+
 ```python
 import spvirit
 
@@ -577,6 +623,7 @@ pip install target/wheels/spvirit_py-*.whl
 maturin develop --release
 python spvirit-py/examples/demo_server.py
 python spvirit-py/examples/demo_nt_access.py
+python spvirit-py/examples/demo_pv_handles.py   # typed PV handles (recommended)
 ```
 
 ### Running the examples
