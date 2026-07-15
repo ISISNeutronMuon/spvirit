@@ -4,6 +4,16 @@
 import spvirit
 
 
+def _local_client(tcp, udp):
+    """Build a Client wired to a specific local server, bypassing UDP search."""
+    return (
+        spvirit.Client.builder()
+        .server_addr(f"127.0.0.1:{tcp}")
+        .udp_port(udp)
+        .build()
+    )
+
+
 def test_constructors_and_options():
     temp = spvirit.ai("PY:TEMP", 22.5, units="degC", prec=2, desc="Temp")
     assert temp.name() == "PY:TEMP"
@@ -58,6 +68,55 @@ def test_server_db_string_records():
     assert h.get() == 2.5
     h.set(3.5)
     assert h.get() == 3.5
+
+
+def test_on_put_decorator_and_wire_rejection():
+    seen = []
+    sp = spvirit.ao("PYW:SP", 25.0, drive_limits=(0.0, 100.0))
+
+    @sp.on_put
+    def _handle(pv, value):
+        seen.append(value)
+        if value > 100.0:
+            return False  # reject
+        return None       # accept
+
+    tcp, udp = 15095, 15096
+    server = spvirit.Server(pvs=[sp], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
+    server.start()
+    import time
+    time.sleep(0.3)
+
+    client = _local_client(tcp, udp)
+    client.put("PYW:SP", 50.0)
+    assert sp.get() == 50.0
+    assert seen and seen[-1] == 50.0
+
+    try:
+        client.put("PYW:SP", 500.0)
+        raise AssertionError("out-of-range put must be rejected on the wire")
+    except Exception as e:
+        assert not isinstance(e, AssertionError)
+    assert sp.get() == 50.0  # unchanged
+
+
+def test_on_put_can_set_other_pvs():
+    a = spvirit.ao("PYC:A", 0.0)
+    b = spvirit.ai("PYC:B", 0.0)
+
+    @a.on_put
+    def _(pv, value):
+        b.set(value * 2.0)
+
+    tcp, udp = 15105, 15106
+    server = spvirit.Server(pvs=[a, b], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
+    server.start()
+    import time
+    time.sleep(0.3)
+    client = _local_client(tcp, udp)
+    client.put("PYC:A", 21.0)
+    time.sleep(0.2)
+    assert b.get() == 42.0
 
 
 def main():

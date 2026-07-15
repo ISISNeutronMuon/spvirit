@@ -109,6 +109,79 @@ impl PyPv {
             }
         }
     }
+
+    /// Attach a PUT handler: `pv.on_put(fn)` or `@pv.on_put`.
+    ///
+    /// The callback is invoked as `callback(pv, value)` whenever a PVAccess
+    /// client writes to this PV, BEFORE the value is applied. Returning
+    /// `False` or raising rejects the PUT on the wire (the client's `put`
+    /// raises); any other return accepts it. Returns the callback unchanged
+    /// (decorator protocol), so it works both as a plain method call and as
+    /// `@pv.on_put`.
+    fn on_put(&self, py: Python<'_>, callback: PyObject) -> PyResult<PyObject> {
+        match &self.kind {
+            PvKind::F64(p) => {
+                let handle = p.clone();
+                let cb = callback.clone_ref(py);
+                let _ = p.clone().on_put(move |_pv, v: f64| {
+                    py_on_put(&cb, PvKind::F64(handle.clone()), PutVal::F64(v))
+                });
+            }
+            PvKind::Bool(p) => {
+                let handle = p.clone();
+                let cb = callback.clone_ref(py);
+                let _ = p.clone().on_put(move |_pv, v: bool| {
+                    py_on_put(&cb, PvKind::Bool(handle.clone()), PutVal::Bool(v))
+                });
+            }
+            PvKind::I32(p) => {
+                let handle = p.clone();
+                let cb = callback.clone_ref(py);
+                let _ = p.clone().on_put(move |_pv, v: i32| {
+                    py_on_put(&cb, PvKind::I32(handle.clone()), PutVal::I32(v))
+                });
+            }
+            PvKind::Str(p) => {
+                let handle = p.clone();
+                let cb = callback.clone_ref(py);
+                let _ = p.clone().on_put(move |_pv, v: String| {
+                    py_on_put(&cb, PvKind::Str(handle.clone()), PutVal::Str(v))
+                });
+            }
+        }
+        Ok(callback)
+    }
+}
+
+pub(crate) enum PutVal {
+    F64(f64),
+    Bool(bool),
+    I32(i32),
+    Str(String),
+}
+
+/// Bridge a wire PUT into a Python callback. Exception or `False` → reject.
+fn py_on_put(cb: &PyObject, kind: PvKind, val: PutVal) -> Result<(), String> {
+    Python::with_gil(|py| {
+        let pv = PyPv { kind };
+        let arg = match val {
+            PutVal::F64(v) => v.into_py_any(py),
+            PutVal::Bool(v) => v.into_py_any(py),
+            PutVal::I32(v) => v.into_py_any(py),
+            PutVal::Str(v) => v.into_py_any(py),
+        }
+        .map_err(|e| e.to_string())?;
+        match cb.call1(py, (pv, arg)) {
+            Err(e) => Err(e.to_string()),
+            Ok(ret) => {
+                if matches!(ret.extract::<bool>(py), Ok(false)) {
+                    Err("rejected by on_put".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    })
 }
 
 /// Shared keyword options applied to any typed handle.
