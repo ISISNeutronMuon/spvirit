@@ -64,6 +64,9 @@ impl PvListMode {
 #[derive(Debug)]
 struct ServerState {
     pv_store: RwLock<HashMap<String, RecordInstance>>,
+    /// Last (value, alarm severity) posted to monitors per PV — the MDEL
+    /// monitor-deadband reference point (EPICS MLST semantics).
+    last_posted: Mutex<HashMap<String, (f64, i32)>>,
     monitors: Mutex<HashMap<String, Vec<MonitorSub>>>,
     conns: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
     sid_counter: AtomicU32,
@@ -98,8 +101,20 @@ impl ServerState {
         advertise_ip: Option<IpAddr>,
         listen_ip: IpAddr,
     ) -> Self {
+        // EPICS initialises MLST from the record's starting value, so even
+        // the first change is subject to the MDEL deadband.
+        let last_posted = pv_store
+            .iter()
+            .filter_map(|(name, record)| match record.to_ntpayload() {
+                NtPayload::Scalar(nt) => {
+                    scalar_as_f64(&nt.value).map(|f| (name.clone(), (f, nt.alarm_severity)))
+                }
+                _ => None,
+            })
+            .collect();
         Self {
             pv_store: RwLock::new(pv_store),
+            last_posted: Mutex::new(last_posted),
             monitors: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
             sid_counter: AtomicU32::new(1),
@@ -433,6 +448,7 @@ async fn run_udp_search(
                 let mut cids = Vec::new();
                 for (cid, name) in &payload.pv_requests {
                     if pv_store.contains_key(name)
+                        || resolve_field_nt(&pv_store, name).is_some()
                         || is_virtual_event_pv(name)
                         || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
                         || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
@@ -754,6 +770,7 @@ async fn handle_connection(
                 for (cid, pv_name) in payload.channels {
                     let pv_store = state.pv_store.read().await;
                     if pv_store.contains_key(&pv_name)
+                        || resolve_field_nt(&pv_store, &pv_name).is_some()
                         || is_virtual_event_pv(&pv_name)
                         || (is_pvlist_virtual_pv(&pv_name) && state.pvlist_mode == PvListMode::List)
                         || (is_server_rpc_pv(&pv_name) && state.pvlist_mode != PvListMode::Off)
@@ -1402,6 +1419,7 @@ async fn handle_connection(
                     let mut cids = Vec::new();
                     for (cid, name) in &payload.pv_requests {
                         if pv_store.contains_key(name)
+                            || resolve_field_nt(&pv_store, name).is_some()
                             || is_virtual_event_pv(name)
                             || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
                             || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
@@ -2060,6 +2078,31 @@ fn virtual_pvlist_nt(entries: Vec<String>) -> NtPayload {
     )
 }
 
+/// Resolve an IOC-style `<record>.<FIELD>[$]` reference against the store.
+fn resolve_field_nt(store: &HashMap<String, RecordInstance>, pv_name: &str) -> Option<NtPayload> {
+    use spvirit_tools::spvirit_server::record_fields::{parse_field_ref, payload_for};
+    let field_ref = parse_field_ref(pv_name)?;
+    let record = store.get(&field_ref.base)?;
+    payload_for(record, &field_ref)
+}
+
+/// Numeric view of a scalar value, for MDEL deadband arithmetic.
+fn scalar_as_f64(v: &ScalarValue) -> Option<f64> {
+    Some(match v {
+        ScalarValue::I8(x) => *x as f64,
+        ScalarValue::I16(x) => *x as f64,
+        ScalarValue::I32(x) => *x as f64,
+        ScalarValue::I64(x) => *x as f64,
+        ScalarValue::U8(x) => *x as f64,
+        ScalarValue::U16(x) => *x as f64,
+        ScalarValue::U32(x) => *x as f64,
+        ScalarValue::U64(x) => *x as f64,
+        ScalarValue::F32(x) => *x as f64,
+        ScalarValue::F64(x) => *x,
+        ScalarValue::Bool(_) | ScalarValue::Str(_) => return None,
+    })
+}
+
 async fn get_nt_snapshot(state: &Arc<ServerState>, pv_name: &str) -> Option<NtPayload> {
     if is_pvlist_virtual_pv(pv_name) {
         if state.pvlist_mode != PvListMode::List {
@@ -2078,7 +2121,10 @@ async fn get_nt_snapshot(state: &Arc<ServerState>, pv_name: &str) -> Option<NtPa
         return Some(virtual_event_nt(pv_name));
     }
     let store = state.pv_store.read().await;
-    store.get(pv_name).map(|r| r.to_ntpayload())
+    store
+        .get(pv_name)
+        .map(|r| r.to_ntpayload())
+        .or_else(|| resolve_field_nt(&store, pv_name))
 }
 
 async fn is_writable_pv(state: &Arc<ServerState>, pv_name: &str) -> bool {
@@ -2247,9 +2293,44 @@ async fn apply_put_and_process(
 
 async fn notify_changed_records(state: &Arc<ServerState>, changed: Vec<(String, NtPayload)>) {
     for (name, payload) in changed {
+        if !should_post_update(state, &name, &payload).await {
+            continue;
+        }
         state.beacon_change.fetch_add(1, Ordering::SeqCst);
         notify_monitors(state, &name, &payload).await;
     }
+}
+
+/// MDEL monitor-deadband gate (EPICS semantics): a numeric-scalar update is
+/// suppressed when MDEL > 0, the alarm severity did not change, and the value
+/// moved less than MDEL from the last *posted* value. Posting records the new
+/// reference point.
+async fn should_post_update(state: &Arc<ServerState>, name: &str, payload: &NtPayload) -> bool {
+    let NtPayload::Scalar(nt) = payload else {
+        return true;
+    };
+    let Some(new_f) = scalar_as_f64(&nt.value) else {
+        return true;
+    };
+    let mdel = {
+        let store = state.pv_store.read().await;
+        match store.get(name) {
+            Some(record) => spvirit_tools::spvirit_server::record_fields::mdel_of(record),
+            None => return true,
+        }
+    };
+    let mut last_posted = state.last_posted.lock().await;
+    let within_deadband = mdel > 0.0
+        && last_posted
+            .get(name)
+            .is_some_and(|(last_f, last_sevr)| {
+                *last_sevr == nt.alarm_severity && (new_f - last_f).abs() < mdel
+            });
+    if within_deadband {
+        return false;
+    }
+    last_posted.insert(name.to_string(), (new_f, nt.alarm_severity));
+    true
 }
 
 fn process_record_by_name(

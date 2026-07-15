@@ -124,7 +124,7 @@ pub fn record_type_name(rt: &RecordType) -> &'static str {
 }
 
 /// The record's MDEL monitor deadband (0.0 when absent or unparsable).
-pub(crate) fn mdel_of(record: &RecordInstance) -> f64 {
+pub fn mdel_of(record: &RecordInstance) -> f64 {
     record
         .raw_fields
         .get("MDEL")
