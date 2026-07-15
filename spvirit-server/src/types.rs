@@ -337,6 +337,20 @@ impl RecordInstance {
         self.data.nt_mut()
     }
 
+    /// Fallible mutable access to the record's `NtScalar`, for record variants
+    /// that carry one (Ai, Ao, Bi, Bo, StringIn, StringOut). `None` otherwise.
+    pub(crate) fn nt_scalar_mut(&mut self) -> Option<&mut NtScalar> {
+        match &mut self.data {
+            RecordData::Ai { nt, .. }
+            | RecordData::Ao { nt, .. }
+            | RecordData::Bi { nt, .. }
+            | RecordData::Bo { nt, .. }
+            | RecordData::StringIn { nt, .. }
+            | RecordData::StringOut { nt, .. } => Some(nt),
+            _ => None,
+        }
+    }
+
     pub fn current_value(&self) -> ScalarValue {
         match self.to_ntpayload() {
             NtPayload::Scalar(nt) => nt.value,

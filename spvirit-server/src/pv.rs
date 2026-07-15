@@ -5,7 +5,14 @@
 //! `PvaServer::serve(...)`. Handles are cheap clones; all clones observe and
 //! drive the same record.
 
+use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
+
 use spvirit_types::ScalarValue;
+
+use crate::pva_server::{make_output_record, make_scalar_record};
+use crate::simple_store::SimplePvStore;
+use crate::types::{RecordInstance, RecordType};
 
 /// Errors from typed PV handle operations.
 #[derive(Debug, Clone, PartialEq)]
@@ -104,6 +111,202 @@ impl PvScalar for String {
     }
 }
 
+pub(crate) struct PendingDef {
+    pub(crate) record: RecordInstance,
+}
+
+pub(crate) enum PvState {
+    Pending(PendingDef),
+    Bound(Arc<SimplePvStore>),
+}
+
+pub(crate) struct PvShared {
+    pub(crate) name: String,
+    pub(crate) state: Mutex<PvState>,
+}
+
+/// Typed handle to a PV record. Cheap to clone; all clones share state.
+pub struct Pv<T: PvScalar> {
+    pub(crate) shared: Arc<PvShared>,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T: PvScalar> Clone for Pv<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: PvScalar> Pv<T> {
+    fn from_record(record: RecordInstance) -> Self {
+        Self {
+            shared: Arc::new(PvShared {
+                name: record.name.clone(),
+                state: Mutex::new(PvState::Pending(PendingDef { record })),
+            }),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.shared.name
+    }
+
+    /// Clone of the pending record template; `None` once bound. Test/serve use.
+    pub(crate) fn pending_record(&self) -> Option<RecordInstance> {
+        match &*self.shared.state.lock().unwrap() {
+            PvState::Pending(def) => Some(def.record.clone()),
+            PvState::Bound(_) => None,
+        }
+    }
+
+    /// Mutate the pending record template. Warns and no-ops if already bound.
+    fn with_record(self, f: impl FnOnce(&mut RecordInstance)) -> Self {
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            match &mut *state {
+                PvState::Pending(def) => f(&mut def.record),
+                PvState::Bound(_) => {
+                    tracing::warn!("Pv '{}': option ignored, already bound", self.shared.name)
+                }
+            }
+        }
+        self
+    }
+
+    pub fn units(self, units: impl Into<String>) -> Self {
+        let u = units.into();
+        self.with_record(|r| {
+            if let Some(nt) = r.nt_scalar_mut() {
+                nt.units = u;
+            }
+        })
+    }
+
+    pub fn prec(self, prec: i32) -> Self {
+        self.with_record(|r| {
+            if let Some(nt) = r.nt_scalar_mut() {
+                nt.display_precision = prec;
+            }
+        })
+    }
+
+    pub fn desc(self, desc: impl Into<String>) -> Self {
+        let d = desc.into();
+        self.with_record(|r| {
+            let d2 = d.clone();
+            r.common.desc = d2;
+            if let Some(nt) = r.nt_scalar_mut() {
+                nt.display_description = d;
+            }
+        })
+    }
+
+    /// Archive deadband (parsed/exposed via field access; PVA monitors use MDEL).
+    pub fn adel(self, deadband: f64) -> Self {
+        self.with_record(|r| {
+            r.raw_fields.insert("ADEL".into(), trim_float(deadband));
+        })
+    }
+
+    /// Monitor deadband — suppresses monitor posts for changes smaller than this.
+    pub fn mdel(self, deadband: f64) -> Self {
+        self.with_record(|r| {
+            r.raw_fields.insert("MDEL".into(), trim_float(deadband));
+        })
+    }
+
+    pub fn drive_limits(self, low: f64, high: f64) -> Self {
+        self.with_record(|r| {
+            if let Some(nt) = r.nt_scalar_mut() {
+                nt.control_low = low;
+                nt.control_high = high;
+            }
+        })
+    }
+
+    pub fn alarm_limits(self, lolo: f64, low: f64, high: f64, hihi: f64) -> Self {
+        self.with_record(|r| {
+            if let Some(nt) = r.nt_scalar_mut() {
+                nt.value_alarm_active = true;
+                nt.value_alarm_low_alarm_limit = lolo;
+                nt.value_alarm_low_warning_limit = low;
+                nt.value_alarm_high_warning_limit = high;
+                nt.value_alarm_high_alarm_limit = hihi;
+            }
+        })
+    }
+}
+
+/// Format a float like EPICS .db files do (no trailing ".0" for integers).
+fn trim_float(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v}")
+    }
+}
+
+impl Pv<f64> {
+    pub fn ai(name: impl Into<String>, initial: f64) -> Self {
+        let name = name.into();
+        Self::from_record(make_scalar_record(
+            &name,
+            RecordType::Ai,
+            ScalarValue::F64(initial),
+        ))
+    }
+    pub fn ao(name: impl Into<String>, initial: f64) -> Self {
+        let name = name.into();
+        Self::from_record(make_output_record(
+            &name,
+            RecordType::Ao,
+            ScalarValue::F64(initial),
+        ))
+    }
+}
+
+impl Pv<bool> {
+    pub fn bi(name: impl Into<String>, initial: bool) -> Self {
+        let name = name.into();
+        Self::from_record(make_scalar_record(
+            &name,
+            RecordType::Bi,
+            ScalarValue::Bool(initial),
+        ))
+    }
+    pub fn bo(name: impl Into<String>, initial: bool) -> Self {
+        let name = name.into();
+        Self::from_record(make_output_record(
+            &name,
+            RecordType::Bo,
+            ScalarValue::Bool(initial),
+        ))
+    }
+}
+
+impl Pv<String> {
+    pub fn string_in(name: impl Into<String>, initial: impl Into<String>) -> Self {
+        let name = name.into();
+        Self::from_record(make_scalar_record(
+            &name,
+            RecordType::StringIn,
+            ScalarValue::Str(initial.into()),
+        ))
+    }
+    pub fn string_out(name: impl Into<String>, initial: impl Into<String>) -> Self {
+        let name = name.into();
+        Self::from_record(make_output_record(
+            &name,
+            RecordType::StringOut,
+            ScalarValue::Str(initial.into()),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +339,56 @@ mod tests {
         };
         assert!(e.to_string().contains("f64"));
         assert!(PvError::Unbound.to_string().contains("not bound"));
+    }
+
+    #[test]
+    fn ai_constructor_builds_record_template() {
+        let pv = Pv::ai("SIM:TEMP", 22.5).units("C").prec(2).desc("Temp");
+        let rec = pv.pending_record().expect("still pending");
+        assert_eq!(rec.name, "SIM:TEMP");
+        let nt = rec.to_ntscalar();
+        assert_eq!(nt.value, ScalarValue::F64(22.5));
+        assert_eq!(nt.units, "C");
+        assert_eq!(nt.display_precision, 2);
+        assert_eq!(rec.common.desc, "Temp");
+        assert!(!rec.writable(), "ai is read-only over the wire");
+        assert_eq!(pv.name(), "SIM:TEMP");
+    }
+
+    #[test]
+    fn ao_is_writable_with_drive_limits() {
+        let pv = Pv::ao("SIM:SP", 25.0).drive_limits(0.0, 100.0);
+        let rec = pv.pending_record().unwrap();
+        assert!(rec.writable());
+        let nt = rec.to_ntscalar();
+        assert_eq!(nt.control_low, 0.0);
+        assert_eq!(nt.control_high, 100.0);
+    }
+
+    #[test]
+    fn mdel_adel_go_to_raw_fields() {
+        let pv = Pv::ai("SIM:X", 0.0).mdel(0.5).adel(1.0);
+        let rec = pv.pending_record().unwrap();
+        assert_eq!(rec.raw_fields.get("MDEL").map(String::as_str), Some("0.5"));
+        assert_eq!(rec.raw_fields.get("ADEL").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn alarm_limits_set_value_alarm_block() {
+        let pv = Pv::ao("SIM:A", 0.0).alarm_limits(-10.0, -5.0, 5.0, 10.0);
+        let nt = pv.pending_record().unwrap().to_ntscalar();
+        assert_eq!(nt.value_alarm_low_alarm_limit, -10.0);
+        assert_eq!(nt.value_alarm_low_warning_limit, -5.0);
+        assert_eq!(nt.value_alarm_high_warning_limit, 5.0);
+        assert_eq!(nt.value_alarm_high_alarm_limit, 10.0);
+        assert!(nt.value_alarm_active);
+    }
+
+    #[test]
+    fn bool_and_string_constructors() {
+        assert!(Pv::bo("B", true).pending_record().unwrap().writable());
+        assert!(!Pv::bi("B2", false).pending_record().unwrap().writable());
+        let s = Pv::string_in("S", "hello").pending_record().unwrap();
+        assert_eq!(s.to_ntscalar().value, ScalarValue::Str("hello".into()));
     }
 }

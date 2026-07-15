@@ -746,7 +746,11 @@ impl PvaServer {
 
 // ─── Record construction helpers ─────────────────────────────────────────
 
-fn make_scalar_record(name: &str, record_type: RecordType, value: ScalarValue) -> RecordInstance {
+pub(crate) fn make_scalar_record(
+    name: &str,
+    record_type: RecordType,
+    value: ScalarValue,
+) -> RecordInstance {
     let nt = NtScalar::from_value(value);
     let data = match record_type {
         RecordType::Ai => RecordData::Ai {
@@ -783,7 +787,11 @@ fn make_scalar_record(name: &str, record_type: RecordType, value: ScalarValue) -
     }
 }
 
-fn make_output_record(name: &str, record_type: RecordType, value: ScalarValue) -> RecordInstance {
+pub(crate) fn make_output_record(
+    name: &str,
+    record_type: RecordType,
+    value: ScalarValue,
+) -> RecordInstance {
     let nt = NtScalar::from_value(value);
     let data = match record_type {
         RecordType::Ao => RecordData::Ao {
