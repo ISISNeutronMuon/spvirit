@@ -140,22 +140,6 @@ impl<T: PvScalar> Clone for Pv<T> {
     }
 }
 
-impl<T: PvScalar> std::fmt::Debug for Pv<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pv")
-            .field("name", &self.shared.name)
-            .finish()
-    }
-}
-
-/// Identity equality: two handles are equal iff they share the same
-/// underlying state (e.g. clones of one another).
-impl<T: PvScalar> PartialEq for Pv<T> {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.shared, &other.shared)
-    }
-}
-
 impl<T: PvScalar> Pv<T> {
     fn from_record(record: RecordInstance) -> Self {
         Self {
@@ -339,6 +323,9 @@ impl<T: PvScalar> Pv<T> {
             .set_value(&self.shared.name, value.into_scalar())
             .await
         {
+            Ok(())
+        } else if store.get_value(&self.shared.name).await.is_some() {
+            // Record exists — the write was a no-op (value unchanged).
             Ok(())
         } else {
             Err(PvError::NotFound(self.shared.name.clone()))
@@ -544,6 +531,21 @@ mod tests {
         let bad = Pv::<bool>::attach(&store, "SIM:Y").await;
         assert!(matches!(bad, Err(PvError::TypeMismatch { .. })));
         let missing = Pv::<f64>::attach(&store, "NOPE").await;
-        assert_eq!(missing, Err(PvError::NotFound("NOPE".into())));
+        assert!(matches!(missing, Err(PvError::NotFound(ref n)) if n == "NOPE"));
+    }
+
+    #[tokio::test]
+    async fn set_same_value_is_ok_not_not_found() {
+        let store = empty_store();
+        let pv = Pv::ai("SIM:Z", 1.0);
+        let any: AnyPv = pv.clone().into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+        any.bind(&store);
+
+        assert_eq!(pv.set(2.5).await, Ok(()));
+        // Second write of the same value is a no-op, not NotFound.
+        assert_eq!(pv.set(2.5).await, Ok(()));
+        assert_eq!(pv.get().await, Ok(2.5));
     }
 }
