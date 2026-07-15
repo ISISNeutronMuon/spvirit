@@ -184,17 +184,28 @@ fn encode_enum(index: i32, choices: &[String], is_be: bool) -> Vec<u8> {
     out
 }
 
-fn encode_timestamp(_nt: &NtScalar, is_be: bool) -> Vec<u8> {
+fn encode_timestamp(nt: &NtScalar, is_be: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let seconds_past_epoch = now.as_secs() as i64;
-    let nanos = now.subsec_nanos() as i32;
+
+    // Prefer an explicit, caller-supplied timestamp. Deriving `now()` here is
+    // unstable: the monitor delta path re-encodes both the previous and next
+    // snapshots at send time, so two `now()` samples taken microseconds apart
+    // leave `secondsPastEpoch` identical (never flagged changed) while
+    // `nanoseconds` differs (spuriously flagged) — freezing the seconds on the
+    // client. A stored `time_stamp` is stable across encodes and fixes this.
+    let (seconds_past_epoch, nanos, user_tag) = match &nt.time_stamp {
+        Some(ts) => (ts.seconds_past_epoch, ts.nanoseconds, ts.user_tag),
+        None => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            (now.as_secs() as i64, now.subsec_nanos() as i32, 0)
+        }
+    };
 
     out.extend_from_slice(&encode_i64(seconds_past_epoch, is_be));
     out.extend_from_slice(&encode_i32(nanos, is_be));
-    out.extend_from_slice(&encode_i32(0, is_be)); // userTag
+    out.extend_from_slice(&encode_i32(user_tag, is_be));
     out
 }
 
@@ -2053,6 +2064,107 @@ mod tests {
             .decode_structure(&pvd[1 + desc_bytes.len()..], &parsed_desc)
             .expect("value");
         assert!(consumed > 0);
+    }
+
+    // --- timeStamp encoding: stored value honored, stable, and distinct -----
+    //
+    // Regression tests for the "monitor seconds freeze, only nanoseconds tick"
+    // bug: `encode_timestamp` used to always stamp `SystemTime::now()`, so the
+    // delta path (which re-encodes prev and next at send time) sampled now()
+    // twice microseconds apart — leaving secondsPastEpoch identical (never
+    // flagged changed) while nanoseconds spuriously differed. A stored
+    // `time_stamp` must be encoded verbatim and be stable across encodes so
+    // that prev/next deltas compare correctly.
+
+    fn decode_nt_full(nt: &NtScalar, is_be: bool) -> DecodedValue {
+        let desc = nt_scalar_desc(&nt.value);
+        let desc_bytes = encode_structure_desc(&desc, is_be);
+        let mut pvd = Vec::new();
+        pvd.push(0x80);
+        pvd.extend_from_slice(&desc_bytes);
+        pvd.extend_from_slice(&encode_nt_scalar_full(nt, is_be));
+        let decoder = PvdDecoder::new(is_be);
+        let parsed_desc = decoder.parse_introspection(&pvd).expect("desc");
+        let (val, _) = decoder
+            .decode_structure(&pvd[1 + desc_bytes.len()..], &parsed_desc)
+            .expect("value");
+        val
+    }
+
+    fn timestamp_fields(v: &DecodedValue) -> (i64, i32) {
+        let DecodedValue::Structure(fields) = v else {
+            panic!("top-level not a structure");
+        };
+        let (_, ts) = fields
+            .iter()
+            .find(|(n, _)| n == "timeStamp")
+            .expect("timeStamp field");
+        let DecodedValue::Structure(ts_fields) = ts else {
+            panic!("timeStamp not a structure");
+        };
+        let mut secs = None;
+        let mut nanos = None;
+        for (n, val) in ts_fields {
+            match (n.as_str(), val) {
+                ("secondsPastEpoch", DecodedValue::Int64(s)) => secs = Some(*s),
+                ("nanoseconds", DecodedValue::Int32(ns)) => nanos = Some(*ns),
+                _ => {}
+            }
+        }
+        (secs.expect("secondsPastEpoch"), nanos.expect("nanoseconds"))
+    }
+
+    #[test]
+    fn encode_timestamp_honors_stored_value() {
+        for is_be in [false, true] {
+            let nt = NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1_234_567_890, 42);
+            let (secs, nanos) = timestamp_fields(&decode_nt_full(&nt, is_be));
+            assert_eq!(secs, 1_234_567_890, "stored seconds must be encoded verbatim");
+            assert_eq!(nanos, 42, "stored nanoseconds must be encoded verbatim");
+        }
+    }
+
+    #[test]
+    fn stored_timestamp_is_stable_across_encodes() {
+        // The property that fixes the delta: encoding the same NtScalar twice
+        // yields byte-identical timeStamps (unlike the now() fallback).
+        let nt = NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1000, 500);
+        let a = encode_nt_scalar_full(&nt, false);
+        let b = encode_nt_scalar_full(&nt, false);
+        assert_eq!(a, b, "a stored timestamp must be stable across encodes");
+    }
+
+    #[test]
+    fn distinct_stored_timestamps_flag_seconds_changed() {
+        // Two same-value snapshots one second apart must produce a delta whose
+        // secondsPastEpoch differs — i.e. the seconds are reported as changed.
+        let prev = NtPayload::Scalar(
+            NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1000, 0),
+        );
+        let next = NtPayload::Scalar(
+            NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1001, 0),
+        );
+        let desc = nt_scalar_desc(&ScalarValue::F64(1.0));
+        let (_bitset, values) =
+            encode_nt_payload_delta(&prev, &next, &desc, false).expect("delta present");
+        // The changed values must carry the new seconds (1001), not be empty.
+        assert!(!values.is_empty(), "delta must carry changed field values");
+        // Full-encode sanity: prev and next decode to different seconds.
+        let NtPayload::Scalar(prev_nt) = &prev else { unreachable!() };
+        let NtPayload::Scalar(next_nt) = &next else { unreachable!() };
+        assert_eq!(timestamp_fields(&decode_nt_full(prev_nt, false)).0, 1000);
+        assert_eq!(timestamp_fields(&decode_nt_full(next_nt, false)).0, 1001);
+    }
+
+    #[test]
+    fn none_timestamp_falls_back_to_now() {
+        // Backward compatibility: no stored timestamp -> stamp current time.
+        let nt = NtScalar::from_value(ScalarValue::F64(1.0));
+        let (secs, _) = timestamp_fields(&decode_nt_full(&nt, false));
+        assert!(
+            secs > 1_700_000_000,
+            "now() fallback should yield a recent epoch, got {secs}"
+        );
     }
 
     #[test]

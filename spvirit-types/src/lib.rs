@@ -176,6 +176,13 @@ pub struct NtScalar {
     pub value_alarm_high_warning_severity: i32,
     pub value_alarm_high_alarm_severity: i32,
     pub value_alarm_hysteresis: u8,
+    /// Optional explicit timestamp for this value. When `Some`, the encoder
+    /// serialises exactly this `timeStamp` (stable across encodes); when
+    /// `None`, the encoder falls back to stamping `SystemTime::now()` at
+    /// encode time. Set this to the time the value was actually acquired /
+    /// updated so that monitor deltas flag `secondsPastEpoch` correctly and
+    /// clients can detect stale data. See `with_timestamp`.
+    pub time_stamp: Option<NtTimeStamp>,
 }
 
 impl NtScalar {
@@ -209,7 +216,21 @@ impl NtScalar {
             value_alarm_high_warning_severity: 0,
             value_alarm_high_alarm_severity: 0,
             value_alarm_hysteresis: 0,
+            time_stamp: None,
         }
+    }
+
+    /// Set an explicit `timeStamp` (seconds/nanoseconds past the UNIX epoch)
+    /// for this value. Supplying a stable, per-update timestamp lets monitor
+    /// deltas report `secondsPastEpoch` changes correctly and lets clients
+    /// see the real acquisition time rather than the server's encode time.
+    pub fn with_timestamp(mut self, seconds_past_epoch: i64, nanoseconds: i32) -> Self {
+        self.time_stamp = Some(NtTimeStamp {
+            seconds_past_epoch,
+            nanoseconds,
+            user_tag: 0,
+        });
+        self
     }
 
     pub fn with_limits(mut self, low: f64, high: f64) -> Self {
@@ -569,4 +590,28 @@ pub(crate) fn default_form_choices() -> Vec<String> {
         "Exponential".to_string(),
         "Engineering".to_string(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_value_has_no_timestamp_by_default() {
+        let nt = NtScalar::from_value(ScalarValue::F64(1.0));
+        assert_eq!(nt.time_stamp, None);
+    }
+
+    #[test]
+    fn with_timestamp_sets_stored_timestamp() {
+        let nt = NtScalar::from_value(ScalarValue::F64(1.0)).with_timestamp(1_700_000_000, 250);
+        assert_eq!(
+            nt.time_stamp,
+            Some(NtTimeStamp {
+                seconds_past_epoch: 1_700_000_000,
+                nanoseconds: 250,
+                user_tag: 0,
+            })
+        );
+    }
 }
