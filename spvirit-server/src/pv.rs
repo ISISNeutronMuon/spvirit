@@ -8,6 +8,7 @@
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
+use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_types::ScalarValue;
 
 use crate::pva_server::{make_output_record, make_scalar_record};
@@ -54,6 +55,19 @@ pub trait PvScalar: Sized + Send + Sync + 'static {
     const TYPE_NAME: &'static str;
     fn into_scalar(self) -> ScalarValue;
     fn from_scalar(v: ScalarValue) -> Option<Self>;
+
+    /// Convert a decoded wire PUT value directly to `Self`.
+    ///
+    /// The default goes through [`crate::convert::decoded_to_scalar_value`],
+    /// but that helper checks "is this truthy/falsy" (bool) before it checks
+    /// numeric types, so *any* nonzero numeric [`DecodedValue`] resolves to
+    /// `ScalarValue::Bool` first — which then fails `from_scalar` for `f64`
+    /// and `i32`. Those impls override this method with a type-directed
+    /// decoder (`decoded_to_f64` / `decoded_to_i32`) so ordinary numeric PUTs
+    /// aren't spuriously rejected.
+    fn from_decoded(dv: &DecodedValue) -> Option<Self> {
+        Self::from_scalar(crate::convert::decoded_to_scalar_value(dv))
+    }
 }
 
 impl PvScalar for f64 {
@@ -68,6 +82,9 @@ impl PvScalar for f64 {
             _ => None,
         }
     }
+    fn from_decoded(dv: &DecodedValue) -> Option<Self> {
+        crate::convert::decoded_to_f64(dv)
+    }
 }
 
 impl PvScalar for bool {
@@ -80,6 +97,9 @@ impl PvScalar for bool {
             ScalarValue::Bool(b) => Some(b),
             _ => None,
         }
+    }
+    fn from_decoded(dv: &DecodedValue) -> Option<Self> {
+        crate::convert::decoded_to_bool(dv)
     }
 }
 
@@ -96,6 +116,9 @@ impl PvScalar for i32 {
             _ => None,
         }
     }
+    fn from_decoded(dv: &DecodedValue) -> Option<Self> {
+        crate::convert::decoded_to_i32(dv)
+    }
 }
 
 impl PvScalar for String {
@@ -109,10 +132,14 @@ impl PvScalar for String {
             _ => None,
         }
     }
+    fn from_decoded(dv: &DecodedValue) -> Option<Self> {
+        crate::convert::decoded_to_string(dv)
+    }
 }
 
 pub(crate) struct PendingDef {
     pub(crate) record: RecordInstance,
+    pub(crate) validator: Option<crate::simple_store::PutValidator>,
 }
 
 pub(crate) enum PvState {
@@ -145,7 +172,10 @@ impl<T: PvScalar> Pv<T> {
         Self {
             shared: Arc::new(PvShared {
                 name: record.name.clone(),
-                state: Mutex::new(PvState::Pending(PendingDef { record })),
+                state: Mutex::new(PvState::Pending(PendingDef {
+                    record,
+                    validator: None,
+                })),
             }),
             _marker: PhantomData,
         }
@@ -238,6 +268,50 @@ impl<T: PvScalar> Pv<T> {
                 nt.value_alarm_high_alarm_limit = hihi;
             }
         })
+    }
+
+    /// Attach a PUT handler. `Err(msg)` rejects the PUT on the wire; `Ok(())`
+    /// accepts it. Called with a bound handle to this PV and the typed value.
+    pub fn on_put<F>(self, f: F) -> Self
+    where
+        F: Fn(&Pv<T>, T) -> Result<(), String> + Send + Sync + 'static,
+    {
+        let handle = self.clone();
+        let validator: crate::simple_store::PutValidator = Arc::new(move |_name, dv| {
+            // Scalar puts may arrive wrapped as a Structure with a "value"
+            // field (mirrors the bare-scalar wrapping in
+            // simple_store::apply_put_to_record) — unwrap it the same way
+            // before converting, or a wrapped put would fail the typed
+            // conversion and be spuriously rejected.
+            let scalar_dv = unwrap_value_field(dv);
+            let typed = T::from_decoded(scalar_dv)
+                .ok_or_else(|| format!("expected {}, got {scalar_dv:?}", T::TYPE_NAME))?;
+            f(&handle, typed)
+        });
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            match &mut *state {
+                PvState::Pending(def) => def.validator = Some(validator),
+                PvState::Bound(_) => {
+                    tracing::warn!("Pv '{}': on_put ignored, already bound", self.shared.name)
+                }
+            }
+        }
+        self
+    }
+}
+
+/// Mirrors `apply_put_to_record`'s bare-scalar wrapping: if `dv` is a
+/// `Structure`, pull out its "value" field; otherwise treat `dv` itself as
+/// the scalar value.
+fn unwrap_value_field(dv: &DecodedValue) -> &DecodedValue {
+    match dv {
+        DecodedValue::Structure(fields) => fields
+            .iter()
+            .find(|(name, _)| name == "value")
+            .map(|(_, v)| v)
+            .unwrap_or(dv),
+        other => other,
     }
 }
 
@@ -398,6 +472,15 @@ impl AnyPv {
     pub fn name(&self) -> &str {
         &self.shared.name
     }
+
+    /// Take the pending PUT validator, if any. `None` once bound.
+    pub(crate) fn take_validator(&self) -> Option<crate::simple_store::PutValidator> {
+        let mut state = self.shared.state.lock().unwrap();
+        match &mut *state {
+            PvState::Pending(def) => def.validator.take(),
+            PvState::Bound(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -547,5 +630,50 @@ mod tests {
         // Second write of the same value is a no-op, not NotFound.
         assert_eq!(pv.set(2.5).await, Ok(()));
         assert_eq!(pv.get().await, Ok(2.5));
+    }
+
+    #[tokio::test]
+    async fn on_put_callback_travels_to_store() {
+        let rejected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r2 = rejected.clone();
+        let pv = Pv::ao("SIM:SP", 1.0).on_put(move |_pv, v: f64| {
+            if v > 100.0 {
+                r2.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err("over limit".into())
+            } else {
+                Ok(())
+            }
+        });
+        let any: AnyPv = pv.clone().into();
+        assert!(any.take_validator().is_some());
+    }
+
+    #[tokio::test]
+    async fn on_put_wrapper_unwraps_structure_wrapped_scalar_put() {
+        // Real puts to scalar records arrive as a Structure with a "value"
+        // field (see apply_put_to_record's bare-scalar wrapping in
+        // simple_store.rs). The typed on_put wrapper must unwrap that the
+        // same way before calling convert::decoded_to_scalar_value, or a
+        // wrapped put would fail the typed conversion and spuriously reject.
+        let store = empty_store();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen2 = seen.clone();
+        let pv = Pv::ao("SIM:WRAP", 1.0).on_put(move |_pv, v: f64| {
+            *seen2.lock().unwrap() = Some(v);
+            Ok(())
+        });
+        let any: AnyPv = pv.clone().into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+        let validator = any.take_validator().expect("validator attached");
+        any.bind(&store);
+
+        let dv = spvirit_codec::spvd_decode::DecodedValue::Structure(vec![(
+            "value".to_string(),
+            spvirit_codec::spvd_decode::DecodedValue::Float64(42.0),
+        )]);
+        let res = validator("SIM:WRAP", &dv);
+        assert_eq!(res, Ok(()));
+        assert_eq!(*seen.lock().unwrap(), Some(42.0));
     }
 }

@@ -32,6 +32,9 @@ pub type ScanCallback = Arc<dyn Fn(&str) -> ScalarValue + Send + Sync>;
 /// Callback that computes a derived PV value from its input values.
 pub type LinkCallback = Arc<dyn Fn(&[ScalarValue]) -> ScalarValue + Send + Sync>;
 
+/// Pre-apply PUT validator: `Err(msg)` rejects the PUT (error on the wire).
+pub(crate) type PutValidator = Arc<dyn Fn(&str, &DecodedValue) -> Result<(), String> + Send + Sync>;
+
 /// A link from one or more input PVs to a computed output PV.
 pub(crate) struct LinkDef {
     pub output: String,
@@ -55,6 +58,7 @@ pub struct SimplePvStore {
     links: Vec<LinkDef>,
     compute_alarms: bool,
     registry: RwLock<Option<Arc<MonitorRegistry>>>,
+    validators: RwLock<HashMap<String, PutValidator>>,
 }
 
 impl SimplePvStore {
@@ -84,6 +88,7 @@ impl SimplePvStore {
             links,
             compute_alarms,
             registry: RwLock::new(None),
+            validators: RwLock::new(HashMap::new()),
         }
     }
 
@@ -91,6 +96,11 @@ impl SimplePvStore {
     /// to PVAccess monitor clients.  Called automatically by [`PvaServer::run`].
     pub async fn set_registry(&self, registry: Arc<MonitorRegistry>) {
         *self.registry.write().await = Some(registry);
+    }
+
+    /// Register a pre-apply PUT validator for a PV.
+    pub(crate) async fn set_validator(&self, name: String, v: PutValidator) {
+        self.validators.write().await.insert(name, v);
     }
 
     /// Insert or replace a PV record at runtime.
@@ -339,6 +349,10 @@ impl Source for SimplePvStore {
         let name = name.to_string();
         let value = value.clone();
         Box::pin(async move {
+            if let Some(validator) = self.validators.read().await.get(&name).cloned() {
+                validator(&name, &value)?;
+            }
+
             let result = {
                 let mut pvs = self.pvs.write().await;
                 let entry = pvs
@@ -1252,5 +1266,53 @@ record(ao, "DB:AO") {
         tokio::task::yield_now().await;
 
         assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_put_before_apply() {
+        let mut records = std::collections::HashMap::new();
+        records.insert(
+            "V".to_string(),
+            crate::pva_server::make_output_record(
+                "V",
+                crate::types::RecordType::Ao,
+                ScalarValue::F64(1.0),
+            ),
+        );
+        let store =
+            SimplePvStore::new(records, std::collections::HashMap::new(), Vec::new(), false);
+        store
+            .set_validator(
+                "V".to_string(),
+                std::sync::Arc::new(|_name, _val| Err("nope".to_string())),
+            )
+            .await;
+
+        let dv = DecodedValue::Float64(2.0);
+        let res = Source::put(&store, "V", &dv).await;
+        assert_eq!(res, Err("nope".to_string()));
+        // value unchanged — validator ran BEFORE apply
+        assert_eq!(store.get_value("V").await, Some(ScalarValue::F64(1.0)));
+    }
+
+    #[tokio::test]
+    async fn validator_allows_structure_wrapped_put_through() {
+        // Real puts to scalar records arrive wrapped as a Structure with a
+        // "value" field (see apply_put_to_record's bare-scalar-wrapping).
+        // The validator itself only sees the raw DecodedValue as given to
+        // `put`; this test documents that a validator returning Ok lets a
+        // structure-wrapped put proceed and apply normally.
+        let mut records = std::collections::HashMap::new();
+        records.insert("W".to_string(), make_ao("W", 1.0));
+        let store =
+            SimplePvStore::new(records, std::collections::HashMap::new(), Vec::new(), false);
+        store
+            .set_validator("W".to_string(), std::sync::Arc::new(|_name, _val| Ok(())))
+            .await;
+
+        let dv = DecodedValue::Structure(vec![("value".to_string(), DecodedValue::Float64(5.0))]);
+        let res = Source::put(&store, "W", &dv).await;
+        assert!(res.is_ok());
+        assert_eq!(store.get_value("W").await, Some(ScalarValue::F64(5.0)));
     }
 }
