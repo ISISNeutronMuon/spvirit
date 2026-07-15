@@ -422,38 +422,53 @@ impl PyServer {
     /// Mint a typed handle to any served record (handle-built or .db-loaded).
     fn pv(&self, py: Python<'_>, name: String) -> PyResult<crate::pv::PyPv> {
         use crate::pv::{PvKind, PyPv, pv_err};
-        use spvirit_types::ScalarValue;
+        use spvirit_types::{NtPayload, ScalarValue};
         let server = self
             .server
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("server already consumed"))?;
         let store = server.store().clone();
-        let sniff = block_on_py(py, store.get_value(&name));
+        let sniff = block_on_py(py, store.get_nt(&name));
         let kind = match sniff {
             None => {
                 return Err(pyo3::exceptions::PyKeyError::new_err(format!(
                     "PV '{name}' not found"
                 )));
             }
-            Some(ScalarValue::F64(_)) | Some(ScalarValue::F32(_)) => {
-                let h = block_on_py(py, server.pv::<f64>(&name)).map_err(pv_err)?;
-                PvKind::F64(h)
-            }
-            Some(ScalarValue::Bool(_)) => {
-                let h = block_on_py(py, server.pv::<bool>(&name)).map_err(pv_err)?;
-                PvKind::Bool(h)
-            }
-            Some(ScalarValue::I8(_)) | Some(ScalarValue::I16(_)) | Some(ScalarValue::I32(_)) => {
+            Some(NtPayload::Scalar(nt)) => match nt.value {
+                ScalarValue::F64(_) | ScalarValue::F32(_) => {
+                    let h = block_on_py(py, server.pv::<f64>(&name)).map_err(pv_err)?;
+                    PvKind::F64(h)
+                }
+                ScalarValue::Bool(_) => {
+                    let h = block_on_py(py, server.pv::<bool>(&name)).map_err(pv_err)?;
+                    PvKind::Bool(h)
+                }
+                ScalarValue::I8(_) | ScalarValue::I16(_) | ScalarValue::I32(_) => {
+                    let h = block_on_py(py, server.pv::<i32>(&name)).map_err(pv_err)?;
+                    PvKind::I32(h)
+                }
+                ScalarValue::Str(_) => {
+                    let h = block_on_py(py, server.pv::<String>(&name)).map_err(pv_err)?;
+                    PvKind::Str(h)
+                }
+                other => {
+                    return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                        "PV '{name}' has unsupported value type {other:?} for typed handles"
+                    )));
+                }
+            },
+            Some(NtPayload::Enum(_)) => {
                 let h = block_on_py(py, server.pv::<i32>(&name)).map_err(pv_err)?;
                 PvKind::I32(h)
             }
-            Some(ScalarValue::Str(_)) => {
-                let h = block_on_py(py, server.pv::<String>(&name)).map_err(pv_err)?;
-                PvKind::Str(h)
+            Some(NtPayload::ScalarArray(_)) => {
+                let h = block_on_py(py, server.array_pv(&name)).map_err(pv_err)?;
+                PvKind::Array(h)
             }
             Some(other) => {
                 return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                    "PV '{name}' has unsupported value type {other:?} for typed handles"
+                    "PV '{name}' has unsupported payload {other:?} for typed handles"
                 )));
             }
         };

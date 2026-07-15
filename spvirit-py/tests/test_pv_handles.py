@@ -166,11 +166,46 @@ def test_pv_inference():
     assert "float" in repr(spvirit.pv("PYI:F", 1.5))
     assert "bool" in repr(spvirit.pv("PYI:B", True))
     assert "str" in repr(spvirit.pv("PYI:S", "x"))
+    assert "int" in repr(spvirit.pv("PYI:I", 3))
     try:
-        spvirit.pv("PYI:I", 3)
-        raise AssertionError("int must raise TypeError")
+        spvirit.pv("PYI:D", {"a": 1})
+        raise AssertionError("dict must raise TypeError")
     except TypeError:
         pass
+
+
+def test_int_and_enum_and_array_constructors():
+    n = spvirit.longout("PYX:N", 5)
+    mode = spvirit.mbbo("PYX:MODE", ["Stop", "Run", "Fault"], 0)
+    wave = spvirit.waveform("PYX:WAVE", [1.0, 2.0, 3.0])
+    server = spvirit.Server(pvs=[n, mode, wave], port=15145, udp_port=15146,
+                            listen_ip="127.0.0.1")
+    n.set(42)
+    assert n.get() == 42
+    mode.set(2)
+    assert mode.get() == 2
+    mode.set(9)              # out-of-range: no-op
+    assert mode.get() == 2
+    wave.set([4.0, 5.0])
+    assert wave.get() == [4.0, 5.0]
+    # typed re-attach picks the right kinds
+    assert server.pv("PYX:N").get() == 42
+    assert server.pv("PYX:WAVE").get() == [4.0, 5.0]
+    assert "array" in repr(server.pv("PYX:WAVE"))
+
+
+def test_pv_inference_int_and_list():
+    assert "int" in repr(spvirit.pv("PYI:N", 3))
+    assert "array" in repr(spvirit.pv("PYI:W", [1.0, 2.0]))
+
+
+def test_set_alarm():
+    t = spvirit.ai("PYA:T", 1.0)
+    spvirit.Server(pvs=[t], port=15155, udp_port=15156, listen_ip="127.0.0.1")
+    t.set_alarm(2, 3, "broken")   # MAJOR severity
+    # no direct alarm getter on handles; absence of exception is the contract,
+    # plus idempotency:
+    t.set_alarm(2, 3, "broken")
 
 
 def main():

@@ -57,6 +57,13 @@ fn spvirit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pv::bo, m)?)?;
     m.add_function(wrap_pyfunction!(pv::string_in, m)?)?;
     m.add_function(wrap_pyfunction!(pv::string_out, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::longin, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::longout, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::mbbi, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::mbbo, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::waveform, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::aai, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::aao, m)?)?;
     m.add_function(wrap_pyfunction!(pv::calc, m)?)?;
     m.add_function(wrap_pyfunction!(pv::pv, m)?)?;
 

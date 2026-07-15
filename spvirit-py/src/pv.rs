@@ -6,8 +6,9 @@ use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 
-use spvirit_server::pv::{AnyPv, Pv, PvError};
+use spvirit_server::pv::{AnyPv, Pv, PvArray, PvError};
 
+use crate::convert::{py_to_scalar_array, scalar_array_to_py};
 use crate::runtime::block_on_py;
 
 pub(crate) fn pv_err(e: PvError) -> PyErr {
@@ -25,6 +26,7 @@ pub(crate) enum PvKind {
     Bool(Pv<bool>),
     I32(Pv<i32>),
     Str(Pv<String>),
+    Array(PvArray),
 }
 
 /// Typed handle to a PV record. Create with `spvirit.ai(...)`, `spvirit.ao(...)`,
@@ -42,6 +44,7 @@ impl PyPv {
             PvKind::Bool(p) => AnyPv::from(p.clone()),
             PvKind::I32(p) => AnyPv::from(p.clone()),
             PvKind::Str(p) => AnyPv::from(p.clone()),
+            PvKind::Array(a) => AnyPv::from(a.clone()),
         }
     }
 }
@@ -55,6 +58,7 @@ impl PyPv {
             PvKind::Bool(p) => p.name(),
             PvKind::I32(p) => p.name(),
             PvKind::Str(p) => p.name(),
+            PvKind::Array(p) => p.name(),
         }
     }
 
@@ -64,6 +68,7 @@ impl PyPv {
             PvKind::Bool(_) => "bool",
             PvKind::I32(_) => "int",
             PvKind::Str(_) => "str",
+            PvKind::Array(_) => "array",
         };
         format!("<spvirit.Pv '{}' ({ty})>", self.name())
     }
@@ -85,6 +90,10 @@ impl PyPv {
             }
             PvKind::Str(p) => {
                 let v: String = value.extract()?;
+                block_on_py(py, p.set(v)).map_err(pv_err)
+            }
+            PvKind::Array(p) => {
+                let v = py_to_scalar_array(value)?;
                 block_on_py(py, p.set(v)).map_err(pv_err)
             }
         }
@@ -109,6 +118,33 @@ impl PyPv {
                 let v = block_on_py(py, p.get()).map_err(pv_err)?;
                 v.into_py_any(py)
             }
+            PvKind::Array(p) => {
+                let v = block_on_py(py, p.get()).map_err(pv_err)?;
+                Ok(scalar_array_to_py(py, &v))
+            }
+        }
+    }
+
+    /// Explicitly set the record's alarm severity/status/message, independent
+    /// of its value.
+    #[pyo3(signature = (severity, status, message=""))]
+    fn set_alarm(&self, py: Python<'_>, severity: i32, status: i32, message: &str) -> PyResult<()> {
+        match &self.kind {
+            PvKind::F64(p) => {
+                block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
+            }
+            PvKind::Bool(p) => {
+                block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
+            }
+            PvKind::I32(p) => {
+                block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
+            }
+            PvKind::Str(p) => {
+                block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
+            }
+            PvKind::Array(p) => {
+                block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
+            }
         }
     }
 
@@ -121,6 +157,11 @@ impl PyPv {
     /// (decorator protocol), so it works both as a plain method call and as
     /// `@pv.on_put`.
     fn on_put(&self, py: Python<'_>, callback: PyObject) -> PyResult<PyObject> {
+        if matches!(&self.kind, PvKind::Array(_)) {
+            return Err(PyTypeError::new_err(
+                "on_put/scan not supported on array PVs",
+            ));
+        }
         match &self.kind {
             PvKind::F64(p) => {
                 let handle = p.clone();
@@ -150,6 +191,7 @@ impl PyPv {
                     py_on_put(&cb, PvKind::Str(handle.clone()), PutVal::Str(v))
                 });
             }
+            PvKind::Array(_) => unreachable!("Array on_put rejected above"),
         }
         Ok(callback)
     }
@@ -165,6 +207,11 @@ impl PyPv {
     /// afterwards is a silent no-op (core logs a warning).
     #[pyo3(signature = (period, callback=None))]
     fn scan(&self, py: Python<'_>, period: f64, callback: Option<PyObject>) -> PyResult<PyObject> {
+        if matches!(&self.kind, PvKind::Array(_)) {
+            return Err(PyTypeError::new_err(
+                "on_put/scan not supported on array PVs",
+            ));
+        }
         match callback {
             Some(cb) => {
                 register_scan(self, period, cb.clone_ref(py));
@@ -224,6 +271,7 @@ fn register_scan(pv: &PyPv, period_secs: f64, cb: PyObject) {
                 .clone()
                 .scan(dur, move |h| scan_bridge_str(&cb, &cache, h));
         }
+        PvKind::Array(_) => unreachable!("Array scan rejected in PyPv::scan"),
     }
 }
 
@@ -405,6 +453,82 @@ pv_ctor!(
     Str,
     "String output (writable)."
 );
+pv_ctor!(
+    longin,
+    Pv::longin,
+    i32,
+    I32,
+    "32-bit integer input (read-only over the wire)."
+);
+pv_ctor!(
+    longout,
+    Pv::longout,
+    i32,
+    I32,
+    "32-bit integer output (writable)."
+);
+
+/// Multi-bit binary input (enum, read-only). Value is the choice index;
+/// out-of-range writes are rejected. Enum records ignore the common
+/// `NtScalar` options (`units`/`prec`/`adel`/`mdel`/limits) — only `desc`
+/// is accepted.
+#[pyfunction]
+#[pyo3(signature = (name, choices, initial, *, desc=None))]
+pub fn mbbi(name: String, choices: Vec<String>, initial: i32, desc: Option<String>) -> PyPv {
+    let mut pv = Pv::mbbi(name, choices, initial);
+    if let Some(d) = desc {
+        pv = pv.desc(d);
+    }
+    PyPv {
+        kind: PvKind::I32(pv),
+    }
+}
+
+/// Multi-bit binary output (enum, writable). Value is the choice index;
+/// out-of-range writes are rejected. Enum records ignore the common
+/// `NtScalar` options (`units`/`prec`/`adel`/`mdel`/limits) — only `desc`
+/// is accepted.
+#[pyfunction]
+#[pyo3(signature = (name, choices, initial, *, desc=None))]
+pub fn mbbo(name: String, choices: Vec<String>, initial: i32, desc: Option<String>) -> PyPv {
+    let mut pv = Pv::mbbo(name, choices, initial);
+    if let Some(d) = desc {
+        pv = pv.desc(d);
+    }
+    PyPv {
+        kind: PvKind::I32(pv),
+    }
+}
+
+/// Array record (writable over the wire). `data` is a list of bool/int/
+/// float/str, or `bytes` for a `U8` array.
+#[pyfunction]
+pub fn waveform(name: String, data: &Bound<'_, PyAny>) -> PyResult<PyPv> {
+    let arr = py_to_scalar_array(data)?;
+    Ok(PyPv {
+        kind: PvKind::Array(PvArray::waveform(name, arr)),
+    })
+}
+
+/// Analog array input (read-only over the wire). `data` is a list of bool/
+/// int/float/str, or `bytes` for a `U8` array.
+#[pyfunction]
+pub fn aai(name: String, data: &Bound<'_, PyAny>) -> PyResult<PyPv> {
+    let arr = py_to_scalar_array(data)?;
+    Ok(PyPv {
+        kind: PvKind::Array(PvArray::aai(name, arr)),
+    })
+}
+
+/// Analog array output (writable). `data` is a list of bool/int/float/str,
+/// or `bytes` for a `U8` array.
+#[pyfunction]
+pub fn aao(name: String, data: &Bound<'_, PyAny>) -> PyResult<PyPv> {
+    let arr = py_to_scalar_array(data)?;
+    Ok(PyPv {
+        kind: PvKind::Array(PvArray::aao(name, arr)),
+    })
+}
 
 /// A derived (read-only) float PV recomputed whenever any input changes.
 ///
@@ -444,10 +568,10 @@ pub fn calc(py: Python<'_>, name: String, inputs: Vec<PyPv>, callback: PyObject)
 }
 
 /// Build a typed PV, inferring the record type from `initial`'s Python type:
-/// `bool` -> `bo`, `float` -> `ao`, `str` -> `string_out`. Plain `int` raises
-/// `TypeError` (longin/longout aren't implemented yet — use a float). Note
-/// `bool` is checked before `int` since `isinstance(True, int)` is `True` in
-/// Python.
+/// `bool` -> `bo`, `int` -> `longout`, `float` -> `ao`, `str` -> `string_out`,
+/// `list`/`bytes` -> `waveform`. Note `bool` is checked before `int` since
+/// `isinstance(True, int)` is `True` in Python. Any other type raises
+/// `TypeError`.
 #[pyfunction]
 #[pyo3(signature = (name, initial, *, units=None, prec=None, desc=None,
                     adel=None, mdel=None, drive_limits=None, alarm_limits=None))]
@@ -463,7 +587,7 @@ pub fn pv(
     drive_limits: Option<(f64, f64)>,
     alarm_limits: Option<(f64, f64, f64, f64)>,
 ) -> PyResult<PyPv> {
-    use pyo3::types::{PyBool, PyFloat, PyInt, PyString};
+    use pyo3::types::{PyBool, PyBytes, PyFloat, PyInt, PyList, PyString};
     let kind = if initial.is_instance_of::<PyBool>() {
         PvKind::Bool(apply_opts(
             Pv::bo(name, initial.extract::<bool>()?),
@@ -476,9 +600,19 @@ pub fn pv(
             alarm_limits,
         ))
     } else if initial.is_instance_of::<PyInt>() {
-        return Err(PyTypeError::new_err(
-            "integer records need longin/longout — not yet implemented; use a float",
-        ));
+        PvKind::I32(apply_opts(
+            Pv::longout(name, initial.extract::<i32>()?),
+            units,
+            prec,
+            desc,
+            adel,
+            mdel,
+            drive_limits,
+            alarm_limits,
+        ))
+    } else if initial.is_instance_of::<PyList>() || initial.is_instance_of::<PyBytes>() {
+        let arr = py_to_scalar_array(initial)?;
+        PvKind::Array(PvArray::waveform(name, arr))
     } else if initial.is_instance_of::<PyFloat>() {
         PvKind::F64(apply_opts(
             Pv::ao(name, initial.extract::<f64>()?),
