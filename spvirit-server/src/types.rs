@@ -25,9 +25,14 @@ pub enum RecordType {
     Mbbi,
     Mbbo,
     Generic,
+    LongIn,
+    LongOut,
 }
 
 impl RecordType {
+    // TODO(follow-up): .db parsing — longin/longout are not yet recognized
+    // here; wiring `.db`-loaded longin/longout records needs db.rs
+    // construction work (out of scope for the handle-API-only gap task).
     pub fn from_db_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "ai" => Some(Self::Ai),
@@ -49,7 +54,7 @@ impl RecordType {
     pub fn is_output(&self) -> bool {
         matches!(
             self,
-            Self::Ao | Self::Bo | Self::StringOut | Self::Aao | Self::Mbbo
+            Self::Ao | Self::Bo | Self::StringOut | Self::Aao | Self::Mbbo | Self::LongOut
         )
     }
 }

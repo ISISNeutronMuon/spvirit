@@ -543,11 +543,17 @@ fn to_record(record: &DbRecord) -> Option<RecordInstance> {
                 indx: fields.get("INDX").and_then(|v| parse_usize(v)).unwrap_or(0),
             }
         }
+        // TODO(follow-up): .db parsing — from_db_name never yields LongIn/
+        // LongOut today, so these arms are unreachable; they're only here to
+        // satisfy exhaustiveness. Wiring longin/longout .db loading is
+        // tracked as follow-up work.
         RecordType::NtTable
         | RecordType::NtNdArray
         | RecordType::Mbbi
         | RecordType::Mbbo
-        | RecordType::Generic => {
+        | RecordType::Generic
+        | RecordType::LongIn
+        | RecordType::LongOut => {
             eprintln!(
                 "Record '{}': type '{}' is not a standard EPICS Base record type and cannot be loaded from .db files",
                 record.name, record.record_type

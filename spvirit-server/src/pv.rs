@@ -460,6 +460,27 @@ impl Pv<String> {
     }
 }
 
+impl Pv<i32> {
+    /// `longin` — 32-bit integer input record (read-only over the wire).
+    pub fn longin(name: impl Into<String>, initial: i32) -> Self {
+        let name = name.into();
+        Self::from_record(make_scalar_record(
+            &name,
+            RecordType::LongIn,
+            ScalarValue::I32(initial),
+        ))
+    }
+    /// `longout` — 32-bit integer output record (writable).
+    pub fn longout(name: impl Into<String>, initial: i32) -> Self {
+        let name = name.into();
+        Self::from_record(make_output_record(
+            &name,
+            RecordType::LongOut,
+            ScalarValue::I32(initial),
+        ))
+    }
+}
+
 impl<T: PvScalar> Pv<T> {
     fn store(&self) -> Result<Arc<SimplePvStore>, PvError> {
         match &*self.shared.state.lock().unwrap() {
@@ -667,6 +688,33 @@ mod tests {
         assert!(!Pv::bi("B2", false).pending_record().unwrap().writable());
         let s = Pv::string_in("S", "hello").pending_record().unwrap();
         assert_eq!(s.to_ntscalar().value, ScalarValue::Str("hello".into()));
+    }
+
+    #[test]
+    fn longin_longout_constructors() {
+        let li = Pv::longin("L:IN", 42);
+        let rec = li.pending_record().unwrap();
+        assert_eq!(rec.record_type, crate::types::RecordType::LongIn);
+        assert_eq!(rec.to_ntscalar().value, ScalarValue::I32(42));
+        assert!(!rec.writable());
+
+        let lo = Pv::longout("L:OUT", 7).drive_limits(0.0, 1000.0);
+        let rec = lo.pending_record().unwrap();
+        assert_eq!(rec.record_type, crate::types::RecordType::LongOut);
+        assert!(rec.writable());
+        assert_eq!(rec.to_ntscalar().control_high, 1000.0);
+    }
+
+    #[tokio::test]
+    async fn longout_set_get_roundtrip() {
+        let store = empty_store();
+        let pv = Pv::longout("L:RT", 1);
+        let any: AnyPv = pv.clone().into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+        any.bind(&store);
+        pv.set(99).await.unwrap();
+        assert_eq!(pv.get().await, Ok(99));
     }
 
     fn empty_store() -> Arc<SimplePvStore> {

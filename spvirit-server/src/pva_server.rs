@@ -921,6 +921,14 @@ pub(crate) fn make_scalar_record(
             siol: None,
             simm: false,
         },
+        // longin reuses the Ai data shape (NtScalar input record)
+        RecordType::LongIn => RecordData::Ai {
+            nt,
+            inp: None,
+            siml: None,
+            siol: None,
+            simm: false,
+        },
         _ => panic!("make_scalar_record: unsupported type {record_type:?}"),
     };
     RecordInstance {
@@ -967,6 +975,19 @@ pub(crate) fn make_output_record(
             out: None,
             dol: None,
             omsl: OutputMode::Supervisory,
+            siml: None,
+            siol: None,
+            simm: false,
+        },
+        // longout reuses the Ao data shape (NtScalar output record)
+        RecordType::LongOut => RecordData::Ao {
+            nt,
+            out: None,
+            dol: None,
+            omsl: OutputMode::Supervisory,
+            drvl: None,
+            drvh: None,
+            oroc: None,
             siml: None,
             siol: None,
             simm: false,
