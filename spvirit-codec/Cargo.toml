@@ -1,6 +1,6 @@
 [package]
 name = "spvirit-codec"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 description = "PVAccess protocol encode/decode and connection state tracking."
 license = "BSD-3-Clause"
@@ -11,6 +11,6 @@ categories = ["science"]
 authors = ["Mateusz Leputa for ISIS Neutron and Muon Source Copyright 2026"]
 
 [dependencies]
-spvirit-types = { version = "0.1.12", path = "../spvirit-types" }
+spvirit-types = { version = "0.1.13", path = "../spvirit-types" }
 hex = "0.4.3"
 tracing = "0.1.41"
