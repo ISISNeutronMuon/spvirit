@@ -80,18 +80,30 @@ async fn pv_handle_api_end_to_end() {
     // GET sees the handle-built PV with metadata.
     let opts = local_pvget_opts("HND:TEMP", tcp_port, udp_port);
     let result = pvget(&opts).await.expect("pvget HND:TEMP");
-    assert!(format_compact_value(&result.value).contains("22.5"));
+    let value = format_compact_value(&result.value);
+    assert!(
+        value.contains("22.5"),
+        "HND:TEMP: expected '22.5' in '{value}'"
+    );
 
     // Field access works on handle-built records (spec requirement).
     let opts = local_pvget_opts("HND:TEMP.RTYP", tcp_port, udp_port);
     let result = pvget(&opts).await.expect("pvget .RTYP");
-    assert!(format_compact_value(&result.value).contains("ai"));
+    let value = format_compact_value(&result.value);
+    assert!(
+        value.contains("ai"),
+        "HND:TEMP.RTYP: expected 'ai' in '{value}'"
+    );
 
     // set() posts a new value visible over the wire.
     temp.set(23.75).await.unwrap();
     let opts = local_pvget_opts("HND:TEMP", tcp_port, udp_port);
     let result = pvget(&opts).await.expect("pvget after set");
-    assert!(format_compact_value(&result.value).contains("23.75"));
+    let value = format_compact_value(&result.value);
+    assert!(
+        value.contains("23.75"),
+        "HND:TEMP after set: expected '23.75' in '{value}'"
+    );
 
     // Accepted PUT via spput; then rejected PUT must exit non-zero.
     let spput = workspace_bin("spput");

@@ -588,7 +588,6 @@ impl AnyPv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spvirit_types::ScalarValue;
 
     #[test]
     fn pvscalar_roundtrip_f64() {
