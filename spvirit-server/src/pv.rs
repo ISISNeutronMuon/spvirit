@@ -533,6 +533,28 @@ impl<T: PvScalar> Pv<T> {
         }
     }
 
+    /// Explicitly set the record's alarm severity/status/message, independent
+    /// of its value. Alarm transitions always post (no MDEL gating, no link
+    /// evaluation). A no-op re-set (unchanged alarm) is `Ok(())`.
+    pub async fn set_alarm(
+        &self,
+        severity: i32,
+        status: i32,
+        message: &str,
+    ) -> Result<(), PvError> {
+        let store = self.store()?;
+        if store
+            .set_alarm(&self.shared.name, severity, status, message)
+            .await
+        {
+            Ok(())
+        } else if store.get_value(&self.shared.name).await.is_some() {
+            Ok(())
+        } else {
+            Err(PvError::NotFound(self.shared.name.clone()))
+        }
+    }
+
     /// Read the current value, typed.
     pub async fn get(&self) -> Result<T, PvError> {
         let store = self.store()?;
@@ -685,6 +707,28 @@ impl PvArray {
                 }),
                 None => Err(PvError::NotFound(self.shared.name.clone())),
             }
+        }
+    }
+
+    /// Explicitly set the record's alarm severity/status/message, independent
+    /// of its value. Alarm transitions always post (no MDEL gating, no link
+    /// evaluation). A no-op re-set (unchanged alarm) is `Ok(())`.
+    pub async fn set_alarm(
+        &self,
+        severity: i32,
+        status: i32,
+        message: &str,
+    ) -> Result<(), PvError> {
+        let store = self.store()?;
+        if store
+            .set_alarm(&self.shared.name, severity, status, message)
+            .await
+        {
+            Ok(())
+        } else if store.get_nt(&self.shared.name).await.is_some() {
+            Ok(())
+        } else {
+            Err(PvError::NotFound(self.shared.name.clone()))
         }
     }
 
@@ -1062,6 +1106,93 @@ mod tests {
         // Second write of the same value is a no-op, not NotFound.
         assert_eq!(pv.set(2.5).await, Ok(()));
         assert_eq!(pv.get().await, Ok(2.5));
+    }
+
+    #[tokio::test]
+    async fn set_alarm_posts_and_reads_back() {
+        let store = empty_store();
+        let pv = Pv::ai("A:1", 1.0);
+        let any: AnyPv = pv.clone().into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+        any.bind(&store);
+
+        // subscribe like a monitor client
+        let mut rx = crate::pvstore::Source::subscribe(&*store, "A:1")
+            .await
+            .unwrap();
+
+        pv.set_alarm(2, 3, "sensor dead").await.unwrap();
+        let rec = store.get_record("A:1").await.unwrap();
+        let nt = rec.to_ntscalar();
+        assert_eq!(nt.alarm_severity, 2);
+        assert_eq!(nt.alarm_status, 3);
+        assert_eq!(nt.alarm_message, "sensor dead");
+        // a payload was posted to the subscriber
+        let posted = rx.try_recv().expect("alarm change must post");
+        drop(posted);
+        // idempotent re-set posts nothing
+        pv.set_alarm(2, 3, "sensor dead").await.unwrap();
+        assert!(rx.try_recv().is_err());
+        // unbound / missing paths
+        let ghost = Pv::ai("A:GHOST", 0.0);
+        assert_eq!(ghost.set_alarm(1, 0, "x").await, Err(PvError::Unbound));
+
+        let missing: Pv<f64> = Pv::attach(&store, "A:1").await.unwrap();
+        // sanity: attach roundtrip still works after alarm writes
+        assert_eq!(missing.get().await, Ok(1.0));
+    }
+
+    #[tokio::test]
+    async fn set_alarm_missing_record_is_not_found() {
+        let store = empty_store();
+        let pv = Pv::ai("A:MISSING", 0.0);
+        let any: AnyPv = pv.clone().into();
+        any.bind(&store);
+        assert_eq!(
+            pv.set_alarm(1, 1, "x").await,
+            Err(PvError::NotFound("A:MISSING".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_alarm_on_enum_and_array_records() {
+        let store = empty_store();
+
+        let mbbo = Pv::mbbo("M:ALM", vec!["Stop".into(), "Run".into()], 0);
+        let any: AnyPv = mbbo.clone().into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+        any.bind(&store);
+
+        let wf = PvArray::waveform("W:ALM", ScalarArrayValue::F64(vec![1.0, 2.0]));
+        let any: AnyPv = wf.clone().into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+        any.bind(&store);
+
+        assert!(store.set_alarm("M:ALM", 2, 5, "enum fault").await);
+        assert!(store.set_alarm("W:ALM", 1, 4, "array fault").await);
+
+        match store.get_nt("M:ALM").await.unwrap() {
+            NtPayload::Enum(nt) => {
+                assert_eq!(nt.alarm.severity, 2);
+                assert_eq!(nt.alarm.status, 5);
+                assert_eq!(nt.alarm.message, "enum fault");
+            }
+            other => panic!("expected Enum, got {other:?}"),
+        }
+        match store.get_nt("W:ALM").await.unwrap() {
+            NtPayload::ScalarArray(nt) => {
+                assert_eq!(nt.alarm.severity, 1);
+                assert_eq!(nt.alarm.status, 4);
+                assert_eq!(nt.alarm.message, "array fault");
+            }
+            other => panic!("expected ScalarArray, got {other:?}"),
+        }
+
+        // idempotent re-set posts nothing / returns false
+        assert!(!store.set_alarm("M:ALM", 2, 5, "enum fault").await);
     }
 
     #[tokio::test]

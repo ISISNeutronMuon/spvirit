@@ -168,6 +168,66 @@ impl SimplePvStore {
         }
     }
 
+    /// Explicitly set a record's alarm fields (severity/status/message),
+    /// independent of its value. Unlike [`SimplePvStore::set_value`], alarm
+    /// transitions always post — there is no MDEL deadband gating and no
+    /// link evaluation (alarm changes don't propagate links). Returns
+    /// `false` if the alarm state is unchanged (idempotent) or the record
+    /// doesn't support alarm fields (`Table`/`NdArray`/`Generic`) or doesn't
+    /// exist.
+    pub async fn set_alarm(&self, name: &str, severity: i32, status: i32, message: &str) -> bool {
+        let payload = {
+            let mut pvs = self.pvs.write().await;
+            let Some(entry) = pvs.get_mut(name) else {
+                return false;
+            };
+            let alarm = if let Some(nt) = entry.record.nt_scalar_mut() {
+                (
+                    &mut nt.alarm_severity,
+                    &mut nt.alarm_status,
+                    &mut nt.alarm_message,
+                )
+            } else {
+                match &mut entry.record.data {
+                    RecordData::NtEnum { nt, .. } => (
+                        &mut nt.alarm.severity,
+                        &mut nt.alarm.status,
+                        &mut nt.alarm.message,
+                    ),
+                    RecordData::Waveform { nt, .. }
+                    | RecordData::Aai { nt, .. }
+                    | RecordData::Aao { nt, .. }
+                    | RecordData::SubArray { nt, .. } => (
+                        &mut nt.alarm.severity,
+                        &mut nt.alarm.status,
+                        &mut nt.alarm.message,
+                    ),
+                    _ => return false,
+                }
+            };
+            let (sev, sta, msg) = alarm;
+            let changed = *sev != severity || *sta != status || msg.as_str() != message;
+            if !changed {
+                return false;
+            }
+            *sev = severity;
+            *sta = status;
+            *msg = message.to_string();
+
+            let payload = entry.record.to_ntpayload();
+            entry
+                .subscribers
+                .retain(|tx| tx.try_send(payload.clone()).is_ok());
+            payload
+        };
+
+        let reg = self.registry.read().await;
+        if let Some(registry) = reg.as_ref() {
+            registry.notify_monitors(name, &payload).await;
+        }
+        true
+    }
+
     /// Core write logic — updates the value, notifies subscribers and monitors,
     /// but does **not** trigger link evaluation (to avoid recursion).
     async fn set_value_inner(&self, name: &str, value: ScalarValue) -> bool {
