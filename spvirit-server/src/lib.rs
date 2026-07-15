@@ -26,6 +26,7 @@ pub mod decode;
 pub mod group;
 pub mod handler;
 pub mod monitor;
+pub mod pv;
 pub mod pva_server;
 pub mod pvstore;
 pub mod record_fields;
@@ -40,6 +41,7 @@ pub use group::{
     parse_group_config, parse_info_group,
 };
 pub use handler::PvListMode;
+pub use pv::{PvError, PvScalar};
 pub use pva_server::{PvaServer, PvaServerBuilder};
 pub use pvstore::{PvInfo, Source, SourceRegistry};
 pub use server::{PvaServerConfig, PvaServerState, run_pva_server, run_pva_server_with_registry};
