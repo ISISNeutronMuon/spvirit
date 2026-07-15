@@ -140,6 +140,8 @@ impl PvScalar for String {
 pub(crate) struct PendingDef {
     pub(crate) record: RecordInstance,
     pub(crate) validator: Option<crate::simple_store::PutValidator>,
+    pub(crate) scan: Option<(std::time::Duration, crate::simple_store::ScanCallback)>,
+    pub(crate) calc: Option<(Vec<String>, crate::simple_store::LinkCallback)>,
 }
 
 pub(crate) enum PvState {
@@ -175,6 +177,8 @@ impl<T: PvScalar> Pv<T> {
                 state: Mutex::new(PvState::Pending(PendingDef {
                     record,
                     validator: None,
+                    scan: None,
+                    calc: None,
                 })),
             }),
             _marker: PhantomData,
@@ -298,6 +302,48 @@ impl<T: PvScalar> Pv<T> {
             }
         }
         self
+    }
+
+    /// Periodically compute and post a new value for this PV.
+    pub fn scan<F>(self, period: std::time::Duration, f: F) -> Self
+    where
+        F: Fn(&Pv<T>) -> T + Send + Sync + 'static,
+    {
+        let handle = self.clone();
+        let cb: crate::simple_store::ScanCallback = Arc::new(move |_name| f(&handle).into_scalar());
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            if let PvState::Pending(def) = &mut *state {
+                def.scan = Some((period, cb));
+            } else {
+                tracing::warn!("Pv '{}': scan ignored, already bound", self.shared.name);
+            }
+        }
+        self
+    }
+}
+
+impl Pv<f64> {
+    /// A derived (read-only) PV recomputed whenever any input changes.
+    pub fn calc<F>(name: impl Into<String>, inputs: &[&Pv<f64>], f: F) -> Self
+    where
+        F: Fn(&[f64]) -> f64 + Send + Sync + 'static,
+    {
+        let name = name.into();
+        let input_names: Vec<String> = inputs.iter().map(|p| p.shared.name.clone()).collect();
+        let initial = ScalarValue::F64(0.0);
+        let pv = Self::from_record(make_scalar_record(&name, RecordType::Ai, initial));
+        let compute: crate::simple_store::LinkCallback = Arc::new(move |values| {
+            let floats: Vec<f64> = values
+                .iter()
+                .map(|v| f64::from_scalar(v.clone()).unwrap_or(0.0))
+                .collect();
+            ScalarValue::F64(f(&floats))
+        });
+        if let PvState::Pending(def) = &mut *pv.shared.state.lock().unwrap() {
+            def.calc = Some((input_names, compute));
+        }
+        pv
     }
 }
 
@@ -478,6 +524,26 @@ impl AnyPv {
         let mut state = self.shared.state.lock().unwrap();
         match &mut *state {
             PvState::Pending(def) => def.validator.take(),
+            PvState::Bound(_) => None,
+        }
+    }
+
+    /// Take the pending scan definition, if any. `None` once bound.
+    pub(crate) fn take_scan(
+        &self,
+    ) -> Option<(std::time::Duration, crate::simple_store::ScanCallback)> {
+        let mut state = self.shared.state.lock().unwrap();
+        match &mut *state {
+            PvState::Pending(def) => def.scan.take(),
+            PvState::Bound(_) => None,
+        }
+    }
+
+    /// Take the pending calc definition, if any. `None` once bound.
+    pub(crate) fn take_calc(&self) -> Option<(Vec<String>, crate::simple_store::LinkCallback)> {
+        let mut state = self.shared.state.lock().unwrap();
+        match &mut *state {
+            PvState::Pending(def) => def.calc.take(),
             PvState::Bound(_) => None,
         }
     }

@@ -744,6 +744,142 @@ impl PvaServer {
     }
 }
 
+// ─── Handle-based (`Pv<T>`) entry point ──────────────────────────────────
+
+impl PvaServer {
+    /// Serve a collection of typed PV handles. Shorthand entry point for the
+    /// handle-based API; combine with `.db_file()`, `.source()`, etc.
+    pub fn serve(pvs: impl IntoIterator<Item = impl Into<crate::pv::AnyPv>>) -> ServeBuilder {
+        ServeBuilder {
+            inner: PvaServerBuilder::new(),
+            handles: Vec::new(),
+        }
+        .pvs(pvs)
+    }
+}
+
+/// Builder for the PV-handle API. Wraps [`PvaServerBuilder`] and adds handle
+/// binding at `build()` time.
+pub struct ServeBuilder {
+    inner: PvaServerBuilder,
+    handles: Vec<crate::pv::AnyPv>,
+}
+
+impl ServeBuilder {
+    pub fn pvs(mut self, pvs: impl IntoIterator<Item = impl Into<crate::pv::AnyPv>>) -> Self {
+        self.handles.extend(pvs.into_iter().map(Into::into));
+        self
+    }
+    pub fn db_file(mut self, path: impl AsRef<str>) -> Self {
+        self.inner = self.inner.db_file(path);
+        self
+    }
+    pub fn db_string(mut self, content: &str) -> Self {
+        self.inner = self.inner.db_string(content);
+        self
+    }
+    pub fn source(mut self, label: impl Into<String>, order: i32, source: Arc<dyn Source>) -> Self {
+        self.inner = self.inner.source(label, order, source);
+        self
+    }
+    pub fn port(mut self, port: u16) -> Self {
+        self.inner = self.inner.port(port);
+        self
+    }
+    pub fn udp_port(mut self, port: u16) -> Self {
+        self.inner = self.inner.udp_port(port);
+        self
+    }
+    pub fn listen_ip(mut self, ip: IpAddr) -> Self {
+        self.inner = self.inner.listen_ip(ip);
+        self
+    }
+    pub fn compute_alarms(mut self, enabled: bool) -> Self {
+        self.inner = self.inner.compute_alarms(enabled);
+        self
+    }
+
+    /// Materialise records, links and scans from the handles, build the
+    /// server, then bind every handle to the store.
+    ///
+    /// Async because registering PUT validators post-build goes through
+    /// `SimplePvStore::set_validator`, which is async (an `RwLock` write);
+    /// there is no synchronous alternative and `spvirit-server` does not
+    /// depend on `futures`, so this awaits inline rather than blocking.
+    pub async fn build(mut self) -> PvaServer {
+        let mut validators: Vec<(String, crate::simple_store::PutValidator)> = Vec::new();
+        for h in &self.handles {
+            let name = h.name().to_string();
+            if let Some(rec) = h.take_record() {
+                self.inner.records.insert(name.clone(), rec);
+            }
+            if let Some(v) = h.take_validator() {
+                validators.push((name.clone(), v));
+            }
+            if let Some((period, cb)) = h.take_scan() {
+                self.inner.scans.push((name.clone(), period, cb));
+            }
+            if let Some((inputs, compute)) = h.take_calc() {
+                self.inner.links.push(LinkDef {
+                    output: name.clone(),
+                    inputs,
+                    compute,
+                });
+            }
+        }
+        let server = self.inner.build();
+        let store = server.store().clone();
+        for h in &self.handles {
+            h.bind(&store);
+        }
+        for (name, v) in validators {
+            store.set_validator(name, v).await;
+        }
+        server
+    }
+
+    /// Build and run (blocks until shutdown).
+    pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+        self.build().await.run().await
+    }
+
+    /// Build and spawn; returns a handle for typed access and shutdown.
+    pub async fn start(self) -> RunningServer {
+        let server = self.build().await;
+        let store = server.store().clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = server.run().await {
+                tracing::error!("PvaServer exited with error: {e}");
+            }
+        });
+        RunningServer { store, handle }
+    }
+}
+
+/// A started server: mint typed handles, then `abort()` to stop.
+pub struct RunningServer {
+    store: Arc<SimplePvStore>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl RunningServer {
+    /// Mint a typed handle to any served record (handle-built or `.db`-loaded).
+    pub async fn pv<T: crate::pv::PvScalar>(
+        &self,
+        name: &str,
+    ) -> Result<crate::pv::Pv<T>, crate::pv::PvError> {
+        crate::pv::Pv::attach(&self.store, name).await
+    }
+
+    pub fn store(&self) -> &Arc<SimplePvStore> {
+        &self.store
+    }
+
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
 // ─── Record construction helpers ─────────────────────────────────────────
 
 pub(crate) fn make_scalar_record(
@@ -982,5 +1118,66 @@ mod tests {
                 Some(ScalarValue::F64(15.0))
             );
         });
+    }
+
+    use crate::pv::{AnyPv, Pv};
+
+    #[tokio::test]
+    async fn serve_builder_binds_handles_and_registers_everything() {
+        let temp = Pv::ai("S:T", 22.5).mdel(0.1);
+        let sp = Pv::ao("S:SP", 25.0).on_put(|_pv, _v: f64| Ok(()));
+        let a = Pv::ai("S:A", 1.0);
+        let b = Pv::ai("S:B", 2.0);
+        let sum = Pv::calc("S:SUM", &[&a, &b], |vals| vals.iter().sum());
+
+        // Rust can't infer the `impl Into<AnyPv>` target type per-element
+        // inside an array literal (E0283), so each handle is converted
+        // explicitly here rather than via a bare `.into()`.
+        let server = PvaServer::serve([AnyPv::from(temp.clone()), AnyPv::from(sp)])
+            .pvs([
+                AnyPv::from(a.clone()),
+                AnyPv::from(b),
+                AnyPv::from(sum.clone()),
+            ])
+            .build()
+            .await;
+
+        // handles are bound: typed set/get works against the built store
+        temp.set(23.0).await.unwrap();
+        assert_eq!(temp.get().await, Ok(23.0));
+
+        // calc evaluated on input change
+        a.set(10.0).await.unwrap();
+        assert_eq!(sum.get().await, Ok(12.0));
+
+        // record made it into the store with its raw fields
+        let rec = server.store().get_record("S:T").await.unwrap();
+        assert_eq!(rec.raw_fields.get("MDEL").map(String::as_str), Some("0.1"));
+    }
+
+    #[tokio::test]
+    async fn running_server_mints_handles_to_db_records() {
+        // parse_db is line-oriented (one `record(...)`/`field(...)`
+        // statement per line); a packed one-liner silently drops its
+        // fields, so this uses the same multi-line shape as the other
+        // db_string tests in this module.
+        let server = PvaServer::serve(Vec::<AnyPv>::new())
+            .db_string("record(ao, \"DB:X\") {\n    field(VAL, \"2.5\")\n}")
+            .build()
+            .await;
+        let store = server.store().clone();
+        let h: crate::pv::Pv<f64> = crate::pv::Pv::attach(&store, "DB:X").await.unwrap();
+        assert_eq!(h.get().await, Ok(2.5));
+    }
+
+    #[tokio::test]
+    async fn homogeneous_iterator_feeds_serve_without_manual_erasure() {
+        let bpms: Vec<Pv<f64>> = (0..100)
+            .map(|i| Pv::ai(format!("BPM:{i:03}:X"), 0.0))
+            .collect();
+        let server = PvaServer::serve(bpms.iter().cloned()).build().await;
+        assert_eq!(server.store().pv_names().await.len(), 100);
+        bpms[42].set(1.23).await.unwrap();
+        assert_eq!(bpms[42].get().await, Ok(1.23));
     }
 }

@@ -42,7 +42,7 @@ pub use group::{
 };
 pub use handler::PvListMode;
 pub use pv::{AnyPv, Pv, PvError, PvScalar};
-pub use pva_server::{PvaServer, PvaServerBuilder};
+pub use pva_server::{PvaServer, PvaServerBuilder, RunningServer, ServeBuilder};
 pub use pvstore::{PvInfo, Source, SourceRegistry};
 pub use server::{PvaServerConfig, PvaServerState, run_pva_server, run_pva_server_with_registry};
 pub use simple_store::SimplePvStore;
