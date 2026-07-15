@@ -51,7 +51,7 @@ pub use group::{
     parse_group_config, parse_info_group,
 };
 pub use handler::PvListMode;
-pub use pv::{AnyPv, Pv, PvError, PvScalar};
+pub use pv::{AnyPv, Pv, PvArray, PvError, PvScalar};
 pub use pva_server::{PvaServer, PvaServerBuilder, RunningServer, ServeBuilder};
 pub use pvstore::{PvInfo, Source, SourceRegistry};
 pub use server::{PvaServerConfig, PvaServerState, run_pva_server, run_pva_server_with_registry};

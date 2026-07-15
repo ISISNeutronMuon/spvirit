@@ -159,23 +159,9 @@ impl PvaServerBuilder {
     /// Add a `waveform` record (array) with the given initial data.
     pub fn waveform(mut self, name: impl Into<String>, data: ScalarArrayValue) -> Self {
         let name = name.into();
-        let ftvl = data.type_label().trim_end_matches("[]").to_string();
-        let nelm = data.len();
         self.records.insert(
             name.clone(),
-            RecordInstance {
-                name: name.clone(),
-                record_type: RecordType::Waveform,
-                common: DbCommonState::default(),
-                data: RecordData::Waveform {
-                    nt: NtScalarArray::from_value(data),
-                    inp: None,
-                    ftvl,
-                    nelm,
-                    nord: nelm,
-                },
-                raw_fields: HashMap::new(),
-            },
+            make_array_record(&name, RecordType::Waveform, data),
         );
         self
     }
@@ -183,23 +169,9 @@ impl PvaServerBuilder {
     /// Add an `aai` (analog array input, read-only) record.
     pub fn aai(mut self, name: impl Into<String>, data: ScalarArrayValue) -> Self {
         let name = name.into();
-        let ftvl = data.type_label().trim_end_matches("[]").to_string();
-        let nelm = data.len();
         self.records.insert(
             name.clone(),
-            RecordInstance {
-                name: name.clone(),
-                record_type: RecordType::Aai,
-                common: DbCommonState::default(),
-                data: RecordData::Aai {
-                    nt: NtScalarArray::from_value(data),
-                    inp: None,
-                    ftvl,
-                    nelm,
-                    nord: nelm,
-                },
-                raw_fields: HashMap::new(),
-            },
+            make_array_record(&name, RecordType::Aai, data),
         );
         self
     }
@@ -207,25 +179,9 @@ impl PvaServerBuilder {
     /// Add an `aao` (analog array output, writable) record.
     pub fn aao(mut self, name: impl Into<String>, data: ScalarArrayValue) -> Self {
         let name = name.into();
-        let ftvl = data.type_label().trim_end_matches("[]").to_string();
-        let nelm = data.len();
         self.records.insert(
             name.clone(),
-            RecordInstance {
-                name: name.clone(),
-                record_type: RecordType::Aao,
-                common: DbCommonState::default(),
-                data: RecordData::Aao {
-                    nt: NtScalarArray::from_value(data),
-                    out: None,
-                    dol: None,
-                    omsl: OutputMode::Supervisory,
-                    ftvl,
-                    nelm,
-                    nord: nelm,
-                },
-                raw_fields: HashMap::new(),
-            },
+            make_array_record(&name, RecordType::Aao, data),
         );
         self
     }
@@ -660,6 +616,12 @@ impl PvaServer {
         crate::pv::Pv::attach(&self.store, name).await
     }
 
+    /// Mint an array handle to any record in this server's store — the
+    /// pre-`run()` counterpart of [`RunningServer::array_pv`].
+    pub async fn array_pv(&self, name: &str) -> Result<crate::pv::PvArray, crate::pv::PvError> {
+        crate::pv::PvArray::attach(&self.store, name).await
+    }
+
     /// Register an additional [`Source`] after building the server.
     ///
     /// This is useful when the source needs a reference to the store
@@ -880,6 +842,11 @@ impl RunningServer {
         crate::pv::Pv::attach(&self.store, name).await
     }
 
+    /// Mint an array handle to any served record (handle-built or `.db`-loaded).
+    pub async fn array_pv(&self, name: &str) -> Result<crate::pv::PvArray, crate::pv::PvError> {
+        crate::pv::PvArray::attach(&self.store, name).await
+    }
+
     pub fn store(&self) -> &Arc<SimplePvStore> {
         &self.store
     }
@@ -999,6 +966,52 @@ pub(crate) fn make_output_record(
         record_type,
         common: DbCommonState::default(),
         data,
+        raw_fields: HashMap::new(),
+    }
+}
+
+/// Build an array-backed record (`waveform`/`aai`/`aao`) with ftvl/nelm/nord
+/// inferred from `data`. Shared by the classic builder (`.waveform`/`.aai`/
+/// `.aao`) and `PvArray`'s constructors so the inference lives in one place.
+pub(crate) fn make_array_record(
+    name: &str,
+    record_type: RecordType,
+    data: ScalarArrayValue,
+) -> RecordInstance {
+    let ftvl = data.type_label().trim_end_matches("[]").to_string();
+    let nelm = data.len();
+    let nt = NtScalarArray::from_value(data);
+    let record_data = match record_type {
+        RecordType::Waveform => RecordData::Waveform {
+            nt,
+            inp: None,
+            ftvl,
+            nelm,
+            nord: nelm,
+        },
+        RecordType::Aai => RecordData::Aai {
+            nt,
+            inp: None,
+            ftvl,
+            nelm,
+            nord: nelm,
+        },
+        RecordType::Aao => RecordData::Aao {
+            nt,
+            out: None,
+            dol: None,
+            omsl: OutputMode::Supervisory,
+            ftvl,
+            nelm,
+            nord: nelm,
+        },
+        _ => panic!("make_array_record: unsupported type {record_type:?}"),
+    };
+    RecordInstance {
+        name: name.to_string(),
+        record_type,
+        common: DbCommonState::default(),
+        data: record_data,
         raw_fields: HashMap::new(),
     }
 }

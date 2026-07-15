@@ -41,9 +41,9 @@ use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 
 use spvirit_codec::spvd_decode::DecodedValue;
-use spvirit_types::ScalarValue;
+use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
-use crate::pva_server::{make_output_record, make_scalar_record};
+use crate::pva_server::{make_array_record, make_output_record, make_scalar_record};
 use crate::simple_store::SimplePvStore;
 use crate::types::{RecordInstance, RecordType};
 
@@ -549,6 +549,23 @@ impl<T: PvScalar> Pv<T> {
 
     /// Mint a bound handle to an existing record (e.g. loaded from a `.db`).
     pub(crate) async fn attach(store: &Arc<SimplePvStore>, name: &str) -> Result<Self, PvError> {
+        // `get_value` alone isn't a safe type sniff: for array-backed
+        // records it returns `ScalarValue::I32(len)` (see
+        // RecordInstance::current_value / types.rs), so `Pv::<i32>::attach`
+        // on a waveform/aai/aao record would wrongly "match" i32. Check the
+        // record's actual payload kind first and refuse array/table/ndarray
+        // payloads outright; only Scalar and Enum records are valid `Pv<T>`
+        // targets (enum records attach as i32 by design, see Task 2).
+        match store.get_nt(name).await {
+            None => return Err(PvError::NotFound(name.to_string())),
+            Some(NtPayload::Scalar(_)) | Some(NtPayload::Enum(_)) => {}
+            Some(other) => {
+                return Err(PvError::TypeMismatch {
+                    expected: T::TYPE_NAME,
+                    actual: nt_payload_kind(&other).to_string(),
+                });
+            }
+        }
         let v = store
             .get_value(name)
             .await
@@ -567,6 +584,144 @@ impl<T: PvScalar> Pv<T> {
             }),
             _marker: PhantomData,
         })
+    }
+}
+
+/// Short label for an `NtPayload` variant, used in `PvError::TypeMismatch`.
+fn nt_payload_kind(p: &NtPayload) -> &'static str {
+    match p {
+        NtPayload::Scalar(_) => "Scalar",
+        NtPayload::ScalarArray(_) => "ScalarArray",
+        NtPayload::Table(_) => "Table",
+        NtPayload::NdArray(_) => "NdArray",
+        NtPayload::Enum(_) => "Enum",
+        NtPayload::Generic { .. } => "Generic",
+    }
+}
+
+/// Handle to an array-backed record (`waveform`/`aai`/`aao`). Unlike `Pv<T>`
+/// this is untyped over the element kind — values are `ScalarArrayValue`.
+/// Cheap to clone; all clones share state.
+pub struct PvArray {
+    pub(crate) shared: Arc<PvShared>,
+}
+
+impl Clone for PvArray {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl PvArray {
+    fn from_record(record: RecordInstance) -> Self {
+        Self {
+            shared: Arc::new(PvShared {
+                name: record.name.clone(),
+                state: Mutex::new(PvState::Pending(PendingDef {
+                    record,
+                    validator: None,
+                    scan: None,
+                    calc: None,
+                })),
+            }),
+        }
+    }
+
+    /// `waveform` — array record, writable over the wire.
+    pub fn waveform(name: impl Into<String>, data: ScalarArrayValue) -> Self {
+        let name = name.into();
+        Self::from_record(make_array_record(&name, RecordType::Waveform, data))
+    }
+
+    /// `aai` — analog array input, read-only over the wire.
+    pub fn aai(name: impl Into<String>, data: ScalarArrayValue) -> Self {
+        let name = name.into();
+        Self::from_record(make_array_record(&name, RecordType::Aai, data))
+    }
+
+    /// `aao` — analog array output, writable over the wire.
+    pub fn aao(name: impl Into<String>, data: ScalarArrayValue) -> Self {
+        let name = name.into();
+        Self::from_record(make_array_record(&name, RecordType::Aao, data))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.shared.name
+    }
+
+    /// Clone of the pending record template; `None` once bound. Test-only —
+    /// `ServeBuilder` reads the pending record via `AnyPv::take_record`.
+    #[cfg(test)]
+    fn pending_record(&self) -> Option<RecordInstance> {
+        match &*self.shared.state.lock().unwrap() {
+            PvState::Pending(def) => Some(def.record.clone()),
+            PvState::Bound(_) => None,
+        }
+    }
+
+    fn store(&self) -> Result<Arc<SimplePvStore>, PvError> {
+        match &*self.shared.state.lock().unwrap() {
+            PvState::Bound(store) => Ok(store.clone()),
+            PvState::Pending(_) => Err(PvError::Unbound),
+        }
+    }
+
+    /// Write an array value through the full posting pipeline.
+    pub async fn set(&self, data: ScalarArrayValue) -> Result<(), PvError> {
+        let store = self.store()?;
+        if store.set_array_value(&self.shared.name, data).await {
+            Ok(())
+        } else {
+            match store.get_nt(&self.shared.name).await {
+                // Record exists and is array-backed — the write was a no-op
+                // or a truncated/rejected update; either way this mirrors
+                // `Pv::set`'s benign-TOCTOU existence check.
+                Some(NtPayload::ScalarArray(_)) => Ok(()),
+                Some(other) => Err(PvError::TypeMismatch {
+                    expected: "array",
+                    actual: nt_payload_kind(&other).to_string(),
+                }),
+                None => Err(PvError::NotFound(self.shared.name.clone())),
+            }
+        }
+    }
+
+    /// Read the current array value.
+    pub async fn get(&self) -> Result<ScalarArrayValue, PvError> {
+        let store = self.store()?;
+        match store.get_nt(&self.shared.name).await {
+            Some(NtPayload::ScalarArray(nt)) => Ok(nt.value),
+            Some(other) => Err(PvError::TypeMismatch {
+                expected: "array",
+                actual: nt_payload_kind(&other).to_string(),
+            }),
+            None => Err(PvError::NotFound(self.shared.name.clone())),
+        }
+    }
+
+    /// Mint a bound handle to an existing array-backed record.
+    pub(crate) async fn attach(store: &Arc<SimplePvStore>, name: &str) -> Result<Self, PvError> {
+        match store.get_nt(name).await {
+            Some(NtPayload::ScalarArray(_)) => Ok(Self {
+                shared: Arc::new(PvShared {
+                    name: name.to_string(),
+                    state: Mutex::new(PvState::Bound(store.clone())),
+                }),
+            }),
+            Some(other) => Err(PvError::TypeMismatch {
+                expected: "array",
+                actual: nt_payload_kind(&other).to_string(),
+            }),
+            None => Err(PvError::NotFound(name.to_string())),
+        }
+    }
+}
+
+impl From<PvArray> for AnyPv {
+    fn from(pv: PvArray) -> Self {
+        Self { shared: pv.shared }
     }
 }
 
@@ -784,6 +939,65 @@ mod tests {
         assert_eq!(rec.current_value(), ScalarValue::I32(2));
         assert!(!rec.set_scalar_value(ScalarValue::I32(-1), true));
         assert_eq!(rec.current_value(), ScalarValue::I32(2));
+    }
+
+    #[tokio::test]
+    async fn pv_array_roundtrip_and_serve() {
+        let wf = PvArray::waveform("W:1", ScalarArrayValue::F64(vec![1.0, 2.0, 3.0]));
+        let server = crate::pva_server::PvaServer::serve([AnyPv::from(wf.clone())])
+            .build()
+            .await;
+        assert_eq!(
+            wf.get().await,
+            Ok(ScalarArrayValue::F64(vec![1.0, 2.0, 3.0]))
+        );
+        wf.set(ScalarArrayValue::F64(vec![4.0, 5.0])).await.unwrap();
+        match wf.get().await.unwrap() {
+            ScalarArrayValue::F64(v) => assert_eq!(v, vec![4.0, 5.0]),
+            other => panic!("wrong kind: {other:?}"),
+        }
+        // typed attach via the server
+        let h = server.array_pv("W:1").await.unwrap();
+        assert!(matches!(h.get().await.unwrap(), ScalarArrayValue::F64(_)));
+        // scalar attach to an array record must type-mismatch
+        assert!(matches!(
+            server.pv::<f64>("W:1").await,
+            Err(PvError::TypeMismatch { .. })
+        ));
+        // array attach to a scalar record must type-mismatch
+        let t = Pv::ai("W:S", 1.0);
+        let s2 = crate::pva_server::PvaServer::serve([AnyPv::from(t)])
+            .build()
+            .await;
+        assert!(matches!(
+            s2.array_pv("W:S").await,
+            Err(PvError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn aai_read_only_aao_writable() {
+        let a = PvArray::aai("W:AI", ScalarArrayValue::I32(vec![1]));
+        assert!(a.pending_record().is_some());
+        assert!(!AnyPv::from(a).take_record().unwrap().writable());
+        let b = PvArray::aao("W:AO", ScalarArrayValue::I32(vec![1]));
+        assert!(AnyPv::from(b).take_record().unwrap().writable());
+    }
+
+    #[tokio::test]
+    async fn scalar_attach_rejects_array_backed_record() {
+        // Regression: Pv::attach used to sniff via get_value, which returns
+        // I32(len) for array records — so Pv::<i32>::attach would WRONGLY
+        // succeed on a waveform/aai/aao record. The payload-kind guard must
+        // reject it as TypeMismatch instead.
+        let store = empty_store();
+        let wf = PvArray::waveform("W:GUARD", ScalarArrayValue::I32(vec![1, 2, 3]));
+        let any: AnyPv = wf.into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+
+        let bad = Pv::<i32>::attach(&store, "W:GUARD").await;
+        assert!(matches!(bad, Err(PvError::TypeMismatch { .. })));
     }
 
     fn empty_store() -> Arc<SimplePvStore> {
