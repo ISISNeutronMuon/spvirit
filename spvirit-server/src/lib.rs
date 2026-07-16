@@ -7,8 +7,18 @@
 //! # High-level API
 //!
 //! ```rust,ignore
-//! use spvirit_server::PvaServer;
+//! use spvirit_server::{AnyPv, Pv, PvaServer};
 //!
+//! let temp = Pv::ai("SIM:TEMP", 22.5).units("C").prec(2);
+//! let sp = Pv::ao("SIM:SETPOINT", 25.0)
+//!     .on_put(|_pv, v: f64| if v.is_finite() { Ok(()) } else { Err("NaN".into()) });
+//!
+//! let server = PvaServer::serve([AnyPv::from(temp.clone()), AnyPv::from(sp)])
+//!     .start()
+//!     .await;
+//! temp.set(23.1).await?;
+//!
+//! // Classic builder (still supported):
 //! let server = PvaServer::builder()
 //!     .ai("SIM:TEMP", 22.5)
 //!     .ao("SIM:SETPOINT", 25.0)
@@ -26,6 +36,7 @@ pub mod decode;
 pub mod group;
 pub mod handler;
 pub mod monitor;
+pub mod pv;
 pub mod pva_server;
 pub mod pvstore;
 pub mod record_fields;
@@ -40,7 +51,8 @@ pub use group::{
     parse_group_config, parse_info_group,
 };
 pub use handler::PvListMode;
-pub use pva_server::{PvaServer, PvaServerBuilder};
+pub use pv::{AnyPv, Pv, PvArray, PvError, PvScalar};
+pub use pva_server::{PvaServer, PvaServerBuilder, RunningServer, ServeBuilder};
 pub use pvstore::{PvInfo, Source, SourceRegistry};
 pub use server::{PvaServerConfig, PvaServerState, run_pva_server, run_pva_server_with_registry};
 pub use simple_store::SimplePvStore;

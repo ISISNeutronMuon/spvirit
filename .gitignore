@@ -12,6 +12,9 @@
 *.swo
 *~
 
+# Python packaging artifacts
+spvirit-py/dist/
+
 # Debug / temporary
 tmp/
 *.pdb

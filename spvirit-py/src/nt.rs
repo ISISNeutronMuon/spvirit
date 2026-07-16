@@ -11,13 +11,18 @@ use crate::convert::{py_to_scalar, py_to_scalar_array, scalar_array_to_py, scala
 
 // ─── PyAlarm ─────────────────────────────────────────────────────────────────
 
+/// Alarm substructure: severity (0=NO_ALARM, 1=MINOR, 2=MAJOR, 3=INVALID),
+/// status, message. Read-only properties.
 #[pyclass(name = "Alarm")]
 #[derive(Clone)]
 pub struct PyAlarm {
+    /// Alarm severity: 0=NO_ALARM, 1=MINOR, 2=MAJOR, 3=INVALID.
     #[pyo3(get)]
     pub severity: i32,
+    /// Alarm status code.
     #[pyo3(get)]
     pub status: i32,
+    /// Alarm message text.
     #[pyo3(get)]
     pub message: String,
 }
@@ -54,13 +59,17 @@ impl PyAlarm {
 
 // ─── PyTimeStamp ─────────────────────────────────────────────────────────────
 
+/// Time stamp substructure: seconds_past_epoch, nanoseconds, user_tag.
 #[pyclass(name = "TimeStamp")]
 #[derive(Clone)]
 pub struct PyTimeStamp {
+    /// Seconds since the Unix epoch.
     #[pyo3(get)]
     pub seconds_past_epoch: i64,
+    /// Nanoseconds part of the time stamp.
     #[pyo3(get)]
     pub nanoseconds: i32,
+    /// Application-defined user tag.
     #[pyo3(get)]
     pub user_tag: i32,
 }
@@ -97,17 +106,23 @@ impl PyTimeStamp {
 
 // ─── PyDisplay ───────────────────────────────────────────────────────────────
 
+/// Display metadata substructure: limits, description, units, precision.
 #[pyclass(name = "Display")]
 #[derive(Clone)]
 pub struct PyDisplay {
+    /// Lower display limit.
     #[pyo3(get)]
     pub limit_low: f64,
+    /// Upper display limit.
     #[pyo3(get)]
     pub limit_high: f64,
+    /// Human-readable description.
     #[pyo3(get)]
     pub description: String,
+    /// Engineering units string.
     #[pyo3(get)]
     pub units: String,
+    /// Display precision (decimal places).
     #[pyo3(get)]
     pub precision: i32,
 }
@@ -154,13 +169,17 @@ impl PyDisplay {
 
 // ─── PyControl ───────────────────────────────────────────────────────────────
 
+/// Control metadata substructure: write limits and minimum step.
 #[pyclass(name = "Control")]
 #[derive(Clone)]
 pub struct PyControl {
+    /// Lower control (write) limit.
     #[pyo3(get)]
     pub limit_low: f64,
+    /// Upper control (write) limit.
     #[pyo3(get)]
     pub limit_high: f64,
+    /// Minimum step between accepted values.
     #[pyo3(get)]
     pub min_step: f64,
 }
@@ -197,6 +216,9 @@ impl PyControl {
 
 // ─── PyNtScalar ──────────────────────────────────────────────────────────────
 
+/// Full-fidelity NTScalar payload: value plus alarm, display, and control
+/// metadata. Used with `Store.get_nt`/`Store.put_nt`, Python sources, and
+/// `Notifier.notify`.
 #[pyclass(name = "NtScalar")]
 pub struct PyNtScalar {
     inner: NtScalar,
@@ -243,61 +265,73 @@ impl PyNtScalar {
         Ok(Self { inner: nt })
     }
 
+    /// Scalar value as a Python object.
     #[getter]
     fn value(&self, py: Python<'_>) -> PyObject {
         scalar_to_py(py, &self.inner.value)
     }
 
+    /// Alarm severity: 0=NO_ALARM, 1=MINOR, 2=MAJOR, 3=INVALID.
     #[getter]
     fn alarm_severity(&self) -> i32 {
         self.inner.alarm_severity
     }
 
+    /// Alarm status code.
     #[getter]
     fn alarm_status(&self) -> i32 {
         self.inner.alarm_status
     }
 
+    /// Alarm message text.
     #[getter]
     fn alarm_message(&self) -> &str {
         &self.inner.alarm_message
     }
 
+    /// Engineering units string.
     #[getter]
     fn units(&self) -> &str {
         &self.inner.units
     }
 
+    /// Lower display limit.
     #[getter]
     fn display_low(&self) -> f64 {
         self.inner.display_low
     }
 
+    /// Upper display limit.
     #[getter]
     fn display_high(&self) -> f64 {
         self.inner.display_high
     }
 
+    /// Display description text.
     #[getter]
     fn display_description(&self) -> &str {
         &self.inner.display_description
     }
 
+    /// Display precision (decimal places).
     #[getter]
     fn display_precision(&self) -> i32 {
         self.inner.display_precision
     }
 
+    /// Lower control (write) limit.
     #[getter]
     fn control_low(&self) -> f64 {
         self.inner.control_low
     }
 
+    /// Upper control (write) limit.
     #[getter]
     fn control_high(&self) -> f64 {
         self.inner.control_high
     }
 
+    /// Minimum step between accepted values.
     #[getter]
     fn control_min_step(&self) -> f64 {
         self.inner.control_min_step
@@ -311,6 +345,8 @@ impl PyNtScalar {
 
 // ─── PyNtScalarArray ─────────────────────────────────────────────────────────
 
+/// Full-fidelity NTScalarArray payload: array value plus alarm, time stamp,
+/// display, and control metadata.
 #[pyclass(name = "NtScalarArray")]
 pub struct PyNtScalarArray {
     inner: NtScalarArray,
@@ -333,26 +369,31 @@ impl PyNtScalarArray {
         })
     }
 
+    /// Array value as a Python list (or bytes for byte arrays).
     #[getter]
     fn value(&self, py: Python<'_>) -> PyObject {
         scalar_array_to_py(py, &self.inner.value)
     }
 
+    /// Alarm substructure.
     #[getter]
     fn alarm(&self) -> PyAlarm {
         PyAlarm::from(&self.inner.alarm)
     }
 
+    /// Time stamp substructure.
     #[getter]
     fn time_stamp(&self) -> PyTimeStamp {
         PyTimeStamp::from(&self.inner.time_stamp)
     }
 
+    /// Display metadata substructure.
     #[getter]
     fn display(&self) -> PyDisplay {
         PyDisplay::from(&self.inner.display)
     }
 
+    /// Control metadata substructure.
     #[getter]
     fn control(&self) -> PyControl {
         PyControl::from(&self.inner.control)
@@ -366,6 +407,8 @@ impl PyNtScalarArray {
 
 // ─── PyNtTable ───────────────────────────────────────────────────────────────
 
+/// NTTable payload: column labels, columns, and optional metadata. Has no
+/// Python constructor — returned by reads such as `Store.get_nt`.
 #[pyclass(name = "NtTable")]
 pub struct PyNtTable {
     inner: NtTable,
@@ -379,6 +422,7 @@ impl PyNtTable {
 
 #[pymethods]
 impl PyNtTable {
+    /// Column labels as a list of strings.
     #[getter]
     fn labels(&self, py: Python<'_>) -> PyResult<PyObject> {
         let items: Vec<PyObject> = self
@@ -399,16 +443,19 @@ impl PyNtTable {
         Ok(dict.into_any().unbind())
     }
 
+    /// Optional descriptor string, or None.
     #[getter]
     fn descriptor(&self) -> Option<&str> {
         self.inner.descriptor.as_deref()
     }
 
+    /// Optional alarm substructure, or None.
     #[getter]
     fn alarm(&self) -> Option<PyAlarm> {
         self.inner.alarm.as_ref().map(PyAlarm::from)
     }
 
+    /// Optional time stamp substructure, or None.
     #[getter]
     fn time_stamp(&self) -> Option<PyTimeStamp> {
         self.inner.time_stamp.as_ref().map(PyTimeStamp::from)
@@ -425,6 +472,8 @@ impl PyNtTable {
 
 // ─── PyNtNdArray ─────────────────────────────────────────────────────────────
 
+/// NTNDArray payload: flat array data plus dimensions and image metadata.
+/// Has no Python constructor — returned by reads such as `Store.get_nt`.
 #[pyclass(name = "NtNdArray")]
 pub struct PyNtNdArray {
     inner: NtNdArray,
@@ -438,27 +487,32 @@ impl PyNtNdArray {
 
 #[pymethods]
 impl PyNtNdArray {
+    /// Flat array data as a Python list (or bytes for byte arrays).
     #[getter]
     fn value(&self, py: Python<'_>) -> PyObject {
         scalar_array_to_py(py, &self.inner.value)
     }
 
+    /// Unique frame identifier.
     #[getter]
     fn unique_id(&self) -> i32 {
         self.inner.unique_id
     }
 
+    /// Compressed data size in bytes.
     #[getter]
     fn compressed_size(&self) -> i64 {
         self.inner.compressed_size
     }
 
+    /// Uncompressed data size in bytes.
     #[getter]
     fn uncompressed_size(&self) -> i64 {
         self.inner.uncompressed_size
     }
 
-    /// Return dimensions as a list of dicts.
+    /// Return dimensions as a list of dicts, one per dimension, with keys
+    /// `size`, `offset`, `full_size`, `binning`, and `reverse`.
     fn dimensions(&self, py: Python<'_>) -> PyResult<PyObject> {
         let items: Vec<PyObject> = self
             .inner
@@ -477,6 +531,7 @@ impl PyNtNdArray {
         Ok(PyList::new(py, &items)?.into_any().unbind())
     }
 
+    /// Time stamp of the data acquisition.
     #[getter]
     fn data_time_stamp(&self) -> PyTimeStamp {
         PyTimeStamp::from(&self.inner.data_time_stamp)

@@ -124,6 +124,8 @@ pub fn record_type_name(rt: &RecordType) -> &'static str {
         RecordType::Mbbi => "mbbi",
         RecordType::Mbbo => "mbbo",
         RecordType::Generic => "generic",
+        RecordType::LongIn => "longin",
+        RecordType::LongOut => "longout",
     }
 }
 
@@ -337,6 +339,7 @@ mod tests {
     fn record_type_names_match_db_names() {
         assert_eq!(record_type_name(&RecordType::Ao), "ao");
         assert_eq!(record_type_name(&RecordType::StringIn), "stringin");
+        assert_eq!(record_type_name(&RecordType::LongIn), "longin");
     }
 
     fn test_record() -> RecordInstance {

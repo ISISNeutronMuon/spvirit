@@ -13,16 +13,30 @@ use spvirit_types::{ScalarArrayValue, ScalarValue};
 
 use crate::convert::{decoded_to_py, py_to_scalar, py_to_scalar_array, scalar_to_py};
 use crate::nt::{nt_payload_to_py, py_to_nt_payload};
-use crate::runtime::RUNTIME;
+use crate::runtime::{RUNTIME, block_on_py};
 use crate::source::{PyNotifier, PySourceAdapter};
 
 // ─── ServerBuilder ───────────────────────────────────────────────────────────
 
+/// Fluent builder for a PVAccess server. Chain record definitions and
+/// configuration, then call `build()`. Single-use: any method called after
+/// `build()` raises RuntimeError.
 #[pyclass(name = "ServerBuilder")]
 pub struct PyServerBuilder {
     builder: Option<spvirit_server::PvaServerBuilder>,
     /// Python sources to wire up on build (label, order, adapter).
     python_sources: Vec<(String, i32, Arc<PySourceAdapter>)>,
+}
+
+/// Take the inner builder, raising `RuntimeError` if `build()` already ran.
+fn take_builder(
+    slf: &mut PyRefMut<'_, PyServerBuilder>,
+) -> PyResult<spvirit_server::PvaServerBuilder> {
+    slf.builder.take().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "ServerBuilder already consumed by build(); create a new builder",
+        )
+    })
 }
 
 #[pymethods]
@@ -35,79 +49,102 @@ impl PyServerBuilder {
         }
     }
 
-    fn ai(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Add an `ai` (analog input) NTScalar double record — read-only over the wire.
+    fn ai(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.ai(name, initial));
-        slf
+        Ok(slf)
     }
 
-    fn ao(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Add an `ao` (analog output) NTScalar double record — writable over the wire.
+    fn ao(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.ao(name, initial));
-        slf
+        Ok(slf)
     }
 
-    fn bi(mut slf: PyRefMut<'_, Self>, name: String, initial: bool) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Add a `bi` (binary input) NTScalar boolean record — read-only over the wire.
+    fn bi(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        initial: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.bi(name, initial));
-        slf
+        Ok(slf)
     }
 
-    fn bo(mut slf: PyRefMut<'_, Self>, name: String, initial: bool) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Add a `bo` (binary output) NTScalar boolean record — writable over the wire.
+    fn bo(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        initial: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.bo(name, initial));
-        slf
+        Ok(slf)
     }
 
-    fn string_in(mut slf: PyRefMut<'_, Self>, name: String, initial: String) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Add a `stringin` NTScalar string record — read-only over the wire.
+    fn string_in(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        initial: String,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.string_in(name, initial));
-        slf
+        Ok(slf)
     }
 
+    /// Add a `stringout` NTScalar string record — writable over the wire.
     fn string_out(
         mut slf: PyRefMut<'_, Self>,
         name: String,
         initial: String,
-    ) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.string_out(name, initial));
-        slf
+        Ok(slf)
     }
 
+    /// Add a `waveform` NTScalarArray record — writable over the wire.
     fn waveform<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data: &Bound<'py, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.waveform(name, arr));
         Ok(slf)
     }
 
+    /// Add an `aai` (analog array input) NTScalarArray record — read-only over the wire.
     fn aai<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data: &Bound<'py, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.aai(name, arr));
         Ok(slf)
     }
 
+    /// Add an `aao` (analog array output) NTScalarArray record — writable over the wire.
     fn aao<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data: &Bound<'py, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.aao(name, arr));
         Ok(slf)
     }
 
+    /// Add a `subArray` record serving a `nelm`-element window of `data`
+    /// starting at `indx` (defaults to the full array).
     #[pyo3(signature = (name, data, indx=0, nelm=None))]
     fn sub_array<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -118,11 +155,12 @@ impl PyServerBuilder {
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
         let n = nelm.unwrap_or(arr.len());
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.sub_array(name, arr, indx, n));
         Ok(slf)
     }
 
+    /// Add an NTTable record from a `{column_name: list}` dict of columns.
     fn nt_table<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -137,11 +175,13 @@ impl PyServerBuilder {
             let col_data = py_to_scalar_array(&val)?;
             cols.push((col_name, col_data));
         }
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.nt_table(name, cols));
         Ok(slf)
     }
 
+    /// Add an NTNDArray record from flat array data and `(size, full_size)`
+    /// dimension pairs.
     fn nt_ndarray<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -149,33 +189,39 @@ impl PyServerBuilder {
         dims: Vec<(i32, i32)>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.nt_ndarray(name, arr, dims));
         Ok(slf)
     }
 
+    /// Add an `mbbi` (multi-bit binary input) NTEnum record — read-only over
+    /// the wire. `initial` is the choice index.
     fn mbbi(
         mut slf: PyRefMut<'_, Self>,
         name: String,
         choices: Vec<String>,
         initial: i32,
-    ) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.mbbi(name, choices, initial));
-        slf
+        Ok(slf)
     }
 
+    /// Add an `mbbo` (multi-bit binary output) NTEnum record — writable over
+    /// the wire. `initial` is the choice index.
     fn mbbo(
         mut slf: PyRefMut<'_, Self>,
         name: String,
         choices: Vec<String>,
         initial: i32,
-    ) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.mbbo(name, choices, initial));
-        slf
+        Ok(slf)
     }
 
+    /// Add a generic structure record with the given struct ID and a
+    /// `{field_name: value}` dict (scalars or lists).
     fn generic<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -188,25 +234,31 @@ impl PyServerBuilder {
             let pv_val = py_to_pv_value(&val)?;
             field_vec.push((field_name, pv_val));
         }
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.generic(name, struct_id, field_vec));
         Ok(slf)
     }
 
-    fn db_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Load record definitions from an EPICS `.db` file at `path`.
+    fn db_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.db_file(path));
-        slf
+        Ok(slf)
     }
 
-    fn db_string(mut slf: PyRefMut<'_, Self>, content: String) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Load record definitions from EPICS `.db` text given as a string.
+    fn db_string(mut slf: PyRefMut<'_, Self>, content: String) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.db_string(&content));
-        slf
+        Ok(slf)
     }
 
-    fn on_put(mut slf: PyRefMut<'_, Self>, name: String, callback: PyObject) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn on_put(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        callback: PyObject,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(
             b.on_put(name, move |pv_name: &str, decoded: &DecodedValue| {
                 Python::with_gil(|py| {
@@ -217,17 +269,17 @@ impl PyServerBuilder {
                 });
             }),
         );
-        slf
+        Ok(slf)
     }
 
     fn scan(
         mut slf: PyRefMut<'_, Self>,
         name: String,
-        period_secs: f64,
+        period: f64,
         callback: PyObject,
-    ) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
-        let dur = Duration::from_secs_f64(period_secs);
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
+        let dur = Duration::from_secs_f64(period);
         slf.builder = Some(b.scan(name, dur, move |pv_name: &str| {
             Python::with_gil(|py| match callback.call1(py, (pv_name,)) {
                 Ok(ret) => py_to_scalar(ret.bind(py)).unwrap_or(ScalarValue::F64(0.0)),
@@ -237,49 +289,66 @@ impl PyServerBuilder {
                 }
             })
         }));
-        slf
+        Ok(slf)
     }
 
-    fn port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Set the TCP port the server listens on.
+    fn port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.port(port));
-        slf
+        Ok(slf)
     }
 
-    fn udp_port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Set the UDP port used for search requests and beacons.
+    fn udp_port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.udp_port(port));
-        slf
+        Ok(slf)
     }
 
+    /// Set the IP address to bind listeners to. Raises ValueError on an
+    /// invalid IP string.
     fn listen_ip(mut slf: PyRefMut<'_, Self>, ip: String) -> PyResult<PyRefMut<'_, Self>> {
         let ip_addr: IpAddr = ip
             .parse()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid IP: {e}")))?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.listen_ip(ip_addr));
         Ok(slf)
     }
 
+    /// Set the IP address advertised to clients in search responses and
+    /// beacons. Raises ValueError on an invalid IP string.
     fn advertise_ip(mut slf: PyRefMut<'_, Self>, ip: String) -> PyResult<PyRefMut<'_, Self>> {
         let ip_addr: IpAddr = ip
             .parse()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid IP: {e}")))?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.advertise_ip(ip_addr));
         Ok(slf)
     }
 
-    fn compute_alarms(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    /// Enable or disable automatic alarm computation from record limits.
+    fn compute_alarms(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.compute_alarms(enabled));
-        slf
+        Ok(slf)
     }
 
-    fn beacon_period(mut slf: PyRefMut<'_, Self>, secs: u64) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
-        slf.builder = Some(b.beacon_period(secs));
-        slf
+    /// Set the UDP beacon period in seconds (float, rounded to whole
+    /// seconds, minimum 1).
+    fn beacon_period(mut slf: PyRefMut<'_, Self>, secs: f64) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
+        slf.builder = Some(b.beacon_period(secs.round().max(1.0) as u64));
+        Ok(slf)
+    }
+
+    fn __repr__(&self) -> &'static str {
+        if self.builder.is_some() {
+            "<spvirit.ServerBuilder>"
+        } else {
+            "<spvirit.ServerBuilder (consumed)>"
+        }
     }
 
     /// Register a Python-defined [`Source`].
@@ -295,15 +364,15 @@ impl PyServerBuilder {
         label: String,
         order: i32,
         source: PyObject,
-    ) -> PyRefMut<'_, Self> {
+    ) -> PyResult<PyRefMut<'_, Self>> {
         let adapter = Arc::new(PySourceAdapter::new(source));
         slf.python_sources
             .push((label.clone(), order, adapter.clone()));
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         // Cast to Arc<dyn Source> via Arc<PySourceAdapter>.
         let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter;
         slf.builder = Some(b.source(label, order, as_dyn));
-        slf
+        Ok(slf)
     }
 
     /// Build and return a `Server` that can be started.
@@ -334,6 +403,9 @@ impl PyServerBuilder {
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
+/// A PVAccess server. Construct with `Server(pvs=..., ...)` or
+/// `ServerBuilder.build()`; start with `start()`, `run()`, or
+/// `start_background()`.
 #[pyclass(name = "Server")]
 pub struct PyServer {
     server: Option<PvaServer>,
@@ -348,6 +420,159 @@ pub struct PyServer {
 
 #[pymethods]
 impl PyServer {
+    /// Build a server from typed PV handles (`spvirit.ai(...)` etc.).
+    ///
+    /// `pvs` — list of `Pv` handles; `sources` — list of `(label, order, obj)`
+    /// tuples of Python `Source` objects; remaining kwargs mirror
+    /// `ServerBuilder` configuration.
+    #[new]
+    #[pyo3(signature = (*, pvs=None, db_file=None, db_string=None, sources=None,
+                        port=None, udp_port=None, listen_ip=None, advertise_ip=None,
+                        compute_alarms=None, beacon_period=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        pvs: Option<Vec<crate::pv::PyPv>>,
+        db_file: Option<String>,
+        db_string: Option<String>,
+        sources: Option<Vec<(String, i32, PyObject)>>,
+        port: Option<u16>,
+        udp_port: Option<u16>,
+        listen_ip: Option<String>,
+        advertise_ip: Option<String>,
+        compute_alarms: Option<bool>,
+        beacon_period: Option<f64>,
+    ) -> PyResult<Self> {
+        let handles: Vec<spvirit_server::pv::AnyPv> =
+            pvs.unwrap_or_default().iter().map(|p| p.any()).collect();
+        let mut sb = PvaServer::serve(handles);
+        if let Some(p) = db_file {
+            sb = sb.db_file(p);
+        }
+        if let Some(s) = db_string {
+            sb = sb.db_string(&s);
+        }
+        if let Some(p) = port {
+            sb = sb.port(p);
+        }
+        if let Some(p) = udp_port {
+            sb = sb.udp_port(p);
+        }
+        if let Some(ip) = listen_ip {
+            let addr: IpAddr = ip
+                .parse()
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid IP: {e}")))?;
+            sb = sb.listen_ip(addr);
+        }
+        if let Some(ip) = advertise_ip {
+            let addr: IpAddr = ip
+                .parse()
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid IP: {e}")))?;
+            sb = sb.advertise_ip(addr);
+        }
+        if let Some(c) = compute_alarms {
+            sb = sb.compute_alarms(c);
+        }
+        if let Some(secs) = beacon_period {
+            sb = sb.beacon_period(secs.round().max(1.0) as u64);
+        }
+        let mut python_sources: Vec<(String, i32, Arc<PySourceAdapter>)> = Vec::new();
+        for (label, order, obj) in sources.unwrap_or_default() {
+            let adapter = Arc::new(PySourceAdapter::new(obj));
+            python_sources.push((label.clone(), order, adapter.clone()));
+            let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter;
+            sb = sb.source(label, order, as_dyn);
+        }
+        let mut server = py.allow_threads(|| RUNTIME.block_on(sb.build()));
+        let store = server.store().clone();
+        let registry = server.monitor_registry();
+        let notifier = PyNotifier::new(registry);
+        for (_, _, adapter) in &python_sources {
+            adapter.invoke_on_start(notifier.clone());
+        }
+        Ok(PyServer {
+            server: Some(server),
+            store: Some(store),
+            notifier: Some(notifier),
+            post_build_sources: python_sources,
+        })
+    }
+
+    /// Return a fresh `ServerBuilder` (equivalent to `ServerBuilder()`).
+    #[staticmethod]
+    fn builder() -> PyServerBuilder {
+        PyServerBuilder::new()
+    }
+
+    /// Start serving on a background thread (returns immediately).
+    fn start(&mut self) -> PyResult<()> {
+        self.start_background().map(|_| ())
+    }
+
+    fn __repr__(&self) -> &'static str {
+        if self.server.is_some() {
+            "<spvirit.Server>"
+        } else {
+            "<spvirit.Server (running)>"
+        }
+    }
+
+    /// Mint a typed handle to any served record (handle-built or .db-loaded).
+    fn pv(&self, py: Python<'_>, name: String) -> PyResult<crate::pv::PyPv> {
+        use crate::pv::{PvKind, PyPv, pv_err};
+        use spvirit_types::{NtPayload, ScalarValue};
+        let server = self
+            .server
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("server already consumed"))?;
+        let store = server.store().clone();
+        let sniff = block_on_py(py, store.get_nt(&name));
+        let kind = match sniff {
+            None => {
+                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                    "PV '{name}' not found"
+                )));
+            }
+            Some(NtPayload::Scalar(nt)) => match nt.value {
+                ScalarValue::F64(_) | ScalarValue::F32(_) => {
+                    let h = block_on_py(py, server.pv::<f64>(&name)).map_err(pv_err)?;
+                    PvKind::F64(h)
+                }
+                ScalarValue::Bool(_) => {
+                    let h = block_on_py(py, server.pv::<bool>(&name)).map_err(pv_err)?;
+                    PvKind::Bool(h)
+                }
+                ScalarValue::I8(_) | ScalarValue::I16(_) | ScalarValue::I32(_) => {
+                    let h = block_on_py(py, server.pv::<i32>(&name)).map_err(pv_err)?;
+                    PvKind::I32(h)
+                }
+                ScalarValue::Str(_) => {
+                    let h = block_on_py(py, server.pv::<String>(&name)).map_err(pv_err)?;
+                    PvKind::Str(h)
+                }
+                other => {
+                    return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                        "PV '{name}' has unsupported value type {other:?} for typed handles"
+                    )));
+                }
+            },
+            Some(NtPayload::Enum(_)) => {
+                let h = block_on_py(py, server.pv::<i32>(&name)).map_err(pv_err)?;
+                PvKind::I32(h)
+            }
+            Some(NtPayload::ScalarArray(_)) => {
+                let h = block_on_py(py, server.array_pv(&name)).map_err(pv_err)?;
+                PvKind::Array(h)
+            }
+            Some(other) => {
+                return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                    "PV '{name}' has unsupported payload {other:?} for typed handles"
+                )));
+            }
+        };
+        Ok(PyPv { kind })
+    }
+
     /// Get a handle to the PV store for runtime get/set.
     fn store(&self) -> PyResult<PyStore> {
         let store = self
@@ -419,6 +644,8 @@ impl PyServer {
 
 // ─── Store ───────────────────────────────────────────────────────────────────
 
+/// Name-keyed runtime access to the server's record store: get/set scalar,
+/// array, and full NT values.
 #[pyclass(name = "Store")]
 pub struct PyStore {
     inner: Arc<SimplePvStore>,
@@ -429,7 +656,7 @@ impl PyStore {
     /// Get the current scalar value of a PV (returns None if not found).
     fn get_value(&self, py: Python<'_>, name: String) -> PyResult<PyObject> {
         let store = self.inner.clone();
-        let val = py.allow_threads(|| RUNTIME.block_on(store.get_value(&name)));
+        let val = block_on_py(py, store.get_value(&name));
         Ok(match val {
             Some(v) => scalar_to_py(py, &v),
             None => py.None(),
@@ -439,7 +666,7 @@ impl PyStore {
     /// Get the full NT payload for a PV (returns NtScalar, NtScalarArray, etc.).
     fn get_nt(&self, py: Python<'_>, name: String) -> PyResult<PyObject> {
         let store = self.inner.clone();
-        let val = py.allow_threads(|| RUNTIME.block_on(store.get_nt(&name)));
+        let val = block_on_py(py, store.get_nt(&name));
         Ok(match val {
             Some(payload) => nt_payload_to_py(py, payload),
             None => py.None(),
@@ -450,7 +677,7 @@ impl PyStore {
     fn set_value(&self, py: Python<'_>, name: String, value: &Bound<'_, PyAny>) -> PyResult<bool> {
         let sv = py_to_scalar(value)?;
         let store = self.inner.clone();
-        Ok(py.allow_threads(|| RUNTIME.block_on(store.set_value(&name, sv))))
+        Ok(block_on_py(py, store.set_value(&name, sv)))
     }
 
     /// Set an array value on a PV. Returns True if the PV exists.
@@ -462,7 +689,7 @@ impl PyStore {
     ) -> PyResult<bool> {
         let arr = py_to_scalar_array(value)?;
         let store = self.inner.clone();
-        Ok(py.allow_threads(|| RUNTIME.block_on(store.set_array_value(&name, arr))))
+        Ok(block_on_py(py, store.set_array_value(&name, arr)))
     }
 
     /// Write a full NT payload (NtScalar, NtScalarArray, etc.) to a PV.
@@ -470,13 +697,19 @@ impl PyStore {
     fn put_nt(&self, py: Python<'_>, name: String, nt: &Bound<'_, PyAny>) -> PyResult<bool> {
         let payload = py_to_nt_payload(nt)?;
         let store = self.inner.clone();
-        Ok(py.allow_threads(|| RUNTIME.block_on(store.put_nt(&name, payload))))
+        Ok(block_on_py(py, store.put_nt(&name, payload)))
     }
 
     /// List all PV names in the store.
     fn pv_names(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let store = self.inner.clone();
-        Ok(py.allow_threads(|| RUNTIME.block_on(store.pv_names())))
+        Ok(block_on_py(py, store.pv_names()))
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let store = self.inner.clone();
+        let n = block_on_py(py, store.pv_names()).len();
+        format!("<spvirit.Store ({n} PVs)>")
     }
 }
 

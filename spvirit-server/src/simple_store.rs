@@ -32,6 +32,9 @@ pub type ScanCallback = Arc<dyn Fn(&str) -> ScalarValue + Send + Sync>;
 /// Callback that computes a derived PV value from its input values.
 pub type LinkCallback = Arc<dyn Fn(&[ScalarValue]) -> ScalarValue + Send + Sync>;
 
+/// Pre-apply PUT validator: `Err(msg)` rejects the PUT (error on the wire).
+pub(crate) type PutValidator = Arc<dyn Fn(&str, &DecodedValue) -> Result<(), String> + Send + Sync>;
+
 /// A link from one or more input PVs to a computed output PV.
 pub(crate) struct LinkDef {
     pub output: String,
@@ -55,6 +58,7 @@ pub struct SimplePvStore {
     links: Vec<LinkDef>,
     compute_alarms: bool,
     registry: RwLock<Option<Arc<MonitorRegistry>>>,
+    validators: RwLock<HashMap<String, PutValidator>>,
 }
 
 impl SimplePvStore {
@@ -84,6 +88,7 @@ impl SimplePvStore {
             links,
             compute_alarms,
             registry: RwLock::new(None),
+            validators: RwLock::new(HashMap::new()),
         }
     }
 
@@ -91,6 +96,11 @@ impl SimplePvStore {
     /// to PVAccess monitor clients.  Called automatically by [`PvaServer::run`].
     pub async fn set_registry(&self, registry: Arc<MonitorRegistry>) {
         *self.registry.write().await = Some(registry);
+    }
+
+    /// Register a pre-apply PUT validator for a PV.
+    pub(crate) async fn set_validator(&self, name: String, v: PutValidator) {
+        self.validators.write().await.insert(name, v);
     }
 
     /// Insert or replace a PV record at runtime.
@@ -156,6 +166,66 @@ impl SimplePvStore {
         } else {
             false
         }
+    }
+
+    /// Explicitly set a record's alarm fields (severity/status/message),
+    /// independent of its value. Unlike [`SimplePvStore::set_value`], alarm
+    /// transitions always post — there is no MDEL deadband gating and no
+    /// link evaluation (alarm changes don't propagate links). Returns
+    /// `false` if the alarm state is unchanged (idempotent) or the record
+    /// doesn't support alarm fields (`Table`/`NdArray`/`Generic`) or doesn't
+    /// exist.
+    pub async fn set_alarm(&self, name: &str, severity: i32, status: i32, message: &str) -> bool {
+        let payload = {
+            let mut pvs = self.pvs.write().await;
+            let Some(entry) = pvs.get_mut(name) else {
+                return false;
+            };
+            let alarm = if let Some(nt) = entry.record.nt_scalar_mut() {
+                (
+                    &mut nt.alarm_severity,
+                    &mut nt.alarm_status,
+                    &mut nt.alarm_message,
+                )
+            } else {
+                match &mut entry.record.data {
+                    RecordData::NtEnum { nt, .. } => (
+                        &mut nt.alarm.severity,
+                        &mut nt.alarm.status,
+                        &mut nt.alarm.message,
+                    ),
+                    RecordData::Waveform { nt, .. }
+                    | RecordData::Aai { nt, .. }
+                    | RecordData::Aao { nt, .. }
+                    | RecordData::SubArray { nt, .. } => (
+                        &mut nt.alarm.severity,
+                        &mut nt.alarm.status,
+                        &mut nt.alarm.message,
+                    ),
+                    _ => return false,
+                }
+            };
+            let (sev, sta, msg) = alarm;
+            let changed = *sev != severity || *sta != status || msg.as_str() != message;
+            if !changed {
+                return false;
+            }
+            *sev = severity;
+            *sta = status;
+            *msg = message.to_string();
+
+            let payload = entry.record.to_ntpayload();
+            entry
+                .subscribers
+                .retain(|tx| tx.try_send(payload.clone()).is_ok());
+            payload
+        };
+
+        let reg = self.registry.read().await;
+        if let Some(registry) = reg.as_ref() {
+            registry.notify_monitors(name, &payload).await;
+        }
+        true
     }
 
     /// Core write logic — updates the value, notifies subscribers and monitors,
@@ -339,6 +409,18 @@ impl Source for SimplePvStore {
         let name = name.to_string();
         let value = value.clone();
         Box::pin(async move {
+            // Clone the validator out inside a tight scope so the read guard
+            // drops before the user callback runs — otherwise temporary
+            // lifetime extension holds the lock across the call, blocking
+            // concurrent set_validator for the duration of every PUT.
+            let validator = {
+                let guard = self.validators.read().await;
+                guard.get(&name).cloned()
+            };
+            if let Some(v) = validator {
+                v(&name, &value)?;
+            }
+
             let result = {
                 let mut pvs = self.pvs.write().await;
                 let entry = pvs
@@ -530,7 +612,9 @@ fn apply_put_to_record(
                         _ => None,
                     };
                     if let Some(idx) = idx {
-                        if nt.index != idx {
+                        if idx < 0 || (idx as usize) >= nt.choices.len() {
+                            // out-of-range index — reject, keep value
+                        } else if nt.index != idx {
                             nt.index = idx;
                             changed = true;
                         }
@@ -829,6 +913,21 @@ mod tests {
         }
     }
 
+    fn make_mbbo(name: &str, choices: Vec<String>, initial: i32) -> RecordInstance {
+        RecordInstance {
+            name: name.to_string(),
+            record_type: RecordType::Mbbo,
+            common: DbCommonState::default(),
+            data: RecordData::NtEnum {
+                nt: spvirit_types::NtEnum::new(initial, choices),
+                inp: None,
+                out: None,
+                omsl: crate::types::OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        }
+    }
+
     fn make_ao(name: &str, val: f64) -> RecordInstance {
         RecordInstance {
             name: name.to_string(),
@@ -1001,6 +1100,30 @@ record(ao, "DB:AO") {
             NtPayload::Scalar(nt) => assert_eq!(nt.value, ScalarValue::F64(99.5)),
             _ => panic!("expected scalar"),
         }
+    }
+
+    #[tokio::test]
+    async fn put_wire_rejects_out_of_range_enum_index() {
+        let mut records = HashMap::new();
+        records.insert(
+            "E".into(),
+            make_mbbo("E", vec!["A".into(), "B".into(), "C".into()], 0),
+        );
+        let store = SimplePvStore::new(records, HashMap::new(), vec![], false);
+
+        // Out-of-range index — must be a no-op (Ok, no changed PVs), index unchanged.
+        let result = Source::put(&store, "E", &DecodedValue::Int32(7))
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+        assert_eq!(store.get_value("E").await.unwrap(), ScalarValue::I32(0));
+
+        // In-range index — applied.
+        let result = Source::put(&store, "E", &DecodedValue::Int32(2))
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(store.get_value("E").await.unwrap(), ScalarValue::I32(2));
     }
 
     #[tokio::test]
@@ -1252,5 +1375,53 @@ record(ao, "DB:AO") {
         tokio::task::yield_now().await;
 
         assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn validator_rejects_put_before_apply() {
+        let mut records = std::collections::HashMap::new();
+        records.insert(
+            "V".to_string(),
+            crate::pva_server::make_output_record(
+                "V",
+                crate::types::RecordType::Ao,
+                ScalarValue::F64(1.0),
+            ),
+        );
+        let store =
+            SimplePvStore::new(records, std::collections::HashMap::new(), Vec::new(), false);
+        store
+            .set_validator(
+                "V".to_string(),
+                std::sync::Arc::new(|_name, _val| Err("nope".to_string())),
+            )
+            .await;
+
+        let dv = DecodedValue::Float64(2.0);
+        let res = Source::put(&store, "V", &dv).await;
+        assert_eq!(res, Err("nope".to_string()));
+        // value unchanged — validator ran BEFORE apply
+        assert_eq!(store.get_value("V").await, Some(ScalarValue::F64(1.0)));
+    }
+
+    #[tokio::test]
+    async fn validator_allows_structure_wrapped_put_through() {
+        // Real puts to scalar records arrive wrapped as a Structure with a
+        // "value" field (see apply_put_to_record's bare-scalar-wrapping).
+        // The validator itself only sees the raw DecodedValue as given to
+        // `put`; this test documents that a validator returning Ok lets a
+        // structure-wrapped put proceed and apply normally.
+        let mut records = std::collections::HashMap::new();
+        records.insert("W".to_string(), make_ao("W", 1.0));
+        let store =
+            SimplePvStore::new(records, std::collections::HashMap::new(), Vec::new(), false);
+        store
+            .set_validator("W".to_string(), std::sync::Arc::new(|_name, _val| Ok(())))
+            .await;
+
+        let dv = DecodedValue::Structure(vec![("value".to_string(), DecodedValue::Float64(5.0))]);
+        let res = Source::put(&store, "W", &dv).await;
+        assert!(res.is_ok());
+        assert_eq!(store.get_value("W").await, Some(ScalarValue::F64(5.0)));
     }
 }
