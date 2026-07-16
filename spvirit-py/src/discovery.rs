@@ -132,6 +132,7 @@ fn search_pv_udp(
     Ok(addr.to_string())
 }
 
+/// Async variant of `search_pv`; returns an awaitable with the same result.
 #[pyfunction(name = "search_pv_async")]
 #[pyo3(signature = (pv_name, udp_port=5076, timeout=3.0, targets=None, debug=false))]
 fn search_pv_udp_async<'py>(
@@ -201,6 +202,8 @@ fn discover_servers_py(
     Ok(list.into())
 }
 
+/// Async variant of `discover_servers`; returns an awaitable with the same
+/// result.
 #[pyfunction(name = "discover_servers_async")]
 #[pyo3(signature = (udp_port=5076, timeout=1.0, targets=None, debug=false))]
 fn discover_servers_async<'py>(
@@ -254,6 +257,7 @@ fn pvlist_py(py: Python<'_>, server_addr: String, timeout: f64) -> PyResult<(Vec
     Ok((names, source_name(src).to_string()))
 }
 
+/// Async variant of `pvlist`; returns an awaitable with the same result.
 #[pyfunction(name = "pvlist_async")]
 #[pyo3(signature = (server_addr, timeout=5.0))]
 fn pvlist_async<'py>(

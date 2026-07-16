@@ -84,6 +84,9 @@ impl ChannelState {
     }
 }
 
+/// Persistent TCP channel to one PV on one server. Create with
+/// `Channel.connect()`; supports repeated get/put/monitor/introspect plus
+/// raw-frame access, and can be used as a context manager.
 #[pyclass(name = "Channel", module = "spvirit.lowlevel")]
 pub struct PyChannel {
     state: Arc<Mutex<ChannelState>>,
@@ -343,6 +346,7 @@ impl PyChannel {
         })
     }
 
+    /// Name of the PV this channel is bound to.
     #[getter]
     fn pv_name(&self, py: Python<'_>) -> String {
         py.allow_threads(|| {
@@ -351,6 +355,7 @@ impl PyChannel {
         })
     }
 
+    /// True while the underlying TCP connection is open.
     #[getter]
     fn is_open(&self, py: Python<'_>) -> bool {
         py.allow_threads(|| {
@@ -359,6 +364,7 @@ impl PyChannel {
         })
     }
 
+    /// Server address as `"ip:port"`, or None when closed.
     #[getter]
     fn server_addr(&self, py: Python<'_>) -> Option<String> {
         py.allow_threads(|| {
@@ -367,6 +373,7 @@ impl PyChannel {
         })
     }
 
+    /// Server-assigned channel ID, or None when closed.
     #[getter]
     fn sid(&self, py: Python<'_>) -> Option<u32> {
         py.allow_threads(|| {
@@ -428,6 +435,7 @@ impl PyChannel {
         block_on_py(py, run_put(state, json, fields)).map_err(to_py_err)
     }
 
+    /// Async variant of `put`; returns an awaitable.
     #[pyo3(signature = (value, fields=None))]
     fn put_async<'py>(
         &self,
@@ -451,6 +459,7 @@ impl PyChannel {
         Ok(PyStructureDesc::from_inner(desc))
     }
 
+    /// Async variant of `introspect`; returns an awaitable.
     fn introspect_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
         future_into_py(py, async move {
@@ -540,6 +549,7 @@ impl PyChannel {
         Ok(crate::packet::PyPacket::from_bytes(bytes))
     }
 
+    /// Async variant of `read_packet`; returns an awaitable.
     #[pyo3(signature = (timeout=None))]
     fn read_packet_async<'py>(
         &self,

@@ -182,11 +182,13 @@ impl PyPvInfo {
         })
     }
 
+    /// True if the PV accepts writes from clients.
     #[getter]
     fn writable(&self) -> bool {
         self.inner.writable
     }
 
+    /// Structure type ID of the claimed PV, or None.
     #[getter]
     fn struct_id(&self) -> Option<String> {
         self.inner.descriptor.struct_id.clone()

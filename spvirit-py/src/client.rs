@@ -18,13 +18,18 @@ use crate::runtime::RUNTIME;
 
 // ─── GetResult ───────────────────────────────────────────────────────────────
 
+/// Result of a get operation: `.pv_name`, `.value` (decoded Python value),
+/// `.raw_pva` (raw PVA frame bytes), `.raw_pvd` (raw pvData body bytes).
 #[pyclass(name = "GetResult")]
 pub struct PyGetResult {
+    /// Name of the PV this result was read from.
     #[pyo3(get)]
     pub pv_name: String,
     value: PyObject,
+    /// Raw PVA frame bytes of the get response.
     #[pyo3(get)]
     pub raw_pva: Vec<u8>,
+    /// Raw pvData body bytes of the get response.
     #[pyo3(get)]
     pub raw_pvd: Vec<u8>,
 }
@@ -47,6 +52,7 @@ impl PyGetResult {
 
 #[pymethods]
 impl PyGetResult {
+    /// Decoded Python value (usually a dict mirroring the NT structure).
     #[getter]
     fn value(&self, py: Python<'_>) -> PyObject {
         self.value.clone_ref(py)
@@ -59,11 +65,15 @@ impl PyGetResult {
 
 // ─── DiscoveredServer ────────────────────────────────────────────────────────
 
+/// A server found by `discover_servers()`: `.guid` (12-byte bytes) and
+/// `.tcp_addr` (`"ip:port"`).
 #[pyclass(name = "DiscoveredServer")]
 #[derive(Clone)]
 pub struct PyDiscoveredServer {
+    /// Server GUID (12 bytes).
     #[pyo3(get)]
     pub guid: Vec<u8>,
+    /// Server TCP address as `"ip:port"`.
     #[pyo3(get)]
     pub tcp_addr: String,
 }
@@ -77,6 +87,8 @@ impl PyDiscoveredServer {
 
 // ─── ClientBuilder ───────────────────────────────────────────────────────────
 
+/// Builder for `Client`. Defaults: TCP 5075, UDP 5076, timeout 5.0 s,
+/// broadcast search enabled.
 #[pyclass(name = "ClientBuilder")]
 pub struct PyClientBuilder {
     udp_port: u16,
@@ -111,26 +123,33 @@ impl PyClientBuilder {
         }
     }
 
+    /// Set the default TCP port used when connecting to servers.
     fn port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyRefMut<'_, Self> {
         slf.tcp_port = port;
         slf
     }
 
+    /// Set the UDP port used for broadcast search.
     fn udp_port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyRefMut<'_, Self> {
         slf.udp_port = port;
         slf
     }
 
+    /// Set the operation timeout in seconds.
     fn timeout(mut slf: PyRefMut<'_, Self>, secs: f64) -> PyRefMut<'_, Self> {
         slf.timeout_secs = secs;
         slf
     }
 
+    /// Disable UDP broadcast search when `enabled` is True (use name servers
+    /// or a fixed server address instead).
     fn no_broadcast(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyRefMut<'_, Self> {
         slf.no_broadcast = enabled;
         slf
     }
 
+    /// Add a name server `"ip:port"` address to query for PV names.
+    /// Raises ValueError on an invalid address.
     fn name_server(mut slf: PyRefMut<'_, Self>, addr: String) -> PyResult<PyRefMut<'_, Self>> {
         let _: SocketAddr = addr.parse().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid address: {e}"))
@@ -139,16 +158,20 @@ impl PyClientBuilder {
         Ok(slf)
     }
 
+    /// Set the user name reported during connection authentication.
     fn authnz_user(mut slf: PyRefMut<'_, Self>, user: String) -> PyRefMut<'_, Self> {
         slf.authnz_user = Some(user);
         slf
     }
 
+    /// Set the host name reported during connection authentication.
     fn authnz_host(mut slf: PyRefMut<'_, Self>, host: String) -> PyRefMut<'_, Self> {
         slf.authnz_host = Some(host);
         slf
     }
 
+    /// Connect directly to the server at `"ip:port"`, skipping search.
+    /// Raises ValueError on an invalid address.
     fn server_addr(mut slf: PyRefMut<'_, Self>, addr: String) -> PyResult<PyRefMut<'_, Self>> {
         let _: SocketAddr = addr.parse().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid address: {e}"))
@@ -157,21 +180,28 @@ impl PyClientBuilder {
         Ok(slf)
     }
 
+    /// Set the IP address search requests are sent to (validated at
+    /// `build()`; ValueError on a bad IP).
     fn search_addr(mut slf: PyRefMut<'_, Self>, addr: String) -> PyRefMut<'_, Self> {
         slf.search_addr = Some(addr);
         slf
     }
 
+    /// Set the local IP address to bind the search socket to (validated at
+    /// `build()`; ValueError on a bad IP).
     fn bind_addr(mut slf: PyRefMut<'_, Self>, addr: String) -> PyRefMut<'_, Self> {
         slf.bind_addr = Some(addr);
         slf
     }
 
+    /// Enable verbose protocol debug logging.
     fn debug(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyRefMut<'_, Self> {
         slf.debug = enabled;
         slf
     }
 
+    /// Build and return a configured `Client`. Raises ValueError if any
+    /// stored address string fails to parse.
     fn build(&self) -> PyResult<PyClient> {
         let mut b = PvaClient::builder()
             .port(self.tcp_port)
@@ -226,6 +256,9 @@ impl PyClientBuilder {
 
 // ─── Client ──────────────────────────────────────────────────────────────────
 
+/// High-level PVAccess client: get/put/monitor/subscribe/info/pvlist.
+/// `Client()` uses broadcast-search defaults; `Client.builder()` configures.
+/// Operations raise the SpviritError hierarchy.
 #[pyclass(name = "Client")]
 pub struct PyClient {
     inner: PvaClient,
@@ -542,7 +575,11 @@ impl Drop for PySubscription {
 
 // ─── discover_servers ────────────────────────────────────────────────────────
 
-/// Discover PVA servers on the network via UDP beacon search.
+/// Discover PVA servers on the network via UDP broadcast search.
+///
+/// `udp_port` (default 5076) is the search port, `timeout` (default 2.0 s)
+/// how long to collect responses, `debug` enables verbose logging.
+/// Returns a list of `DiscoveredServer`.
 #[pyfunction]
 #[pyo3(signature = (udp_port=5076, timeout=2.0, debug=false))]
 pub fn py_discover_servers(

@@ -18,6 +18,9 @@ use crate::source::{PyNotifier, PySourceAdapter};
 
 // ─── ServerBuilder ───────────────────────────────────────────────────────────
 
+/// Fluent builder for a PVAccess server. Chain record definitions and
+/// configuration, then call `build()`. Single-use: any method called after
+/// `build()` raises RuntimeError.
 #[pyclass(name = "ServerBuilder")]
 pub struct PyServerBuilder {
     builder: Option<spvirit_server::PvaServerBuilder>,
@@ -46,18 +49,21 @@ impl PyServerBuilder {
         }
     }
 
+    /// Add an `ai` (analog input) NTScalar double record — read-only over the wire.
     fn ai(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyResult<PyRefMut<'_, Self>> {
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.ai(name, initial));
         Ok(slf)
     }
 
+    /// Add an `ao` (analog output) NTScalar double record — writable over the wire.
     fn ao(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyResult<PyRefMut<'_, Self>> {
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.ao(name, initial));
         Ok(slf)
     }
 
+    /// Add a `bi` (binary input) NTScalar boolean record — read-only over the wire.
     fn bi(
         mut slf: PyRefMut<'_, Self>,
         name: String,
@@ -68,6 +74,7 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add a `bo` (binary output) NTScalar boolean record — writable over the wire.
     fn bo(
         mut slf: PyRefMut<'_, Self>,
         name: String,
@@ -78,6 +85,7 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add a `stringin` NTScalar string record — read-only over the wire.
     fn string_in(
         mut slf: PyRefMut<'_, Self>,
         name: String,
@@ -88,6 +96,7 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add a `stringout` NTScalar string record — writable over the wire.
     fn string_out(
         mut slf: PyRefMut<'_, Self>,
         name: String,
@@ -98,6 +107,7 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add a `waveform` NTScalarArray record — writable over the wire.
     fn waveform<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -109,6 +119,7 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add an `aai` (analog array input) NTScalarArray record — read-only over the wire.
     fn aai<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -120,6 +131,7 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add an `aao` (analog array output) NTScalarArray record — writable over the wire.
     fn aao<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -131,6 +143,8 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add a `subArray` record serving a `nelm`-element window of `data`
+    /// starting at `indx` (defaults to the full array).
     #[pyo3(signature = (name, data, indx=0, nelm=None))]
     fn sub_array<'py>(
         mut slf: PyRefMut<'py, Self>,
@@ -146,6 +160,7 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add an NTTable record from a `{column_name: list}` dict of columns.
     fn nt_table<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -165,6 +180,8 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add an NTNDArray record from flat array data and `(size, full_size)`
+    /// dimension pairs.
     fn nt_ndarray<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -177,6 +194,8 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add an `mbbi` (multi-bit binary input) NTEnum record — read-only over
+    /// the wire. `initial` is the choice index.
     fn mbbi(
         mut slf: PyRefMut<'_, Self>,
         name: String,
@@ -188,6 +207,8 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add an `mbbo` (multi-bit binary output) NTEnum record — writable over
+    /// the wire. `initial` is the choice index.
     fn mbbo(
         mut slf: PyRefMut<'_, Self>,
         name: String,
@@ -199,6 +220,8 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Add a generic structure record with the given struct ID and a
+    /// `{field_name: value}` dict (scalars or lists).
     fn generic<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
@@ -216,12 +239,14 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Load record definitions from an EPICS `.db` file at `path`.
     fn db_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyResult<PyRefMut<'_, Self>> {
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.db_file(path));
         Ok(slf)
     }
 
+    /// Load record definitions from EPICS `.db` text given as a string.
     fn db_string(mut slf: PyRefMut<'_, Self>, content: String) -> PyResult<PyRefMut<'_, Self>> {
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.db_string(&content));
@@ -267,18 +292,22 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Set the TCP port the server listens on.
     fn port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyResult<PyRefMut<'_, Self>> {
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.port(port));
         Ok(slf)
     }
 
+    /// Set the UDP port used for search requests and beacons.
     fn udp_port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyResult<PyRefMut<'_, Self>> {
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.udp_port(port));
         Ok(slf)
     }
 
+    /// Set the IP address to bind listeners to. Raises ValueError on an
+    /// invalid IP string.
     fn listen_ip(mut slf: PyRefMut<'_, Self>, ip: String) -> PyResult<PyRefMut<'_, Self>> {
         let ip_addr: IpAddr = ip
             .parse()
@@ -288,6 +317,8 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Set the IP address advertised to clients in search responses and
+    /// beacons. Raises ValueError on an invalid IP string.
     fn advertise_ip(mut slf: PyRefMut<'_, Self>, ip: String) -> PyResult<PyRefMut<'_, Self>> {
         let ip_addr: IpAddr = ip
             .parse()
@@ -297,12 +328,15 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Enable or disable automatic alarm computation from record limits.
     fn compute_alarms(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyResult<PyRefMut<'_, Self>> {
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.compute_alarms(enabled));
         Ok(slf)
     }
 
+    /// Set the UDP beacon period in seconds (float, rounded to whole
+    /// seconds, minimum 1).
     fn beacon_period(mut slf: PyRefMut<'_, Self>, secs: f64) -> PyResult<PyRefMut<'_, Self>> {
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.beacon_period(secs.round().max(1.0) as u64));
@@ -369,6 +403,9 @@ impl PyServerBuilder {
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
+/// A PVAccess server. Construct with `Server(pvs=..., ...)` or
+/// `ServerBuilder.build()`; start with `start()`, `run()`, or
+/// `start_background()`.
 #[pyclass(name = "Server")]
 pub struct PyServer {
     server: Option<PvaServer>,
@@ -607,6 +644,8 @@ impl PyServer {
 
 // ─── Store ───────────────────────────────────────────────────────────────────
 
+/// Name-keyed runtime access to the server's record store: get/set scalar,
+/// array, and full NT values.
 #[pyclass(name = "Store")]
 pub struct PyStore {
     inner: Arc<SimplePvStore>,
