@@ -577,6 +577,32 @@ client.info("SIM:TEMP")                         # {"struct_id": ..., "fields": [
 client.pvlist("192.168.1.10:5075")              # PV names from a specific server
 ```
 
+Non-blocking monitors — `monitor_non_blocking` returns immediately with a
+`Subscription` handle while updates are delivered on a background thread:
+
+```python
+sub = client.monitor_non_blocking("SIM:TEMP", lambda v: print(v))
+# ... program continues; run as many concurrent subscriptions as you like ...
+sub.pv_name       # "SIM:TEMP"
+sub.is_active     # True while updates are flowing
+sub.close()       # stop promptly (idempotent, works even on a quiet PV)
+sub.error         # None, or the message if the subscription ended on an error
+
+with client.monitor_non_blocking("SIM:PRESSURE", handle) as sub:   # context manager
+    ...
+```
+
+- The callback receives each update sequentially (per subscription) on a
+  runtime worker thread; keep it short, and hand heavy work to a queue.
+  Returning `False` or raising unsubscribes, exactly like `monitor`.
+- Inside the callback you may call other spvirit operations (`pv.set()`,
+  `client.get()`, …) — re-entrancy is safe.
+- Network failures don't raise (there is no caller to raise into): the
+  subscription ends, `is_active` becomes `False`, and `error` holds the
+  message.
+- Dropping the last reference to a `Subscription` closes it — keep the handle
+  alive for as long as you want updates.
+
 Configure with the builder when defaults don't fit:
 
 ```python

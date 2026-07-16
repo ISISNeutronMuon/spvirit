@@ -2,6 +2,8 @@
 
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pyo3::prelude::*;
@@ -395,6 +397,138 @@ impl PyClient {
         let client = self.inner.clone();
         py.allow_threads(|| RUNTIME.block_on(client.pvlist(addr)))
             .map_err(to_py_err)
+    }
+
+    /// Subscribe to a PV without blocking; returns a `Subscription` handle.
+    ///
+    /// `callback(value)` runs on a background runtime thread for each update,
+    /// sequentially per subscription. Returning `False` (or raising) from the
+    /// callback unsubscribes, matching `monitor`. Call `subscription.close()`
+    /// to stop promptly — it works even while the PV is quiet. If the
+    /// subscription ends on a network/protocol error, `subscription.error`
+    /// holds the message and `is_active` becomes `False`.
+    #[pyo3(signature = (pv_name, callback, fields=None))]
+    fn monitor_non_blocking(
+        &self,
+        pv_name: String,
+        callback: PyObject,
+        fields: Option<Vec<String>>,
+    ) -> PySubscription {
+        let client = self.inner.clone();
+        let fields = fields.unwrap_or_default();
+        let state = Arc::new(SubscriptionState {
+            active: AtomicBool::new(true),
+            error: Mutex::new(None),
+        });
+        let task_state = state.clone();
+        let task_pv = pv_name.clone();
+        let handle = RUNTIME.spawn(async move {
+            let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+            let result = client
+                .pvmonitor_fields(&task_pv, &refs, |decoded| {
+                    let keep_going = Python::with_gil(|py| {
+                        let py_val = decoded_to_py(py, decoded);
+                        match callback.call1(py, (py_val,)) {
+                            Ok(ret) => ret.extract::<bool>(py).unwrap_or(true),
+                            Err(_) => false,
+                        }
+                    });
+                    if keep_going {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    }
+                })
+                .await;
+            if let Err(e) = result {
+                *task_state.error.lock().unwrap() = Some(e.to_string());
+            }
+            task_state.active.store(false, Ordering::SeqCst);
+        });
+        PySubscription {
+            pv_name,
+            state,
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+}
+
+// ─── Subscription ────────────────────────────────────────────────────────────
+
+struct SubscriptionState {
+    active: AtomicBool,
+    error: Mutex<Option<String>>,
+}
+
+/// Handle to a non-blocking monitor started with `Client.monitor_non_blocking`.
+#[pyclass(name = "Subscription")]
+pub struct PySubscription {
+    pv_name: String,
+    state: Arc<SubscriptionState>,
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl PySubscription {
+    fn abort_task(&self) {
+        if let Some(h) = self.handle.lock().unwrap().take() {
+            h.abort();
+        }
+    }
+}
+
+#[pymethods]
+impl PySubscription {
+    /// Name of the PV this subscription watches.
+    #[getter]
+    fn pv_name(&self) -> &str {
+        &self.pv_name
+    }
+
+    /// True while updates are still being delivered.
+    #[getter]
+    fn is_active(&self) -> bool {
+        self.state.active.load(Ordering::SeqCst)
+    }
+
+    /// Error message if the subscription ended on a failure, else None.
+    #[getter]
+    fn error(&self) -> Option<String> {
+        self.state.error.lock().unwrap().clone()
+    }
+
+    /// Stop the subscription. Idempotent; returns immediately and works
+    /// even while the PV is quiet.
+    fn close(&self) {
+        self.abort_task();
+        self.state.active.store(false, Ordering::SeqCst);
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc=None, _tb=None))]
+    fn __exit__(
+        &self,
+        _exc_type: Option<PyObject>,
+        _exc: Option<PyObject>,
+        _tb: Option<PyObject>,
+    ) -> bool {
+        self.close();
+        false
+    }
+
+    fn __repr__(&self) -> String {
+        let status = if self.is_active() { "active" } else { "closed" };
+        format!("<spvirit.Subscription '{}' ({status})>", self.pv_name)
+    }
+}
+
+impl Drop for PySubscription {
+    // A subscription nobody holds a handle to is uncontrollable; stop it
+    // rather than leak a detached task.
+    fn drop(&mut self) {
+        self.abort_task();
     }
 }
 

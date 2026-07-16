@@ -221,6 +221,81 @@ def test_async_aget_aset():
     assert asyncio.run(flow()) == 6.28
 
 
+def _wait_for(cond, timeout=5.0):
+    """Poll `cond()` until truthy or the deadline expires; return its result."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = cond()
+        if result:
+            return result
+        time.sleep(0.02)
+    return cond()
+
+
+def test_monitor_non_blocking():
+    t = spvirit.ao("PYM:T", 1.0)
+    tcp, udp = 15175, 15176
+    server = spvirit.Server(pvs=[t], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
+    server.start()
+
+    updates = []
+    client = _local_client(tcp, udp)
+    sub = client.monitor_non_blocking("PYM:T", lambda v: updates.append(v))
+    assert sub.pv_name == "PYM:T"
+    assert "PYM:T" in repr(sub)
+
+    assert _wait_for(lambda: len(updates) >= 1), "no initial monitor update"
+    assert sub.is_active
+    t.set(2.5)
+    assert _wait_for(lambda: any(u.get("value") == 2.5 for u in updates)), \
+        "value update not delivered"
+
+    sub.close()
+    assert not sub.is_active
+    assert sub.error is None
+    sub.close()  # idempotent
+    seen = len(updates)
+    t.set(9.9)
+    import time
+    time.sleep(0.3)
+    assert len(updates) == seen, "closed subscription must not deliver updates"
+
+
+def test_monitor_non_blocking_callback_false_stops():
+    t = spvirit.ao("PYM:S", 1.0)
+    tcp, udp = 15185, 15186
+    server = spvirit.Server(pvs=[t], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
+    server.start()
+
+    updates = []
+
+    def once(value):
+        updates.append(value)
+        return False  # unsubscribe after the first update
+
+    client = _local_client(tcp, udp)
+    sub = client.monitor_non_blocking("PYM:S", once)
+    assert _wait_for(lambda: not sub.is_active), \
+        "returning False from the callback must end the subscription"
+    assert len(updates) == 1
+    assert sub.error is None
+
+
+def test_monitor_non_blocking_context_manager():
+    t = spvirit.ao("PYM:C", 1.0)
+    tcp, udp = 15195, 15196
+    server = spvirit.Server(pvs=[t], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
+    server.start()
+
+    updates = []
+    client = _local_client(tcp, udp)
+    with client.monitor_non_blocking("PYM:C", lambda v: updates.append(v)) as sub:
+        assert _wait_for(lambda: len(updates) >= 1)
+        assert sub.is_active
+    assert not sub.is_active
+
+
 def main():
     for fn in sorted(k for k in globals() if k.startswith("test_")):
         globals()[fn]()
