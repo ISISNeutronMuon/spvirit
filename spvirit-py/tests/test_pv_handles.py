@@ -208,7 +208,7 @@ def test_set_alarm():
     t.set_alarm(2, 3, "broken")
 
 
-def test_async_aget_aset():
+def test_async_set_get():
     import asyncio
 
     t = spvirit.ao("PYAS:T", 1.0)
