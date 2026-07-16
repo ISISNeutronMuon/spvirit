@@ -395,6 +395,9 @@ impl RecordInstance {
                 return false;
             }
             nt.index = idx;
+            // NtEnum encodes its stored time_stamp verbatim — stamp the
+            // update time or clients see epoch 0 forever.
+            nt.time_stamp = now_nt_timestamp();
             return true;
         }
 
@@ -603,8 +606,17 @@ impl RecordInstance {
                 }
             }
         };
-        if changed && compute_alarms {
-            nt.update_alarm_from_value();
+        if changed {
+            // A `None` time_stamp makes the encoder stamp now() at *encode*
+            // time. The monitor delta path re-encodes the previous and next
+            // snapshots microseconds apart, so secondsPastEpoch compares
+            // equal and is never flagged changed — freezing the seconds on
+            // monitoring clients. Store the update time so encodes are
+            // stable (see spvd_encode::encode_timestamp).
+            nt.time_stamp = Some(now_nt_timestamp());
+            if compute_alarms {
+                nt.update_alarm_from_value();
+            }
         }
         changed
     }
@@ -653,11 +665,17 @@ impl RecordInstance {
                 | RecordData::Bo { nt, .. }
                 | RecordData::StringIn { nt, .. }
                 | RecordData::StringOut { nt, .. },
-                NtPayload::Scalar(next),
+                NtPayload::Scalar(mut next),
             ) => {
                 if *nt == next {
                     false
                 } else {
+                    // Respect a caller-supplied acquisition time; otherwise
+                    // stamp the update time so monitor deltas stay stable
+                    // (see set_scalar_value).
+                    if next.time_stamp.is_none() {
+                        next.time_stamp = Some(now_nt_timestamp());
+                    }
                     *nt = next;
                     true
                 }
@@ -674,31 +692,49 @@ impl RecordInstance {
                 if *nt == next {
                     false
                 } else {
+                    // Epoch 0 is the untouched default, never a real
+                    // acquisition time — stamp the update time instead.
+                    if next.time_stamp == NtTimeStamp::default() {
+                        next.time_stamp = now_nt_timestamp();
+                    }
                     *nord = next_len;
                     *nt = next;
                     true
                 }
             }
-            (RecordData::NtTable { nt, .. }, NtPayload::Table(next)) => {
+            (RecordData::NtTable { nt, .. }, NtPayload::Table(mut next)) => {
                 if next.validate().is_err() || *nt == next {
                     false
                 } else {
+                    if next.time_stamp.is_none() {
+                        next.time_stamp = Some(now_nt_timestamp());
+                    }
                     *nt = next;
                     true
                 }
             }
-            (RecordData::NtNdArray { nt, .. }, NtPayload::NdArray(next)) => {
+            (RecordData::NtNdArray { nt, .. }, NtPayload::NdArray(mut next)) => {
                 if next.validate().is_err() || *nt == next {
                     false
                 } else {
+                    let ts = now_nt_timestamp();
+                    if next.time_stamp.is_none() {
+                        next.time_stamp = Some(ts.clone());
+                    }
+                    if next.data_time_stamp == NtTimeStamp::default() {
+                        next.data_time_stamp = ts;
+                    }
                     *nt = next;
                     true
                 }
             }
-            (RecordData::NtEnum { nt, .. }, NtPayload::Enum(next)) => {
+            (RecordData::NtEnum { nt, .. }, NtPayload::Enum(mut next)) => {
                 if *nt == next {
                     false
                 } else {
+                    if next.time_stamp == NtTimeStamp::default() {
+                        next.time_stamp = now_nt_timestamp();
+                    }
                     *nt = next;
                     true
                 }

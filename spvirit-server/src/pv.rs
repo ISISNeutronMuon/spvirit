@@ -832,6 +832,7 @@ impl AnyPv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spvirit_types::NtScalar;
 
     #[test]
     fn pvscalar_roundtrip_f64() {
@@ -983,6 +984,63 @@ mod tests {
         assert_eq!(rec.current_value(), ScalarValue::I32(2));
         assert!(!rec.set_scalar_value(ScalarValue::I32(-1), true));
         assert_eq!(rec.current_value(), ScalarValue::I32(2));
+    }
+
+    #[test]
+    fn set_scalar_value_stamps_timestamp() {
+        let mut rec = Pv::ao("A:TS", 1.0).pending_record().unwrap();
+        assert!(rec.set_scalar_value(ScalarValue::F64(2.0), false));
+        match rec.to_ntpayload() {
+            NtPayload::Scalar(nt) => {
+                let ts = nt.time_stamp.expect("scalar update must store a timestamp");
+                assert!(ts.seconds_past_epoch > 0);
+            }
+            other => panic!("expected scalar payload, got {other:?}"),
+        }
+        // Unchanged value: no post, timestamp keeps the last update time.
+        assert!(!rec.set_scalar_value(ScalarValue::F64(2.0), false));
+    }
+
+    #[test]
+    fn set_scalar_value_stamps_enum_timestamp() {
+        let mut rec = Pv::mbbo("M:TS", vec!["Off".into(), "On".into()], 0)
+            .pending_record()
+            .unwrap();
+        assert!(rec.set_scalar_value(ScalarValue::I32(1), false));
+        match rec.to_ntpayload() {
+            NtPayload::Enum(nt) => {
+                assert!(nt.time_stamp.seconds_past_epoch > 0);
+            }
+            other => panic!("expected enum payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_nt_payload_stamps_missing_timestamp_but_keeps_explicit_one() {
+        let mut rec = Pv::ao("A:NT", 1.0).pending_record().unwrap();
+
+        // No caller timestamp: server stamps the update time.
+        let nt = NtScalar::from_value(ScalarValue::F64(2.0));
+        assert!(rec.set_nt_payload(NtPayload::Scalar(nt)));
+        match rec.to_ntpayload() {
+            NtPayload::Scalar(nt) => {
+                let ts = nt.time_stamp.expect("put_nt must store a timestamp");
+                assert!(ts.seconds_past_epoch > 0);
+            }
+            other => panic!("expected scalar payload, got {other:?}"),
+        }
+
+        // Explicit caller timestamp is preserved verbatim.
+        let nt = NtScalar::from_value(ScalarValue::F64(3.0)).with_timestamp(1_700_000_000, 42);
+        assert!(rec.set_nt_payload(NtPayload::Scalar(nt)));
+        match rec.to_ntpayload() {
+            NtPayload::Scalar(nt) => {
+                let ts = nt.time_stamp.unwrap();
+                assert_eq!(ts.seconds_past_epoch, 1_700_000_000);
+                assert_eq!(ts.nanoseconds, 42);
+            }
+            other => panic!("expected scalar payload, got {other:?}"),
+        }
     }
 
     #[tokio::test]

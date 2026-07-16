@@ -1308,12 +1308,24 @@ record(ao, "DB:AO") {
                 .await
         );
 
+        // The caller supplied no timestamps, so the store stamps the update
+        // time — compare everything else verbatim.
         match store.get_nt("TEST:TBL").await.unwrap() {
-            NtPayload::Table(nt) => assert_eq!(nt, table),
+            NtPayload::Table(mut nt) => {
+                let ts = nt.time_stamp.take().expect("table put must be stamped");
+                assert!(ts.seconds_past_epoch > 0);
+                assert_eq!(nt, table);
+            }
             _ => panic!("expected table payload"),
         }
         match store.get_nt("TEST:NDA").await.unwrap() {
-            NtPayload::NdArray(nt) => assert_eq!(nt, ndarray),
+            NtPayload::NdArray(mut nt) => {
+                let ts = nt.time_stamp.take().expect("ndarray put must be stamped");
+                assert!(ts.seconds_past_epoch > 0);
+                assert!(nt.data_time_stamp.seconds_past_epoch > 0);
+                nt.data_time_stamp = Default::default();
+                assert_eq!(nt, ndarray);
+            }
             _ => panic!("expected ndarray payload"),
         }
     }
