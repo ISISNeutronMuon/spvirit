@@ -875,27 +875,39 @@ impl PvaCancelRequestPayload {
 
 #[derive(Debug)]
 pub struct PvaDestroyRequestPayload {
+    pub sid: u32,
     pub request_id: u32,
-    pub status: Option<PvaStatus>,
 }
 
 impl PvaDestroyRequestPayload {
+    /// Decode a `destroyRequest` (0x0F) payload.
+    ///
+    /// The PVA spec payload is `serverChannelID (i32)` followed by
+    /// `requestID (i32)`. Older spvirit clients sent only the 4-byte
+    /// requestID; that legacy form is still accepted (with `sid` = 0).
     pub fn new(raw: &[u8], is_be: bool) -> Option<Self> {
-        if raw.len() < 4 {
+        let word = |range: std::ops::Range<usize>| -> Option<u32> {
+            let bytes = raw.get(range)?.try_into().ok()?;
+            Some(if is_be {
+                u32::from_be_bytes(bytes)
+            } else {
+                u32::from_le_bytes(bytes)
+            })
+        };
+        if raw.len() >= 8 {
+            Some(Self {
+                sid: word(0..4)?,
+                request_id: word(4..8)?,
+            })
+        } else if raw.len() >= 4 {
+            Some(Self {
+                sid: 0,
+                request_id: word(0..4)?,
+            })
+        } else {
             debug!("PvaDestroyRequestPayload::new: raw too short {}", raw.len());
-            return None;
+            None
         }
-        let request_id = if is_be {
-            u32::from_be_bytes(raw[0..4].try_into().ok()?)
-        } else {
-            u32::from_le_bytes(raw[0..4].try_into().ok()?)
-        };
-        let (status, _) = if raw.len() > 4 {
-            decode_status(&raw[4..], is_be)
-        } else {
-            (None, 0)
-        };
-        Some(Self { request_id, status })
     }
 }
 
@@ -1771,15 +1783,11 @@ impl fmt::Display for PvaCancelRequestPayload {
 
 impl fmt::Display for PvaDestroyRequestPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let status = self.status.as_ref().map(|s| s.code);
-        match status {
-            Some(code) => write!(
-                f,
-                "DESTROY_REQUEST(id={}, status={})",
-                self.request_id, code
-            ),
-            None => write!(f, "DESTROY_REQUEST(id={})", self.request_id),
-        }
+        write!(
+            f,
+            "DESTROY_REQUEST(sid={}, id={})",
+            self.sid, self.request_id
+        )
     }
 }
 
@@ -1887,6 +1895,23 @@ impl fmt::Display for PvaOpPayload {
 mod tests {
     use super::*;
     use crate::spvd_decode::extract_nt_scalar_value;
+
+    #[test]
+    fn destroy_request_decodes_spec_and_legacy_forms() {
+        // Spec form (pvxs/pvAccessCPP): serverChannelID then requestID.
+        let mut spec = Vec::new();
+        spec.extend_from_slice(&7u32.to_le_bytes());
+        spec.extend_from_slice(&42u32.to_le_bytes());
+        let p = PvaDestroyRequestPayload::new(&spec, false).unwrap();
+        assert_eq!((p.sid, p.request_id), (7, 42));
+
+        // Legacy 4-byte spvirit form: requestID only.
+        let legacy = 42u32.to_le_bytes();
+        let p = PvaDestroyRequestPayload::new(&legacy, false).unwrap();
+        assert_eq!((p.sid, p.request_id), (0, 42));
+
+        assert!(PvaDestroyRequestPayload::new(&[0u8; 3], false).is_none());
+    }
     use crate::spvd_encode::{
         encode_nt_payload_bitset_parts, encode_nt_scalar_bitset_parts, encode_size_pvd,
         nt_payload_desc, nt_scalar_desc,

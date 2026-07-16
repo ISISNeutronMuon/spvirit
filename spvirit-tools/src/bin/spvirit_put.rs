@@ -37,13 +37,16 @@ fn parse_cli_value(raw: &str) -> Value {
     Value::String(raw.to_string())
 }
 
-fn encode_destroy_request(request_id: u32, version: u8, is_be: bool) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&if is_be {
-        request_id.to_be_bytes()
-    } else {
-        request_id.to_le_bytes()
-    });
+fn encode_destroy_request(sid: u32, request_id: u32, version: u8, is_be: bool) -> Vec<u8> {
+    // destroyRequest (0x0F): serverChannelID then requestID, both i32.
+    let mut payload = Vec::with_capacity(8);
+    for word in [sid, request_id] {
+        payload.extend_from_slice(&if is_be {
+            word.to_be_bytes()
+        } else {
+            word.to_le_bytes()
+        });
+    }
     let mut out = encode_header(false, is_be, false, version, 15, payload.len() as u32);
     out.extend_from_slice(&payload);
     out
@@ -85,7 +88,7 @@ async fn run_get_cycle(
     .await?;
     ensure_status_ok(&get_data_resp, is_be, "get data")?;
 
-    let destroy = encode_destroy_request(ioid, version, is_be);
+    let destroy = encode_destroy_request(sid, ioid, version, is_be);
     stream.write_all(&destroy).await?;
     Ok(())
 }
@@ -168,7 +171,7 @@ async fn pvput_full_flow(opts: &PvGetOptions, input: &Value) -> Result<(), PvGet
     ensure_status_ok(&put_resp, is_be, "put data")?;
 
     // Explicitly retire request lifecycle to mirror EPICS base traces.
-    let destroy = encode_destroy_request(put_ioid, version, is_be);
+    let destroy = encode_destroy_request(sid, put_ioid, version, is_be);
     stream.write_all(&destroy).await?;
 
     run_get_cycle(&mut stream, opts.timeout, sid, 3u32, version, is_be).await?;
