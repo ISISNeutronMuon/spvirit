@@ -175,8 +175,3 @@ kwargs, NT constructor signatures, and shrink the "NT scalar type coverage"
 caveat block (the `KeyError` and "cannot be created from factories"
 limitations disappear).
 
-## Incidental fix
-
-`spvirit-server/src/types.rs:45` has a comment line starting with `\`
-instead of `//` (pre-existing build breaker in the working tree); fix in
-passing.
