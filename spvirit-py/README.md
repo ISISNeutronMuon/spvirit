@@ -33,6 +33,7 @@ protocol internals, and the CLI tools (`spget`, `spput`, `spmonitor`,
 
 - [Installation](#installation)
 - [Core concepts](#core-concepts)
+- [IOC-style record PVs vs raw NT PVs](#ioc-style-record-pvs-vs-raw-nt-pvs)
 - [Building servers with typed PV handles](#building-servers-with-typed-pv-handles)
   - [Creating PVs](#creating-pvs)
   - [Common options](#common-options)
@@ -88,6 +89,40 @@ To build from source instead, see [Building from source](#building-from-source).
 - Everything blocking releases the GIL and runs on a shared Tokio runtime;
   async variants (`set_async`, `get_async`, `connect_async`, ...) integrate with `asyncio`. See
   [Threading and async model](#threading-and-async-model).
+
+---
+
+## IOC-style record PVs vs raw NT PVs
+
+Everything on the wire is a Normative Type (usually NTScalar), but the API
+works at two distinct levels — know which one you are on:
+
+**IOC-style records** are what the typed handles, the classic builder, and
+`.db` loading create. The server behaves like an EPICS record: `units`,
+`prec`, `desc`, and limits become record fields visible QSRV-style
+(`PV.EGU`, `PV.DESC`, …); MDEL/ADEL deadbands throttle monitors; alarm
+severity is computed from the alarm limits (or set with `set_alarm`); every
+post is timestamped for you. You work with plain Python values —
+`pv.set(21.5)`, `store.set_value(...)`.
+
+**Raw NT PVs** are full Normative Type payloads you construct and move
+yourself: [`NtScalar` and friends](#normative-type-classes) written with
+`store.put_nt(...)`, published with `notifier.notify(...)`, or served from a
+[dynamic source's](#dynamic-sources) `get`/`put`. You control — and must
+supply — the alarm, timestamp, display, and control metadata on each
+payload; no deadbands or alarm computation are applied for you (an explicit
+timestamp is honored; a zeroed one is stamped by the server).
+
+|  | IOC-style records | Raw NT payloads |
+|---|---|---|
+| Created via | `spvirit.ai(...)` …, `ServerBuilder`, `db_file=` | `NtScalar(...)` …, `PvInfo` + source |
+| Read/write | plain values (`set`/`get`, `set_value`) | whole payloads (`put_nt`/`get_nt`, `notify`) |
+| Alarms, timestamps, deadbands | managed by the server | yours, per update |
+| Best for | soft IOCs, simulators, record-like PVs | gateways, tables, images, per-update metadata |
+
+The levels mix freely: `store.get_nt(name)` returns the full NT payload of
+an IOC-style record, and `store.put_nt` writes one — useful when a mostly
+record-like PV occasionally needs explicit metadata.
 
 ---
 

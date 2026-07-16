@@ -129,6 +129,27 @@ The five Normative Types in Spvirit:
 | NTTable | `NtTable` | Named columns of `ScalarArrayValue` | Tabular data |
 | NTNDArray | `NtNdArray` | `ScalarArrayValue` + dimensions + attributes | Image / detector data (areaDetector) |
 
+### IOC-style record PVs vs raw NT PVs
+
+Everything on the wire is a Normative Type, but spvirit gives you two levels
+at which to work, and it pays to know which one you are on:
+
+|  | IOC-style records | Raw NT payloads |
+|---|---|---|
+| You create them with | `Pv<T>` handles (`Pv::ai(...)` …), builder methods (`.ai()`, `.waveform()` …), `.db` files | `NtScalar`/`NtScalarArray`/… built by hand; hand-built `RecordInstance`; custom `Source` impls |
+| You read/write | plain values: `pv.set(21.5)`, `store.set_value(...)` | whole payloads: `store.put_nt(...)` / `get_nt(...)`, `Notifier` posts |
+| Alarm state | computed for you from HIHI/HIGH/LOW/LOLO limits (`compute_alarms`), or `pv.set_alarm(...)` | you set `alarm` on every payload yourself |
+| Timestamps | stamped automatically on every post | yours to fill in — an explicit `timeStamp` is honored, a zero one is stamped for you |
+| Display/control metadata (EGU, PREC, limits) | record fields, visible QSRV-style (`PV.EGU`, `PV.DESC`, …) | whatever you put in the payload, each update |
+| Monitor deadbands (MDEL/ADEL) | applied by the server | not applied — every `put_nt`/notify posts |
+| Best for | soft IOCs, simulators, anything that should feel like an EPICS record | gateways/bridges, tables, images, PVs whose metadata changes per update |
+
+Rule of thumb: stay IOC-style (`Pv<T>` handles first, `.db` files for existing
+databases) until you need per-update control of the metadata or a payload
+shape the record layer doesn't model — then drop to `put_nt`/`get_nt`,
+hand-built records, or a custom `Source`. The two mix freely in one server:
+`store.get_nt()` returns the full payload of an IOC-style record too.
+
 ### Enums in EPICS (bi/bo and ZNAM/ONAM)
 
 EPICS doesn't have a first-class enum type like Rust. Instead, **binary records** (`bi`/`bo`) use two string labels — `ZNAM` (the "zero" name) and `ONAM` (the "one" name) — to map a boolean value to human-readable choices:
