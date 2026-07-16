@@ -25,9 +25,14 @@ pub enum RecordType {
     Mbbi,
     Mbbo,
     Generic,
+    LongIn,
+    LongOut,
 }
 
 impl RecordType {
+    // TODO(follow-up): .db parsing — longin/longout are not yet recognized
+    // here; wiring `.db`-loaded longin/longout records needs db.rs
+    // construction work (out of scope for the handle-API-only gap task).
     pub fn from_db_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "ai" => Some(Self::Ai),
@@ -49,7 +54,7 @@ impl RecordType {
     pub fn is_output(&self) -> bool {
         matches!(
             self,
-            Self::Ao | Self::Bo | Self::StringOut | Self::Aao | Self::Mbbo
+            Self::Ao | Self::Bo | Self::StringOut | Self::Aao | Self::Mbbo | Self::LongOut
         )
     }
 }
@@ -337,6 +342,20 @@ impl RecordInstance {
         self.data.nt_mut()
     }
 
+    /// Fallible mutable access to the record's `NtScalar`, for record variants
+    /// that carry one (Ai, Ao, Bi, Bo, StringIn, StringOut). `None` otherwise.
+    pub(crate) fn nt_scalar_mut(&mut self) -> Option<&mut NtScalar> {
+        match &mut self.data {
+            RecordData::Ai { nt, .. }
+            | RecordData::Ao { nt, .. }
+            | RecordData::Bi { nt, .. }
+            | RecordData::Bo { nt, .. }
+            | RecordData::StringIn { nt, .. }
+            | RecordData::StringOut { nt, .. } => Some(nt),
+            _ => None,
+        }
+    }
+
     pub fn current_value(&self) -> ScalarValue {
         match self.to_ntpayload() {
             NtPayload::Scalar(nt) => nt.value,
@@ -349,6 +368,24 @@ impl RecordInstance {
     }
 
     pub fn set_scalar_value(&mut self, value: ScalarValue, compute_alarms: bool) -> bool {
+        if let RecordData::NtEnum { nt, .. } = &mut self.data {
+            let idx = match &value {
+                ScalarValue::I32(i) => *i,
+                ScalarValue::I16(i) => *i as i32,
+                ScalarValue::I8(i) => *i as i32,
+                ScalarValue::I64(i) => *i as i32,
+                _ => return false,
+            };
+            if idx < 0 || (idx as usize) >= nt.choices.len() {
+                return false; // out-of-range index — reject, keep value
+            }
+            if nt.index == idx {
+                return false;
+            }
+            nt.index = idx;
+            return true;
+        }
+
         let nt = match &mut self.data {
             RecordData::Ai { nt, .. }
             | RecordData::Ao { nt, .. }

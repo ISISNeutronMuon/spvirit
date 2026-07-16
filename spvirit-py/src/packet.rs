@@ -65,60 +65,74 @@ impl PyPacket {
 
 #[pymethods]
 impl PyPacket {
+    /// Header magic byte (0xCA for a valid PVA frame).
     #[getter]
     fn magic(&self) -> u8 {
         self.magic
     }
+    /// Protocol version byte from the header.
     #[getter]
     fn version(&self) -> u8 {
         self.version
     }
+    /// Command byte from the header.
     #[getter]
     fn command(&self) -> u8 {
         self.command
     }
+    /// Human-readable name of the command byte.
     #[getter]
     fn command_name(&self) -> &'static str {
         command_name(self.command)
     }
+    /// Raw header flags byte.
     #[getter]
     fn flags(&self) -> u8 {
         self.flags_raw
     }
+    /// True if this is an application message.
     #[getter]
     fn is_application(&self) -> bool {
         self.is_application
     }
+    /// True if this is a control message.
     #[getter]
     fn is_control(&self) -> bool {
         self.is_control
     }
+    /// Segmentation flag bits as an int; 0 means unsegmented.
     #[getter]
     fn is_segmented(&self) -> u8 {
         self.is_segmented
     }
+    /// True if the message was sent by a client.
     #[getter]
     fn is_client(&self) -> bool {
         self.is_client
     }
+    /// True if the message was sent by a server.
     #[getter]
     fn is_server(&self) -> bool {
         self.is_server
     }
+    /// True if the payload is big-endian (MSB flag set).
     #[getter]
     fn is_msb(&self) -> bool {
         self.is_msb
     }
+    /// Payload length in bytes as declared in the header.
     #[getter]
     fn payload_length(&self) -> u32 {
         self.payload_length
     }
 
+    /// Complete frame bytes (header + payload).
     #[getter]
     fn bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         PyBytes::new(py, &self.bytes)
     }
 
+    /// Payload bytes (everything after the 8-byte header).
     #[getter]
     fn payload<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let start = 8.min(self.bytes.len());

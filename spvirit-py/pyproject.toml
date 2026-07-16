@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "spvirit"
+description = "Pure-Rust EPICS PVAccess client and server with a typed Python API."
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+authors = [
+    { name = "Mateusz Leputa", email = "mateo.leputa@googlemail.com" },
+]
+requires-python = ">=3.9"
+keywords = ["epics", "pvaccess", "ioc", "controls", "instrumentation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: System :: Hardware",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/ISISNeutronMuon/spvirit"
+Issues = "https://github.com/ISISNeutronMuon/spvirit/issues"
+
+[tool.maturin]
+# Version comes from Cargo.toml; the module is the cdylib `spvirit`.
+features = ["pyo3/extension-module"]

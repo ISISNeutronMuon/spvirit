@@ -41,6 +41,7 @@ impl PyFieldDesc {
 
 #[pymethods]
 impl PyFieldDesc {
+    /// Field name.
     #[getter]
     fn name(&self) -> &str {
         &self.inner.name
@@ -137,11 +138,13 @@ impl PyStructureDesc {
 
 #[pymethods]
 impl PyStructureDesc {
+    /// Structure type ID (e.g. `"epics:nt/NTScalar:1.0"`), or None.
     #[getter]
     fn struct_id(&self) -> Option<&str> {
         self.inner.struct_id.as_deref()
     }
 
+    /// Ordered list of `FieldDesc` entries for this structure.
     #[getter]
     fn fields(&self) -> Vec<PyFieldDesc> {
         self.inner

@@ -28,12 +28,30 @@ pub fn init_async_runtime() {
 
 /// Block on a future, releasing the GIL for the duration.  Use from sync
 /// methods.
+///
+/// Handle-aware: if we're already executing inside a `RUNTIME`-driven task
+/// (e.g. a `Pv::on_put` validator invoked while a client PUT is being
+/// processed on a runtime worker thread, and that validator's Python
+/// callback turns around and calls `pv.set()`/`pv.get()` on some other PV),
+/// a plain `RUNTIME.block_on(fut)` would panic — you cannot block_on inside
+/// a runtime. In that case we use `tokio::task::block_in_place`, which lets
+/// the current worker thread block while the runtime moves other tasks to
+/// different workers (mirrors the re-entrancy handling in
+/// `source::PyNotifier::notify`). Outside the runtime (the common case —
+/// called straight from a Python thread), we just `RUNTIME.block_on` as
+/// before.
 pub fn block_on_py<F, T>(py: Python<'_>, fut: F) -> T
 where
     F: Future<Output = T> + Send,
     T: Send,
 {
-    py.allow_threads(|| RUNTIME.block_on(fut))
+    py.allow_threads(|| {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| RUNTIME.block_on(fut))
+        } else {
+            RUNTIME.block_on(fut)
+        }
+    })
 }
 
 /// Convert a Rust future into a Python awaitable (asyncio Future).

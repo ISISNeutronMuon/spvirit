@@ -57,12 +57,12 @@ record(ao, "SIM:SETPOINT") {
 }
 ```
 
-In Spvirit, a `RecordInstance` holds all of this — the record type, the current value (as a Normative Type), and the common fields. You can either build records in code with `PvaServer::builder().ai(...)` or load them from `.db` files with `.db_file("path.db")`.
+In Spvirit, a `RecordInstance` holds all of this — the record type, the current value (as a Normative Type), and the common fields. You can build records in code with typed PV handles (`Pv::ai(...)`, recommended), with the classic builder (`PvaServer::builder().ai(...)`), or load them from `.db` files with `.db_file("path.db")`.
 
 ```mermaid
 flowchart LR
     DB[".db file"] -->|parse_db| RI["RecordInstance"]
-    Code["builder.ai(...)"] --> RI
+    Code["Pv::ai(...) handles / builder.ai(...)"] --> RI
     RI --> Store["SimplePvStore"]
     Store --> Server["PvaServer"]
     Server -->|PVAccess protocol| Client["PvaClient"]
@@ -129,6 +129,27 @@ The five Normative Types in Spvirit:
 | NTTable | `NtTable` | Named columns of `ScalarArrayValue` | Tabular data |
 | NTNDArray | `NtNdArray` | `ScalarArrayValue` + dimensions + attributes | Image / detector data (areaDetector) |
 
+### IOC-style record PVs vs raw NT PVs
+
+Everything on the wire is a Normative Type, but spvirit gives you two levels
+at which to work, and it pays to know which one you are on:
+
+|  | IOC-style records | Raw NT payloads |
+|---|---|---|
+| You create them with | `Pv<T>` handles (`Pv::ai(...)` …), builder methods (`.ai()`, `.waveform()` …), `.db` files | `NtScalar`/`NtScalarArray`/… built by hand; hand-built `RecordInstance`; custom `Source` impls |
+| You read/write | plain values: `pv.set(21.5)`, `store.set_value(...)` | whole payloads: `store.put_nt(...)` / `get_nt(...)`, `Notifier` posts |
+| Alarm state | computed for you from HIHI/HIGH/LOW/LOLO limits (`compute_alarms`), or `pv.set_alarm(...)` | you set `alarm` on every payload yourself |
+| Timestamps | stamped automatically on every post | yours to fill in — an explicit `timeStamp` is honored, a zero one is stamped for you |
+| Display/control metadata (EGU, PREC, limits) | record fields, visible QSRV-style (`PV.EGU`, `PV.DESC`, …) | whatever you put in the payload, each update |
+| Monitor deadbands (MDEL/ADEL) | applied by the server | not applied — every `put_nt`/notify posts |
+| Best for | soft IOCs, simulators, anything that should feel like an EPICS record | gateways/bridges, tables, images, PVs whose metadata changes per update |
+
+Rule of thumb: stay IOC-style (`Pv<T>` handles first, `.db` files for existing
+databases) until you need per-update control of the metadata or a payload
+shape the record layer doesn't model — then drop to `put_nt`/`get_nt`,
+hand-built records, or a custom `Source`. The two mix freely in one server:
+`store.get_nt()` returns the full payload of an IOC-style record too.
+
 ### Enums in EPICS (bi/bo and ZNAM/ONAM)
 
 EPICS doesn't have a first-class enum type like Rust. Instead, **binary records** (`bi`/`bo`) use two string labels — `ZNAM` (the "zero" name) and `ONAM` (the "one" name) — to map a boolean value to human-readable choices:
@@ -148,6 +169,8 @@ When a client reads this PV, the NTScalar's value is the integer index (0 or 1),
 flowchart TD
     subgraph Server Side
         DB[".db file"] -->|load_db / parse_db| Records["HashMap&lt;String, RecordInstance&gt;"]
+        Handles["Pv::ai() .units() .on_put() ...
+        typed handles (recommended)"] --> Records
         Builder["PvaServer::builder()
         .ai() .ao() .bo() ..."] --> Records
         Records --> Store["SimplePvStore
@@ -266,7 +289,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo run -p spvirit-client --example pvmonitor
 ```
 
-#### Running a PVAccess server
+#### Running a PVAccess server (typed PV handles — recommended)
+
+A `Pv<T>` is a typed handle you create, configure, and keep. Behavior attaches
+to the PV itself, and after the server starts you read/write through the
+handle — no string lookups, no untyped values:
+
+```rust
+use spvirit_server::{AnyPv, Pv, PvaServer};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = Pv::ai("SIM:TEMPERATURE", 22.5).units("degC").prec(2);
+    let setpoint = Pv::ao("SIM:SETPOINT", 25.0)
+        .drive_limits(0.0, 100.0)
+        .on_put(|_pv, v: f64| {
+            if v.is_finite() { Ok(()) } else { Err("not a number".into()) } // Err rejects the PUT
+        });
+
+    let server = PvaServer::serve([AnyPv::from(temp.clone()), AnyPv::from(setpoint)])
+        .start()
+        .await;
+
+    temp.set(23.1).await?;          // posts to monitors, stamps time, honors MDEL
+    let t: f64 = temp.get().await?; // typed read
+    println!("temperature: {t}");
+
+    // handles work for .db-loaded records too: server.pv::<f64>("SOME:PV").await?
+    server.store(); // deep-end access is still there
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+```
+
+Handles are cheap clones, so bulk creation is just a loop:
+
+```rust
+let bpms: Vec<Pv<f64>> = (0..100)
+    .map(|i| Pv::ai(format!("BPM:{i:03}:X"), 0.0).units("mm"))
+    .collect();
+let server = PvaServer::serve(bpms.iter().cloned()).start().await;
+bpms[42].set(1.23).await?;
+```
+
+Every handle-built PV is a real record, so IOC-style field access
+(`SIM:TEMPERATURE.RTYP`, `.DESC$`) and MDEL/ADEL deadbands work automatically —
+including for the EPICS Archiver Appliance.
+
+Beyond `Pv::ai`/`ao`/`bi`/`bo`/`string_in`/`string_out`, there are `Pv<i32>`
+constructors for 32-bit integers (`Pv::longin`/`Pv::longout`) and enums
+(`Pv::mbbi`/`Pv::mbbo`, backed by a choice list with the index as the value),
+plus `PvArray::waveform`/`PvArray::aai`/`PvArray::aao` for array records
+(`ScalarArrayValue`-typed). Every handle also has an async `set_alarm(severity,
+status, message)` to set alarm state independent of the value.
+
+#### Running a PVAccess server (classic builder)
 ```rust
 use spvirit_server::PvaServer;
 
@@ -479,6 +557,10 @@ When to use record/value APIs (`set_value` / `set_array_value`):
 
 The `spvirit-py` crate provides Python bindings via [PyO3](https://pyo3.rs) and is built with [maturin](https://www.maturin.rs/).
 
+Released versions are on PyPI (`pip install spvirit`), and the complete Python
+API guide — servers, typed handles, sources, client, low-level channel, and
+codec — lives in [`spvirit-py/README.md`](spvirit-py/README.md).
+
 #### Prerequisites
 - Python 3.9+
 - Rust toolchain (see above)
@@ -498,7 +580,79 @@ pip install maturin
 maturin develop --release
 ```
 
-After `maturin develop` the `spvirit` module is importable from the venv:
+After `maturin develop` the `spvirit` module is importable from the venv.
+
+#### Typed PV handles (recommended)
+
+A `spvirit.Pv` is a typed handle you create, configure, and keep — mirroring
+the Rust `Pv<T>` handle API above. Attach `on_put`/`scan`/`calc` to it, *then*
+hand it to `Server(pvs=[...])`; attaching any of these **after** the PV is
+served is a silent no-op (the core only logs a tracing warning, it does not
+raise):
+
+```python
+import spvirit
+
+temp = spvirit.ai("SIM:TEMPERATURE", 22.5, units="degC", prec=2)
+setpoint = spvirit.ao("SIM:SETPOINT", 25.0, drive_limits=(0.0, 100.0))
+
+@setpoint.on_put
+def _on_setpoint(pv, value):
+    if value > 100.0:
+        return False  # reject the PUT on the wire
+
+@temp.scan(period=1.0)
+def _simulate(pv):
+    return pv.get() + 0.1 * (setpoint.get() - pv.get())  # relax toward setpoint
+
+power = spvirit.calc("SIM:POWER", [temp, setpoint], lambda v: max(0.0, v[1] - v[0]))
+# calc callbacks that raise (or return a non-float) post 0.0, not the last
+# value — asymmetric with .scan(), which re-posts its own cache instead.
+
+# Attach on_put/scan/calc BEFORE this — attaching afterwards is a no-op.
+server = spvirit.Server(pvs=[temp, setpoint, power])
+server.start()  # background thread; server.run() blocks instead
+
+temp.set(23.1)          # posts to monitors, stamps time, honors MDEL
+print(temp.get())       # typed read
+
+# server.pv(name) mints a handle to any served record, including .db-loaded ones
+h = server.pv("SIM:TEMPERATURE")
+```
+
+Besides `ai`/`ao`/`bi`/`bo`/`string_in`/`string_out`, there are constructors
+for 32-bit integers (`longin`/`longout`), enums (`mbbi`/`mbbo`, which take a
+`choices: list[str]` and store the choice index as an `int`; out-of-range
+writes are rejected), and arrays (`waveform`/`aai`/`aao`). Array constructors
+and `.set()` take a Python `list` of `bool`/`int`/`float`/`str`, or `bytes`
+for a `U8` array; if you have a numpy array, call `.tolist()` first. Every
+handle also has `set_alarm(severity, status, message="")` to set alarm state
+independent of the value. `on_put`/`scan` are scalar-only — attaching either
+to an array handle raises `TypeError`.
+
+`set`/`get` block (releasing the GIL); `set_async`/`get_async` are `async`
+equivalents for use inside `asyncio` code:
+
+```python
+import asyncio
+
+async def main():
+    await setpoint.set_async(30.0)
+    value = await temp.get_async()
+    print(value)
+
+asyncio.run(main())
+```
+
+`spvirit.pv(name, initial, ...)` infers the record type from `initial`'s
+Python type instead of naming a constructor: `bool` -> `bo`, `int` -> `longout`,
+`float` -> `ao`, `str` -> `string_out`, `list`/`bytes` -> `waveform`. Any other
+type raises `TypeError`.
+
+See `spvirit-py/examples/demo_pv_handles.py` for a complete runnable demo.
+
+#### Classic builder
+
 ```python
 import spvirit
 
@@ -527,6 +681,7 @@ pip install target/wheels/spvirit_py-*.whl
 maturin develop --release
 python spvirit-py/examples/demo_server.py
 python spvirit-py/examples/demo_nt_access.py
+python spvirit-py/examples/demo_pv_handles.py   # typed PV handles (recommended)
 ```
 
 ### Running the examples
