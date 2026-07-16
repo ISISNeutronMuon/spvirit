@@ -377,6 +377,28 @@ def test_pv_inference_rejects_opts_on_arrays():
         pass
 
 
+def test_client_usable_inside_callbacks():
+    # Client calls run on runtime worker threads when made from inside an
+    # on_put/source callback; they must re-enter the runtime, not panic.
+    import time
+    a = spvirit.ao("PYG:A", 1.0)
+    b = spvirit.ao("PYG:B", 2.0)
+    tcp, udp = 15245, 15246
+    inner = _local_client(tcp, udp)
+    seen = []
+
+    @a.on_put
+    def _(pv, value):
+        seen.append(inner.get("PYG:B").value["value"])
+
+    server = spvirit.Server(pvs=[a, b], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
+    server.start()
+    time.sleep(0.3)
+    client = _local_client(tcp, udp)
+    client.put("PYG:A", 5.0)
+    assert seen == [2.0]
+
+
 def test_fields_accepts_single_string():
     import time
     t = spvirit.ao("PYF:T", 5.0)

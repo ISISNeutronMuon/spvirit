@@ -54,6 +54,7 @@ protocol internals, and the CLI tools (`spget`, `spput`, `spmonitor`,
 - [Wire codec: spvirit.codec](#wire-codec-spviritcodec)
 - [Threading and async model](#threading-and-async-model)
 - [Errors and exceptions](#errors-and-exceptions)
+- [Examples](#examples)
 - [Building from source](#building-from-source)
 
 ---
@@ -884,6 +885,29 @@ fit:
 | `KeyError` | `server.pv(name)` for an unknown or unsupported record |
 | `TypeError` | wrong value type; `on_put`/`scan` on an array PV; bad `calc` inputs; metadata options on an array `pv()` |
 | `ValueError` | invalid address strings; non-finite floats in client puts |
+
+## Examples
+
+Runnable scripts live in
+[`spvirit-py/examples/`](https://github.com/ISISNeutronMuon/spvirit/tree/main/spvirit-py/examples).
+Start with the mailbox pair, then pick by topic:
+
+- `demo_mailbox.py` / `demo_mailbox_client.py` — the smallest useful IOC (one
+  writable PV) and a client that gets, puts, and subscribes to it.
+- `demo_pvfind.py` — locate a PV (UDP search or a given address) and print its
+  full structure introspection and current value.
+- `demo_wire_inspector.py` — decode the actual PVAccess frames behind a get:
+  introspection dump, captured raw bytes through `codec.decode_packet`, and
+  live frames off the TCP stream.
+- `demo_gateway.py` — a mini-gateway: a dynamic source that proxies another
+  server under a `GW:` prefix with a put allow-list.
+- `demo_expr_namespace.py` — an infinite computed namespace: any
+  `EXPR:<expression>` PV is evaluated on demand.
+- `demo_10k_farm.py` — 10,000 PVs plus calc aggregation built in a
+  comprehension, with build/serve/write timings.
+
+The directory also holds demos for every other part of the API (channels,
+codec, discovery, NT access, and one per dynamic-source pattern).
 
 ## Building from source
 

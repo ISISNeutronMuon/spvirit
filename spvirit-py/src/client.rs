@@ -293,18 +293,15 @@ impl PyClient {
     ) -> PyResult<PyGetResult> {
         let client = self.inner.clone();
         let fields = crate::channel::normalize_fields(py, fields)?;
-        let result = py
-            .allow_threads(|| {
-                RUNTIME.block_on(async {
-                    if fields.is_empty() {
-                        client.pvget(&pv_name).await
-                    } else {
-                        let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-                        client.pvget_fields(&pv_name, &refs).await
-                    }
-                })
-            })
-            .map_err(to_py_err)?;
+        let result = crate::runtime::block_on_py(py, async {
+            if fields.is_empty() {
+                client.pvget(&pv_name).await
+            } else {
+                let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+                client.pvget_fields(&pv_name, &refs).await
+            }
+        })
+        .map_err(to_py_err)?;
         let value = decoded_to_py(py, &result.value);
         Ok(PyGetResult {
             pv_name: result.pv_name,
@@ -330,15 +327,13 @@ impl PyClient {
         let json_val = py_to_json(value.bind(py))?;
         let client = self.inner.clone();
         let fields = crate::channel::normalize_fields(py, fields)?;
-        py.allow_threads(|| {
-            RUNTIME.block_on(async {
-                if fields.is_empty() {
-                    client.pvput(&pv_name, json_val).await
-                } else {
-                    let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-                    client.pvput_fields(&pv_name, json_val, &refs).await
-                }
-            })
+        crate::runtime::block_on_py(py, async {
+            if fields.is_empty() {
+                client.pvput(&pv_name, json_val).await
+            } else {
+                let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+                client.pvput_fields(&pv_name, json_val, &refs).await
+            }
         })
         .map_err(to_py_err)
     }
@@ -362,8 +357,9 @@ impl PyClient {
         let mut cb_err: Option<PyErr> = None;
         // The GIL is released for the wait; the callback reacquires it per
         // update via with_gil.
-        let result = py.allow_threads(|| {
-            RUNTIME.block_on(async {
+        let result = crate::runtime::block_on_py(py, {
+            let cb_err = &mut cb_err;
+            async move {
                 let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
                 client
                     .pvmonitor_fields(&pv_name, &refs, |decoded| {
@@ -375,7 +371,7 @@ impl PyClient {
                                     ret.extract::<bool>(py).unwrap_or(true)
                                 }
                                 Err(e) => {
-                                    cb_err = Some(e);
+                                    *cb_err = Some(e);
                                     false
                                 }
                             }
@@ -387,7 +383,7 @@ impl PyClient {
                         }
                     })
                     .await
-            })
+            }
         });
         if let Some(e) = cb_err {
             return Err(e);
@@ -398,9 +394,7 @@ impl PyClient {
     /// Retrieve introspection (field description) for a PV.
     fn info(&self, py: Python<'_>, pv_name: String) -> PyResult<PyObject> {
         let client = self.inner.clone();
-        let desc = py
-            .allow_threads(|| RUNTIME.block_on(client.pvinfo(&pv_name)))
-            .map_err(to_py_err)?;
+        let desc = crate::runtime::block_on_py(py, client.pvinfo(&pv_name)).map_err(to_py_err)?;
         // Return as a dict: {struct_id, fields: [{name, field_type}, ...]}
         let dict = PyDict::new(py);
         dict.set_item("struct_id", &desc.struct_id)?;
@@ -425,8 +419,7 @@ impl PyClient {
             pyo3::exceptions::PyValueError::new_err(format!("invalid address: {e}"))
         })?;
         let client = self.inner.clone();
-        py.allow_threads(|| RUNTIME.block_on(client.pvlist(addr)))
-            .map_err(to_py_err)
+        crate::runtime::block_on_py(py, client.pvlist(addr)).map_err(to_py_err)
     }
 
     /// Subscribe to a PV without blocking; returns a `Subscription` handle.
@@ -590,8 +583,7 @@ pub fn py_discover_servers(
 ) -> PyResult<Vec<PyDiscoveredServer>> {
     let targets = build_auto_broadcast_targets();
     let dur = Duration::from_secs_f64(timeout);
-    let servers = py
-        .allow_threads(|| RUNTIME.block_on(discover_servers(udp_port, dur, &targets, debug)))
+    let servers = crate::runtime::block_on_py(py, discover_servers(udp_port, dur, &targets, debug))
         .map_err(to_py_err)?;
     Ok(servers
         .into_iter()
