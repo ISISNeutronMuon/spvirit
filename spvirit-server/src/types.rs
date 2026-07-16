@@ -8,6 +8,18 @@ use std::time::Duration;
 
 pub use spvirit_types::*;
 
+/// Current wall-clock time as an [`NtTimeStamp`] (UNIX epoch).
+fn now_nt_timestamp() -> NtTimeStamp {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    NtTimeStamp {
+        seconds_past_epoch: now.as_secs() as i64,
+        nanoseconds: now.subsec_nanos() as i32,
+        user_tag: 0,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordType {
     Ai,
@@ -598,6 +610,20 @@ impl RecordInstance {
     }
 
     pub fn set_array_value(&mut self, value: ScalarArrayValue) -> bool {
+        // Unlike NtScalar (where a `None` time_stamp makes the encoder fall
+        // back to now()), array payloads encode their stored time_stamp
+        // verbatim — so stamp the update time here or clients see epoch 0.
+        let ts = now_nt_timestamp();
+        // NtNdArray keeps its dimensions; only the flat pixel data changes.
+        if let RecordData::NtNdArray { nt, .. } = &mut self.data {
+            if nt.value == value {
+                return false;
+            }
+            nt.value = value;
+            nt.time_stamp = Some(ts.clone());
+            nt.data_time_stamp = ts;
+            return true;
+        }
         let (nt, nord, nelm) = match &mut self.data {
             RecordData::Waveform { nt, nord, nelm, .. }
             | RecordData::Aai { nt, nord, nelm, .. }
@@ -614,6 +640,7 @@ impl RecordInstance {
 
         *nord = next.len();
         nt.value = next;
+        nt.time_stamp = ts;
         true
     }
 

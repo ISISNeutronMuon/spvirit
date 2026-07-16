@@ -636,7 +636,11 @@ pub fn descriptor_for_payload(payload: &NtPayload) -> StructureDesc {
     match payload {
         NtPayload::Scalar(nt) => nt_scalar_desc(&nt.value),
         NtPayload::ScalarArray(arr) => nt_scalar_array_desc(&arr.value),
-        _ => StructureDesc::new(),
+        // Table / NdArray / Enum / Generic: the codec knows how to build the
+        // full structure descriptor. An empty descriptor here makes GET and
+        // MONITOR init hand clients an empty structure, so every read of
+        // these PV types decodes as {}.
+        _ => spvirit_codec::spvd_encode::nt_payload_desc(payload),
     }
 }
 
