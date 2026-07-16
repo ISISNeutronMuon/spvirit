@@ -25,6 +25,17 @@ pub struct PyServerBuilder {
     python_sources: Vec<(String, i32, Arc<PySourceAdapter>)>,
 }
 
+/// Take the inner builder, raising `RuntimeError` if `build()` already ran.
+fn take_builder(
+    slf: &mut PyRefMut<'_, PyServerBuilder>,
+) -> PyResult<spvirit_server::PvaServerBuilder> {
+    slf.builder.take().ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "ServerBuilder already consumed by build(); create a new builder",
+        )
+    })
+}
+
 #[pymethods]
 impl PyServerBuilder {
     #[new]
@@ -35,44 +46,56 @@ impl PyServerBuilder {
         }
     }
 
-    fn ai(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn ai(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.ai(name, initial));
-        slf
+        Ok(slf)
     }
 
-    fn ao(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn ao(mut slf: PyRefMut<'_, Self>, name: String, initial: f64) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.ao(name, initial));
-        slf
+        Ok(slf)
     }
 
-    fn bi(mut slf: PyRefMut<'_, Self>, name: String, initial: bool) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn bi(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        initial: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.bi(name, initial));
-        slf
+        Ok(slf)
     }
 
-    fn bo(mut slf: PyRefMut<'_, Self>, name: String, initial: bool) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn bo(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        initial: bool,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.bo(name, initial));
-        slf
+        Ok(slf)
     }
 
-    fn string_in(mut slf: PyRefMut<'_, Self>, name: String, initial: String) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn string_in(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        initial: String,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.string_in(name, initial));
-        slf
+        Ok(slf)
     }
 
     fn string_out(
         mut slf: PyRefMut<'_, Self>,
         name: String,
         initial: String,
-    ) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.string_out(name, initial));
-        slf
+        Ok(slf)
     }
 
     fn waveform<'py>(
@@ -81,7 +104,7 @@ impl PyServerBuilder {
         data: &Bound<'py, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.waveform(name, arr));
         Ok(slf)
     }
@@ -92,7 +115,7 @@ impl PyServerBuilder {
         data: &Bound<'py, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.aai(name, arr));
         Ok(slf)
     }
@@ -103,7 +126,7 @@ impl PyServerBuilder {
         data: &Bound<'py, PyAny>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.aao(name, arr));
         Ok(slf)
     }
@@ -118,7 +141,7 @@ impl PyServerBuilder {
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
         let n = nelm.unwrap_or(arr.len());
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.sub_array(name, arr, indx, n));
         Ok(slf)
     }
@@ -137,7 +160,7 @@ impl PyServerBuilder {
             let col_data = py_to_scalar_array(&val)?;
             cols.push((col_name, col_data));
         }
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.nt_table(name, cols));
         Ok(slf)
     }
@@ -149,7 +172,7 @@ impl PyServerBuilder {
         dims: Vec<(i32, i32)>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let arr = py_to_scalar_array(data)?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.nt_ndarray(name, arr, dims));
         Ok(slf)
     }
@@ -159,10 +182,10 @@ impl PyServerBuilder {
         name: String,
         choices: Vec<String>,
         initial: i32,
-    ) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.mbbi(name, choices, initial));
-        slf
+        Ok(slf)
     }
 
     fn mbbo(
@@ -170,10 +193,10 @@ impl PyServerBuilder {
         name: String,
         choices: Vec<String>,
         initial: i32,
-    ) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.mbbo(name, choices, initial));
-        slf
+        Ok(slf)
     }
 
     fn generic<'py>(
@@ -188,25 +211,29 @@ impl PyServerBuilder {
             let pv_val = py_to_pv_value(&val)?;
             field_vec.push((field_name, pv_val));
         }
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.generic(name, struct_id, field_vec));
         Ok(slf)
     }
 
-    fn db_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn db_file(mut slf: PyRefMut<'_, Self>, path: String) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.db_file(path));
-        slf
+        Ok(slf)
     }
 
-    fn db_string(mut slf: PyRefMut<'_, Self>, content: String) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn db_string(mut slf: PyRefMut<'_, Self>, content: String) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.db_string(&content));
-        slf
+        Ok(slf)
     }
 
-    fn on_put(mut slf: PyRefMut<'_, Self>, name: String, callback: PyObject) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn on_put(
+        mut slf: PyRefMut<'_, Self>,
+        name: String,
+        callback: PyObject,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(
             b.on_put(name, move |pv_name: &str, decoded: &DecodedValue| {
                 Python::with_gil(|py| {
@@ -217,17 +244,17 @@ impl PyServerBuilder {
                 });
             }),
         );
-        slf
+        Ok(slf)
     }
 
     fn scan(
         mut slf: PyRefMut<'_, Self>,
         name: String,
-        period_secs: f64,
+        period: f64,
         callback: PyObject,
-    ) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
-        let dur = Duration::from_secs_f64(period_secs);
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
+        let dur = Duration::from_secs_f64(period);
         slf.builder = Some(b.scan(name, dur, move |pv_name: &str| {
             Python::with_gil(|py| match callback.call1(py, (pv_name,)) {
                 Ok(ret) => py_to_scalar(ret.bind(py)).unwrap_or(ScalarValue::F64(0.0)),
@@ -237,26 +264,26 @@ impl PyServerBuilder {
                 }
             })
         }));
-        slf
+        Ok(slf)
     }
 
-    fn port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.port(port));
-        slf
+        Ok(slf)
     }
 
-    fn udp_port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn udp_port(mut slf: PyRefMut<'_, Self>, port: u16) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.udp_port(port));
-        slf
+        Ok(slf)
     }
 
     fn listen_ip(mut slf: PyRefMut<'_, Self>, ip: String) -> PyResult<PyRefMut<'_, Self>> {
         let ip_addr: IpAddr = ip
             .parse()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid IP: {e}")))?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.listen_ip(ip_addr));
         Ok(slf)
     }
@@ -265,21 +292,29 @@ impl PyServerBuilder {
         let ip_addr: IpAddr = ip
             .parse()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid IP: {e}")))?;
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.advertise_ip(ip_addr));
         Ok(slf)
     }
 
-    fn compute_alarms(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
+    fn compute_alarms(mut slf: PyRefMut<'_, Self>, enabled: bool) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
         slf.builder = Some(b.compute_alarms(enabled));
-        slf
+        Ok(slf)
     }
 
-    fn beacon_period(mut slf: PyRefMut<'_, Self>, secs: u64) -> PyRefMut<'_, Self> {
-        let b = slf.builder.take().expect("builder consumed");
-        slf.builder = Some(b.beacon_period(secs));
-        slf
+    fn beacon_period(mut slf: PyRefMut<'_, Self>, secs: f64) -> PyResult<PyRefMut<'_, Self>> {
+        let b = take_builder(&mut slf)?;
+        slf.builder = Some(b.beacon_period(secs.round().max(1.0) as u64));
+        Ok(slf)
+    }
+
+    fn __repr__(&self) -> &'static str {
+        if self.builder.is_some() {
+            "<spvirit.ServerBuilder>"
+        } else {
+            "<spvirit.ServerBuilder (consumed)>"
+        }
     }
 
     /// Register a Python-defined [`Source`].
@@ -295,15 +330,15 @@ impl PyServerBuilder {
         label: String,
         order: i32,
         source: PyObject,
-    ) -> PyRefMut<'_, Self> {
+    ) -> PyResult<PyRefMut<'_, Self>> {
         let adapter = Arc::new(PySourceAdapter::new(source));
         slf.python_sources
             .push((label.clone(), order, adapter.clone()));
-        let b = slf.builder.take().expect("builder consumed");
+        let b = take_builder(&mut slf)?;
         // Cast to Arc<dyn Source> via Arc<PySourceAdapter>.
         let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter;
         slf.builder = Some(b.source(label, order, as_dyn));
-        slf
+        Ok(slf)
     }
 
     /// Build and return a `Server` that can be started.
@@ -355,7 +390,8 @@ impl PyServer {
     /// `ServerBuilder` configuration.
     #[new]
     #[pyo3(signature = (*, pvs=None, db_file=None, db_string=None, sources=None,
-                        port=None, udp_port=None, listen_ip=None, compute_alarms=None))]
+                        port=None, udp_port=None, listen_ip=None, advertise_ip=None,
+                        compute_alarms=None, beacon_period=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -366,7 +402,9 @@ impl PyServer {
         port: Option<u16>,
         udp_port: Option<u16>,
         listen_ip: Option<String>,
+        advertise_ip: Option<String>,
         compute_alarms: Option<bool>,
+        beacon_period: Option<f64>,
     ) -> PyResult<Self> {
         let handles: Vec<spvirit_server::pv::AnyPv> =
             pvs.unwrap_or_default().iter().map(|p| p.any()).collect();
@@ -389,8 +427,17 @@ impl PyServer {
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid IP: {e}")))?;
             sb = sb.listen_ip(addr);
         }
+        if let Some(ip) = advertise_ip {
+            let addr: IpAddr = ip
+                .parse()
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid IP: {e}")))?;
+            sb = sb.advertise_ip(addr);
+        }
         if let Some(c) = compute_alarms {
             sb = sb.compute_alarms(c);
+        }
+        if let Some(secs) = beacon_period {
+            sb = sb.beacon_period(secs.round().max(1.0) as u64);
         }
         let mut python_sources: Vec<(String, i32, Arc<PySourceAdapter>)> = Vec::new();
         for (label, order, obj) in sources.unwrap_or_default() {
@@ -414,9 +461,23 @@ impl PyServer {
         })
     }
 
+    /// Return a fresh `ServerBuilder` (equivalent to `ServerBuilder()`).
+    #[staticmethod]
+    fn builder() -> PyServerBuilder {
+        PyServerBuilder::new()
+    }
+
     /// Start serving on a background thread (returns immediately).
     fn start(&mut self) -> PyResult<()> {
         self.start_background().map(|_| ())
+    }
+
+    fn __repr__(&self) -> &'static str {
+        if self.server.is_some() {
+            "<spvirit.Server>"
+        } else {
+            "<spvirit.Server (running)>"
+        }
     }
 
     /// Mint a typed handle to any served record (handle-built or .db-loaded).
@@ -604,6 +665,12 @@ impl PyStore {
     fn pv_names(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let store = self.inner.clone();
         Ok(block_on_py(py, store.pv_names()))
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let store = self.inner.clone();
+        let n = block_on_py(py, store.pv_names()).len();
+        format!("<spvirit.Store ({n} PVs)>")
     }
 }
 

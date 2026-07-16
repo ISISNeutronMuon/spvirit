@@ -28,7 +28,6 @@ fn spvirit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::PyClient>()?;
     m.add_class::<client::PyClientBuilder>()?;
     m.add_class::<client::PyGetResult>()?;
-    m.add_class::<client::PyMonitorEvent>()?;
     m.add_class::<client::PyDiscoveredServer>()?;
     m.add_class::<client::PySubscription>()?;
 

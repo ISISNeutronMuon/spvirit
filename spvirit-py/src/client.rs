@@ -57,27 +57,6 @@ impl PyGetResult {
     }
 }
 
-// ─── MonitorEvent ────────────────────────────────────────────────────────────
-
-#[pyclass(name = "MonitorEvent")]
-pub struct PyMonitorEvent {
-    #[pyo3(get)]
-    pub pv_name: String,
-    value: PyObject,
-}
-
-#[pymethods]
-impl PyMonitorEvent {
-    #[getter]
-    fn value(&self, py: Python<'_>) -> PyObject {
-        self.value.clone_ref(py)
-    }
-
-    fn __repr__(&self) -> String {
-        format!("MonitorEvent(pv_name={:?})", self.pv_name)
-    }
-}
-
 // ─── DiscoveredServer ────────────────────────────────────────────────────────
 
 #[pyclass(name = "DiscoveredServer")]
@@ -236,6 +215,13 @@ impl PyClientBuilder {
         }
         Ok(PyClient { inner: b.build() })
     }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<spvirit.ClientBuilder (tcp={}, udp={}, timeout={}s)>",
+            self.tcp_port, self.udp_port, self.timeout_secs
+        )
+    }
 }
 
 // ─── Client ──────────────────────────────────────────────────────────────────
@@ -262,25 +248,26 @@ impl PyClient {
 
     /// Fetch the current value of a PV (blocking).
     ///
-    /// If `fields` is provided, the pvRequest restricts the returned
-    /// structure to those dotted paths (e.g. `["value", "alarm.severity"]`).
+    /// If `fields` is provided (a list of dotted paths or a single string,
+    /// e.g. `["value", "alarm.severity"]`), the pvRequest restricts the
+    /// returned structure to those paths.
     #[pyo3(signature = (pv_name, fields=None))]
     fn get(
         &self,
         py: Python<'_>,
         pv_name: String,
-        fields: Option<Vec<String>>,
+        fields: Option<PyObject>,
     ) -> PyResult<PyGetResult> {
         let client = self.inner.clone();
+        let fields = crate::channel::normalize_fields(py, fields)?;
         let result = py
             .allow_threads(|| {
                 RUNTIME.block_on(async {
-                    match fields {
-                        None => client.pvget(&pv_name).await,
-                        Some(ref f) => {
-                            let refs: Vec<&str> = f.iter().map(String::as_str).collect();
-                            client.pvget_fields(&pv_name, &refs).await
-                        }
+                    if fields.is_empty() {
+                        client.pvget(&pv_name).await
+                    } else {
+                        let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+                        client.pvget_fields(&pv_name, &refs).await
                     }
                 })
             })
@@ -296,26 +283,27 @@ impl PyClient {
 
     /// Write a value to a PV (blocking).
     ///
-    /// `fields` selects which pvRequest fields are targeted. Defaults to
-    /// `["value"]` when omitted.
+    /// `fields` selects which pvRequest fields are targeted (a list of
+    /// dotted paths or a single string). Defaults to `["value"]` when
+    /// omitted.
     #[pyo3(signature = (pv_name, value, fields=None))]
     fn put(
         &self,
         py: Python<'_>,
         pv_name: String,
         value: PyObject,
-        fields: Option<Vec<String>>,
+        fields: Option<PyObject>,
     ) -> PyResult<()> {
         let json_val = py_to_json(value.bind(py))?;
         let client = self.inner.clone();
+        let fields = crate::channel::normalize_fields(py, fields)?;
         py.allow_threads(|| {
             RUNTIME.block_on(async {
-                match fields {
-                    None => client.pvput(&pv_name, json_val).await,
-                    Some(ref f) => {
-                        let refs: Vec<&str> = f.iter().map(String::as_str).collect();
-                        client.pvput_fields(&pv_name, json_val, &refs).await
-                    }
+                if fields.is_empty() {
+                    client.pvput(&pv_name, json_val).await
+                } else {
+                    let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+                    client.pvput_fields(&pv_name, json_val, &refs).await
                 }
             })
         })
@@ -324,44 +312,53 @@ impl PyClient {
 
     /// Subscribe to a PV and call `callback(value_dict)` for each update.
     ///
-    /// Blocks until the callback returns `False` or raises an exception.
-    /// `fields` restricts the subscription to the given dotted paths.
+    /// Blocks (GIL released between updates) until the callback returns
+    /// `False` or raises — a raised exception stops the monitor and
+    /// propagates to the caller. `fields` restricts the subscription to the
+    /// given dotted paths. For a non-blocking variant see `subscribe`.
     #[pyo3(signature = (pv_name, callback, fields=None))]
     fn monitor(
         &self,
-        _py: Python<'_>,
+        py: Python<'_>,
         pv_name: String,
         callback: PyObject,
-        fields: Option<Vec<String>>,
+        fields: Option<PyObject>,
     ) -> PyResult<()> {
         let client = self.inner.clone();
-        let fields = fields.unwrap_or_default();
-        // We need the GIL inside the callback, so we cannot use allow_threads
-        // for the entire operation. Instead we spawn on the runtime and
-        // use Python::with_gil inside the callback.
-        let result = RUNTIME.block_on(async {
-            let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-            client
-                .pvmonitor_fields(&pv_name, &refs, |decoded| {
-                    let keep_going = Python::with_gil(|py| {
-                        let py_val = decoded_to_py(py, decoded);
-                        match callback.call1(py, (py_val,)) {
-                            Ok(ret) => {
-                                // If callback returns False, stop
-                                ret.extract::<bool>(py).unwrap_or(true)
+        let fields = crate::channel::normalize_fields(py, fields)?;
+        let mut cb_err: Option<PyErr> = None;
+        // The GIL is released for the wait; the callback reacquires it per
+        // update via with_gil.
+        let result = py.allow_threads(|| {
+            RUNTIME.block_on(async {
+                let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+                client
+                    .pvmonitor_fields(&pv_name, &refs, |decoded| {
+                        let keep_going = Python::with_gil(|py| {
+                            let py_val = decoded_to_py(py, decoded);
+                            match callback.call1(py, (py_val,)) {
+                                Ok(ret) => {
+                                    // If callback returns False, stop
+                                    ret.extract::<bool>(py).unwrap_or(true)
+                                }
+                                Err(e) => {
+                                    cb_err = Some(e);
+                                    false
+                                }
                             }
-                            Err(_) => false,
+                        });
+                        if keep_going {
+                            ControlFlow::Continue(())
+                        } else {
+                            ControlFlow::Break(())
                         }
-                    });
-                    if keep_going {
-                        ControlFlow::Continue(())
-                    } else {
-                        ControlFlow::Break(())
-                    }
-                })
-                .await
+                    })
+                    .await
+            })
         });
-        // Release the GIL while we were waiting
+        if let Some(e) = cb_err {
+            return Err(e);
+        }
         result.map_err(to_py_err)
     }
 
@@ -402,20 +399,22 @@ impl PyClient {
     /// Subscribe to a PV without blocking; returns a `Subscription` handle.
     ///
     /// `callback(value)` runs on a background runtime thread for each update,
-    /// sequentially per subscription. Returning `False` (or raising) from the
-    /// callback unsubscribes, matching `monitor`. Call `subscription.close()`
-    /// to stop promptly — it works even while the PV is quiet. If the
+    /// sequentially per subscription. Returning `False` from the callback
+    /// unsubscribes, matching `monitor`; raising also unsubscribes and stores
+    /// the message in `subscription.error`. Call `subscription.close()` to
+    /// stop promptly — it works even while the PV is quiet. If the
     /// subscription ends on a network/protocol error, `subscription.error`
     /// holds the message and `is_active` becomes `False`.
     #[pyo3(signature = (pv_name, callback, fields=None))]
-    fn monitor_non_blocking(
+    fn subscribe(
         &self,
+        py: Python<'_>,
         pv_name: String,
         callback: PyObject,
-        fields: Option<Vec<String>>,
-    ) -> PySubscription {
+        fields: Option<PyObject>,
+    ) -> PyResult<PySubscription> {
         let client = self.inner.clone();
-        let fields = fields.unwrap_or_default();
+        let fields = crate::channel::normalize_fields(py, fields)?;
         let state = Arc::new(SubscriptionState {
             active: AtomicBool::new(true),
             error: Mutex::new(None),
@@ -430,7 +429,12 @@ impl PyClient {
                         let py_val = decoded_to_py(py, decoded);
                         match callback.call1(py, (py_val,)) {
                             Ok(ret) => ret.extract::<bool>(py).unwrap_or(true),
-                            Err(_) => false,
+                            Err(e) => {
+                                // No caller to raise into: record the failure
+                                // on the subscription and stop.
+                                *task_state.error.lock().unwrap() = Some(e.to_string());
+                                false
+                            }
                         }
                     });
                     if keep_going {
@@ -445,11 +449,15 @@ impl PyClient {
             }
             task_state.active.store(false, Ordering::SeqCst);
         });
-        PySubscription {
+        Ok(PySubscription {
             pv_name,
             state,
             handle: Mutex::new(Some(handle)),
-        }
+        })
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "<spvirit.Client>"
     }
 }
 
@@ -460,7 +468,7 @@ struct SubscriptionState {
     error: Mutex<Option<String>>,
 }
 
-/// Handle to a non-blocking monitor started with `Client.monitor_non_blocking`.
+/// Handle to a non-blocking monitor started with `Client.subscribe`.
 #[pyclass(name = "Subscription")]
 pub struct PySubscription {
     pv_name: String,

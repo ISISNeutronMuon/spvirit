@@ -36,7 +36,7 @@ protocol internals, and the CLI tools (`spget`, `spput`, `spmonitor`,
 - [Building servers with typed PV handles](#building-servers-with-typed-pv-handles)
   - [Creating PVs](#creating-pvs)
   - [Common options](#common-options)
-  - [Reading and writing: set / get / aset / aget](#reading-and-writing-set--get--aset--aget)
+  - [Reading and writing: set / get / set_async / get_async](#reading-and-writing-set--get--set_async--get_async)
   - [Reacting to client writes: on_put](#reacting-to-client-writes-on_put)
   - [Periodic updates: scan](#periodic-updates-scan)
   - [Computed PVs: calc](#computed-pvs-calc)
@@ -86,7 +86,7 @@ To build from source instead, see [Building from source](#building-from-source).
   a low-level `Channel` (persistent connection, raw frame access) plus
   discovery and codec utilities.
 - Everything blocking releases the GIL and runs on a shared Tokio runtime;
-  async variants (`aget`, `aset`, `*_async`) integrate with `asyncio`. See
+  async variants (`set_async`, `get_async`, `connect_async`, ...) integrate with `asyncio`. See
   [Threading and async model](#threading-and-async-model).
 
 ---
@@ -165,8 +165,8 @@ table = spvirit.aao("SIM:TBL", [1, 2, 3])             # writable
 ```
 
 `data` may be a list of `bool`/`int`/`float`/`str` (element type inferred from
-the first element) or `bytes` (stored as an unsigned-byte array, returned to
-Python as `bytes`).
+the first element; an empty list defaults to `double[]`) or `bytes` (stored
+as an unsigned-byte array, returned to Python as `bytes`).
 
 Type-inferred creation — `spvirit.pv(name, initial, **opts)` picks the record
 type from the initial value:
@@ -208,23 +208,26 @@ pressure = spvirit.ai(
 - Field values are visible to clients QSRV-style: `pvget SIM:PRESSURE.EGU`,
   `SIM:PRESSURE.DESC`, `SIM:PRESSURE.RTYP`, etc.
 
-### Reading and writing: set / get / aset / aget
+### Reading and writing: set / get / set_async / get_async
 
 ```python
 temp.set(21.7)        # blocking; full posting pipeline (monitors, deadbands, alarms)
 value = temp.get()    # blocking; returns float/bool/int/str/list per PV type
 
 # asyncio variants
-await temp.aset(21.8)
-value = await temp.aget()
+await temp.set_async(21.8)
+value = await temp.get_async()
 ```
 
 - All four release the GIL; blocking calls are safe from any Python thread.
 - Writing the wrong Python type raises `TypeError`.
 - Calling `set`/`get` on a handle that has not been given to a `Server` yet
   raises `RuntimeError` ("unbound").
-- `pv.name()` returns the PV name; `repr(pv)` shows the name and value kind,
+- `pv.name` is the PV name; `repr(pv)` shows the name and value kind,
   e.g. `<spvirit.Pv 'SIM:TEMP' (float)>`.
+- `set()` writes authoritatively: it is **not** subject to the PV's `on_put`
+  validator, which guards client (wire) writes only — the same split as
+  p4p's `post()` vs its put handler.
 
 ### Reacting to client writes: on_put
 
@@ -238,7 +241,7 @@ sp = spvirit.ao("SIM:SP", 20.0)
 def check(pv, value):
     if value < 0:
         return False          # reject: client's put fails on the wire
-    print(f"{pv.name()} <- {value}")
+    print(f"{pv.name} <- {value}")
 ```
 
 - The callback receives `(pv, value)` — the handle itself and the incoming
@@ -318,7 +321,9 @@ server = spvirit.Server(
     port=5075,                  # TCP port (default 5075)
     udp_port=5076,              # UDP search/beacon port (default 5076)
     listen_ip="0.0.0.0",        # bind address
+    advertise_ip="192.168.1.10",  # address advertised in beacons/search replies
     compute_alarms=True,        # derive severity from alarm_limits
+    beacon_period=15,           # beacon interval, whole seconds
 )
 ```
 
@@ -335,7 +340,10 @@ Other methods:
 - `server.pv(name) -> Pv` — mint a typed handle to **any** served record,
   including ones loaded from a `.db` file or added via the classic builder.
   The handle's type is inferred from the record (floats → float, enums → int
-  index, arrays → array). Unknown names raise `KeyError`.
+  index, arrays → array). Unknown names raise `KeyError`, and so do records
+  with no handle representation (NTTable, NTNDArray, generic structures —
+  use the [`Store`](#runtime-store-access) for those).
+- `Server.builder()` — static shorthand for `spvirit.ServerBuilder()`.
 - `server.store() -> Store` — runtime get/set access (see below).
 - `server.notifier() -> Notifier` — publish monitor updates for
   source-claimed PVs.
@@ -436,6 +444,14 @@ server = (
 server.start()
 ```
 
+The full method set: record definitions `ai`, `ao`, `bi`, `bo`, `string_in`,
+`string_out`, `mbbi`, `mbbo`, `waveform`, `aai`, `aao`, `sub_array`,
+`nt_table`, `nt_ndarray`, `generic` (no `longin`/`longout` — 32-bit integer
+records exist only in the handle API); loading `db_file`, `db_string`;
+callbacks `on_put`, `scan`; configuration `port`, `udp_port`, `listen_ip`,
+`advertise_ip`, `compute_alarms`, `beacon_period` (whole seconds),
+`add_source`; and `build()`.
+
 Differences from the handle API:
 
 - `on_put(name, callback)` is string-keyed and receives `(pv_name, value)`;
@@ -444,7 +460,9 @@ Differences from the handle API:
   value; errors post `0.0`.
 - `build()` returns the same `Server` class described above, so `server.pv(name)`
   works to obtain typed handles onto builder-defined records afterwards.
-- A builder is single-use: methods after `build()` raise `RuntimeError`.
+- A builder is single-use: any method after `build()` raises `RuntimeError`.
+- The builder's record methods take no metadata kwargs (`units=`, `prec=`, …);
+  set fields via a `.db` file or use the handle factories.
 
 ---
 
@@ -523,7 +541,8 @@ Key points:
   `PvInfo.nt_scalar_array("double")` (pass the *element* type), or the full
   `PvInfo(struct_id, fields, writable=False)` where `fields` maps field names
   to type strings (`"double"`, `"int"`, `"string"`, `"boolean"`, `"double[]"`,
-  `"any"`, …).
+  `"any"`, …). A `PvInfo` exposes read-only `.writable` and `.struct_id`
+  properties.
 - `put` return values become monitor updates: return one NT payload, a dict
   `{pv_name: payload}`, or a list of `(pv_name, payload)` tuples to fan
   updates out to related PVs; return `None` for no propagation. Raising an
@@ -595,6 +614,7 @@ result.pv_name                                  # "SIM:TEMP"
 result.raw_pva, result.raw_pvd                  # raw wire bytes, if you need them
 
 client.get("SIM:TEMP", fields=["value", "alarm.severity"])   # partial pvRequest
+client.get("SIM:TEMP", fields="value")          # single field: plain str is fine too
 
 client.put("SIM:SP", 21.0)                      # blocking put (fields default: ["value"])
 client.put("SIM:MODE", 2, fields=["value.index"])
@@ -603,35 +623,37 @@ def on_update(value):
     print(value)
     if done:
         return False                            # returning False stops the monitor
-client.monitor("SIM:TEMP", on_update)           # blocks until stopped
+client.monitor("SIM:TEMP", on_update)           # blocks until stopped;
+                                                # an exception raised in the
+                                                # callback stops it and propagates
 
 client.info("SIM:TEMP")                         # {"struct_id": ..., "fields": [...]}
 client.pvlist("192.168.1.10:5075")              # PV names from a specific server
 ```
 
-Non-blocking monitors — `monitor_non_blocking` returns immediately with a
+Non-blocking monitors — `subscribe` returns immediately with a
 `Subscription` handle while updates are delivered on a background thread:
 
 ```python
-sub = client.monitor_non_blocking("SIM:TEMP", lambda v: print(v))
+sub = client.subscribe("SIM:TEMP", lambda v: print(v))
 # ... program continues; run as many concurrent subscriptions as you like ...
 sub.pv_name       # "SIM:TEMP"
 sub.is_active     # True while updates are flowing
 sub.close()       # stop promptly (idempotent, works even on a quiet PV)
 sub.error         # None, or the message if the subscription ended on an error
 
-with client.monitor_non_blocking("SIM:PRESSURE", handle) as sub:   # context manager
+with client.subscribe("SIM:PRESSURE", handle) as sub:   # context manager
     ...
 ```
 
 - The callback receives each update sequentially (per subscription) on a
   runtime worker thread; keep it short, and hand heavy work to a queue.
-  Returning `False` or raising unsubscribes, exactly like `monitor`.
+  Returning `False` unsubscribes, exactly like `monitor`.
 - Inside the callback you may call other spvirit operations (`pv.set()`,
   `client.get()`, …) — re-entrancy is safe.
-- Network failures don't raise (there is no caller to raise into): the
-  subscription ends, `is_active` becomes `False`, and `error` holds the
-  message.
+- Failures don't raise (there is no caller to raise into): on a network error
+  or an exception in the callback, the subscription ends, `is_active` becomes
+  `False`, and `error` holds the message.
 - Dropping the last reference to a `Subscription` closes it — keep the handle
   alive for as long as you want updates.
 
@@ -662,8 +684,15 @@ for srv in spvirit.discover_servers(timeout=2.0):
     print(srv.guid.hex(), srv.tcp_addr)
 ```
 
+(`spvirit.lowlevel` has its own `discover_servers` for diagnostic use — note
+it returns `{"guid": hexstr, "addr": ...}` dicts rather than
+`DiscoveredServer` objects, defaults to `timeout=1.0`, and accepts a
+`targets=` list.)
+
 All client operations block with the GIL released and raise the
-[`SpviritError` exception tree](#errors-and-exceptions) on failure.
+[`SpviritError` exception tree](#errors-and-exceptions) on failure. Every
+`fields=` parameter across the client API accepts either a list of dotted
+paths or a single string.
 
 ---
 
@@ -681,21 +710,28 @@ with Channel.connect("SIM:TEMP", "127.0.0.1:5075", timeout=5.0) as ch:
     r1 = ch.get()                   # reuses the connection — fast repeated gets
     r2 = ch.get(fields=["value"])
     ch.put(22.0)                    # fields: None -> ["value"], or str, or list
-    ch.monitor(lambda v: print(v))  # blocks; callback returns False to stop
-# closed on exit; every method also exists as *_async (connect_async,
-# get_async, put_async, introspect_async, read_packet_async)
+    ch.monitor(lambda v: print(v))  # blocks; callback returns False to stop,
+                                    # a raised exception stops it and propagates
+    ch.close()                      # or rely on the context manager;
+                                    # later operations raise ProtocolError
+# async variants: connect_async, get_async, put_async, introspect_async,
+# read_packet_async (monitor, close, and read_until are sync-only)
 ```
 
 Raw frame access for protocol work:
 
 ```python
 pkt = ch.read_packet(timeout=1.0)          # next raw PVA frame -> Packet
-pkt.command_name, pkt.payload_length       # header fields
-pkt.is_application, pkt.is_control, pkt.is_server, pkt.is_msb
-pkt.bytes, pkt.payload                     # full frame / payload bytes
+pkt.magic, pkt.version, pkt.command        # raw header fields (ints)
+pkt.command_name, pkt.payload_length       # e.g. "MONITOR", body length
+pkt.flags                                  # raw flag byte; decoded views:
+pkt.is_application, pkt.is_control, pkt.is_client, pkt.is_server, pkt.is_msb
+pkt.is_segmented                           # segmentation flag bits (int, 0 = none)
+pkt.bytes, pkt.payload, len(pkt)           # full frame / payload bytes / frame len
 pkt.details()                              # command-specific decoded dict
+pkt.decode()                               # same as codec.decode_packet(pkt.bytes)
 pkt = ch.read_until(lambda p: p.command_name == "MONITOR", timeout=5.0,
-                    max_frames=100)
+                    max_frames=100)        # RuntimeError if max_frames exhausted
 ```
 
 Operations on one channel serialize internally, so concurrent `get_async`
@@ -717,6 +753,11 @@ variants where noted:
 - `parse_addr_list(s)`, `auto_broadcast_targets()`,
   `default_search_targets(search_addr=None, bind_addr=None)` — address-list
   helpers honoring `EPICS_PVA_ADDR_LIST` / `EPICS_PVA_AUTO_ADDR_LIST`.
+
+`targets=` accepts a list of `(target_ip, bind_ip)` tuples or of
+`{"target": ..., "bind": ...}` dicts, so the output of
+`default_search_targets()` / `auto_broadcast_targets()` can be passed
+straight through.
 
 ---
 
@@ -745,7 +786,11 @@ codec.decode_packet(frame_bytes)                 # full frame -> dict with magic
                                                  # command_name, flags, details, ...
 ```
 
-All functions accept `is_be=True` for big-endian streams (default little).
+The wire-level encoders/decoders (`decode_introspection`, `decode_value`,
+`encode_pv_request`, `encode_put_payload`) accept `is_be=True` for big-endian
+streams (default little); `format_value`, `extract_nt_value`, and
+`decode_packet` take no endianness flag. `StructureDesc` also supports
+`len(desc)` for its field count.
 
 ---
 
@@ -755,14 +800,14 @@ All functions accept `is_be=True` for big-endian streams (default little).
   created lazily. Blocking methods release the GIL, so other Python threads
   keep running during network operations.
 - **Sync and async mix freely.** `set()`/`get()`/`Client.get()` etc. can be
-  called from any Python thread. The async variants (`aget`, `aset`,
-  `connect_async`, `get_async`, …) return awaitables for use inside
-  `asyncio` code:
+  called from any Python thread. The async variants (`Pv.set_async`/`get_async`,
+  `Channel.connect_async`/`get_async`/`put_async`, …) return awaitables for
+  use inside `asyncio` code:
 
   ```python
   async def main():
-      await sp.aset(21.0)
-      print(await temp.aget())
+      await sp.set_async(21.0)
+      print(await temp.get_async())
   asyncio.run(main())
   ```
 
@@ -784,19 +829,25 @@ Client, channel, discovery, and codec operations raise this hierarchy
 
 | Exception | Meaning |
 |---|---|
-| `spvirit.TimeoutError` | operation or search timed out |
+| `spvirit.TimeoutError` | operation or search timed out (also subclasses builtin `TimeoutError`) |
 | `spvirit.SearchError` | PV could not be located |
 | `spvirit.ProtocolError` | unexpected/invalid protocol state |
 | `spvirit.DecodeError` | malformed wire data |
-| `spvirit.IoError` | socket/OS-level failure |
+| `spvirit.IoError` | socket/OS-level failure (also subclasses builtin `OSError`) |
+| `spvirit.PutRejectedError` | a put was rejected by an `on_put` validator |
 
-PV-handle operations use builtin exceptions instead:
+`spvirit.TimeoutError` and `spvirit.IoError` deliberately dual-inherit, so
+idiomatic `except TimeoutError:` and `except OSError:` catch them alongside
+`except spvirit.SpviritError:`.
+
+PV-handle operations use builtin exceptions where a builtin is the idiomatic
+fit:
 
 | Exception | Raised when |
 |---|---|
-| `RuntimeError` | handle not yet bound to a server; or a put was rejected |
-| `KeyError` | `server.pv(name)` for an unknown/unsupported record |
-| `TypeError` | wrong value type; `on_put`/`scan` on an array PV; bad `calc` inputs |
+| `RuntimeError` | handle not yet bound to a server; `ServerBuilder` method after `build()` |
+| `KeyError` | `server.pv(name)` for an unknown or unsupported record |
+| `TypeError` | wrong value type; `on_put`/`scan` on an array PV; bad `calc` inputs; metadata options on an array `pv()` |
 | `ValueError` | invalid address strings; non-finite floats in client puts |
 
 ## Building from source

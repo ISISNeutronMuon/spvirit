@@ -2,39 +2,119 @@
 //!
 //! ```text
 //! SpviritError(Exception)
-//! ├── TimeoutError
+//! ├── TimeoutError        (also subclasses builtin TimeoutError)
 //! ├── SearchError
 //! ├── ProtocolError
 //! ├── DecodeError
-//! └── IoError
+//! ├── IoError             (also subclasses builtin OSError)
+//! └── PutRejectedError
 //! ```
 
 use pyo3::create_exception;
 use pyo3::prelude::*;
+use pyo3::sync::GILOnceCell;
+use pyo3::types::{PyDict, PyTuple, PyType};
 use spvirit_client::PvGetError;
 
-create_exception!(spvirit, SpviritError, pyo3::exceptions::PyException);
-create_exception!(spvirit, TimeoutError, SpviritError);
-create_exception!(spvirit, SearchError, SpviritError);
-create_exception!(spvirit, ProtocolError, SpviritError);
-create_exception!(spvirit, DecodeError, SpviritError);
-create_exception!(spvirit, IoError, SpviritError);
+create_exception!(
+    spvirit,
+    SpviritError,
+    pyo3::exceptions::PyException,
+    "Base class for all spvirit errors."
+);
+create_exception!(
+    spvirit,
+    SearchError,
+    SpviritError,
+    "The PV could not be located."
+);
+create_exception!(
+    spvirit,
+    ProtocolError,
+    SpviritError,
+    "Unexpected or invalid PVAccess protocol state."
+);
+create_exception!(spvirit, DecodeError, SpviritError, "Malformed wire data.");
+create_exception!(
+    spvirit,
+    PutRejectedError,
+    SpviritError,
+    "A put was rejected by the PV's on_put validator."
+);
+
+// TimeoutError and IoError also subclass the corresponding builtins
+// (TimeoutError / OSError) so idiomatic `except TimeoutError:` and
+// `except OSError:` catch them. `create_exception!` only supports a single
+// base, so these two are created dynamically with `type()` at module init.
+static TIMEOUT_ERROR: GILOnceCell<Py<PyType>> = GILOnceCell::new();
+static IO_ERROR: GILOnceCell<Py<PyType>> = GILOnceCell::new();
+
+fn new_dual_exception(
+    py: Python<'_>,
+    name: &str,
+    extra_base: &Bound<'_, PyType>,
+    doc: &str,
+) -> PyResult<Py<PyType>> {
+    let bases = PyTuple::new(py, [&py.get_type::<SpviritError>(), extra_base])?;
+    let dict = PyDict::new(py);
+    dict.set_item("__doc__", doc)?;
+    dict.set_item("__module__", "spvirit")?;
+    let ty = py
+        .get_type::<PyType>()
+        .call1((name, bases, dict))?
+        .downcast_into::<PyType>()?;
+    Ok(ty.unbind())
+}
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add("SpviritError", m.py().get_type::<SpviritError>())?;
-    m.add("TimeoutError", m.py().get_type::<TimeoutError>())?;
-    m.add("SearchError", m.py().get_type::<SearchError>())?;
-    m.add("ProtocolError", m.py().get_type::<ProtocolError>())?;
-    m.add("DecodeError", m.py().get_type::<DecodeError>())?;
-    m.add("IoError", m.py().get_type::<IoError>())?;
+    let py = m.py();
+    m.add("SpviritError", py.get_type::<SpviritError>())?;
+    m.add("SearchError", py.get_type::<SearchError>())?;
+    m.add("ProtocolError", py.get_type::<ProtocolError>())?;
+    m.add("DecodeError", py.get_type::<DecodeError>())?;
+    m.add("PutRejectedError", py.get_type::<PutRejectedError>())?;
+
+    let timeout = TIMEOUT_ERROR.get_or_try_init(py, || {
+        new_dual_exception(
+            py,
+            "TimeoutError",
+            &py.get_type::<pyo3::exceptions::PyTimeoutError>(),
+            "Operation or search timed out.",
+        )
+    })?;
+    m.add("TimeoutError", timeout.bind(py))?;
+
+    let io = IO_ERROR.get_or_try_init(py, || {
+        new_dual_exception(
+            py,
+            "IoError",
+            &py.get_type::<pyo3::exceptions::PyOSError>(),
+            "Socket or OS-level failure.",
+        )
+    })?;
+    m.add("IoError", io.bind(py))?;
     Ok(())
+}
+
+fn timeout_err(msg: String) -> PyErr {
+    Python::with_gil(|py| match TIMEOUT_ERROR.get(py) {
+        Some(ty) => PyErr::from_type(ty.bind(py).clone(), msg),
+        None => SpviritError::new_err(msg),
+    })
+}
+
+fn io_err(msg: String) -> PyErr {
+    Python::with_gil(|py| match IO_ERROR.get(py) {
+        Some(ty) => PyErr::from_type(ty.bind(py).clone(), msg),
+        None => SpviritError::new_err(msg),
+    })
 }
 
 /// Convert a `PvGetError` into the matching Python exception.
 pub fn to_py_err(e: PvGetError) -> PyErr {
     match e {
-        PvGetError::Io(e) => IoError::new_err(e.to_string()),
-        PvGetError::Timeout(ctx) => TimeoutError::new_err(ctx.to_string()),
+        PvGetError::Io(e) => io_err(e.to_string()),
+        PvGetError::Timeout(ctx) => timeout_err(ctx.to_string()),
         PvGetError::Search(ctx) => SearchError::new_err(ctx.to_string()),
         PvGetError::Protocol(ctx) => ProtocolError::new_err(ctx),
         PvGetError::Decode(ctx) => DecodeError::new_err(ctx),
@@ -44,7 +124,7 @@ pub fn to_py_err(e: PvGetError) -> PyErr {
 /// Convert a raw `std::io::Error` into the matching Python exception.
 #[allow(dead_code)]
 pub fn io_to_py_err(e: std::io::Error) -> PyErr {
-    IoError::new_err(e.to_string())
+    io_err(e.to_string())
 }
 
 /// Convert a codec / decode string error to `DecodeError`.

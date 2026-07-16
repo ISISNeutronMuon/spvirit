@@ -35,8 +35,8 @@ print("serving DEMO:TEMP / DEMO:SP / DEMO:POWER — Ctrl+C to stop")
 
 # Every handle also has async aset/aget for use inside asyncio code, e.g.:
 #     async def bump():
-#         await setpoint.aset(30.0)
-#         print(await temp.aget())
+#         await setpoint.set_async(30.0)
+#         print(await temp.get_async())
 #     asyncio.run(bump())
 
 while True:

@@ -16,15 +16,15 @@ def _local_client(tcp, udp):
 
 def test_constructors_and_options():
     temp = spvirit.ai("PY:TEMP", 22.5, units="degC", prec=2, desc="Temp")
-    assert temp.name() == "PY:TEMP"
+    assert temp.name == "PY:TEMP"
     assert "PY:TEMP" in repr(temp)
 
     sp = spvirit.ao("PY:SP", 25.0, drive_limits=(0.0, 100.0), mdel=0.1)
-    assert sp.name() == "PY:SP"
+    assert sp.name == "PY:SP"
 
     en = spvirit.bo("PY:EN", False)
     msg = spvirit.string_in("PY:MSG", "hello")
-    assert en.name() == "PY:EN" and msg.name() == "PY:MSG"
+    assert en.name == "PY:EN" and msg.name == "PY:MSG"
 
 
 def test_unbound_set_get_raise():
@@ -215,8 +215,8 @@ def test_async_aget_aset():
     spvirit.Server(pvs=[t], port=15165, udp_port=15166, listen_ip="127.0.0.1")
 
     async def flow():
-        await t.aset(6.28)
-        return await t.aget()
+        await t.set_async(6.28)
+        return await t.get_async()
 
     assert asyncio.run(flow()) == 6.28
 
@@ -233,7 +233,7 @@ def _wait_for(cond, timeout=5.0):
     return cond()
 
 
-def test_monitor_non_blocking():
+def test_subscribe():
     t = spvirit.ao("PYM:T", 1.0)
     tcp, udp = 15175, 15176
     server = spvirit.Server(pvs=[t], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
@@ -241,7 +241,7 @@ def test_monitor_non_blocking():
 
     updates = []
     client = _local_client(tcp, udp)
-    sub = client.monitor_non_blocking("PYM:T", lambda v: updates.append(v))
+    sub = client.subscribe("PYM:T", lambda v: updates.append(v))
     assert sub.pv_name == "PYM:T"
     assert "PYM:T" in repr(sub)
 
@@ -262,7 +262,7 @@ def test_monitor_non_blocking():
     assert len(updates) == seen, "closed subscription must not deliver updates"
 
 
-def test_monitor_non_blocking_callback_false_stops():
+def test_subscribe_callback_false_stops():
     t = spvirit.ao("PYM:S", 1.0)
     tcp, udp = 15185, 15186
     server = spvirit.Server(pvs=[t], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
@@ -275,14 +275,14 @@ def test_monitor_non_blocking_callback_false_stops():
         return False  # unsubscribe after the first update
 
     client = _local_client(tcp, udp)
-    sub = client.monitor_non_blocking("PYM:S", once)
+    sub = client.subscribe("PYM:S", once)
     assert _wait_for(lambda: not sub.is_active), \
         "returning False from the callback must end the subscription"
     assert len(updates) == 1
     assert sub.error is None
 
 
-def test_monitor_non_blocking_context_manager():
+def test_subscribe_context_manager():
     t = spvirit.ao("PYM:C", 1.0)
     tcp, udp = 15195, 15196
     server = spvirit.Server(pvs=[t], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
@@ -290,10 +290,103 @@ def test_monitor_non_blocking_context_manager():
 
     updates = []
     client = _local_client(tcp, udp)
-    with client.monitor_non_blocking("PYM:C", lambda v: updates.append(v)) as sub:
+    with client.subscribe("PYM:C", lambda v: updates.append(v)) as sub:
         assert _wait_for(lambda: len(updates) >= 1)
         assert sub.is_active
     assert not sub.is_active
+
+
+def test_exception_hierarchy():
+    assert issubclass(spvirit.TimeoutError, TimeoutError)          # builtin
+    assert issubclass(spvirit.TimeoutError, spvirit.SpviritError)
+    assert issubclass(spvirit.IoError, OSError)
+    assert issubclass(spvirit.IoError, spvirit.SpviritError)
+    assert issubclass(spvirit.PutRejectedError, spvirit.SpviritError)
+    assert not hasattr(spvirit, "MonitorEvent")  # dead API removed
+
+
+def test_handle_set_bypasses_on_put():
+    # on_put validates *client* (wire) writes only; the owning process
+    # writes authoritatively through the handle, like p4p's post().
+    seen = []
+    sp = spvirit.ao("PYR:SP", 1.0)
+
+    @sp.on_put
+    def _(pv, value):
+        seen.append(value)
+        return False  # would reject a wire put
+
+    spvirit.Server(pvs=[sp], port=15205, udp_port=15206, listen_ip="127.0.0.1")
+    sp.set(2.0)                # not subject to the validator
+    assert sp.get() == 2.0
+    assert seen == []
+
+
+def test_monitor_callback_exception_propagates():
+    import time
+    t = spvirit.ao("PYE:T", 1.0)
+    tcp, udp = 15215, 15216
+    server = spvirit.Server(pvs=[t], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
+    server.start()
+    time.sleep(0.3)
+    client = _local_client(tcp, udp)
+
+    def boom(v):
+        raise ValueError("boom")
+
+    try:
+        client.monitor("PYE:T", boom)
+        raise AssertionError("callback exception must propagate out of monitor")
+    except ValueError as e:
+        assert "boom" in str(e)
+
+
+def test_subscribe_callback_exception_recorded():
+    import time
+    t = spvirit.ao("PYE:S", 1.0)
+    tcp, udp = 15225, 15226
+    server = spvirit.Server(pvs=[t], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
+    server.start()
+    time.sleep(0.3)
+    client = _local_client(tcp, udp)
+
+    def boom(v):
+        raise ValueError("kaput")
+
+    sub = client.subscribe("PYE:S", boom)
+    assert _wait_for(lambda: not sub.is_active), \
+        "raising callback must end the subscription"
+    assert sub.error is not None and "kaput" in sub.error
+
+
+def test_builder_consumed_raises_runtime_error():
+    b = spvirit.ServerBuilder().ai("PYB:X", 1.0)
+    b.build()
+    try:
+        b.ao("PYB:Y", 2.0)
+        raise AssertionError("consumed builder must raise RuntimeError")
+    except RuntimeError:
+        pass
+
+
+def test_pv_inference_rejects_opts_on_arrays():
+    try:
+        spvirit.pv("PYI:WU", [1.0, 2.0], units="mm")
+        raise AssertionError("array pv() with metadata opts must raise TypeError")
+    except TypeError:
+        pass
+
+
+def test_fields_accepts_single_string():
+    import time
+    t = spvirit.ao("PYF:T", 5.0)
+    tcp, udp = 15235, 15236
+    server = spvirit.Server(pvs=[t], port=tcp, udp_port=udp, listen_ip="127.0.0.1")
+    server.start()
+    time.sleep(0.3)
+    client = _local_client(tcp, udp)
+    r = client.get("PYF:T", fields="value")   # str, not list
+    assert r.value["value"] == 5.0
 
 
 def main():

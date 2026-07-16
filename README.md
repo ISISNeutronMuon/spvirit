@@ -609,15 +609,15 @@ handle also has `set_alarm(severity, status, message="")` to set alarm state
 independent of the value. `on_put`/`scan` are scalar-only — attaching either
 to an array handle raises `TypeError`.
 
-`set`/`get` block (releasing the GIL); `aset`/`aget` are `async` equivalents
-for use inside `asyncio` code:
+`set`/`get` block (releasing the GIL); `set_async`/`get_async` are `async`
+equivalents for use inside `asyncio` code:
 
 ```python
 import asyncio
 
 async def main():
-    await setpoint.aset(30.0)
-    value = await temp.aget()
+    await setpoint.set_async(30.0)
+    value = await temp.get_async()
     print(value)
 
 asyncio.run(main())

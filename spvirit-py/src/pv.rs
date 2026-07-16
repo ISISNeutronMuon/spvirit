@@ -16,7 +16,7 @@ pub(crate) fn pv_err(e: PvError) -> PyErr {
         PvError::Unbound => PyRuntimeError::new_err(e.to_string()),
         PvError::NotFound(_) => PyKeyError::new_err(e.to_string()),
         PvError::TypeMismatch { .. } => PyTypeError::new_err(e.to_string()),
-        PvError::PutRejected(_) => PyRuntimeError::new_err(e.to_string()),
+        PvError::PutRejected(_) => crate::errors::PutRejectedError::new_err(e.to_string()),
     }
 }
 
@@ -52,6 +52,7 @@ impl PyPv {
 #[pymethods]
 impl PyPv {
     /// PV name.
+    #[getter]
     fn name(&self) -> &str {
         match &self.kind {
             PvKind::F64(p) => p.name(),
@@ -125,8 +126,12 @@ impl PyPv {
         }
     }
 
-    /// Write a value through the full posting pipeline (async).
-    fn aset<'py>(&self, py: Python<'py>, value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    /// Write a value through the full posting pipeline (async variant of `set`).
+    fn set_async<'py>(
+        &self,
+        py: Python<'py>,
+        value: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         match &self.kind {
             PvKind::F64(p) => {
                 let v: f64 = value.extract()?;
@@ -171,8 +176,8 @@ impl PyPv {
         }
     }
 
-    /// Read the current value, typed (async).
-    fn aget<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Read the current value, typed (async variant of `get`).
+    fn get_async<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         match &self.kind {
             PvKind::F64(p) => {
                 let handle = p.clone();
@@ -642,10 +647,15 @@ pub fn calc(py: Python<'_>, name: String, inputs: Vec<PyPv>, callback: PyObject)
     let cb = callback.clone_ref(py);
     let out = Pv::calc(name, &refs, move |vals: &[f64]| {
         Python::with_gil(|py| {
-            let list = pyo3::types::PyList::new(py, vals).ok();
-            match list.and_then(|l| cb.call1(py, (l,)).ok()) {
-                Some(ret) => ret.extract::<f64>(py).unwrap_or(0.0),
-                None => 0.0,
+            let called = pyo3::types::PyList::new(py, vals)
+                .and_then(|l| cb.call1(py, (l,)))
+                .and_then(|ret| ret.extract::<f64>(py));
+            match called {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("calc callback failed, posting 0.0: {e}");
+                    0.0
+                }
             }
         })
     });
@@ -698,6 +708,21 @@ pub fn pv(
             alarm_limits,
         ))
     } else if initial.is_instance_of::<PyList>() || initial.is_instance_of::<PyBytes>() {
+        // Array records carry no scalar metadata; reject rather than
+        // silently discard the options.
+        if units.is_some()
+            || prec.is_some()
+            || desc.is_some()
+            || adel.is_some()
+            || mdel.is_some()
+            || drive_limits.is_some()
+            || alarm_limits.is_some()
+        {
+            return Err(PyTypeError::new_err(
+                "metadata options (units/prec/desc/adel/mdel/drive_limits/alarm_limits) \
+                 are not supported for array PVs",
+            ));
+        }
         let arr = py_to_scalar_array(initial)?;
         PvKind::Array(PvArray::waveform(name, arr))
     } else if initial.is_instance_of::<PyFloat>() {

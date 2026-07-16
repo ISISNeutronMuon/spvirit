@@ -50,7 +50,7 @@ fn build_pv_request(fields: &[String], is_be: bool) -> Vec<u8> {
 /// Accepts `None` -> empty, a single string (treated as a one-entry list;
 /// this preserves backwards compatibility with the previous `field: str`
 /// kwarg), or an iterable of strings.
-fn normalize_fields(py: Python<'_>, fields: Option<PyObject>) -> PyResult<Vec<String>> {
+pub(crate) fn normalize_fields(py: Python<'_>, fields: Option<PyObject>) -> PyResult<Vec<String>> {
     let Some(obj) = fields else {
         return Ok(Vec::new());
     };
@@ -236,6 +236,7 @@ async fn run_monitor(
     state: Arc<Mutex<ChannelState>>,
     callback: PyObject,
     fields: Vec<String>,
+    cb_err: &mut Option<PyErr>,
 ) -> Result<(), PvGetError> {
     let mut guard = state.lock().await;
     let timeout = guard.timeout;
@@ -287,7 +288,10 @@ async fn run_monitor(
                                 let v = decoded_to_py(py, &decoded);
                                 match callback.call1(py, (v,)) {
                                     Ok(ret) => ret.extract::<bool>(py).unwrap_or(true),
-                                    Err(_) => false,
+                                    Err(e) => {
+                                        *cb_err = Some(e);
+                                        false
+                                    }
                                 }
                             });
                             if !keep_going {
@@ -371,16 +375,16 @@ impl PyChannel {
         })
     }
 
-    /// Fetch the current value (blocking).  Returns a dict mirroring the
-    /// NT structure.
+    /// Fetch the current value (blocking). Returns a `GetResult` whose
+    /// `.value` is a dict mirroring the NT structure.
     #[pyo3(signature = (fields=None))]
     fn get(
         &self,
         py: Python<'_>,
-        fields: Option<Vec<String>>,
+        fields: Option<PyObject>,
     ) -> PyResult<crate::client::PyGetResult> {
         let state = self.state.clone();
-        let fields = fields.unwrap_or_default();
+        let fields = normalize_fields(py, fields)?;
         let (pv_name, value, raw_pva, raw_pvd) =
             block_on_py(py, run_get(state, fields)).map_err(to_py_err)?;
         let py_val = decoded_to_py(py, &value);
@@ -389,14 +393,15 @@ impl PyChannel {
         ))
     }
 
+    /// Async variant of `get`; returns an awaitable resolving to a `GetResult`.
     #[pyo3(signature = (fields=None))]
     fn get_async<'py>(
         &self,
         py: Python<'py>,
-        fields: Option<Vec<String>>,
+        fields: Option<PyObject>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let state = self.state.clone();
-        let fields = fields.unwrap_or_default();
+        let fields = normalize_fields(py, fields)?;
         future_into_py(py, async move {
             let (pv_name, value, raw_pva, raw_pvd) =
                 run_get(state, fields).await.map_err(to_py_err)?;
@@ -454,8 +459,9 @@ impl PyChannel {
         })
     }
 
-    /// Subscribe and block until `callback(value)` returns False or
-    /// raises an exception.
+    /// Subscribe and block (GIL released between updates) until
+    /// `callback(value)` returns False or raises — a raised exception stops
+    /// the monitor and propagates to the caller.
     ///
     /// `fields` restricts the subscription to the given dotted paths.
     #[pyo3(signature = (callback, fields=None))]
@@ -463,14 +469,18 @@ impl PyChannel {
         &self,
         py: Python<'_>,
         callback: PyObject,
-        fields: Option<Vec<String>>,
+        fields: Option<PyObject>,
     ) -> PyResult<()> {
         let state = self.state.clone();
-        let fields = fields.unwrap_or_default();
-        let _ = py;
-        crate::runtime::RUNTIME
-            .block_on(run_monitor(state, callback, fields))
-            .map_err(to_py_err)
+        let fields = normalize_fields(py, fields)?;
+        let mut cb_err: Option<PyErr> = None;
+        let result = py.allow_threads(|| {
+            crate::runtime::RUNTIME.block_on(run_monitor(state, callback, fields, &mut cb_err))
+        });
+        if let Some(e) = cb_err {
+            return Err(e);
+        }
+        result.map_err(to_py_err)
     }
 
     /// Close the underlying TCP stream.  Subsequent operations raise

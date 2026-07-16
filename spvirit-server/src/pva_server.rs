@@ -765,8 +765,16 @@ impl ServeBuilder {
         self.inner = self.inner.listen_ip(ip);
         self
     }
+    pub fn advertise_ip(mut self, ip: IpAddr) -> Self {
+        self.inner = self.inner.advertise_ip(ip);
+        self
+    }
     pub fn compute_alarms(mut self, enabled: bool) -> Self {
         self.inner = self.inner.compute_alarms(enabled);
+        self
+    }
+    pub fn beacon_period(mut self, secs: u64) -> Self {
+        self.inner = self.inner.beacon_period(secs);
         self
     }
 

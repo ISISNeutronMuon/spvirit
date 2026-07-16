@@ -67,10 +67,35 @@ fn default_search_targets(
     Ok(list.into())
 }
 
-fn to_search_targets(items: Vec<(String, String)>) -> PyResult<Vec<SearchTarget>> {
+/// A user-supplied search target: either a `(target_ip, bind_ip)` tuple or a
+/// `{"target": ..., "bind": ...}` dict as produced by
+/// `default_search_targets()` / `auto_broadcast_targets()`.
+#[derive(FromPyObject)]
+pub(crate) enum TargetSpec {
+    Pair(String, String),
+    Map(std::collections::HashMap<String, String>),
+}
+
+fn to_search_targets(items: Vec<TargetSpec>) -> PyResult<Vec<SearchTarget>> {
     items
         .into_iter()
-        .map(|(t, b)| {
+        .map(|spec| {
+            let (t, b) = match spec {
+                TargetSpec::Pair(t, b) => (t, b),
+                TargetSpec::Map(m) => {
+                    let t = m.get("target").cloned().ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(
+                            "target dict must have 'target' and 'bind' keys",
+                        )
+                    })?;
+                    let b = m.get("bind").cloned().ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(
+                            "target dict must have 'target' and 'bind' keys",
+                        )
+                    })?;
+                    (t, b)
+                }
+            };
             Ok(SearchTarget {
                 target: parse_ip(&t)?,
                 bind: parse_ip(&b)?,
@@ -79,7 +104,7 @@ fn to_search_targets(items: Vec<(String, String)>) -> PyResult<Vec<SearchTarget>
         .collect()
 }
 
-fn resolve_targets(targets: Option<Vec<(String, String)>>) -> PyResult<Vec<SearchTarget>> {
+fn resolve_targets(targets: Option<Vec<TargetSpec>>) -> PyResult<Vec<SearchTarget>> {
     match targets {
         Some(items) => to_search_targets(items),
         None => Ok(build_search_targets(None, None)),
@@ -95,7 +120,7 @@ fn search_pv_udp(
     pv_name: String,
     udp_port: u16,
     timeout: f64,
-    targets: Option<Vec<(String, String)>>,
+    targets: Option<Vec<TargetSpec>>,
     debug: bool,
 ) -> PyResult<String> {
     let tgts = resolve_targets(targets)?;
@@ -114,7 +139,7 @@ fn search_pv_udp_async<'py>(
     pv_name: String,
     udp_port: u16,
     timeout: f64,
-    targets: Option<Vec<(String, String)>>,
+    targets: Option<Vec<TargetSpec>>,
     debug: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let tgts = resolve_targets(targets)?;
@@ -157,7 +182,7 @@ fn discover_servers_py(
     py: Python<'_>,
     udp_port: u16,
     timeout: f64,
-    targets: Option<Vec<(String, String)>>,
+    targets: Option<Vec<TargetSpec>>,
     debug: bool,
 ) -> PyResult<PyObject> {
     let tgts = resolve_targets(targets)?;
@@ -182,7 +207,7 @@ fn discover_servers_async<'py>(
     py: Python<'py>,
     udp_port: u16,
     timeout: f64,
-    targets: Option<Vec<(String, String)>>,
+    targets: Option<Vec<TargetSpec>>,
     debug: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let tgts = resolve_targets(targets)?;
