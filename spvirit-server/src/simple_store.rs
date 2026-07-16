@@ -612,7 +612,9 @@ fn apply_put_to_record(
                         _ => None,
                     };
                     if let Some(idx) = idx {
-                        if nt.index != idx {
+                        if idx < 0 || (idx as usize) >= nt.choices.len() {
+                            // out-of-range index — reject, keep value
+                        } else if nt.index != idx {
                             nt.index = idx;
                             changed = true;
                         }
@@ -911,6 +913,21 @@ mod tests {
         }
     }
 
+    fn make_mbbo(name: &str, choices: Vec<String>, initial: i32) -> RecordInstance {
+        RecordInstance {
+            name: name.to_string(),
+            record_type: RecordType::Mbbo,
+            common: DbCommonState::default(),
+            data: RecordData::NtEnum {
+                nt: spvirit_types::NtEnum::new(initial, choices),
+                inp: None,
+                out: None,
+                omsl: crate::types::OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        }
+    }
+
     fn make_ao(name: &str, val: f64) -> RecordInstance {
         RecordInstance {
             name: name.to_string(),
@@ -1083,6 +1100,30 @@ record(ao, "DB:AO") {
             NtPayload::Scalar(nt) => assert_eq!(nt.value, ScalarValue::F64(99.5)),
             _ => panic!("expected scalar"),
         }
+    }
+
+    #[tokio::test]
+    async fn put_wire_rejects_out_of_range_enum_index() {
+        let mut records = HashMap::new();
+        records.insert(
+            "E".into(),
+            make_mbbo("E", vec!["A".into(), "B".into(), "C".into()], 0),
+        );
+        let store = SimplePvStore::new(records, HashMap::new(), vec![], false);
+
+        // Out-of-range index — must be a no-op (Ok, no changed PVs), index unchanged.
+        let result = Source::put(&store, "E", &DecodedValue::Int32(7))
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+        assert_eq!(store.get_value("E").await.unwrap(), ScalarValue::I32(0));
+
+        // In-range index — applied.
+        let result = Source::put(&store, "E", &DecodedValue::Int32(2))
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(store.get_value("E").await.unwrap(), ScalarValue::I32(2));
     }
 
     #[tokio::test]
