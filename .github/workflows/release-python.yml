@@ -1,0 +1,97 @@
+name: Release Python package
+
+on:
+  push:
+    tags:
+      - "spvirit-py-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: Build wheels (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x64
+          - name: macos-x86_64
+            runner: macos-13
+            target: x86_64
+          - name: macos-aarch64
+            runner: macos-latest
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: spvirit-py
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          manylinux: auto
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform.name }}
+          path: spvirit-py/dist
+
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: spvirit-py
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: spvirit-py/dist
+
+  publish:
+    name: Publish to PyPI
+    # Only publish on tag pushes; workflow_dispatch runs stop after building.
+    if: startsWith(github.ref, 'refs/tags/spvirit-py-v')
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/spvirit
+    permissions:
+      # Required for PyPI trusted publishing (OIDC).
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

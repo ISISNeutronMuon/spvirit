@@ -536,6 +536,10 @@ When to use record/value APIs (`set_value` / `set_array_value`):
 
 The `spvirit-py` crate provides Python bindings via [PyO3](https://pyo3.rs) and is built with [maturin](https://www.maturin.rs/).
 
+Released versions are on PyPI (`pip install spvirit`), and the complete Python
+API guide — servers, typed handles, sources, client, low-level channel, and
+codec — lives in [`spvirit-py/README.md`](spvirit-py/README.md).
+
 #### Prerequisites
 - Python 3.9+
 - Rust toolchain (see above)
