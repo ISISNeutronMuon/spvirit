@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-client"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "chrono",
  "dns-lookup",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-codec"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "hex",
  "spvirit-types",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-py"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-server"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "get_if_addrs",
  "regex",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-tools"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "argparse",
  "chrono",
@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-types"
-version = "0.1.13"
+version = "0.1.14"
 
 [[package]]
 name = "static_assertions"

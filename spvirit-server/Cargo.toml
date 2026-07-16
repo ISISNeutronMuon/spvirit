@@ -1,6 +1,6 @@
 [package]
 name = "spvirit-server"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
 description = "PVAccess server library for EPICS"
 license = "BSD-3-Clause"
@@ -11,8 +11,8 @@ categories = ["science"]
 authors = ["Mateusz Leputa for ISIS Neutron and Muon Source Copyright 2026"]
 
 [dependencies]
-spvirit-types = { version = "0.1.13", path = "../spvirit-types" }
-spvirit-codec = { version = "0.1.13", path = "../spvirit-codec" }
+spvirit-types = { version = "0.1.14", path = "../spvirit-types" }
+spvirit-codec = { version = "0.1.14", path = "../spvirit-codec" }
 
 tokio = { version = "1.47.1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
 tracing = "0.1.41"
