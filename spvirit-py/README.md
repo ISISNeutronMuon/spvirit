@@ -98,21 +98,53 @@ This is the recommended API. Each factory returns a `Pv` handle; the handle is
 
 ### Creating PVs
 
-Scalar records:
+Scalar records (each is served as an NTScalar with the given value type):
 
-| Factory | Value type | Writable by clients | EPICS analogue |
-|---|---|---|---|
-| `spvirit.ai(name, initial, **opts)` | `float` | no | analog input |
-| `spvirit.ao(name, initial, **opts)` | `float` | yes | analog output |
-| `spvirit.bi(name, initial, **opts)` | `bool` | no | binary input |
-| `spvirit.bo(name, initial, **opts)` | `bool` | yes | binary output |
-| `spvirit.longin(name, initial, **opts)` | `int` (32-bit) | no | long input |
-| `spvirit.longout(name, initial, **opts)` | `int` (32-bit) | yes | long output |
-| `spvirit.string_in(name, initial, **opts)` | `str` | no | string input |
-| `spvirit.string_out(name, initial, **opts)` | `str` | yes | string output |
+| Factory | Python type | Wire NT type | Writable by clients | EPICS analogue |
+|---|---|---|---|---|
+| `spvirit.ai(name, initial, **opts)` | `float` | NTScalar `double` | no | analog input |
+| `spvirit.ao(name, initial, **opts)` | `float` | NTScalar `double` | yes | analog output |
+| `spvirit.bi(name, initial, **opts)` | `bool` | NTScalar `boolean` | no | binary input |
+| `spvirit.bo(name, initial, **opts)` | `bool` | NTScalar `boolean` | yes | binary output |
+| `spvirit.longin(name, initial, **opts)` | `int` | NTScalar `int` (32-bit) | no | long input |
+| `spvirit.longout(name, initial, **opts)` | `int` | NTScalar `int` (32-bit) | yes | long output |
+| `spvirit.string_in(name, initial, **opts)` | `str` | NTScalar `string` | no | string input |
+| `spvirit.string_out(name, initial, **opts)` | `str` | NTScalar `string` | yes | string output |
 
 "Read-only over the wire" means network clients cannot PUT the value; your
 Python code can always `set()` it.
+
+#### NT scalar type coverage
+
+PVAccess defines twelve NTScalar value types: `boolean`, `byte`, `short`,
+`int`, `long`, their unsigned variants (`ubyte`, `ushort`, `uint`, `ulong`),
+`float`, `double`, and `string`. Handles reduce these to four Python value
+kinds, and `server.pv(name)` — which can attach to *any* served record,
+including `.db`-loaded and classic-builder ones — maps wire types onto
+handles as follows:
+
+| Wire NT scalar type | Handle kind | Notes |
+|---|---|---|
+| `double`, `float` | `float` | `float` (f32) is widened to Python `float` |
+| `boolean` | `bool` | |
+| `byte`, `short`, `int` | `int` | narrower ints are widened to 32-bit |
+| `string` | `str` | |
+| NTEnum | `int` | the value is the choice index |
+| NTScalarArray (any element type) | array | see element notes below |
+| `long`, `ubyte`, `ushort`, `uint`, `ulong` | — | `server.pv()` raises `KeyError` |
+
+64-bit and unsigned scalar records cannot currently be created from the
+handle factories either — `longin`/`longout` are 32-bit. If you need those
+wire types today, serve them via a [dynamic source](#dynamic-sources), whose
+`PvInfo` accepts the full type-string set (e.g. `"long"`, `"ulong"`,
+`"ushort"`), and read/write them through source `get`/`put` rather than a
+typed handle.
+
+Array element types: `waveform`/`aai`/`aao` infer the element type from the
+data — `bytes` becomes an unsigned-byte (`ubyte[]`) array and reads back as
+`bytes`; lists become `boolean[]`/`long[]`/`double[]`/`string[]` from the
+first element (int lists are stored as 64-bit elements) and read back as
+lists. Mixed-type lists raise `TypeError`.
 
 Enum records (served as NTEnum, value is the choice index):
 
