@@ -1,6 +1,6 @@
 [package]
 name = "spvirit-types"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 description = "Shared PVAccess Normative Type (NT) data model types."
 license = "BSD-3-Clause"
