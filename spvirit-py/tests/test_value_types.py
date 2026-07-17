@@ -264,6 +264,44 @@ def test_builder_typed_records():
     assert cfg["taps"] == [1, 2]
 
 
+def test_store_set_value_respects_record_type():
+    u16 = spvirit.scalar("VST:U16", 5, type="ushort", writable=True)
+    server = spvirit.Server(pvs=[u16], port=16076, udp_port=16077,
+                            listen_ip="127.0.0.1")
+    store = server.start_background()
+    assert store.set_value("VST:U16", 42) is True
+    from spvirit.lowlevel import Channel
+    with Channel.connect("VST:U16", "127.0.0.1:16076", timeout=5.0) as ch:
+        assert ch.introspect().field("value").type_code == "uint16"
+    _expect(OverflowError, lambda: store.set_value("VST:U16", 70000))
+    _expect(TypeError, lambda: store.set_value("VST:U16", "x"))
+    assert store.set_value("VST:NOPE", 1) is False
+
+
+def test_store_set_array_value_respects_element_type():
+    wf = spvirit.waveform("VST:WF", [0] * 3, type="float")
+    server = spvirit.Server(pvs=[wf], port=16078, udp_port=16079,
+                            listen_ip="127.0.0.1")
+    store = server.start_background()
+    assert store.set_array_value("VST:WF", [1, 2]) is True   # ints -> float[]
+    assert wf.get() == [1.0, 2.0]
+    _expect(OverflowError, lambda: store.set_array_value("VST:WF", [1e300]))
+    assert store.set_array_value("VST:NOPE", [1]) is False
+
+
+def test_store_put_nt_coerces_payload_value():
+    u8 = spvirit.scalar("VST:U8", 1, type="ubyte", writable=True)
+    server = spvirit.Server(pvs=[u8], port=16080, udp_port=16081,
+                            listen_ip="127.0.0.1")
+    store = server.start_background()
+    # payload built without type= carries a long value; put coerces to ubyte
+    assert store.put_nt("VST:U8", spvirit.NtScalar(7, units="ct")) is True
+    nt = store.get_nt("VST:U8")
+    assert nt.value == 7 and nt.value_type == "ubyte" and nt.units == "ct"
+    _expect(OverflowError,
+            lambda: store.put_nt("VST:U8", spvirit.NtScalar(300)))
+
+
 def main():
     for fn in sorted(k for k in globals() if k.startswith("test_")):
         globals()[fn]()

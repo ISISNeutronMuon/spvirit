@@ -9,11 +9,12 @@ use pyo3::prelude::*;
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::SimplePvStore;
 use spvirit_server::pva_server::PvaServer;
-use spvirit_types::{ScalarArrayValue, ScalarValue};
+use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 use crate::convert::{
-    decoded_to_py, parse_scalar_type, py_to_scalar, py_to_scalar_array,
-    py_to_scalar_array_maybe_typed, py_to_scalar_array_typed, py_to_scalar_typed, scalar_to_py,
+    coerce_scalar_array_value, coerce_scalar_value, decoded_to_py, parse_scalar_type, py_to_scalar,
+    py_to_scalar_array, py_to_scalar_array_maybe_typed, py_to_scalar_array_typed,
+    py_to_scalar_typed, scalar_array_type_code, scalar_to_py, scalar_value_type_code,
 };
 use crate::nt::{nt_payload_to_py, py_to_nt_payload};
 use crate::runtime::{RUNTIME, block_on_py};
@@ -713,30 +714,59 @@ impl PyStore {
         })
     }
 
-    /// Set a scalar value on a PV. Returns True if the PV exists.
+    /// Set a scalar value on a PV, strictly coerced to the record's current
+    /// wire type (the record is the authority — writes never retype it).
+    /// Returns True if the PV exists.
     fn set_value(&self, py: Python<'_>, name: String, value: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let sv = py_to_scalar(value)?;
         let store = self.inner.clone();
+        let sv = match block_on_py(py, store.get_value(&name)) {
+            Some(current) => py_to_scalar_typed(value, scalar_value_type_code(&current))?,
+            None => return Ok(false),
+        };
         Ok(block_on_py(py, store.set_value(&name, sv)))
     }
 
-    /// Set an array value on a PV. Returns True if the PV exists.
+    /// Set an array value on a PV, strictly coerced to the record's current
+    /// element type. Returns True if the PV exists.
     fn set_array_value(
         &self,
         py: Python<'_>,
         name: String,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<bool> {
-        let arr = py_to_scalar_array(value)?;
         let store = self.inner.clone();
+        let code = match block_on_py(py, store.get_nt(&name)) {
+            Some(NtPayload::ScalarArray(nt)) => Some(scalar_array_type_code(&nt.value)),
+            Some(NtPayload::NdArray(nt)) => Some(scalar_array_type_code(&nt.value)),
+            Some(_) => None, // non-array record: keep inference, core decides
+            None => return Ok(false),
+        };
+        let arr = match code {
+            Some(c) => py_to_scalar_array_typed(value, c)?,
+            None => py_to_scalar_array(value)?,
+        };
         Ok(block_on_py(py, store.set_array_value(&name, arr)))
     }
 
-    /// Write a full NT payload (NtScalar, NtScalarArray, etc.) to a PV.
+    /// Write a full NT payload (NtScalar, NtScalarArray, etc.) to a PV. The
+    /// payload's value is strictly coerced to the record's current wire type.
     /// Returns True if the PV exists.
     fn put_nt(&self, py: Python<'_>, name: String, nt: &Bound<'_, PyAny>) -> PyResult<bool> {
         let payload = py_to_nt_payload(nt)?;
         let store = self.inner.clone();
+        let payload = match (block_on_py(py, store.get_nt(&name)), payload) {
+            (None, _) => return Ok(false),
+            (Some(NtPayload::Scalar(current)), NtPayload::Scalar(mut new)) => {
+                new.value = coerce_scalar_value(new.value, scalar_value_type_code(&current.value))?;
+                NtPayload::Scalar(new)
+            }
+            (Some(NtPayload::ScalarArray(current)), NtPayload::ScalarArray(mut new)) => {
+                new.value =
+                    coerce_scalar_array_value(new.value, scalar_array_type_code(&current.value))?;
+                NtPayload::ScalarArray(new)
+            }
+            (_, p) => p, // table/ndarray/enum/generic or kind mismatch: core decides
+        };
         Ok(block_on_py(py, store.put_nt(&name, payload)))
     }
 
