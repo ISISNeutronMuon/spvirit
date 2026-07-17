@@ -189,6 +189,45 @@ def test_scalar_factory_scan():
     assert hb.get() >= 1
 
 
+def test_typed_waveform_keeps_element_type_across_set():
+    wf = spvirit.waveform("VTA:WF", [0] * 4, type="ushort")
+    server = spvirit.Server(pvs=[wf], port=16066, udp_port=16067,
+                            listen_ip="127.0.0.1")
+    server.start()
+    wf.set([1, 2, 3])                       # plain int list must stay ushort
+    assert wf.get() == [1, 2, 3]
+    _expect(OverflowError, lambda: wf.set([70000]))
+    _expect(TypeError, lambda: wf.set(["x"]))
+    from spvirit.lowlevel import Channel
+    with Channel.connect("VTA:WF", "127.0.0.1:16066", timeout=5.0) as ch:
+        assert ch.introspect().field("value").type_code == "uint16"
+
+
+def test_typed_aai_aao_and_empty_list():
+    r = spvirit.aai("VTA:R", [], type="float")
+    w = spvirit.aao("VTA:W", [1.0, 2.0], type="float")
+    server = spvirit.Server(pvs=[r, w], port=16068, udp_port=16069,
+                            listen_ip="127.0.0.1")
+    server.start()
+    assert r.get() == []
+    assert w.get() == [1.0, 2.0]
+    _expect(ValueError, lambda: spvirit.waveform("VTA:BAD", [], type="nope"))
+
+
+def test_pv_factory_type_override():
+    p = spvirit.pv("VTP:U32", 7, type="uint")
+    assert "(uint)" in repr(p)
+    q = spvirit.pv("VTP:WF", [0] * 3, type="short")
+    d = spvirit.pv("VTP:D", 7, type="double")     # maps onto the native float kind
+    assert "(float)" in repr(d)
+    server = spvirit.Server(pvs=[p, q, d], port=16070, udp_port=16071,
+                            listen_ip="127.0.0.1")
+    server.start()
+    assert p.get() == 7
+    assert d.get() == 7.0
+    _expect(OverflowError, lambda: q.set([2**20]))
+
+
 def main():
     for fn in sorted(k for k in globals() if k.startswith("test_")):
         globals()[fn]()

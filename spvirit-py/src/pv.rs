@@ -106,7 +106,16 @@ impl PyPv {
                 block_on_py(py, p.set(v)).map_err(pv_err)
             }
             PvKind::Array(p) => {
-                let v = py_to_scalar_array(value)?;
+                // Bound handles coerce strictly to the record's current element type
+                // (the record is the authority); unbound handles fall back to
+                // inference — set() on them raises Unbound in p.set() anyway.
+                let v = match block_on_py(py, async { p.get().await }) {
+                    Ok(cur) => crate::convert::py_to_scalar_array_typed(
+                        value,
+                        crate::convert::scalar_array_type_code(&cur),
+                    )?,
+                    Err(_) => py_to_scalar_array(value)?,
+                };
                 block_on_py(py, p.set(v)).map_err(pv_err)
             }
             PvKind::Typed(p, code) => {
@@ -186,7 +195,13 @@ impl PyPv {
                 })
             }
             PvKind::Array(p) => {
-                let v = py_to_scalar_array(value)?;
+                let v = match block_on_py(py, async { p.get().await }) {
+                    Ok(cur) => crate::convert::py_to_scalar_array_typed(
+                        value,
+                        crate::convert::scalar_array_type_code(&cur),
+                    )?,
+                    Err(_) => py_to_scalar_array(value)?,
+                };
                 let handle = p.clone();
                 future_into_py(py, async move {
                     handle.set(v).await.map_err(pv_err)?;
@@ -699,30 +714,36 @@ pub fn mbbo(name: String, choices: Vec<String>, initial: i32, desc: Option<Strin
 }
 
 /// Array record (writable over the wire). `data` is a list of bool/int/
-/// float/str, or `bytes` for a `U8` array.
+/// float/str, or `bytes` for a `U8` array. `type=` selects the element
+/// type explicitly (e.g. "ushort", "float").
 #[pyfunction]
-pub fn waveform(name: String, data: &Bound<'_, PyAny>) -> PyResult<PyPv> {
-    let arr = py_to_scalar_array(data)?;
+#[pyo3(signature = (name, data, *, r#type=None))]
+pub fn waveform(name: String, data: &Bound<'_, PyAny>, r#type: Option<String>) -> PyResult<PyPv> {
+    let arr = crate::convert::py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
     Ok(PyPv {
         kind: PvKind::Array(PvArray::waveform(name, arr)),
     })
 }
 
 /// Analog array input (read-only over the wire). `data` is a list of bool/
-/// int/float/str, or `bytes` for a `U8` array.
+/// int/float/str, or `bytes` for a `U8` array. `type=` selects the element
+/// type explicitly (e.g. "ushort", "float").
 #[pyfunction]
-pub fn aai(name: String, data: &Bound<'_, PyAny>) -> PyResult<PyPv> {
-    let arr = py_to_scalar_array(data)?;
+#[pyo3(signature = (name, data, *, r#type=None))]
+pub fn aai(name: String, data: &Bound<'_, PyAny>, r#type: Option<String>) -> PyResult<PyPv> {
+    let arr = crate::convert::py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
     Ok(PyPv {
         kind: PvKind::Array(PvArray::aai(name, arr)),
     })
 }
 
 /// Analog array output (writable). `data` is a list of bool/int/float/str,
-/// or `bytes` for a `U8` array.
+/// or `bytes` for a `U8` array. `type=` selects the element type explicitly
+/// (e.g. "ushort", "float").
 #[pyfunction]
-pub fn aao(name: String, data: &Bound<'_, PyAny>) -> PyResult<PyPv> {
-    let arr = py_to_scalar_array(data)?;
+#[pyo3(signature = (name, data, *, r#type=None))]
+pub fn aao(name: String, data: &Bound<'_, PyAny>, r#type: Option<String>) -> PyResult<PyPv> {
+    let arr = crate::convert::py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
     Ok(PyPv {
         kind: PvKind::Array(PvArray::aao(name, arr)),
     })
@@ -777,7 +798,7 @@ pub fn calc(py: Python<'_>, name: String, inputs: Vec<PyPv>, callback: PyObject)
 /// `TypeError`.
 #[pyfunction]
 #[pyo3(signature = (name, initial, *, units=None, prec=None, desc=None,
-                    adel=None, mdel=None, drive_limits=None, alarm_limits=None))]
+                    adel=None, mdel=None, drive_limits=None, alarm_limits=None, r#type=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn pv(
     name: String,
@@ -789,8 +810,63 @@ pub fn pv(
     mdel: Option<f64>,
     drive_limits: Option<(f64, f64)>,
     alarm_limits: Option<(f64, f64, f64, f64)>,
+    r#type: Option<String>,
 ) -> PyResult<PyPv> {
     use pyo3::types::{PyBool, PyBytes, PyFloat, PyInt, PyList, PyString};
+
+    if let Some(t) = &r#type {
+        let code = parse_scalar_type(t)?;
+        // Arrays: typed waveform (same metadata-option rejection as inferred arrays).
+        if initial.is_instance_of::<PyList>() || initial.is_instance_of::<PyBytes>() {
+            if units.is_some()
+                || prec.is_some()
+                || desc.is_some()
+                || adel.is_some()
+                || mdel.is_some()
+                || drive_limits.is_some()
+                || alarm_limits.is_some()
+            {
+                return Err(PyTypeError::new_err(
+                    "metadata options (units/prec/desc/adel/mdel/drive_limits/alarm_limits) \
+                     are not supported for array PVs",
+                ));
+            }
+            let arr = crate::convert::py_to_scalar_array_typed(initial, code)?;
+            return Ok(PyPv {
+                kind: PvKind::Array(PvArray::waveform(name, arr)),
+            });
+        }
+        let sv = py_to_scalar_typed(initial, code)?;
+        // The four native kinds keep their monomorphic handles (calc() inputs,
+        // existing repr contracts); everything else rides PvKind::Typed.
+        let kind = match sv {
+            ScalarValue::F64(v) => PvKind::F64(apply_opts(
+                Pv::ao(name, v),
+                units, prec, desc, adel, mdel, drive_limits, alarm_limits,
+            )),
+            ScalarValue::Bool(v) => PvKind::Bool(apply_opts(
+                Pv::bo(name, v),
+                units, prec, desc, adel, mdel, drive_limits, alarm_limits,
+            )),
+            ScalarValue::I32(v) => PvKind::I32(apply_opts(
+                Pv::longout(name, v),
+                units, prec, desc, adel, mdel, drive_limits, alarm_limits,
+            )),
+            ScalarValue::Str(v) => PvKind::Str(apply_opts(
+                Pv::string_out(name, v),
+                units, prec, desc, adel, mdel, drive_limits, alarm_limits,
+            )),
+            other => PvKind::Typed(
+                apply_opts(
+                    Pv::<ScalarValue>::scalar_out(name, other),
+                    units, prec, desc, adel, mdel, drive_limits, alarm_limits,
+                ),
+                code,
+            ),
+        };
+        return Ok(PyPv { kind });
+    }
+
     let kind = if initial.is_instance_of::<PyBool>() {
         PvKind::Bool(apply_opts(
             Pv::bo(name, initial.extract::<bool>()?),
