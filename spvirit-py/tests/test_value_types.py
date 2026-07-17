@@ -228,6 +228,17 @@ def test_pv_factory_type_override():
     _expect(OverflowError, lambda: q.set([2**20]))
 
 
+def test_server_pv_attaches_to_unsigned_and_64bit_records():
+    ul = spvirit.scalar("VTH:UL", 10, type="ulong", writable=True)
+    server = spvirit.Server(pvs=[ul], port=16072, udp_port=16073,
+                            listen_ip="127.0.0.1")
+    h = server.pv("VTH:UL")           # used to raise KeyError
+    assert "(ulong)" in repr(h)
+    h.set(2**63 + 1)
+    assert ul.get() == 2**63 + 1
+    _expect(OverflowError, lambda: h.set(-1))
+
+
 def main():
     for fn in sorted(k for k in globals() if k.startswith("test_")):
         globals()[fn]()

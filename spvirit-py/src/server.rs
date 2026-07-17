@@ -550,10 +550,11 @@ impl PyServer {
                     let h = block_on_py(py, server.pv::<String>(&name)).map_err(pv_err)?;
                     PvKind::Str(h)
                 }
+                // long / ubyte / ushort / uint / ulong — dynamically typed handle.
                 other => {
-                    return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                        "PV '{name}' has unsupported value type {other:?} for typed handles"
-                    )));
+                    let code = crate::convert::scalar_value_type_code(&other);
+                    let h = block_on_py(py, server.pv::<ScalarValue>(&name)).map_err(pv_err)?;
+                    PvKind::Typed(h, code)
                 }
             },
             Some(NtPayload::Enum(_)) => {
