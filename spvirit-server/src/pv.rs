@@ -1401,6 +1401,54 @@ mod tests {
     }
 
     #[test]
+    fn set_scalar_value_same_variant_u64_is_exact() {
+        let mut rec = make_output_record("S:U64", RecordType::LongOut, ScalarValue::U64(1));
+        let changed = rec.set_scalar_value(ScalarValue::U64(u64::MAX), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::U64(u64::MAX));
+    }
+
+    #[test]
+    fn set_scalar_value_same_variant_f32_is_exact() {
+        let mut rec = make_output_record("S:F32", RecordType::LongOut, ScalarValue::F32(1.5));
+        let changed = rec.set_scalar_value(ScalarValue::F32(2.5), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::F32(2.5));
+    }
+
+    #[test]
+    fn set_scalar_value_same_variant_i64_is_exact() {
+        let mut rec = make_output_record("S:I64", RecordType::LongOut, ScalarValue::I64(1));
+        let changed = rec.set_scalar_value(ScalarValue::I64(i64::MIN), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::I64(i64::MIN));
+    }
+
+    #[test]
+    fn set_scalar_value_cross_variant_preserves_target_variant_from_i32() {
+        let mut rec = make_output_record("S:U16", RecordType::LongOut, ScalarValue::U16(5));
+        let changed = rec.set_scalar_value(ScalarValue::I32(42), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::U16(42));
+    }
+
+    #[test]
+    fn set_scalar_value_cross_variant_preserves_target_variant_from_f64() {
+        let mut rec = make_output_record("S:U16", RecordType::LongOut, ScalarValue::U16(5));
+        let changed = rec.set_scalar_value(ScalarValue::F64(7.0), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::U16(7));
+    }
+
+    #[test]
+    fn set_scalar_value_unchanged_u64_returns_false() {
+        let mut rec = make_output_record("S:U64B", RecordType::LongOut, ScalarValue::U64(5));
+        let changed = rec.set_scalar_value(ScalarValue::U64(5), true);
+        assert!(!changed);
+        assert_eq!(rec.current_value(), ScalarValue::U64(5));
+    }
+
+    #[test]
     fn scalar_value_from_decoded_maps_one_to_one() {
         assert_eq!(
             ScalarValue::from_decoded(&DecodedValue::UInt32(7)),

@@ -460,6 +460,75 @@ impl RecordInstance {
         };
 
         let changed = match (&mut nt.value, value) {
+            // Same-variant fast path: exact compare-and-assign for every
+            // variant, including the 8 non-native numeric ones. This must
+            // come before the native↔native arms below and the f64-based
+            // catch-all so 64-bit integers (and other precision-sensitive
+            // types) never round-trip through f64.
+            (ScalarValue::I8(current), ScalarValue::I8(v)) => {
+                if *current == v {
+                    false
+                } else {
+                    *current = v;
+                    true
+                }
+            }
+            (ScalarValue::I16(current), ScalarValue::I16(v)) => {
+                if *current == v {
+                    false
+                } else {
+                    *current = v;
+                    true
+                }
+            }
+            (ScalarValue::I64(current), ScalarValue::I64(v)) => {
+                if *current == v {
+                    false
+                } else {
+                    *current = v;
+                    true
+                }
+            }
+            (ScalarValue::U8(current), ScalarValue::U8(v)) => {
+                if *current == v {
+                    false
+                } else {
+                    *current = v;
+                    true
+                }
+            }
+            (ScalarValue::U16(current), ScalarValue::U16(v)) => {
+                if *current == v {
+                    false
+                } else {
+                    *current = v;
+                    true
+                }
+            }
+            (ScalarValue::U32(current), ScalarValue::U32(v)) => {
+                if *current == v {
+                    false
+                } else {
+                    *current = v;
+                    true
+                }
+            }
+            (ScalarValue::U64(current), ScalarValue::U64(v)) => {
+                if *current == v {
+                    false
+                } else {
+                    *current = v;
+                    true
+                }
+            }
+            (ScalarValue::F32(current), ScalarValue::F32(v)) => {
+                if (*current - v).abs() < f32::EPSILON {
+                    false
+                } else {
+                    *current = v;
+                    true
+                }
+            }
             (ScalarValue::Bool(current), ScalarValue::Bool(v)) => {
                 if *current == v {
                     false
@@ -612,7 +681,38 @@ impl RecordInstance {
                     ScalarValue::U32(v) => *v as f64,
                     ScalarValue::U64(v) => *v as f64,
                     ScalarValue::F32(v) => *v as f64,
+                    // I32/F64/Bool as the *incoming* value only reach this
+                    // catch-all when the *target* is one of the new
+                    // non-native numeric variants (native-target combos of
+                    // these are already consumed by the explicit arms
+                    // above), e.g. a U16 record receiving an I32 or F64 put.
+                    ScalarValue::I32(v) => *v as f64,
+                    ScalarValue::F64(v) => *v,
+                    ScalarValue::Bool(v) => {
+                        if *v {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
                     _ => return false,
+                };
+                // Integer-to-integer conversions route through i128 instead
+                // of f64 so 64-bit magnitudes (I64/U64) survive the
+                // coercion intact — an f64 round-trip would round them.
+                // `None` when `other` is a float (F32/F64); those targets
+                // fall back to the `as_f64` path below.
+                let as_i128: Option<i128> = match &other {
+                    ScalarValue::I8(v) => Some(*v as i128),
+                    ScalarValue::I16(v) => Some(*v as i128),
+                    ScalarValue::I32(v) => Some(*v as i128),
+                    ScalarValue::I64(v) => Some(*v as i128),
+                    ScalarValue::U8(v) => Some(*v as i128),
+                    ScalarValue::U16(v) => Some(*v as i128),
+                    ScalarValue::U32(v) => Some(*v as i128),
+                    ScalarValue::U64(v) => Some(*v as i128),
+                    ScalarValue::Bool(v) => Some(if *v { 1 } else { 0 }),
+                    _ => None,
                 };
                 match target {
                     ScalarValue::Bool(current) => {
@@ -644,6 +744,83 @@ impl RecordInstance {
                     ScalarValue::Str(current) => {
                         let next = as_f64.to_string();
                         if *current == next {
+                            false
+                        } else {
+                            *current = next;
+                            true
+                        }
+                    }
+                    // Non-native numeric targets: prefer the exact i128
+                    // route for integer-to-integer coercions; fall back to
+                    // the f64 path when `other` is a float (F32). Final
+                    // narrowing uses C-like `as` cast semantics, mirroring
+                    // the `as_f64 as i32` arm above.
+                    ScalarValue::I8(current) => {
+                        let next = as_i128.map(|i| i as i8).unwrap_or(as_f64 as i8);
+                        if *current == next {
+                            false
+                        } else {
+                            *current = next;
+                            true
+                        }
+                    }
+                    ScalarValue::I16(current) => {
+                        let next = as_i128.map(|i| i as i16).unwrap_or(as_f64 as i16);
+                        if *current == next {
+                            false
+                        } else {
+                            *current = next;
+                            true
+                        }
+                    }
+                    ScalarValue::I64(current) => {
+                        let next = as_i128.map(|i| i as i64).unwrap_or(as_f64 as i64);
+                        if *current == next {
+                            false
+                        } else {
+                            *current = next;
+                            true
+                        }
+                    }
+                    ScalarValue::U8(current) => {
+                        let next = as_i128.map(|i| i as u8).unwrap_or(as_f64 as u8);
+                        if *current == next {
+                            false
+                        } else {
+                            *current = next;
+                            true
+                        }
+                    }
+                    ScalarValue::U16(current) => {
+                        let next = as_i128.map(|i| i as u16).unwrap_or(as_f64 as u16);
+                        if *current == next {
+                            false
+                        } else {
+                            *current = next;
+                            true
+                        }
+                    }
+                    ScalarValue::U32(current) => {
+                        let next = as_i128.map(|i| i as u32).unwrap_or(as_f64 as u32);
+                        if *current == next {
+                            false
+                        } else {
+                            *current = next;
+                            true
+                        }
+                    }
+                    ScalarValue::U64(current) => {
+                        let next = as_i128.map(|i| i as u64).unwrap_or(as_f64 as u64);
+                        if *current == next {
+                            false
+                        } else {
+                            *current = next;
+                            true
+                        }
+                    }
+                    ScalarValue::F32(current) => {
+                        let next = as_f64 as f32;
+                        if (*current - next).abs() < f32::EPSILON {
                             false
                         } else {
                             *current = next;
