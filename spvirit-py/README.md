@@ -209,6 +209,15 @@ A dynamically typed handle's `set()`/`get()` still uses plain Python `int`
 values, coerced with the same strict rules as above (an out-of-range write
 raises `OverflowError`).
 
+**Widened `int` handles are not range-checked.** A `byte`/`short`/`int`
+record maps onto the plain Python `int` handle kind above, which is *not*
+the same code path as `spvirit.scalar()`'s typed handles or
+`store.set_value` — writes through it use the core's C-style narrowing cast
+instead of strict coercion, so an out-of-range write silently wraps (e.g.
+`300` written to a `byte` record stores `44`) rather than raising
+`OverflowError`. Use `spvirit.scalar(name, initial, type="byte", ...)` or
+`store.set_value` when you need strict range enforcement on these types.
+
 Array element types: `waveform`/`aai`/`aao` infer the element type from the
 data when `type=` is omitted — `bytes` becomes an unsigned-byte (`ubyte[]`)
 array and reads back as `bytes`; lists become `boolean[]`/`long[]`/
@@ -578,12 +587,15 @@ store.put_nt("DEMO:TEMP", nt)         # write a full NT payload
 timestamp, display, and control substructures — see
 [Normative Type classes](#normative-type-classes).
 
-`set_value`, `set_array_value`, and `put_nt` coerce the incoming value
-strictly to the record's *existing* wire type (the same OverflowError/
-TypeError rules as elsewhere) and never retype a record — there is no way to
-change a record's wire type after creation through the store. Writing to a
-name that isn't served returns `False` (or, for `get_value`, `None`) rather
-than raising.
+`set_value` and `set_array_value` coerce the incoming value strictly to the
+record's *existing* wire type (the same OverflowError/TypeError rules as
+elsewhere) and never retype a record — there is no way to change a scalar or
+scalar-array record's wire type after creation through the store. `put_nt`
+follows the same never-retype rule for `NtScalar`/`NtScalarArray` payloads;
+for `NtTable`/`NtNdArray` payloads, `put_nt` replaces the record's stored
+payload wholesale — columns, element types, and all — since the whole
+structure comes from the payload you supply. Writing to a name that isn't
+served returns `False` (or, for `get_value`, `None`) rather than raising.
 
 ---
 

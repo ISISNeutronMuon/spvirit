@@ -200,6 +200,17 @@ impl PyServerBuilder {
             let col_data = py_to_scalar_array_maybe_typed(&val, ty.as_deref())?;
             cols.push((col_name, col_data));
         }
+        if let Some(d) = types {
+            let valid: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+            for key in d.keys().iter() {
+                let key: String = key.extract()?;
+                if !valid.contains(&key.as_str()) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "types: unknown column {key:?} (valid columns: {valid:?})"
+                    )));
+                }
+            }
+        }
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.nt_table(name, cols));
         Ok(slf)
@@ -273,6 +284,17 @@ impl PyServerBuilder {
                 None => py_to_pv_value(&val)?,
             };
             field_vec.push((field_name, pv_val));
+        }
+        if let Some(d) = types {
+            let valid: Vec<&str> = field_vec.iter().map(|(n, _)| n.as_str()).collect();
+            for key in d.keys().iter() {
+                let key: String = key.extract()?;
+                if !valid.contains(&key.as_str()) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "types: unknown field {key:?} (valid fields: {valid:?})"
+                    )));
+                }
+            }
         }
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.generic(name, struct_id, field_vec));

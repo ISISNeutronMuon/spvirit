@@ -98,6 +98,8 @@ def test_nttable_constructor_with_types():
     # custom labels
     t3 = spvirit.NtTable({"a": [1]}, labels=["Column A"])
     assert t3.labels == ["Column A"]
+    # unknown types= key rejected
+    _expect(ValueError, lambda: spvirit.NtTable({"a": [1]}, types={"nope": "int"}))
 
 
 def test_ntndarray_constructor():
@@ -262,6 +264,15 @@ def test_builder_typed_records():
     cfg = store.get_nt("VTB:CFG")
     assert cfg["gain"] == 2.0
     assert cfg["taps"] == [1, 2]
+
+
+def test_builder_typed_records_reject_unknown_types_key():
+    # unknown key in nt_table's types= raises at the method call, before build()
+    _expect(ValueError, lambda: spvirit.ServerBuilder().nt_table(
+        "VTB:TBL2", {"n": ["a"], "c": [3]}, types={"nope": "ubyte"}))
+    # unknown key in generic's types= raises at the method call, before build()
+    _expect(ValueError, lambda: spvirit.ServerBuilder().generic(
+        "VTB:CFG2", "my:cfg:1.0", {"gain": 2}, types={"nope": "float"}))
 
 
 def test_store_set_value_respects_record_type():

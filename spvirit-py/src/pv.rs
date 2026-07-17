@@ -796,6 +796,17 @@ pub fn calc(py: Python<'_>, name: String, inputs: Vec<PyPv>, callback: PyObject)
 /// `list`/`bytes` -> `waveform`. Note `bool` is checked before `int` since
 /// `isinstance(True, int)` is `True` in Python. Any other type raises
 /// `TypeError`.
+///
+/// `type=` overrides inference and picks the wire value type explicitly
+/// (same type-string convention as `spvirit.scalar(...)`): `double`,
+/// `boolean`, `int`, and `string` map onto the same native handle kinds as
+/// the inferred cases above (`bo`/`longout`/`ao`/`string_out` respectively);
+/// any other scalar type (`long`, the unsigned variants, `float`) produces a
+/// dynamically typed handle. A `list`/`bytes` `initial` combined with
+/// `type=` produces a typed waveform instead of inferring the element type.
+/// Metadata options (`units`/`prec`/`desc`/`adel`/`mdel`/`drive_limits`/
+/// `alarm_limits`) are rejected with `TypeError` for array PVs, whether the
+/// element type was inferred or given via `type=`.
 #[pyfunction]
 #[pyo3(signature = (name, initial, *, units=None, prec=None, desc=None,
                     adel=None, mdel=None, drive_limits=None, alarm_limits=None, r#type=None))]

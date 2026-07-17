@@ -510,6 +510,17 @@ impl PyNtTable {
             let values = crate::convert::py_to_scalar_array_maybe_typed(&val, ty.as_deref())?;
             cols.push(NtTableColumn { name, values });
         }
+        if let Some(d) = types {
+            let valid: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+            for key in d.keys().iter() {
+                let key: String = key.extract()?;
+                if !valid.contains(&key.as_str()) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "types: unknown column {key:?} (valid columns: {valid:?})"
+                    )));
+                }
+            }
+        }
         let labels = labels.unwrap_or_else(|| cols.iter().map(|c| c.name.clone()).collect());
         let nt = NtTable {
             labels,
