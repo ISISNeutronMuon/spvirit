@@ -827,7 +827,6 @@ impl RecordInstance {
                             true
                         }
                     }
-                    _ => false,
                 }
             }
         };
