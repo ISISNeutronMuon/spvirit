@@ -239,6 +239,31 @@ def test_server_pv_attaches_to_unsigned_and_64bit_records():
     _expect(OverflowError, lambda: h.set(-1))
 
 
+def test_builder_typed_records():
+    server = (
+        spvirit.ServerBuilder()
+        .waveform("VTB:WF", [0] * 3, type="ushort")
+        .aai("VTB:R", [1, 2], type="uint")
+        .aao("VTB:W", [0.5], type="float")
+        .sub_array("VTB:SUB", [0] * 8, indx=2, nelm=4, type="short")
+        .nt_table("VTB:TBL", {"n": ["a"], "c": [3]}, types={"c": "ubyte"})
+        .nt_ndarray("VTB:IMG", [0] * 6, [(3, 0), (2, 0)], type="ushort")
+        .generic("VTB:CFG", "my:cfg:1.0", {"gain": 2, "taps": [1, 2]},
+                 types={"gain": "float", "taps": "short[]"})
+        .port(16074).udp_port(16075).listen_ip("127.0.0.1")
+        .build()
+    )
+    store = server.start_background()
+    assert store.get_nt("VTB:WF").value_type == "ushort"
+    assert store.get_nt("VTB:R").value_type == "uint"
+    assert store.get_nt("VTB:W").value_type == "float"
+    assert store.get_nt("VTB:TBL").column_types() == {"n": "string", "c": "ubyte"}
+    assert store.get_nt("VTB:IMG").value_type == "ushort"
+    cfg = store.get_nt("VTB:CFG")
+    assert cfg["gain"] == 2.0
+    assert cfg["taps"] == [1, 2]
+
+
 def main():
     for fn in sorted(k for k in globals() if k.startswith("test_")):
         globals()[fn]()
