@@ -33,33 +33,17 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 use tokio::sync::mpsc;
 
-use spvirit_codec::spvd_decode::{DecodedValue, FieldDesc, FieldType, StructureDesc, TypeCode};
+use spvirit_codec::spvd_decode::{DecodedValue, FieldDesc, FieldType, StructureDesc};
 use spvirit_server::monitor::MonitorRegistry;
 use spvirit_server::pvstore::{PvInfo, Source};
 use spvirit_types::NtPayload;
 
 use crate::convert::decoded_to_py;
+use crate::convert::parse_type_code;
 use crate::nt::{nt_payload_to_py, py_to_nt_payload};
 use crate::runtime::RUNTIME;
 
 // ─── Type-string parsing ─────────────────────────────────────────────────────
-
-fn parse_type_code(s: &str) -> Option<TypeCode> {
-    Some(match s {
-        "boolean" | "bool" => TypeCode::Boolean,
-        "byte" | "int8" | "i8" => TypeCode::Int8,
-        "short" | "int16" | "i16" => TypeCode::Int16,
-        "int" | "int32" | "i32" => TypeCode::Int32,
-        "long" | "int64" | "i64" => TypeCode::Int64,
-        "ubyte" | "uint8" | "u8" => TypeCode::UInt8,
-        "ushort" | "uint16" | "u16" => TypeCode::UInt16,
-        "uint" | "uint32" | "u32" => TypeCode::UInt32,
-        "ulong" | "uint64" | "u64" => TypeCode::UInt64,
-        "float" | "float32" | "f32" => TypeCode::Float32,
-        "double" | "float64" | "f64" => TypeCode::Float64,
-        _ => return None,
-    })
-}
 
 /// Parse a type string like `"double"`, `"int"`, `"string"`, `"double[]"`,
 /// `"string[]"`, or `"any"` into a [`FieldType`].

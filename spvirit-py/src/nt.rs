@@ -7,7 +7,10 @@ use spvirit_types::{
     NtTimeStamp, PvValue,
 };
 
-use crate::convert::{py_to_scalar, py_to_scalar_array, scalar_array_to_py, scalar_to_py};
+use crate::convert::{
+    py_to_scalar_array_maybe_typed, py_to_scalar_maybe_typed, scalar_array_to_py,
+    scalar_array_type_code, scalar_to_py, scalar_value_type_code, wire_type_name,
+};
 
 // ─── PyAlarm ─────────────────────────────────────────────────────────────────
 
@@ -234,7 +237,8 @@ impl PyNtScalar {
 impl PyNtScalar {
     /// Create an NtScalar from a Python value with optional metadata.
     #[new]
-    #[pyo3(signature = (value, units=String::new(), display_low=0.0, display_high=0.0, display_description=String::new(), display_precision=0, control_low=0.0, control_high=0.0, control_min_step=0.0, alarm_severity=0, alarm_status=0, alarm_message=String::new()))]
+    #[pyo3(signature = (value, units=String::new(), display_low=0.0, display_high=0.0, display_description=String::new(), display_precision=0, control_low=0.0, control_high=0.0, control_min_step=0.0, alarm_severity=0, alarm_status=0, alarm_message=String::new(), r#type=None))]
+    #[allow(clippy::too_many_arguments)]
     fn py_new(
         value: &Bound<'_, PyAny>,
         units: String,
@@ -248,8 +252,9 @@ impl PyNtScalar {
         alarm_severity: i32,
         alarm_status: i32,
         alarm_message: String,
+        r#type: Option<String>,
     ) -> PyResult<Self> {
-        let sv = py_to_scalar(value)?;
+        let sv = py_to_scalar_maybe_typed(value, r#type.as_deref())?;
         let mut nt = NtScalar::from_value(sv);
         nt.units = units;
         nt.display_low = display_low;
@@ -269,6 +274,12 @@ impl PyNtScalar {
     #[getter]
     fn value(&self, py: Python<'_>) -> PyObject {
         scalar_to_py(py, &self.inner.value)
+    }
+
+    /// Canonical wire value-type name, e.g. "double", "ushort", "string".
+    #[getter]
+    fn value_type(&self) -> &'static str {
+        wire_type_name(scalar_value_type_code(&self.inner.value))
     }
 
     /// Alarm severity: 0=NO_ALARM, 1=MINOR, 2=MAJOR, 3=INVALID.
@@ -362,8 +373,9 @@ impl PyNtScalarArray {
 impl PyNtScalarArray {
     /// Create an NtScalarArray from a Python list/bytes.
     #[new]
-    fn py_new(value: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let arr = py_to_scalar_array(value)?;
+    #[pyo3(signature = (value, r#type=None))]
+    fn py_new(value: &Bound<'_, PyAny>, r#type: Option<String>) -> PyResult<Self> {
+        let arr = py_to_scalar_array_maybe_typed(value, r#type.as_deref())?;
         Ok(Self {
             inner: NtScalarArray::from_value(arr),
         })
@@ -373,6 +385,12 @@ impl PyNtScalarArray {
     #[getter]
     fn value(&self, py: Python<'_>) -> PyObject {
         scalar_array_to_py(py, &self.inner.value)
+    }
+
+    /// Canonical wire element-type name, e.g. "double", "ushort".
+    #[getter]
+    fn value_type(&self) -> &'static str {
+        wire_type_name(scalar_array_type_code(&self.inner.value))
     }
 
     /// Alarm substructure.
