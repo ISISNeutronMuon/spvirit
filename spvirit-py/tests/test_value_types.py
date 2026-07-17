@@ -1,6 +1,8 @@
 """Plain-assert tests for explicit NT value-type selection. Run directly:
    ./.venv/Scripts/python.exe tests/test_value_types.py
 """
+import time
+
 import spvirit
 
 
@@ -107,6 +109,84 @@ def test_ntndarray_constructor():
     raw = spvirit.NtNdArray(bytes(6), [3, 2])
     assert raw.value_type == "ubyte"
     assert raw.value == bytes(6)
+
+
+def test_scalar_factory_all_types_serve_and_roundtrip():
+    pvs = [
+        spvirit.scalar("VT:UL", 2**63 + 9, type="ulong", writable=True),
+        spvirit.scalar("VT:F32", 1.5, type="float", writable=True, units="V"),
+        spvirit.scalar("VT:U8", 200, type="ubyte"),
+        spvirit.scalar("VT:S", "hey", type="string"),
+        spvirit.scalar("VT:B", True, type="boolean"),
+    ]
+    assert "(ulong)" in repr(pvs[0])
+    server = spvirit.Server(pvs=pvs, port=16060, udp_port=16061,
+                            listen_ip="127.0.0.1")
+    server.start()
+    assert pvs[0].get() == 2**63 + 9
+    pvs[0].set(2**64 - 1)
+    assert pvs[0].get() == 2**64 - 1
+    _expect(OverflowError, lambda: pvs[0].set(-1))
+    _expect(TypeError, lambda: pvs[0].set("nope"))
+    assert pvs[1].get() == 1.5
+    assert pvs[2].get() == 200
+    _expect(OverflowError, lambda: pvs[2].set(300))
+    assert pvs[3].get() == "hey"
+    assert pvs[4].get() is True
+    # wire introspection reports the requested value type
+    from spvirit.lowlevel import Channel
+    with Channel.connect("VT:UL", "127.0.0.1:16060", timeout=5.0) as ch:
+        desc = ch.introspect()
+        assert desc.field("value").type_code == "uint64"
+    with Channel.connect("VT:F32", "127.0.0.1:16060", timeout=5.0) as ch:
+        assert ch.introspect().field("value").type_code == "float32"
+
+
+def test_scalar_factory_validation():
+    _expect(ValueError, lambda: spvirit.scalar("VT:BAD", 1, type="nope"))
+    _expect(OverflowError, lambda: spvirit.scalar("VT:OV", 300, type="ubyte"))
+    _expect(TypeError, lambda: spvirit.scalar("VT:K", 1.5, type="int"))
+
+
+def test_scalar_factory_on_put_and_wire_write():
+    seen = []
+    ct = spvirit.scalar("VTW:CT", 5, type="ushort", writable=True)
+
+    @ct.on_put
+    def _check(pv, value):
+        seen.append(value)
+        if value > 1000:
+            return False
+
+    server = spvirit.Server(pvs=[ct], port=16062, udp_port=16063,
+                            listen_ip="127.0.0.1")
+    server.start()
+    time.sleep(0.3)
+    client = (spvirit.Client.builder()
+              .server_addr("127.0.0.1:16062").udp_port(16063).build())
+    client.put("VTW:CT", 42)
+    assert ct.get() == 42
+    assert seen == [42]
+    try:
+        client.put("VTW:CT", 2000)   # rejected by on_put
+    except spvirit.SpviritError:
+        pass
+    assert ct.get() == 42
+
+
+def test_scalar_factory_scan():
+    hb = spvirit.scalar("VTS:HB", 0, type="uint")
+    counter = iter(range(1, 100))
+
+    @hb.scan(period=0.05)
+    def _tick(pv):
+        return next(counter)
+
+    server = spvirit.Server(pvs=[hb], port=16064, udp_port=16065,
+                            listen_ip="127.0.0.1")
+    server.start()
+    time.sleep(0.5)
+    assert hb.get() >= 1
 
 
 def main():

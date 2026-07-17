@@ -66,6 +66,7 @@ fn spvirit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pv::aao, m)?)?;
     m.add_function(wrap_pyfunction!(pv::calc, m)?)?;
     m.add_function(wrap_pyfunction!(pv::pv, m)?)?;
+    m.add_function(wrap_pyfunction!(pv::scalar, m)?)?;
 
     // Module-level functions
     m.add_function(wrap_pyfunction!(client::py_discover_servers, m)?)?;

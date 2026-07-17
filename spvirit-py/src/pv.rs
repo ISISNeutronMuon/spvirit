@@ -6,9 +6,14 @@ use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 
+use spvirit_codec::spvd_decode::TypeCode;
 use spvirit_server::pv::{AnyPv, Pv, PvArray, PvError};
+use spvirit_types::ScalarValue;
 
-use crate::convert::{py_to_scalar_array, scalar_array_to_py};
+use crate::convert::{
+    parse_scalar_type, py_to_scalar_array, py_to_scalar_typed, scalar_array_to_py, scalar_to_py,
+    wire_type_name,
+};
 use crate::runtime::{block_on_py, future_into_py};
 
 pub(crate) fn pv_err(e: PvError) -> PyErr {
@@ -27,6 +32,10 @@ pub(crate) enum PvKind {
     I32(Pv<i32>),
     Str(Pv<String>),
     Array(PvArray),
+    /// Dynamically typed scalar — covers all twelve NTScalar wire types.
+    /// The TypeCode is the record's wire type; Python values are strictly
+    /// coerced against it at the boundary.
+    Typed(Pv<ScalarValue>, TypeCode),
 }
 
 /// Typed handle to a PV record. Create with `spvirit.ai(...)`, `spvirit.ao(...)`,
@@ -45,6 +54,7 @@ impl PyPv {
             PvKind::I32(p) => AnyPv::from(p.clone()),
             PvKind::Str(p) => AnyPv::from(p.clone()),
             PvKind::Array(a) => AnyPv::from(a.clone()),
+            PvKind::Typed(p, _) => AnyPv::from(p.clone()),
         }
     }
 }
@@ -60,16 +70,18 @@ impl PyPv {
             PvKind::I32(p) => p.name(),
             PvKind::Str(p) => p.name(),
             PvKind::Array(p) => p.name(),
+            PvKind::Typed(p, _) => p.name(),
         }
     }
 
     fn __repr__(&self) -> String {
-        let ty = match &self.kind {
-            PvKind::F64(_) => "float",
-            PvKind::Bool(_) => "bool",
-            PvKind::I32(_) => "int",
-            PvKind::Str(_) => "str",
-            PvKind::Array(_) => "array",
+        let ty: String = match &self.kind {
+            PvKind::F64(_) => "float".into(),
+            PvKind::Bool(_) => "bool".into(),
+            PvKind::I32(_) => "int".into(),
+            PvKind::Str(_) => "str".into(),
+            PvKind::Array(_) => "array".into(),
+            PvKind::Typed(_, code) => wire_type_name(*code).into(),
         };
         format!("<spvirit.Pv '{}' ({ty})>", self.name())
     }
@@ -97,6 +109,10 @@ impl PyPv {
                 let v = py_to_scalar_array(value)?;
                 block_on_py(py, p.set(v)).map_err(pv_err)
             }
+            PvKind::Typed(p, code) => {
+                let v = py_to_scalar_typed(value, *code)?;
+                block_on_py(py, p.set(v)).map_err(pv_err)
+            }
         }
     }
 
@@ -122,6 +138,10 @@ impl PyPv {
             PvKind::Array(p) => {
                 let v = block_on_py(py, p.get()).map_err(pv_err)?;
                 Ok(scalar_array_to_py(py, &v))
+            }
+            PvKind::Typed(p, _) => {
+                let v = block_on_py(py, p.get()).map_err(pv_err)?;
+                Ok(scalar_to_py(py, &v))
             }
         }
     }
@@ -173,6 +193,14 @@ impl PyPv {
                     Python::with_gil(|py| py.None().into_py_any(py))
                 })
             }
+            PvKind::Typed(p, code) => {
+                let v = py_to_scalar_typed(value, *code)?;
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    handle.set(v).await.map_err(pv_err)?;
+                    Python::with_gil(|py| py.None().into_py_any(py))
+                })
+            }
         }
     }
 
@@ -214,6 +242,13 @@ impl PyPv {
                     Ok(Python::with_gil(|py| scalar_array_to_py(py, &v)))
                 })
             }
+            PvKind::Typed(p, _) => {
+                let handle = p.clone();
+                future_into_py(py, async move {
+                    let v = handle.get().await.map_err(pv_err)?;
+                    Ok(Python::with_gil(|py| scalar_to_py(py, &v)))
+                })
+            }
         }
     }
 
@@ -235,6 +270,9 @@ impl PyPv {
                 block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
             }
             PvKind::Array(p) => {
+                block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
+            }
+            PvKind::Typed(p, _) => {
                 block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
             }
         }
@@ -281,6 +319,14 @@ impl PyPv {
                 let cb = callback.clone_ref(py);
                 let _ = p.clone().on_put(move |_pv, v: String| {
                     py_on_put(&cb, PvKind::Str(handle.clone()), PutVal::Str(v))
+                });
+            }
+            PvKind::Typed(p, code) => {
+                let handle = p.clone();
+                let c = *code;
+                let cb = callback.clone_ref(py);
+                let _ = p.clone().on_put(move |_pv, v: ScalarValue| {
+                    py_on_put(&cb, PvKind::Typed(handle.clone(), c), PutVal::Scalar(v))
                 });
             }
             PvKind::Array(_) => unreachable!("Array on_put rejected above"),
@@ -363,6 +409,13 @@ fn register_scan(pv: &PyPv, period_secs: f64, cb: PyObject) {
                 .clone()
                 .scan(dur, move |h| scan_bridge_str(&cb, &cache, h));
         }
+        PvKind::Typed(p, code) => {
+            let cache = Mutex::new(None);
+            let c = *code;
+            let _ = p
+                .clone()
+                .scan(dur, move |h| scan_bridge_typed(&cb, &cache, h, c));
+        }
         PvKind::Array(_) => unreachable!("Array scan rejected in PyPv::scan"),
     }
 }
@@ -413,11 +466,63 @@ scan_bridge_fn!(scan_bridge_bool, bool, Bool, false);
 scan_bridge_fn!(scan_bridge_i32, i32, I32, 0i32);
 scan_bridge_fn!(scan_bridge_str, String, Str, String::new());
 
+/// Scan bridge for dynamically typed scalars: the Python return value is
+/// strictly coerced to the record's wire type; failures fall back to the
+/// cached last value or the type's zero default (same contract as the four
+/// monomorphic bridges above).
+fn scan_bridge_typed(
+    cb: &PyObject,
+    cache: &Mutex<Option<ScalarValue>>,
+    h: &Pv<ScalarValue>,
+    code: TypeCode,
+) -> ScalarValue {
+    Python::with_gil(|py| {
+        let pv = PyPv {
+            kind: PvKind::Typed(h.clone(), code),
+        };
+        let result = match cb.call1(py, (pv,)) {
+            Ok(ret) if ret.is_none(py) => None,
+            Ok(ret) => py_to_scalar_typed(ret.bind(py), code).ok(),
+            Err(e) => {
+                tracing::error!("scan callback error: {e}");
+                None
+            }
+        };
+        let mut guard = cache.lock().unwrap();
+        match result {
+            Some(v) => {
+                *guard = Some(v.clone());
+                v
+            }
+            None => guard.clone().unwrap_or_else(|| default_scalar(code)),
+        }
+    })
+}
+
+/// Zero/empty default for each wire type (scan fallback before first tick).
+fn default_scalar(code: TypeCode) -> ScalarValue {
+    match code {
+        TypeCode::Boolean => ScalarValue::Bool(false),
+        TypeCode::Int8 => ScalarValue::I8(0),
+        TypeCode::Int16 => ScalarValue::I16(0),
+        TypeCode::Int32 => ScalarValue::I32(0),
+        TypeCode::Int64 => ScalarValue::I64(0),
+        TypeCode::UInt8 => ScalarValue::U8(0),
+        TypeCode::UInt16 => ScalarValue::U16(0),
+        TypeCode::UInt32 => ScalarValue::U32(0),
+        TypeCode::UInt64 => ScalarValue::U64(0),
+        TypeCode::Float32 => ScalarValue::F32(0.0),
+        TypeCode::String => ScalarValue::Str(String::new()),
+        _ => ScalarValue::F64(0.0),
+    }
+}
+
 pub(crate) enum PutVal {
     F64(f64),
     Bool(bool),
     I32(i32),
     Str(String),
+    Scalar(ScalarValue),
 }
 
 /// Bridge a wire PUT into a Python callback. Exception or `False` → reject.
@@ -429,6 +534,7 @@ fn py_on_put(cb: &PyObject, kind: PvKind, val: PutVal) -> Result<(), String> {
             PutVal::Bool(v) => v.into_py_any(py),
             PutVal::I32(v) => v.into_py_any(py),
             PutVal::Str(v) => v.into_py_any(py),
+            PutVal::Scalar(v) => Ok(scalar_to_py(py, &v)),
         }
         .map_err(|e| e.to_string())?;
         match cb.call1(py, (pv, arg)) {
@@ -754,4 +860,51 @@ pub fn pv(
         )));
     };
     Ok(PyPv { kind })
+}
+
+/// Generic scalar record covering all twelve NTScalar wire value types.
+///
+/// `type` is required (no inference): "boolean", "byte", "short", "int",
+/// "long", "ubyte", "ushort", "uint", "ulong", "float", "double", "string"
+/// (aliases like "u16"/"f32" accepted). `writable=False` serves the
+/// read-only (input) flavor, `True` the writable (output) flavor. The
+/// initial value is strictly coerced: out-of-range raises OverflowError,
+/// wrong kinds raise TypeError.
+#[pyfunction]
+#[pyo3(signature = (name, initial, *, r#type, writable=false, units=None, prec=None,
+                    desc=None, adel=None, mdel=None, drive_limits=None, alarm_limits=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn scalar(
+    name: String,
+    initial: &Bound<'_, PyAny>,
+    r#type: String,
+    writable: bool,
+    units: Option<String>,
+    prec: Option<i32>,
+    desc: Option<String>,
+    adel: Option<f64>,
+    mdel: Option<f64>,
+    drive_limits: Option<(f64, f64)>,
+    alarm_limits: Option<(f64, f64, f64, f64)>,
+) -> PyResult<PyPv> {
+    let code = parse_scalar_type(&r#type)?;
+    let sv = py_to_scalar_typed(initial, code)?;
+    let handle = if writable {
+        Pv::<ScalarValue>::scalar_out(name, sv)
+    } else {
+        Pv::<ScalarValue>::scalar_in(name, sv)
+    };
+    let handle = apply_opts(
+        handle,
+        units,
+        prec,
+        desc,
+        adel,
+        mdel,
+        drive_limits,
+        alarm_limits,
+    );
+    Ok(PyPv {
+        kind: PvKind::Typed(handle, code),
+    })
 }
