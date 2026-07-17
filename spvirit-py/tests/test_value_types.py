@@ -78,6 +78,37 @@ def test_ntscalararray_type_selection():
     assert spvirit.NtScalarArray([1, 2]).value_type == "long"
 
 
+def test_nttable_constructor_with_types():
+    t = spvirit.NtTable(
+        {"name": ["a", "b"], "count": [1, 2]},
+        types={"count": "uint"},
+        descriptor="demo",
+    )
+    assert t.labels == ["name", "count"]
+    assert t.columns() == {"name": ["a", "b"], "count": [1, 2]}
+    assert t.column_types() == {"name": "string", "count": "uint"}
+    assert t.descriptor == "demo"
+    # untyped columns keep inference (ints -> long)
+    t2 = spvirit.NtTable({"x": [1]})
+    assert t2.column_types() == {"x": "long"}
+    # mismatched column lengths rejected
+    _expect(ValueError, lambda: spvirit.NtTable({"a": [1], "b": [1, 2]}))
+    # custom labels
+    t3 = spvirit.NtTable({"a": [1]}, labels=["Column A"])
+    assert t3.labels == ["Column A"]
+
+
+def test_ntndarray_constructor():
+    nd = spvirit.NtNdArray([0] * 12, [4, 3], type="ushort")
+    assert nd.value_type == "ushort"
+    assert [d["size"] for d in nd.dimensions()] == [4, 3]
+    assert [d["offset"] for d in nd.dimensions()] == [0, 0]
+    assert nd.uncompressed_size == 24   # 12 elements x 2 bytes
+    raw = spvirit.NtNdArray(bytes(6), [3, 2])
+    assert raw.value_type == "ubyte"
+    assert raw.value == bytes(6)
+
+
 def main():
     for fn in sorted(k for k in globals() if k.startswith("test_")):
         globals()[fn]()

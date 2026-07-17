@@ -3,8 +3,8 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use spvirit_types::{
-    NtAlarm, NtControl, NtDisplay, NtNdArray, NtPayload, NtScalar, NtScalarArray, NtTable,
-    NtTimeStamp, PvValue,
+    NdCodec, NdDimension, NtAlarm, NtControl, NtDisplay, NtNdArray, NtPayload, NtScalar,
+    NtScalarArray, NtTable, NtTableColumn, NtTimeStamp, PvValue,
 };
 
 use crate::convert::{
@@ -425,8 +425,10 @@ impl PyNtScalarArray {
 
 // ─── PyNtTable ───────────────────────────────────────────────────────────────
 
-/// NTTable payload: column labels, columns, and optional metadata. Has no
-/// Python constructor — returned by reads such as `Store.get_nt`.
+/// NTTable payload: column labels, columns, and optional metadata.
+/// Create an NTTable from a `{name: list|bytes}` dict of columns.
+/// `types` optionally maps column names to value-type strings; `labels`
+/// defaults to the column names.
 #[pyclass(name = "NtTable")]
 pub struct PyNtTable {
     inner: NtTable,
@@ -486,12 +488,58 @@ impl PyNtTable {
             self.inner.columns.len()
         )
     }
+
+    #[new]
+    #[pyo3(signature = (columns, *, labels=None, types=None, descriptor=None))]
+    fn py_new(
+        columns: &Bound<'_, PyDict>,
+        labels: Option<Vec<String>>,
+        types: Option<&Bound<'_, PyDict>>,
+        descriptor: Option<String>,
+    ) -> PyResult<Self> {
+        let mut cols = Vec::with_capacity(columns.len());
+        for (key, val) in columns.iter() {
+            let name: String = key.extract()?;
+            let ty: Option<String> = match types {
+                Some(d) => match d.get_item(&name)? {
+                    Some(t) => Some(t.extract()?),
+                    None => None,
+                },
+                None => None,
+            };
+            let values = crate::convert::py_to_scalar_array_maybe_typed(&val, ty.as_deref())?;
+            cols.push(NtTableColumn { name, values });
+        }
+        let labels = labels.unwrap_or_else(|| cols.iter().map(|c| c.name.clone()).collect());
+        let nt = NtTable {
+            labels,
+            columns: cols,
+            descriptor,
+            alarm: None,
+            time_stamp: None,
+        };
+        nt.validate()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(Self { inner: nt })
+    }
+
+    /// Return `{column_name: wire_type_name}` for every column.
+    fn column_types(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = PyDict::new(py);
+        for col in &self.inner.columns {
+            dict.set_item(
+                &col.name,
+                crate::convert::wire_type_name(crate::convert::scalar_array_type_code(&col.values)),
+            )?;
+        }
+        Ok(dict.into_any().unbind())
+    }
 }
 
 // ─── PyNtNdArray ─────────────────────────────────────────────────────────────
 
 /// NTNDArray payload: flat array data plus dimensions and image metadata.
-/// Has no Python constructor — returned by reads such as `Store.get_nt`.
+/// Create an NTNDArray from flat data and per-dimension sizes (offsets 0).
 #[pyclass(name = "NtNdArray")]
 pub struct PyNtNdArray {
     inner: NtNdArray,
@@ -553,6 +601,48 @@ impl PyNtNdArray {
     #[getter]
     fn data_time_stamp(&self) -> PyTimeStamp {
         PyTimeStamp::from(&self.inner.data_time_stamp)
+    }
+
+    #[new]
+    #[pyo3(signature = (value, dims, *, r#type=None))]
+    fn py_new(value: &Bound<'_, PyAny>, dims: Vec<i32>, r#type: Option<String>) -> PyResult<Self> {
+        let arr = crate::convert::py_to_scalar_array_maybe_typed(value, r#type.as_deref())?;
+        let uncompressed = (arr.len() * arr.element_size_bytes().max(1)) as i64;
+        let dimension: Vec<NdDimension> = dims
+            .into_iter()
+            .map(|size| NdDimension {
+                size,
+                offset: 0,
+                full_size: size,
+                binning: 1,
+                reverse: false,
+            })
+            .collect();
+        Ok(Self {
+            inner: NtNdArray {
+                value: arr,
+                codec: NdCodec {
+                    name: String::new(),
+                    parameters: Default::default(),
+                },
+                compressed_size: uncompressed,
+                uncompressed_size: uncompressed,
+                dimension,
+                unique_id: 0,
+                data_time_stamp: NtTimeStamp::default(),
+                attribute: vec![],
+                descriptor: None,
+                alarm: None,
+                time_stamp: None,
+                display: None,
+            },
+        })
+    }
+
+    /// Canonical wire element-type name, e.g. "ubyte", "ushort".
+    #[getter]
+    fn value_type(&self) -> &'static str {
+        crate::convert::wire_type_name(crate::convert::scalar_array_type_code(&self.inner.value))
     }
 
     fn __repr__(&self) -> String {
