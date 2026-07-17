@@ -783,6 +783,20 @@ pub fn nt_table_desc(nt: &NtTable) -> StructureDesc {
                     fields: value_fields,
                 }),
             },
+            FieldDesc {
+                name: "descriptor".to_string(),
+                field_type: FieldType::String,
+            },
+            FieldDesc {
+                name: "alarm".to_string(),
+                field_type: FieldType::Structure(alarm_desc()),
+            },
+            // Required by archiving clients: the EPICS Archiver Appliance
+            // refuses (or NPEs on) structures without a top-level timeStamp.
+            FieldDesc {
+                name: "timeStamp".to_string(),
+                field_type: FieldType::Structure(timestamp_desc()),
+            },
         ],
     }
 }
@@ -793,6 +807,18 @@ pub fn encode_nt_table_full(nt: &NtTable, is_be: bool) -> Vec<u8> {
     for NtTableColumn { values, .. } in &nt.columns {
         out.extend_from_slice(&encode_scalar_array_value_pvd(values, is_be));
     }
+    out.extend_from_slice(&encode_string_pvd(
+        nt.descriptor.as_deref().unwrap_or(""),
+        is_be,
+    ));
+    out.extend_from_slice(&encode_nt_alarm(
+        nt.alarm.as_ref().unwrap_or(&NtAlarm::default()),
+        is_be,
+    ));
+    out.extend_from_slice(&encode_nt_timestamp(
+        nt.time_stamp.as_ref().unwrap_or(&NtTimeStamp::default()),
+        is_be,
+    ));
     out
 }
 
@@ -2230,6 +2256,61 @@ mod tests {
             consumed,
             data_bytes.len(),
             "consumed should match data_bytes.len()"
+        );
+    }
+
+    #[test]
+    fn nt_table_wire_format_carries_metadata() {
+        use spvirit_types::{NtTable, NtTableColumn, ScalarArrayValue};
+
+        // NTTable per the normative type spec carries descriptor, alarm and
+        // timeStamp. The EPICS Archiver Appliance in particular requires a
+        // top-level timeStamp field to archive a structure at all.
+        let nt = NtTable {
+            labels: vec!["a".to_string()],
+            columns: vec![NtTableColumn {
+                name: "a".to_string(),
+                values: ScalarArrayValue::F64(vec![1.0, 2.0]),
+            }],
+            descriptor: Some("desc".to_string()),
+            alarm: None,
+            time_stamp: Some(NtTimeStamp {
+                seconds_past_epoch: 1_700_000_000,
+                nanoseconds: 42,
+                user_tag: 0,
+            }),
+        };
+
+        let desc = nt_table_desc(&nt);
+        let names: Vec<&str> = desc.fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"timeStamp"), "desc must expose timeStamp");
+        assert!(names.contains(&"alarm"), "desc must expose alarm");
+        assert!(names.contains(&"descriptor"), "desc must expose descriptor");
+
+        // Encoded data must decode fully and consistently against the desc.
+        let data_bytes = encode_nt_table_full(&nt, false);
+        let decoder = PvdDecoder::new(false);
+        let (decoded, consumed) = decoder
+            .decode_structure(&data_bytes, &desc)
+            .expect("data decode failed");
+        assert_eq!(consumed, data_bytes.len());
+        let DecodedValue::Structure(fields) = decoded else {
+            panic!("expected structure");
+        };
+        let (_, ts) = fields
+            .iter()
+            .find(|(n, _)| n == "timeStamp")
+            .expect("timeStamp value present");
+        let DecodedValue::Structure(ts_fields) = ts else {
+            panic!("expected timeStamp structure");
+        };
+        let (_, secs) = ts_fields
+            .iter()
+            .find(|(n, _)| n == "secondsPastEpoch")
+            .expect("secondsPastEpoch present");
+        assert!(
+            matches!(secs, DecodedValue::Int64(1_700_000_000)),
+            "expected secondsPastEpoch=1700000000, got {secs:?}"
         );
     }
 

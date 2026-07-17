@@ -379,6 +379,54 @@ impl RecordInstance {
         }
     }
 
+    /// Fill in any missing (`None` or epoch-0) timestamps with the current
+    /// time. Called when a record enters a store so that PVs that are never
+    /// updated afterwards (e.g. a static NTTable) still serve a valid
+    /// timestamp — clients like the EPICS Archiver Appliance reject epoch-0
+    /// events.
+    pub(crate) fn stamp_missing_timestamps(&mut self) {
+        let ts = now_nt_timestamp();
+        match &mut self.data {
+            RecordData::Ai { nt, .. }
+            | RecordData::Ao { nt, .. }
+            | RecordData::Bi { nt, .. }
+            | RecordData::Bo { nt, .. }
+            | RecordData::StringIn { nt, .. }
+            | RecordData::StringOut { nt, .. } => {
+                if nt.time_stamp.is_none() {
+                    nt.time_stamp = Some(ts);
+                }
+            }
+            RecordData::Waveform { nt, .. }
+            | RecordData::Aai { nt, .. }
+            | RecordData::Aao { nt, .. }
+            | RecordData::SubArray { nt, .. } => {
+                if nt.time_stamp == NtTimeStamp::default() {
+                    nt.time_stamp = ts;
+                }
+            }
+            RecordData::NtEnum { nt, .. } => {
+                if nt.time_stamp == NtTimeStamp::default() {
+                    nt.time_stamp = ts;
+                }
+            }
+            RecordData::NtTable { nt, .. } => {
+                if nt.time_stamp.is_none() {
+                    nt.time_stamp = Some(ts);
+                }
+            }
+            RecordData::NtNdArray { nt, .. } => {
+                if nt.time_stamp.is_none() {
+                    nt.time_stamp = Some(ts.clone());
+                }
+                if nt.data_time_stamp == NtTimeStamp::default() {
+                    nt.data_time_stamp = ts;
+                }
+            }
+            RecordData::Generic { .. } => {}
+        }
+    }
+
     pub fn set_scalar_value(&mut self, value: ScalarValue, compute_alarms: bool) -> bool {
         if let RecordData::NtEnum { nt, .. } = &mut self.data {
             let idx = match &value {

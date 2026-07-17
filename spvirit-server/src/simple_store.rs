@@ -70,7 +70,8 @@ impl SimplePvStore {
     ) -> Self {
         let pvs = records
             .into_iter()
-            .map(|(name, record)| {
+            .map(|(name, mut record)| {
+                record.stamp_missing_timestamps();
                 let last_posted = initial_posted(&record);
                 (
                     name,
@@ -104,7 +105,8 @@ impl SimplePvStore {
     }
 
     /// Insert or replace a PV record at runtime.
-    pub async fn insert(&self, name: String, record: RecordInstance) {
+    pub async fn insert(&self, name: String, mut record: RecordInstance) {
+        record.stamp_missing_timestamps();
         let mut pvs = self.pvs.write().await;
         let last_posted = initial_posted(&record);
         pvs.insert(
@@ -1064,6 +1066,54 @@ record(ao, "DB:AO") {
                 omsl: crate::types::OutputMode::Supervisory,
             },
             raw_fields: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn store_stamps_initial_timestamps_on_static_records() {
+        // Records that are never updated after creation (e.g. a static
+        // NTTable) must still carry a valid timestamp — clients like the
+        // EPICS Archiver Appliance reject epoch-0 events.
+        let mut records = HashMap::new();
+        records.insert("TEST:TBL".into(), make_nt_table("TEST:TBL"));
+        records.insert("TEST:NDA".into(), make_nt_ndarray("TEST:NDA"));
+        records.insert(
+            "TEST:ENUM".into(),
+            make_mbbo("TEST:ENUM", vec!["A".into(), "B".into()], 0),
+        );
+        records.insert(
+            "TEST:WF".into(),
+            make_waveform("TEST:WF", ScalarArrayValue::F64(vec![0.0])),
+        );
+        records.insert("TEST:AI".into(), make_ai("TEST:AI", 1.0));
+        let store = SimplePvStore::new(records, HashMap::new(), vec![], false);
+
+        match store.get_nt("TEST:TBL").await.unwrap() {
+            NtPayload::Table(nt) => {
+                assert!(nt.time_stamp.expect("table stamped").seconds_past_epoch > 0)
+            }
+            _ => panic!("expected table"),
+        }
+        match store.get_nt("TEST:NDA").await.unwrap() {
+            NtPayload::NdArray(nt) => {
+                assert!(nt.time_stamp.expect("ndarray stamped").seconds_past_epoch > 0);
+                assert!(nt.data_time_stamp.seconds_past_epoch > 0);
+            }
+            _ => panic!("expected ndarray"),
+        }
+        match store.get_nt("TEST:ENUM").await.unwrap() {
+            NtPayload::Enum(nt) => assert!(nt.time_stamp.seconds_past_epoch > 0),
+            _ => panic!("expected enum"),
+        }
+        match store.get_nt("TEST:WF").await.unwrap() {
+            NtPayload::ScalarArray(nt) => assert!(nt.time_stamp.seconds_past_epoch > 0),
+            _ => panic!("expected scalar array"),
+        }
+        match store.get_nt("TEST:AI").await.unwrap() {
+            NtPayload::Scalar(nt) => {
+                assert!(nt.time_stamp.expect("scalar stamped").seconds_past_epoch > 0)
+            }
+            _ => panic!("expected scalar"),
         }
     }
 
