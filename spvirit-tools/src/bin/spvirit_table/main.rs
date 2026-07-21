@@ -32,7 +32,10 @@ enum PvSpec {
     Scalar(WireType),
     Array(WireType),
     Enum { choices: Vec<String> },
-    Table { columns: Vec<(String, WireType)> },
+    Table {
+        #[allow(dead_code)] // reserved for future table :set / column-aware editing
+        columns: Vec<(String, WireType)>,
+    },
 }
 
 impl PvSpec {
@@ -167,6 +170,10 @@ impl ServerHandle {
                         .collect()
                 };
                 for (name, sval, choices, idx) in updates {
+                    // Manual :set/:del/stop removes the animator; skip a stale write so manual control wins.
+                    if !anim_map.lock().unwrap().contains_key(&name) {
+                        continue;
+                    }
                     match choices {
                         None => {
                             store.set_value(&name, sval).await;

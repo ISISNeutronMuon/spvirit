@@ -25,6 +25,8 @@ impl WireType {
         }
     }
 
+    // used only by the round-trip test; from_token is the runtime path
+    #[allow(dead_code)]
     pub fn from_label(s: &str) -> Option<WireType> {
         WireType::ALL.into_iter().find(|t| t.label() == s)
     }
