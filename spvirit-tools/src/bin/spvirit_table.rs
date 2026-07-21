@@ -332,42 +332,43 @@ fn centered(pct_w: u16, pct_h: u16, area: ratatui::layout::Rect) -> ratatui::lay
 fn commit_add(
     app: &mut App,
     srv: &ServerHandle,
-    name: String,
+    name: &str,
     kind: Kind,
     ty: WireType,
     writable: bool,
     val: &str,
-) {
-    if app.rows.iter().any(|r| r.name == name) || srv.exists(&name) {
+) -> bool {
+    if app.rows.iter().any(|r| r.name == name) || srv.exists(name) {
         app.status = format!("name {name:?} already exists");
-        return;
+        return false;
     }
     let display;
     match kind {
         Kind::Scalar => match parse_scalar(ty, val) {
             Ok(v) => {
                 display = format_scalar(&v);
-                srv.add_scalar(&name, v, writable);
+                srv.add_scalar(name, v, writable);
             }
             Err(e) => {
                 app.status = e;
-                return;
+                return false;
             }
         },
         Kind::Array => match parse_array(ty, val) {
             Ok(v) => {
                 display = format_array(&v);
-                srv.add_array(&name, v, writable);
+                srv.add_array(name, v, writable);
             }
             Err(e) => {
                 app.status = e;
-                return;
+                return false;
             }
         },
     }
     app.status = format!("added {name}");
-    app.rows.push(PvRow { name, kind, ty, writable, display });
+    app.rows.push(PvRow { name: name.to_string(), kind, ty, writable, display });
     app.table.select(Some(app.rows.len() - 1));
+    true
 }
 
 fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
@@ -463,7 +464,11 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
         },
         Mode::AddValue { name, kind, ty, writable, mut buf } => match code {
             KeyCode::Esc => {}
-            KeyCode::Enter => commit_add(app, srv, name, kind, ty, writable, &buf),
+            KeyCode::Enter => {
+                if !commit_add(app, srv, &name, kind, ty, writable, &buf) {
+                    app.mode = Mode::AddValue { name, kind, ty, writable, buf };
+                }
+            }
             KeyCode::Char(c) => {
                 buf.push(c);
                 app.mode = Mode::AddValue { name, kind, ty, writable, buf };
@@ -486,7 +491,10 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
                             app.rows[row].display = format_scalar(&v);
                             app.status = format!("set {name}");
                         }
-                        Err(e) => app.status = e,
+                        Err(e) => {
+                            app.status = e;
+                            app.mode = Mode::Edit { row, buf };
+                        }
                     },
                     Kind::Array => match parse_array(r.ty, &buf) {
                         Ok(v) => {
@@ -494,7 +502,10 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
                             app.rows[row].display = format_array(&v);
                             app.status = format!("set {name}");
                         }
-                        Err(e) => app.status = e,
+                        Err(e) => {
+                            app.status = e;
+                            app.mode = Mode::Edit { row, buf };
+                        }
                     },
                 }
             }
