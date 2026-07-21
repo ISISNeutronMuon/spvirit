@@ -86,9 +86,29 @@ pub fn is_enum_only(g: &Generator) -> bool {
     matches!(g, Generator::Cycle)
 }
 
+impl Generator {
+    /// The parameter keys this generator actually reads in `sample`. A key
+    /// outside this set is rejected by `build_anim` (rather than silently
+    /// ignored) so that e.g. `sine min=-2` — which does nothing, since sine's
+    /// range is `amp`/`offset` — fails loudly instead of misleading the user.
+    fn param_keys(self) -> &'static [&'static str] {
+        match self {
+            Generator::Sine => &["amp", "offset", "period", "phase"],
+            Generator::Ramp => &["min", "max", "period"],
+            Generator::Triangle => &["min", "max", "period"],
+            Generator::Square => &["lo", "hi", "period", "duty"],
+            Generator::Noise => &["min", "max"],
+            Generator::Walk => &["start", "step", "min", "max"],
+            Generator::Count => &["start", "step"],
+            Generator::Cycle => &["period"],
+        }
+    }
+}
+
 /// Build an `AnimSpec` from a generator name and raw `key=value` params.
-/// Unknown generators or unparsable params are errors; unknown param keys for
-/// a generator are ignored (forward-compatible).
+/// Unknown generators, unparsable values, and params the chosen generator does
+/// not use are all errors (the last so that inapplicable params fail loudly
+/// rather than being silently ignored).
 pub fn build_anim(generator: &str, params: &[(String, String)]) -> Result<AnimSpec, String> {
     let g = match generator {
         "sine" => Generator::Sine,
@@ -101,12 +121,19 @@ pub fn build_anim(generator: &str, params: &[(String, String)]) -> Result<AnimSp
         "cycle" => Generator::Cycle,
         other => return Err(format!("unknown generator {other:?}")),
     };
+    let keys = g.param_keys();
     let mut p = Params::default();
     // `period` for cycle defaults to 1.0
     if g == Generator::Cycle {
         p.period = 1.0;
     }
     for (k, v) in params {
+        if !keys.contains(&k.as_str()) {
+            return Err(format!(
+                "{generator}: param {k:?} is not used by {generator} (uses: {})",
+                keys.join(", ")
+            ));
+        }
         let f: f64 = v.parse().map_err(|_| format!("{generator}: param {k}={v:?} is not a number"))?;
         match k.as_str() {
             "amp" => p.amp = f,
@@ -235,5 +262,24 @@ mod tests {
     fn unknown_generator_and_bad_param() {
         assert!(build_anim("bogus", &[]).is_err());
         assert!(build_anim("sine", &[("amp".into(), "x".into())]).is_err());
+    }
+
+    #[test]
+    fn rejects_params_a_generator_does_not_use() {
+        // sine's range is amp/offset, not min/max — min must be rejected, not
+        // silently ignored (the bug: sine min=-2 stayed at the default ±1).
+        let err = build_anim("sine", &[("min".into(), "-2".into())]).unwrap_err();
+        assert!(err.contains("min"), "error should name the offending key: {err}");
+        assert!(err.contains("amp"), "error should list the params sine uses: {err}");
+
+        // square uses lo/hi, not min/max.
+        assert!(build_anim("square", &[("max".into(), "1".into())]).is_err());
+        // count uses start/step, not min/max.
+        assert!(build_anim("count", &[("min".into(), "0".into())]).is_err());
+
+        // applicable params still build fine.
+        assert!(build_anim("sine", &[("amp".into(), "1.5".into()), ("offset".into(), "-0.5".into())]).is_ok());
+        assert!(build_anim("noise", &[("min".into(), "-2".into()), ("max".into(), "1".into())]).is_ok());
+        assert!(build_anim("ramp", &[("min".into(), "-2".into()), ("max".into(), "1".into()), ("period".into(), "5".into())]).is_ok());
     }
 }
