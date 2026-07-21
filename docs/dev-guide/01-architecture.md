@@ -1,0 +1,117 @@
+# Architecture Overview
+
+## What this project is
+
+Spvirit is a from-scratch Rust implementation of the EPICS **PVAccess**
+protocol: wire codec, client, server (softIOC-like), CLI tools, and Python
+bindings. It interoperates with EPICS Base, p4p/pvxs, and PVAccessJava.
+
+If you are new to EPICS, read the "Key Concepts" section of the top-level
+`README.md` first — it explains PVs, records, `.db` files, and Normative
+Types (NT) with diagrams. This guide assumes that vocabulary.
+
+## Crate dependency graph
+
+```
+                 spvirit-types        (pure NT data model, zero deps)
+                       │
+                 spvirit-codec        (PVA wire format + PVD codec + state tracker)
+                    ┌──┴──────────┐
+             spvirit-client   spvirit-server
+                    └──┬──────────┘
+              ┌────────┴────────┐
+        spvirit-tools      spvirit-py
+        (CLI binaries)     (PyO3 bindings)
+```
+
+- **spvirit-types** — `ScalarValue`, `NtScalar`, `NtPayload`, etc. Everything
+  the wire carries, as plain Rust data. Chapter 02.
+- **spvirit-codec** — encode/decode for both protocol layers: the PVA message
+  layer (headers, commands) and the PVD data layer (introspection
+  descriptors, values, bitsets). Also a passive connection-state tracker used
+  by the diagnostic tools. Chapter 02.
+- **spvirit-client** — search/discovery, channel lifecycle, get/put/monitor/
+  info. Chapter 04.
+- **spvirit-server** — the `Source` provider model, `SimplePvStore` record
+  store, protocol runtime (UDP search, TCP handler, beacons, monitors), `.db`
+  parser, and the typed `Pv<T>` handle layer. Chapter 03.
+- **spvirit-tools** — 11 CLI binaries (`spget`, `spput`, `spmonitor`,
+  `spexplore`, `spserver`, …) plus the workspace's integration/interop test
+  suite. Chapter 04.
+- **spvirit-py** — PyO3 bindings mirroring the handle API in Python,
+  plus Python-defined dynamic sources and a low-level channel/codec surface.
+  Chapter 05.
+
+## The two protocol layers
+
+PVAccess is two nested encodings, and the codec keeps them in separate
+modules:
+
+1. **PVA message layer** (`epics_decode.rs` / `spvirit_encode.rs`): 8-byte
+   header (magic 0xCA, flags carrying byte order + segmentation, command
+   byte, payload length), ~20 command types (Search, CreateChannel, the Op
+   family for GET/PUT/MONITOR/RPC, Beacon, …).
+2. **PVD data layer** (`spvd_decode.rs` / `spvd_encode.rs`): self-describing
+   structured data — type descriptors (`FieldDesc`/`StructureDesc`) with a
+   per-connection introspection cache, values (`DecodedValue`), and bitsets
+   for delta updates.
+
+Key asymmetry to internalize: **NT types flow into the encoder; the decoder
+emits `DecodedValue`**, a separate tree. Consumers (server, client, py) each
+convert `DecodedValue` to what they need — there is no shared reverse
+mapping.
+
+## Server data flow (the picture to keep in your head)
+
+```
+                     ┌────────────── PvaServer::run ──────────────┐
+ client SEARCH ──► UDP responder          TCP handler ◄── client TCP
+                        │                  │       ▲
+                        │            decode PUT    │ frames (writer task)
+                        ▼                  ▼       │
+                  SourceRegistry ──► SimplePvStore ──► MonitorRegistry
+                  (priority list)    (records, MDEL,     (per-sub delta
+                   builtin @0        validators, links,   frames, pipeline
+                   record-fields @10 on_put, timestamps)  credits)
+                   user sources)           ▲
+                                           │ set_value / set (internal writes)
+                              scan tasks / Pv<T> handles / links
+```
+
+Two write entry points converge on the store: wire PUTs (via the handler →
+registry → `Source::put`) and internal writes (scan callbacks, `Pv::set`,
+link evaluation → `store.set_value`). Both end at
+`MonitorRegistry::notify_monitors`, which builds full-or-delta frames per
+subscriber and pushes bytes into each connection's writer channel.
+
+## Two API levels, everywhere
+
+The project consistently offers an IOC-style record level and a raw-NT level
+(the README's "IOC-style records vs raw NT PVs" table is the user-facing
+version of this):
+
+| | Record level | Raw NT level |
+|---|---|---|
+| Rust server | `Pv<T>` handles, builder methods, `.db` files | `put_nt`/`get_nt`, hand-built `RecordInstance`, custom `Source` |
+| Python | `spvirit.ai(...)` etc., `Server(pvs=[...])` | `Store.put_nt`, `NtScalar`/`NtTable` classes, dynamic sources + `Notifier` |
+| Behavior | alarms computed, timestamps stamped, MDEL applied | caller owns metadata; every post goes out |
+
+Keep new features consistent with this split: record-level conveniences
+should be sugar over the NT level, not a parallel implementation.
+
+## Design invariants worth knowing before changing anything
+
+1. **Timestamps**: a missing (`None`/epoch-0) timestamp is stamped at
+   *encode* time, which breaks monitor deltas and Archiver Appliance
+   ingestion. All mutation paths stamp update time; keep it that way.
+2. **The introspection registry is per-connection state** — decoders must be
+   reused across a connection's packets (0xFE type refs).
+3. **First-claim-wins source priority** — `claim` must be cheap and
+   idempotent because `get`/`put`/`subscribe` re-claim.
+4. **on_put (post-apply, can't reject) vs PUT validator (pre-apply, can
+   reject)** are different mechanisms; the Python `on_put` maps to the
+   validator.
+5. **Monitor bitset ordering is heuristic** (three decode variants + scoring)
+   because implementations disagree; be careful "simplifying" it.
+6. **Bool coercion trap**: `decoded_to_scalar_value` checks truthiness before
+   numeric types; typed paths override `from_decoded` to avoid it.
