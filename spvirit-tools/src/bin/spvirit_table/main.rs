@@ -18,6 +18,8 @@ use parse::{WireType, format_array, format_scalar, parse_array, parse_scalar};
 
 mod pattern;
 
+mod anim;
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Kind {
     Scalar,
