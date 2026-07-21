@@ -1033,6 +1033,7 @@ At the top of `spvirit_table.rs`, extend imports:
 
 ```rust
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1098,6 +1099,9 @@ struct Live {
 }
 
 type Animators = Arc<Mutex<HashMap<String, Live>>>;
+
+/// Shared, live-tunable tick rate in Hz, encoded as `f64::to_bits`.
+type RateHz = Arc<AtomicU64>;
 ```
 
 - [ ] **Step 3: Extend `App` and `Mode`**
@@ -1138,7 +1142,7 @@ struct App {
     tcp_port: u16,
     udp_port: u16,
     animators: Animators,
-    rate_hz: f64,
+    rate: RateHz,
 }
 ```
 
@@ -1153,6 +1157,7 @@ struct ServerHandle {
     rt: tokio::runtime::Runtime,
     server: RunningServer,
     animators: Animators,
+    rate: RateHz,
 }
 
 impl ServerHandle {
@@ -1170,15 +1175,17 @@ impl ServerHandle {
                 .await
         });
         let animators: Animators = Arc::new(Mutex::new(HashMap::new()));
+        let rate: RateHz = Arc::new(AtomicU64::new(rate_hz.to_bits()));
 
         // Background tick task: sample all animators and write to the store.
+        // Re-reads the shared rate each iteration so `:rate` retunes live.
         let store = server.store().clone();
         let anim_map = animators.clone();
-        let period = Duration::from_secs_f64(1.0 / rate_hz);
+        let rate_read = rate.clone();
         rt.spawn(async move {
-            let mut ticker = tokio::time::interval(period);
             loop {
-                ticker.tick().await;
+                let hz = f64::from_bits(rate_read.load(Ordering::Relaxed)).max(0.1);
+                tokio::time::sleep(Duration::from_secs_f64(1.0 / hz)).await;
                 // Compute under the lock; do NOT hold it across awaits.
                 let updates: Vec<(String, ScalarValue, Option<Vec<String>>, i32)> = {
                     let mut map = anim_map.lock().unwrap();
@@ -1211,7 +1218,7 @@ impl ServerHandle {
             }
         });
 
-        Ok(Self { rt, server, animators })
+        Ok(Self { rt, server, animators, rate })
     }
 
     fn add_scalar(&self, name: &str, v: ScalarValue, writable: bool) {
@@ -1258,6 +1265,9 @@ impl ServerHandle {
     fn animators(&self) -> &Animators {
         &self.animators
     }
+    fn rate(&self) -> &RateHz {
+        &self.rate
+    }
     fn abort(&self) {
         self.server.abort();
     }
@@ -1301,7 +1311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcp_port,
         udp_port,
         animators: srv.animators().clone(),
-        rate_hz,
+        rate: srv.rate().clone(),
     };
     let result = run_ui(terminal, app, &srv);
     ratatui::restore();
@@ -1439,8 +1449,9 @@ fn exec_command(app: &mut App, srv: &ServerHandle, line: &str) {
     match cmd {
         Command::Quit => { /* handled by caller via a sentinel below */ }
         Command::Help => { app.mode = Mode::Help; }
-        Command::Rate { .. } => {
-            app.status = "rate changes require restart (--rate); tick task is fixed at startup".into();
+        Command::Rate { hz } => {
+            app.rate.store(hz.to_bits(), Ordering::Relaxed);
+            app.status = format!("tick rate -> {hz} Hz");
         }
         Command::Add { pattern, spec, writable, value } => exec_add(app, srv, &pattern, spec, writable, &value),
         Command::Set { pattern, value } => exec_set(app, srv, &pattern, &value),
@@ -1454,7 +1465,7 @@ fn exec_command(app: &mut App, srv: &ServerHandle, line: &str) {
 }
 ```
 
-Note on `:rate` — the tick task's interval is fixed when the runtime task is spawned. Rather than add live-reconfiguration plumbing (YAGNI), `:rate` reports that the rate is set via `--rate` at startup. `App.rate_hz` is shown in the title bar. (If live rate is wanted later, the tick task can read an `Arc<AtomicU64>`.)
+Note on `:rate` — the tick task re-reads the shared `Arc<AtomicU64>` (`app.rate`) each iteration, so `:rate 20` retunes the running animation on the next tick. The current rate is shown in the title bar.
 
 - [ ] **Step 3: Implement the per-verb executors**
 
@@ -1763,7 +1774,7 @@ In `draw`, replace the body-row builder so the Value column shows a `~` prefix f
     drop(animated);
 ```
 
-(Change the `Table::new(body, widths)` call to take the collected `Vec`.) Update the title format string to end with `(a add · : cmd · ? help · q quit)` and include `rate {rate_hz}Hz`.
+(Change the `Table::new(body, widths)` call to take the collected `Vec`.) Update the title format string to end with `(a add · : cmd · ? help · q quit)` and include the current rate, read live: `let rate_hz = f64::from_bits(app.rate.load(Ordering::Relaxed));` then `rate {rate_hz}Hz`.
 
 Extend `prompt_text` for the two new modes:
 
@@ -2058,7 +2069,7 @@ git commit -m "docs+test: document sptable types/commands/animation; wire enum t
 - Module split → Tasks 2/4/5 create `parse`/`pattern`/`anim`. ✓
 - Docs + wire test → Task 9. ✓
 
-**Placeholder scan:** No TBD/TODO. Every code step shows complete code. The `:rate` live-reconfig limitation is called out explicitly (reports startup-only) rather than left vague. The wire-test assertion note (index vs choice) is a real, bounded adjust-after-first-run, not a placeholder.
+**Placeholder scan:** No TBD/TODO. Every code step shows complete code. `:rate` retunes the tick task live via a shared `Arc<AtomicU64>`. The wire-test assertion note (index vs choice) is a real, bounded adjust-after-first-run, not a placeholder.
 
 **Type consistency:**
 - `expand_pattern(&str) -> Result<Vec<String>, String>` and `EXPAND_CAP` consistent across Tasks 4/7.
