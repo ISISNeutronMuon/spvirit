@@ -93,5 +93,5 @@ required-features = ["client"]
 
 [[bin]]
 name = "sptable"
-path = "src/bin/spvirit_table.rs"
+path = "src/bin/spvirit_table/main.rs"
 required-features = ["server", "tui"]
