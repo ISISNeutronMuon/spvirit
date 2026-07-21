@@ -250,7 +250,7 @@ Extend `parse` with alias-aware type tokens, a spec descriptor, the command AST,
   - `pub enum SpecInput { Scalar(WireType), Array(WireType), Enum, Table }`
   - `pub fn parse_typespec(tok: &str) -> Result<SpecInput, String>`
   - `pub fn coerce_scalar(raw: f64, ty: WireType) -> ScalarValue`
-  - `pub enum Command { Add { pattern, spec, writable, value }, Set { pattern, value }, Del { pattern: Option<String> }, Rename { old, new }, Access { pattern, writable }, Anim { pattern, gen: String, params: Vec<(String, String)> }, Stop { pattern: Option<String> }, Rate { hz: f64 }, Source { path: String }, Help, Quit }`
+  - `pub enum Command { Add { pattern, spec, writable, value }, Set { pattern, value }, Del { pattern: Option<String> }, Rename { old, new }, Access { pattern, writable }, Anim { pattern, generator: String, params: Vec<(String, String)> }, Stop { pattern: Option<String> }, Rate { hz: f64 }, Source { path: String }, Help, Quit }` (field named `generator`, not `gen` — reserved keyword in edition 2024)
   - `pub fn parse_command(line: &str) -> Result<Command, String>`
 
 - [ ] **Step 1: Write the failing tests**
@@ -329,9 +329,9 @@ fn parse_command_verbs_and_shorthands() {
         Command::Access { writable: true, .. }));
     // anim
     match parse_command("anim SIM:X sine amp=5 period=2").unwrap() {
-        Command::Anim { pattern, gen, params } => {
+        Command::Anim { pattern, generator, params } => {
             assert_eq!(pattern, "SIM:X");
-            assert_eq!(gen, "sine");
+            assert_eq!(generator, "sine");
             assert_eq!(params, vec![("amp".to_string(), "5".to_string()),
                                     ("period".to_string(), "2".to_string())]);
         }
@@ -446,7 +446,7 @@ pub enum Command {
     Del { pattern: Option<String> },
     Rename { old: String, new: String },
     Access { pattern: String, writable: bool },
-    Anim { pattern: String, gen: String, params: Vec<(String, String)> },
+    Anim { pattern: String, generator: String, params: Vec<(String, String)> },
     Stop { pattern: Option<String> },
     Rate { hz: f64 },
     Source { path: String },
@@ -495,13 +495,13 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
         }
         "anim" => {
             let name = rest.first().ok_or("anim: missing name")?;
-            let gen = rest.get(1).ok_or("anim: missing generator")?;
+            let generator = rest.get(1).ok_or("anim: missing generator")?;
             let mut params = Vec::new();
             for kv in &rest[2..] {
                 let (k, v) = kv.split_once('=').ok_or_else(|| format!("anim: bad param {kv:?} (want key=value)"))?;
                 params.push((k.to_string(), v.to_string()));
             }
-            Ok(Command::Anim { pattern: name.to_string(), gen: gen.to_string(), params })
+            Ok(Command::Anim { pattern: name.to_string(), generator: generator.to_string(), params })
         }
         "stop" => Ok(Command::Stop { pattern: rest.first().map(|s| s.to_string()) }),
         "rate" => {
@@ -723,11 +723,11 @@ git commit -m "feat(tools): sptable brace-pattern expansion"
 - Produces:
   - `pub struct Rng { state: u64 }` with `new(seed: u64)`, `next_f64(&mut self) -> f64` (uniform [0,1))
   - `pub enum Generator { Sine, Ramp, Triangle, Square, Noise, Walk, Count, Cycle }`
-  - `pub struct AnimSpec { pub gen: Generator, pub p: Params }` where `Params` holds all resolved numeric fields
+  - `pub struct AnimSpec { pub generator: Generator, pub p: Params }` where `Params` holds all resolved numeric fields (name it `generator`, not `gen` — `gen` is a reserved keyword in edition 2024)
   - `pub struct AnimState { rng: Rng, count: f64, walk: f64, walk_init: bool }` with `new(seed: u64)`
-  - `pub fn build_anim(gen: &str, params: &[(String, String)]) -> Result<AnimSpec, String>`
+  - `pub fn build_anim(generator: &str, params: &[(String, String)]) -> Result<AnimSpec, String>`
   - `pub fn sample(spec: &AnimSpec, st: &mut AnimState, t: f64) -> f64`
-  - `pub fn is_enum_only(gen: &Generator) -> bool` (true for `Cycle`)
+  - `pub fn is_enum_only(g: &Generator) -> bool` (true for `Cycle`)
 
 - [ ] **Step 1: Write the failing tests + skeleton**
 
@@ -744,10 +744,10 @@ use std::f64::consts::PI;
 mod tests {
     use super::*;
 
-    fn spec(gen: &str, params: &[(&str, &str)]) -> AnimSpec {
+    fn spec(generator: &str, params: &[(&str, &str)]) -> AnimSpec {
         let p: Vec<(String, String)> =
             params.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        build_anim(gen, &p).unwrap()
+        build_anim(generator, &p).unwrap()
     }
 
     #[test]
@@ -795,7 +795,7 @@ mod tests {
         assert_eq!(sample(&s, &mut st, 0.0), 2.0);
 
         let c = spec("cycle", &[("period", "2")]);
-        assert!(is_enum_only(&c.gen));
+        assert!(is_enum_only(&c.generator));
         let mut cs = AnimState::new(1);
         // index grows as floor(t/period)
         assert_eq!(sample(&c, &mut cs, 0.0), 0.0);
@@ -886,7 +886,7 @@ impl Default for Params {
 
 #[derive(Copy, Clone, Debug)]
 pub struct AnimSpec {
-    pub gen: Generator,
+    pub generator: Generator,
     pub p: Params,
 }
 
@@ -903,15 +903,15 @@ impl AnimState {
     }
 }
 
-pub fn is_enum_only(gen: &Generator) -> bool {
-    matches!(gen, Generator::Cycle)
+pub fn is_enum_only(g: &Generator) -> bool {
+    matches!(g, Generator::Cycle)
 }
 
 /// Build an `AnimSpec` from a generator name and raw `key=value` params.
 /// Unknown generators or unparsable params are errors; unknown param keys for
 /// a generator are ignored (forward-compatible).
-pub fn build_anim(gen: &str, params: &[(String, String)]) -> Result<AnimSpec, String> {
-    let g = match gen {
+pub fn build_anim(generator: &str, params: &[(String, String)]) -> Result<AnimSpec, String> {
+    let g = match generator {
         "sine" => Generator::Sine,
         "ramp" => Generator::Ramp,
         "triangle" => Generator::Triangle,
@@ -928,7 +928,7 @@ pub fn build_anim(gen: &str, params: &[(String, String)]) -> Result<AnimSpec, St
         p.period = 1.0;
     }
     for (k, v) in params {
-        let f: f64 = v.parse().map_err(|_| format!("{gen}: param {k}={v:?} is not a number"))?;
+        let f: f64 = v.parse().map_err(|_| format!("{generator}: param {k}={v:?} is not a number"))?;
         match k.as_str() {
             "amp" => p.amp = f,
             "offset" => p.offset = f,
@@ -945,9 +945,9 @@ pub fn build_anim(gen: &str, params: &[(String, String)]) -> Result<AnimSpec, St
         }
     }
     if p.period <= 0.0 {
-        return Err(format!("{gen}: period must be positive"));
+        return Err(format!("{generator}: period must be positive"));
     }
-    Ok(AnimSpec { gen: g, p })
+    Ok(AnimSpec { generator: g, p })
 }
 ```
 
@@ -961,7 +961,7 @@ Add to `anim.rs`:
 /// caller coerces to the PV's wire type (or, for `cycle`, to an enum index).
 pub fn sample(spec: &AnimSpec, st: &mut AnimState, t: f64) -> f64 {
     let p = &spec.p;
-    match spec.gen {
+    match spec.generator {
         Generator::Sine => p.offset + p.amp * (2.0 * PI * t / p.period + p.phase).sin(),
         Generator::Ramp => {
             let frac = (t / p.period).rem_euclid(1.0);
@@ -1458,7 +1458,7 @@ fn exec_command(app: &mut App, srv: &ServerHandle, line: &str) {
         Command::Del { pattern } => exec_del(app, srv, pattern),
         Command::Rename { old, new } => exec_rename(app, srv, &old, &new),
         Command::Access { pattern, writable } => exec_access(app, srv, &pattern, writable),
-        Command::Anim { pattern, gen, params } => exec_anim(app, srv, &pattern, &gen, &params),
+        Command::Anim { pattern, generator, params } => exec_anim(app, srv, &pattern, &generator, &params),
         Command::Stop { pattern } => exec_stop(app, srv, pattern),
         Command::Source { path } => exec_source(app, srv, &path),
     }
@@ -1665,8 +1665,8 @@ fn exec_access(app: &mut App, srv: &ServerHandle, pattern: &str, writable: bool)
     app.status = format!("access changed on {changed}");
 }
 
-fn exec_anim(app: &mut App, srv: &ServerHandle, pattern: &str, gen: &str, params: &[(String, String)]) {
-    let spec = match build_anim(gen, params) { Ok(s) => s, Err(e) => { app.status = e; return; } };
+fn exec_anim(app: &mut App, srv: &ServerHandle, pattern: &str, generator: &str, params: &[(String, String)]) {
+    let spec = match build_anim(generator, params) { Ok(s) => s, Err(e) => { app.status = e; return; } };
     let names = match expand_pattern(pattern) { Ok(n) => n, Err(e) => { app.status = e; return; } };
     let mut on = 0usize;
     let mut seed: u64 = 0x9E3779B97F4A7C15;
@@ -1674,7 +1674,7 @@ fn exec_anim(app: &mut App, srv: &ServerHandle, pattern: &str, gen: &str, params
         let Some(i) = row_index(app, &name) else { continue; };
         let target = match &app.rows[i].spec {
             PvSpec::Scalar(ty) if *ty != WireType::Str => Target::Scalar(*ty),
-            PvSpec::Enum { choices } if is_enum_only(&spec.gen) => Target::Enum(choices.clone()),
+            PvSpec::Enum { choices } if is_enum_only(&spec.generator) => Target::Enum(choices.clone()),
             PvSpec::Enum { .. } => { app.status = format!("{name}: enum takes only the 'cycle' generator"); return; }
             _ => { app.status = format!("{name}: only numeric scalars (and enum+cycle) are animatable"); return; }
         };
@@ -1683,7 +1683,7 @@ fn exec_anim(app: &mut App, srv: &ServerHandle, pattern: &str, gen: &str, params
         app.animators.lock().unwrap().insert(name, live);
         on += 1;
     }
-    app.status = format!("animating {on} ({gen})");
+    app.status = format!("animating {on} ({generator})");
 }
 
 fn exec_stop(app: &mut App, _srv: &ServerHandle, pattern: Option<String>) {
@@ -2073,8 +2073,8 @@ git commit -m "docs+test: document sptable types/commands/animation; wire enum t
 
 **Type consistency:**
 - `expand_pattern(&str) -> Result<Vec<String>, String>` and `EXPAND_CAP` consistent across Tasks 4/7.
-- `parse_command(&str) -> Result<Command, String>` and the `Command` variants (`Add{pattern,spec,writable,value}`, `Set{pattern,value}`, `Del{pattern:Option}`, `Rename{old,new}`, `Access{pattern,writable}`, `Anim{pattern,gen,params}`, `Stop{pattern:Option}`, `Rate{hz}`, `Source{path}`, `Help`, `Quit`) defined in Task 3, consumed unchanged in Task 7.
-- `build_anim(gen:&str, params:&[(String,String)]) -> Result<AnimSpec,String>` and `sample(&AnimSpec, &mut AnimState, f64) -> f64` defined Task 5, used Tasks 6/7.
+- `parse_command(&str) -> Result<Command, String>` and the `Command` variants (`Add{pattern,spec,writable,value}`, `Set{pattern,value}`, `Del{pattern:Option}`, `Rename{old,new}`, `Access{pattern,writable}`, `Anim{pattern,generator,params}`, `Stop{pattern:Option}`, `Rate{hz}`, `Source{path}`, `Help`, `Quit`) defined in Task 3, consumed unchanged in Task 7.
+- `build_anim(generator:&str, params:&[(String,String)]) -> Result<AnimSpec,String>` and `sample(&AnimSpec, &mut AnimState, f64) -> f64` defined Task 5, used Tasks 6/7.
 - `coerce_scalar(f64, WireType) -> ScalarValue` defined Task 3, used in Task 6 tick task.
 - `ServerHandle` methods (`add_enum`, `add_table`, `set_enum`, `read_enum`, `animators`) defined Task 6, used Tasks 7/8.
 - `PvSpec` / `AddKind` / `Target` / `Live` / `Animators` defined Task 6, used Tasks 7/8.
