@@ -119,6 +119,14 @@ impl SimplePvStore {
         );
     }
 
+    /// Remove a PV record at runtime. Returns `true` if a record was removed,
+    /// `false` if no record with that name existed. Dropping the entry drops
+    /// its subscriber senders, which closes any active monitor channels for
+    /// that PV.
+    pub async fn remove(&self, name: &str) -> bool {
+        self.pvs.write().await.remove(name).is_some()
+    }
+
     /// Read the current [`ScalarValue`] of a PV.
     pub async fn get_value(&self, name: &str) -> Option<ScalarValue> {
         let pvs = self.pvs.read().await;
@@ -1468,6 +1476,22 @@ record(ao, "DB:AO") {
         assert_eq!(res, Err("nope".to_string()));
         // value unchanged — validator ran BEFORE apply
         assert_eq!(store.get_value("V").await, Some(ScalarValue::F64(1.0)));
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_record_and_is_idempotent() {
+        let mut records = std::collections::HashMap::new();
+        records.insert(
+            "T:GONE".to_string(),
+            crate::pva_server::make_scalar_record("T:GONE", RecordType::Ai, ScalarValue::F64(1.0)),
+        );
+        let store = SimplePvStore::new(records, Default::default(), Vec::new(), false);
+
+        assert!(store.get_value("T:GONE").await.is_some());
+        assert!(store.remove("T:GONE").await, "first remove returns true");
+        assert!(store.get_value("T:GONE").await.is_none(), "record is gone");
+        assert!(!store.remove("T:GONE").await, "second remove returns false");
+        assert!(store.claim("T:GONE").await.is_none(), "claim no longer matches");
     }
 
     #[tokio::test]

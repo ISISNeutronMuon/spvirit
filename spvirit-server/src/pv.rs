@@ -586,10 +586,11 @@ impl<T: PvScalar> Pv<T> {
         {
             Ok(())
         } else if store.get_value(&self.shared.name).await.is_some() {
-            // Record exists — the write was a no-op (value unchanged). This
-            // existence check is a benign TOCTOU: records are never removed
-            // from SimplePvStore, so a `Some` here can't go stale by the time
-            // we return `Ok`.
+            // Record exists — the write was a no-op (value unchanged). Records
+            // CAN now be removed at runtime (`SimplePvStore::remove`), so this
+            // is a genuine (benign) TOCTOU: if the record were removed between
+            // the failed set and this check we would fall through to the
+            // `NotFound` arm, which is the correct outcome.
             Ok(())
         } else {
             Err(PvError::NotFound(self.shared.name.clone()))
