@@ -1,7 +1,10 @@
 //! sptable — interactive spreadsheet IOC. Each row is one dynamically-added PV.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -11,36 +14,72 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Table
 
 use spvirit_tools::spvirit_server::pv::AnyPv;
 use spvirit_tools::spvirit_server::pva_server::{PvaServer, RunningServer};
-use spvirit_types::{ScalarArrayValue, ScalarValue};
+use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 mod parse;
-use parse::{WireType, format_array, format_scalar, parse_array, parse_scalar};
+use parse::{WireType, coerce_scalar, format_array, format_scalar, parse_array, parse_scalar};
 
 mod pattern;
 
 mod anim;
+use anim::{AnimSpec, AnimState, Generator, is_enum_only, sample};
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum Kind {
-    Scalar,
-    Array,
+enum PvSpec {
+    Scalar(WireType),
+    Array(WireType),
+    Enum { choices: Vec<String> },
+    Table { columns: Vec<(String, WireType)> },
 }
 
-impl Kind {
-    fn label(self) -> &'static str {
+impl PvSpec {
+    fn kind_label(&self) -> &'static str {
         match self {
-            Kind::Scalar => "scalar",
-            Kind::Array => "array",
+            PvSpec::Scalar(_) => "scalar",
+            PvSpec::Array(_) => "array",
+            PvSpec::Enum { .. } => "enum",
+            PvSpec::Table { .. } => "table",
+        }
+    }
+    fn type_label(&self) -> String {
+        match self {
+            PvSpec::Scalar(t) | PvSpec::Array(t) => t.label().to_string(),
+            PvSpec::Enum { .. } => "enum".to_string(),
+            PvSpec::Table { .. } => "table".to_string(),
         }
     }
 }
 
 struct PvRow {
     name: String,
-    kind: Kind,
-    ty: WireType,
     writable: bool,
-    display: String, // last known value, formatted
+    display: String,
+    spec: PvSpec,
+}
+
+/// How a sampled value is applied to a PV.
+enum Target {
+    Scalar(WireType),
+    Enum(Vec<String>),
+}
+
+/// A running animation: spec + mutable state + wall-clock origin + target.
+struct Live {
+    spec: AnimSpec,
+    state: AnimState,
+    start: Instant,
+    target: Target,
+}
+
+type Animators = Arc<Mutex<HashMap<String, Live>>>;
+
+/// Shared, live-tunable tick rate in Hz, encoded as `f64::to_bits`.
+type RateHz = Arc<AtomicU64>;
+
+#[derive(Copy, Clone)]
+enum AddKind {
+    Scalar,
+    Array,
+    Enum,
 }
 
 /// Modal input state for the multi-step "add row" flow and inline edit.
@@ -48,10 +87,14 @@ enum Mode {
     Browse,
     AddName { buf: String },
     AddKind { name: String },
-    AddType { name: String, kind: Kind, idx: usize },
-    AddAccess { name: String, kind: Kind, ty: WireType, writable: bool },
-    AddValue { name: String, kind: Kind, ty: WireType, writable: bool, buf: String },
+    AddType { name: String, kind: AddKind, idx: usize },
+    AddChoices { name: String, buf: String },              // enum wizard
+    AddIndex { name: String, choices: Vec<String>, buf: String },
+    AddAccess { name: String, spec_kind: AddKind, ty: WireType, choices: Vec<String>, index: i32, writable: bool },
+    AddValue { name: String, ty: WireType, is_array: bool, writable: bool, buf: String },
     Edit { row: usize, buf: String },
+    Command { buf: String },
+    Help,
 }
 
 struct App {
@@ -61,16 +104,20 @@ struct App {
     status: String,
     tcp_port: u16,
     udp_port: u16,
+    animators: Animators,
+    rate: RateHz,
 }
 
 /// Owns the runtime + running server; all async store calls go through here.
 struct ServerHandle {
     rt: tokio::runtime::Runtime,
     server: RunningServer,
+    animators: Animators,
+    rate: RateHz,
 }
 
 impl ServerHandle {
-    fn start(tcp: u16, udp: u16) -> Result<Self, Box<dyn std::error::Error>> {
+    fn start(tcp: u16, udp: u16, rate_hz: f64) -> Result<Self, Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -83,7 +130,53 @@ impl ServerHandle {
                 .start()
                 .await
         });
-        Ok(Self { rt, server })
+        let animators: Animators = Arc::new(Mutex::new(HashMap::new()));
+        let rate: RateHz = Arc::new(AtomicU64::new(rate_hz.to_bits()));
+
+        // Background tick task: sample all animators and write to the store.
+        // Re-reads the shared rate each iteration so `:rate` retunes live.
+        let store = server.store().clone();
+        let anim_map = animators.clone();
+        let rate_read = rate.clone();
+        rt.spawn(async move {
+            loop {
+                let hz = f64::from_bits(rate_read.load(Ordering::Relaxed)).max(0.1);
+                tokio::time::sleep(Duration::from_secs_f64(1.0 / hz)).await;
+                // Compute under the lock; do NOT hold it across awaits.
+                let updates: Vec<(String, ScalarValue, Option<Vec<String>>, i32)> = {
+                    let mut map = anim_map.lock().unwrap();
+                    map.iter_mut()
+                        .map(|(name, live)| {
+                            let t = live.start.elapsed().as_secs_f64();
+                            let raw = sample(&live.spec, &mut live.state, t);
+                            match &live.target {
+                                Target::Scalar(ty) => {
+                                    (name.clone(), coerce_scalar(raw, *ty), None, 0)
+                                }
+                                Target::Enum(choices) => {
+                                    let n = choices.len().max(1) as i64;
+                                    let idx = (raw as i64).rem_euclid(n) as i32;
+                                    (name.clone(), ScalarValue::I32(idx), Some(choices.clone()), idx)
+                                }
+                            }
+                        })
+                        .collect()
+                };
+                for (name, sval, choices, idx) in updates {
+                    match choices {
+                        None => {
+                            store.set_value(&name, sval).await;
+                        }
+                        Some(choices) => {
+                            let nt = NtPayload::Enum(spvirit_types::NtEnum::new(idx, choices));
+                            store.put_nt(&name, nt).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Self { rt, server, animators, rate })
     }
 
     fn add_scalar(&self, name: &str, v: ScalarValue, writable: bool) {
@@ -92,11 +185,21 @@ impl ServerHandle {
     fn add_array(&self, name: &str, v: ScalarArrayValue, writable: bool) {
         self.rt.block_on(self.server.add_array(name, v, writable));
     }
+    fn add_enum(&self, name: &str, choices: Vec<String>, index: i32, writable: bool) {
+        self.rt.block_on(self.server.add_enum(name, choices, index, writable));
+    }
+    fn add_table(&self, name: &str, columns: Vec<(String, ScalarArrayValue)>) {
+        self.rt.block_on(self.server.add_table(name, columns));
+    }
     fn set_scalar(&self, name: &str, v: ScalarValue) {
         self.rt.block_on(self.server.store().set_value(name, v));
     }
     fn set_array(&self, name: &str, v: ScalarArrayValue) {
         self.rt.block_on(self.server.store().set_array_value(name, v));
+    }
+    fn set_enum(&self, name: &str, index: i32, choices: Vec<String>) {
+        let nt = NtPayload::Enum(spvirit_types::NtEnum::new(index, choices));
+        self.rt.block_on(self.server.store().put_nt(name, nt));
     }
     fn remove(&self, name: &str) -> bool {
         self.rt.block_on(self.server.store().remove(name))
@@ -109,6 +212,22 @@ impl ServerHandle {
         self.rt
             .block_on(self.server.store().get_value(name))
             .map(|v| format_scalar(&v))
+    }
+    /// Read an enum row's current display: `index (choice)`.
+    fn read_enum(&self, name: &str) -> Option<String> {
+        match self.rt.block_on(self.server.store().get_nt(name)) {
+            Some(NtPayload::Enum(e)) => {
+                let choice = e.selected().unwrap_or("?");
+                Some(format!("{} ({})", e.index, choice))
+            }
+            _ => None,
+        }
+    }
+    fn animators(&self) -> &Animators {
+        &self.animators
+    }
+    fn rate(&self) -> &RateHz {
+        &self.rate
     }
     fn abort(&self) {
         self.server.abort();
@@ -126,8 +245,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let body = app.rows.iter().map(|r| {
         Row::new([
             Cell::from(r.name.clone()),
-            Cell::from(r.kind.label()),
-            Cell::from(r.ty.label()),
+            Cell::from(r.spec.kind_label()),
+            Cell::from(r.spec.type_label()),
             Cell::from(if r.writable { "RW" } else { "RO" }),
             Cell::from(r.display.clone()),
         ])
@@ -174,18 +293,21 @@ fn prompt_text(mode: &Mode) -> Option<(&'static str, String)> {
         Mode::AddType { idx, .. } => {
             Some((" type (←/→, Enter) ", WireType::ALL[*idx].label().to_string()))
         }
+        Mode::AddChoices { buf, .. } => {
+            Some((" enum choices, comma-separated (Enter) ", buf.clone()))
+        }
+        Mode::AddIndex { buf, .. } => Some((" initial index (Enter) ", buf.clone())),
         Mode::AddAccess { writable, .. } => Some((
             " access: [r]ead-only / [w]ritable (Enter) ",
             if *writable { "writable" } else { "read-only" }.to_string(),
         )),
-        Mode::AddValue { buf, ty, kind, .. } => Some((
-            match kind {
-                Kind::Array => " values, comma-separated (Enter) ",
-                Kind::Scalar => " initial value (Enter) ",
-            },
+        Mode::AddValue { buf, ty, is_array, .. } => Some((
+            if *is_array { " values, comma-separated (Enter) " } else { " initial value (Enter) " },
             format!("[{}] {}", ty.label(), buf),
         )),
         Mode::Edit { buf, .. } => Some((" new value (Enter) ", buf.clone())),
+        Mode::Command { buf } => Some((" command (Enter) ", buf.clone())),
+        Mode::Help => Some((" help ", "press any key to close".to_string())),
     }
 }
 
@@ -212,7 +334,7 @@ fn commit_add(
     app: &mut App,
     srv: &ServerHandle,
     name: &str,
-    kind: Kind,
+    is_array: bool,
     ty: WireType,
     writable: bool,
     val: &str,
@@ -222,30 +344,34 @@ fn commit_add(
         return false;
     }
     let display;
-    match kind {
-        Kind::Scalar => match parse_scalar(ty, val) {
-            Ok(v) => {
-                display = format_scalar(&v);
-                srv.add_scalar(name, v, writable);
-            }
-            Err(e) => {
-                app.status = e;
-                return false;
-            }
-        },
-        Kind::Array => match parse_array(ty, val) {
+    let spec;
+    if is_array {
+        match parse_array(ty, val) {
             Ok(v) => {
                 display = format_array(&v);
                 srv.add_array(name, v, writable);
+                spec = PvSpec::Array(ty);
             }
             Err(e) => {
                 app.status = e;
                 return false;
             }
-        },
+        }
+    } else {
+        match parse_scalar(ty, val) {
+            Ok(v) => {
+                display = format_scalar(&v);
+                srv.add_scalar(name, v, writable);
+                spec = PvSpec::Scalar(ty);
+            }
+            Err(e) => {
+                app.status = e;
+                return false;
+            }
+        }
     }
     app.status = format!("added {name}");
-    app.rows.push(PvRow { name: name.to_string(), kind, ty, writable, display });
+    app.rows.push(PvRow { name: name.to_string(), writable, display, spec });
     app.table.select(Some(app.rows.len() - 1));
     true
 }
@@ -307,8 +433,12 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
         },
         Mode::AddKind { name } => match code {
             KeyCode::Esc => {}
-            KeyCode::Char('s') => app.mode = Mode::AddType { name, kind: Kind::Scalar, idx: 0 },
-            KeyCode::Char('a') => app.mode = Mode::AddType { name, kind: Kind::Array, idx: 0 },
+            KeyCode::Char('s') => {
+                app.mode = Mode::AddType { name, kind: AddKind::Scalar, idx: 0 }
+            }
+            KeyCode::Char('a') => {
+                app.mode = Mode::AddType { name, kind: AddKind::Array, idx: 0 }
+            }
             _ => app.mode = Mode::AddKind { name },
         },
         Mode::AddType { name, kind, mut idx } => match code {
@@ -322,49 +452,65 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
                 app.mode = Mode::AddType { name, kind, idx };
             }
             KeyCode::Enter => {
-                app.mode = Mode::AddAccess { name, kind, ty: WireType::ALL[idx], writable: true }
+                app.mode = Mode::AddAccess {
+                    name,
+                    spec_kind: kind,
+                    ty: WireType::ALL[idx],
+                    choices: Vec::new(),
+                    index: 0,
+                    writable: true,
+                }
             }
             _ => app.mode = Mode::AddType { name, kind, idx },
         },
-        Mode::AddAccess { name, kind, ty, mut writable } => match code {
+        Mode::AddAccess { name, spec_kind, ty, choices, index, mut writable } => match code {
             KeyCode::Esc => {}
             KeyCode::Char('r') => {
                 writable = false;
-                app.mode = Mode::AddAccess { name, kind, ty, writable };
+                app.mode = Mode::AddAccess { name, spec_kind, ty, choices, index, writable };
             }
             KeyCode::Char('w') => {
                 writable = true;
-                app.mode = Mode::AddAccess { name, kind, ty, writable };
+                app.mode = Mode::AddAccess { name, spec_kind, ty, choices, index, writable };
             }
             KeyCode::Enter => {
-                app.mode = Mode::AddValue { name, kind, ty, writable, buf: String::new() }
+                let is_array = matches!(spec_kind, AddKind::Array);
+                app.mode = Mode::AddValue { name, ty, is_array, writable, buf: String::new() }
             }
-            _ => app.mode = Mode::AddAccess { name, kind, ty, writable },
+            _ => app.mode = Mode::AddAccess { name, spec_kind, ty, choices, index, writable },
         },
-        Mode::AddValue { name, kind, ty, writable, mut buf } => match code {
+        Mode::AddValue { name, ty, is_array, writable, mut buf } => match code {
             KeyCode::Esc => {}
             KeyCode::Enter => {
-                if !commit_add(app, srv, &name, kind, ty, writable, &buf) {
-                    app.mode = Mode::AddValue { name, kind, ty, writable, buf };
+                if !commit_add(app, srv, &name, is_array, ty, writable, &buf) {
+                    app.mode = Mode::AddValue { name, ty, is_array, writable, buf };
                 }
             }
             KeyCode::Char(c) => {
                 buf.push(c);
-                app.mode = Mode::AddValue { name, kind, ty, writable, buf };
+                app.mode = Mode::AddValue { name, ty, is_array, writable, buf };
             }
             KeyCode::Backspace => {
                 buf.pop();
-                app.mode = Mode::AddValue { name, kind, ty, writable, buf };
+                app.mode = Mode::AddValue { name, ty, is_array, writable, buf };
             }
-            _ => app.mode = Mode::AddValue { name, kind, ty, writable, buf },
+            _ => app.mode = Mode::AddValue { name, ty, is_array, writable, buf },
+        },
+        Mode::AddChoices { name, buf } => match code {
+            KeyCode::Esc => {}
+            _ => app.mode = Mode::AddChoices { name, buf },
+        },
+        Mode::AddIndex { name, choices, buf } => match code {
+            KeyCode::Esc => {}
+            _ => app.mode = Mode::AddIndex { name, choices, buf },
         },
         Mode::Edit { row, mut buf } => match code {
             KeyCode::Esc => {}
             KeyCode::Enter => {
                 let r = &app.rows[row];
                 let name = r.name.clone();
-                match r.kind {
-                    Kind::Scalar => match parse_scalar(r.ty, &buf) {
+                match &r.spec {
+                    PvSpec::Scalar(ty) => match parse_scalar(*ty, &buf) {
                         Ok(v) => {
                             srv.set_scalar(&name, v.clone());
                             app.rows[row].display = format_scalar(&v);
@@ -375,7 +521,7 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
                             app.mode = Mode::Edit { row, buf };
                         }
                     },
-                    Kind::Array => match parse_array(r.ty, &buf) {
+                    PvSpec::Array(ty) => match parse_array(*ty, &buf) {
                         Ok(v) => {
                             srv.set_array(&name, v.clone());
                             app.rows[row].display = format_array(&v);
@@ -386,6 +532,9 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
                             app.mode = Mode::Edit { row, buf };
                         }
                     },
+                    PvSpec::Enum { .. } | PvSpec::Table { .. } => {
+                        app.status = "edit not supported for this kind yet".to_string();
+                    }
                 }
             }
             KeyCode::Char(c) => {
@@ -398,16 +547,29 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
             }
             _ => app.mode = Mode::Edit { row, buf },
         },
+        Mode::Command { buf } => match code {
+            KeyCode::Esc => {}
+            _ => app.mode = Mode::Command { buf },
+        },
+        Mode::Help => {}
     }
     false
 }
 
-fn refresh_scalars(app: &mut App, srv: &ServerHandle) {
+fn refresh_values(app: &mut App, srv: &ServerHandle) {
     for r in app.rows.iter_mut() {
-        if r.kind == Kind::Scalar
-            && let Some(s) = srv.read_scalar(&r.name)
-        {
-            r.display = s;
+        match &r.spec {
+            PvSpec::Scalar(_) => {
+                if let Some(s) = srv.read_scalar(&r.name) {
+                    r.display = s;
+                }
+            }
+            PvSpec::Enum { .. } => {
+                if let Some(s) = srv.read_enum(&r.name) {
+                    r.display = s;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -418,9 +580,9 @@ fn run_ui(
     srv: &ServerHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        // Reflect external PUTs into scalar rows each tick.
+        // Reflect external PUTs into scalar/enum rows each tick.
         if matches!(app.mode, Mode::Browse) {
-            refresh_scalars(&mut app, srv);
+            refresh_values(&mut app, srv);
         }
         terminal.draw(|f| draw(f, &app))?;
         if event::poll(Duration::from_millis(500))?
@@ -437,16 +599,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use argparse::{ArgumentParser, Store};
     let mut tcp_port: u16 = 5075;
     let mut udp_port: u16 = 5076;
+    let mut rate_hz: f64 = 10.0;
     {
         let mut ap = ArgumentParser::new();
         ap.set_description("Interactive spreadsheet IOC — each row is a PV");
         ap.refer(&mut tcp_port).add_option(&["--port"], Store, "TCP port (default 5075)");
         ap.refer(&mut udp_port)
             .add_option(&["--udp-port"], Store, "UDP search port (default 5076)");
+        ap.refer(&mut rate_hz).add_option(
+            &["--rate"],
+            Store,
+            "animation tick rate Hz (default 10)",
+        );
         ap.parse_args_or_exit();
     }
+    if rate_hz <= 0.0 {
+        eprintln!("--rate must be positive");
+        std::process::exit(2);
+    }
 
-    let srv = ServerHandle::start(tcp_port, udp_port)?;
+    let srv = ServerHandle::start(tcp_port, udp_port, rate_hz)?;
 
     color_eyre::install()?;
     let terminal = ratatui::init();
@@ -454,9 +626,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rows: Vec::new(),
         table: TableState::default(),
         mode: Mode::Browse,
-        status: format!("serving on 127.0.0.1:{tcp_port} — press 'a' to add a PV"),
+        status: format!("serving on 127.0.0.1:{tcp_port} — 'a' add · ':' cmd · '?' help"),
         tcp_port,
         udp_port,
+        animators: srv.animators().clone(),
+        rate: srv.rate().clone(),
     };
     let result = run_ui(terminal, app, &srv);
     ratatui::restore();
