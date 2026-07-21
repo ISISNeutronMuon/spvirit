@@ -14,7 +14,7 @@
 - `record.writable()` is **always `true`** for `NtEnum`/`NtTable` (spvirit-server/src/types.rs:303). Enum `writable` selects `Mbbo` vs `Mbbi` record type only (advertised access); table is always RW.
 - Server-crate record helpers (`make_scalar_record`, `make_output_record`, `make_array_record`) are `pub(crate)` in `pva_server.rs`; new `make_enum_record`/`make_table_record` join them there. Imports already in `pva_server.rs`: `NtEnum`, `NtTable as NtTableType`, `NtTableColumn`, `ScalarArrayValue`, `ScalarValue`, `DbCommonState`, `OutputMode`, `RecordData`, `RecordInstance`, `RecordType`, `HashMap`.
 - The store's general setter is `SimplePvStore::put_nt(&self, name: &str, payload: NtPayload) -> bool` (async); scalar/array use `set_value`/`set_array_value`.
-- Binary submodules for `src/bin/spvirit_table.rs` live in `src/bin/spvirit_table/` and are declared `mod parse;` etc. in the bin root (standard cargo resolution; subdir files are NOT compiled as separate binaries).
+- The `sptable` binary is directory-style: crate root is `src/bin/spvirit_table/main.rs` (declared via `[[bin]] path` in `spvirit-tools/Cargo.toml`), with sibling modules `parse.rs`/`pattern.rs`/`anim.rs` in the same `src/bin/spvirit_table/` directory, declared `mod parse;` etc. in `main.rs`. (A bin crate root resolves `mod x;` to a file beside the root file, so the module files sit next to `main.rs` — NOT in a further subdirectory. Sibling `.rs` files here are modules, not separate binaries.)
 - No new dependencies. Randomness uses a hand-rolled `xorshift64` seeded per animator.
 - Tests: server via `cargo test -p spvirit-server`; binary unit tests via `cargo test -p spvirit-tools --bin sptable`.
 - Pattern-expansion safety cap: **1000** PVs per command (a `const`).
@@ -191,7 +191,7 @@ Move the existing `WireType`, `parse_scalar`, `parse_array`, `format_scalar`, `f
 
 **Files:**
 - Create: `spvirit-tools/src/bin/spvirit_table/parse.rs`
-- Modify: `spvirit-tools/src/bin/spvirit_table.rs` (remove moved items; add `mod parse;` + `use`)
+- Modify: `spvirit-tools/src/bin/spvirit_table/main.rs` (remove moved items; add `mod parse;` + `use`)
 
 **Interfaces:**
 - Produces (all `pub` in `parse`): `WireType` (+ `ALL`, `label`, `from_label`), `parse_scalar`, `parse_array`, `format_scalar`, `format_array`.
@@ -230,7 +230,7 @@ Expected: builds clean.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add spvirit-tools/src/bin/spvirit_table.rs spvirit-tools/src/bin/spvirit_table/parse.rs
+git add spvirit-tools/src/bin/spvirit_table/main.rs spvirit-tools/src/bin/spvirit_table/parse.rs
 git commit -m "refactor(tools): extract sptable parse module"
 ```
 
@@ -539,7 +539,7 @@ git commit -m "feat(tools): sptable typespec aliases, Command AST + parse_comman
 
 **Files:**
 - Create: `spvirit-tools/src/bin/spvirit_table/pattern.rs`
-- Modify: `spvirit-tools/src/bin/spvirit_table.rs` (add `mod pattern;`)
+- Modify: `spvirit-tools/src/bin/spvirit_table/main.rs` (add `mod pattern;`)
 
 **Interfaces:**
 - Produces: `pub const EXPAND_CAP: usize = 1000;` and `pub fn expand_pattern(s: &str) -> Result<Vec<String>, String>`
@@ -707,7 +707,7 @@ Expected: PASS (all pattern tests green).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add spvirit-tools/src/bin/spvirit_table.rs spvirit-tools/src/bin/spvirit_table/pattern.rs
+git add spvirit-tools/src/bin/spvirit_table/main.rs spvirit-tools/src/bin/spvirit_table/pattern.rs
 git commit -m "feat(tools): sptable brace-pattern expansion"
 ```
 
@@ -717,7 +717,7 @@ git commit -m "feat(tools): sptable brace-pattern expansion"
 
 **Files:**
 - Create: `spvirit-tools/src/bin/spvirit_table/anim.rs`
-- Modify: `spvirit-tools/src/bin/spvirit_table.rs` (add `mod anim;`)
+- Modify: `spvirit-tools/src/bin/spvirit_table/main.rs` (add `mod anim;`)
 
 **Interfaces:**
 - Produces:
@@ -1004,7 +1004,7 @@ Expected: PASS (all anim tests green).
 - [ ] **Step 6: Commit**
 
 ```bash
-git add spvirit-tools/src/bin/spvirit_table.rs spvirit-tools/src/bin/spvirit_table/anim.rs
+git add spvirit-tools/src/bin/spvirit_table/main.rs spvirit-tools/src/bin/spvirit_table/anim.rs
 git commit -m "feat(tools): sptable animation generators + PRNG"
 ```
 
@@ -1015,7 +1015,7 @@ git commit -m "feat(tools): sptable animation generators + PRNG"
 Replace the `Kind`/`ty` model with `PvSpec`, extend `ServerHandle` with enum/table adds, enum set (via `put_nt`), a shared animator map, and the background tick task. No command dispatch yet (Task 7) — this task just makes the plumbing compile and keeps the existing scalar/array behavior working.
 
 **Files:**
-- Modify: `spvirit-tools/src/bin/spvirit_table.rs`
+- Modify: `spvirit-tools/src/bin/spvirit_table/main.rs`
 
 **Interfaces:**
 - Consumes: `parse::{WireType, coerce_scalar}`, `anim::{AnimSpec, AnimState, Generator, is_enum_only, sample}`, `RunningServer::{add_enum, add_table}`, `SimplePvStore::{put_nt, set_value, set_array_value, get_nt, remove}`.
@@ -1357,7 +1357,7 @@ Expected: PASS (pure-module tests unaffected).
 - [ ] **Step 8: Commit**
 
 ```bash
-git add spvirit-tools/src/bin/spvirit_table.rs
+git add spvirit-tools/src/bin/spvirit_table/main.rs
 git commit -m "feat(tools): sptable PvSpec model + animation tick task plumbing"
 ```
 
@@ -1368,7 +1368,7 @@ git commit -m "feat(tools): sptable PvSpec model + animation tick task plumbing"
 Wire the command line: `:` enters `Mode::Command`, Enter runs `parse_command` → `expand_pattern` → executor; `?` opens `Mode::Help`. Render enum/table rows and the `~` animation marker.
 
 **Files:**
-- Modify: `spvirit-tools/src/bin/spvirit_table.rs`
+- Modify: `spvirit-tools/src/bin/spvirit_table/main.rs`
 
 **Interfaces:**
 - Consumes: `parse::{Command, SpecInput, parse_command, parse_scalar, parse_array}`, `pattern::expand_pattern`, `anim::build_anim`, Task 6 `ServerHandle` methods + `Animators`.
@@ -1823,7 +1823,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add spvirit-tools/src/bin/spvirit_table.rs
+git add spvirit-tools/src/bin/spvirit_table/main.rs
 git commit -m "feat(tools): sptable command line, patterns, animation, enum/table rendering"
 ```
 
@@ -1834,7 +1834,7 @@ git commit -m "feat(tools): sptable command line, patterns, animation, enum/tabl
 Extend the modal `a` wizard with an `[e]num` branch (choices → index → access) and finalize the `AddKind` wiring left open in Task 6. Table stays command-line-only.
 
 **Files:**
-- Modify: `spvirit-tools/src/bin/spvirit_table.rs`
+- Modify: `spvirit-tools/src/bin/spvirit_table/main.rs`
 
 - [ ] **Step 1: Update `AddKind` prompt and branch**
 
@@ -1981,7 +1981,7 @@ Confirm each step, then continue.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add spvirit-tools/src/bin/spvirit_table.rs
+git add spvirit-tools/src/bin/spvirit_table/main.rs
 git commit -m "feat(tools): sptable enum wizard branch + help/command hints"
 ```
 
