@@ -644,21 +644,19 @@ fn prompt_text(mode: &Mode) -> Option<(&'static str, String)> {
     match mode {
         Mode::Browse => None,
         Mode::AddName { buf } => Some((" new PV name (Enter) ", buf.clone())),
-        Mode::AddKind { .. } => Some((" kind: [s]calar / [a]rray ", String::new())),
+        Mode::AddKind { .. } => Some((" kind: [s]calar / [a]rray / [e]num (table via :add) ", String::new())),
         Mode::AddType { idx, .. } => {
             Some((" type (←/→, Enter) ", WireType::ALL[*idx].label().to_string()))
         }
-        Mode::AddChoices { buf, .. } => {
-            Some((" enum choices, comma-separated (Enter) ", buf.clone()))
-        }
-        Mode::AddIndex { buf, .. } => Some((" initial index (Enter) ", buf.clone())),
+        Mode::AddChoices { buf, .. } => Some((" enum choices, comma-separated (Enter) ", buf.clone())),
+        Mode::AddIndex { buf, .. } => Some((" initial index (Enter, default 0) ", buf.clone())),
         Mode::AddAccess { writable, .. } => Some((
             " access: [r]ead-only / [w]ritable (Enter) ",
             if *writable { "writable" } else { "read-only" }.to_string(),
         )),
         Mode::AddValue { buf, ty, is_array, .. } => Some((
             if *is_array { " values, comma-separated (Enter) " } else { " initial value (Enter) " },
-            format!("[{}] {}", ty.label(), buf),
+            format!("[{}] {buf}", ty.label()),
         )),
         Mode::Edit { buf, .. } => Some((" new value (Enter) ", buf.clone())),
         Mode::Command { buf } => Some((" :command (Enter run · Esc cancel) ", format!(":{buf}"))),
@@ -706,52 +704,6 @@ fn centered(pct_w: u16, pct_h: u16, area: ratatui::layout::Rect) -> ratatui::lay
             Constraint::Percentage((100 - pct_w) / 2),
         ])
         .split(v[1])[1]
-}
-
-fn commit_add(
-    app: &mut App,
-    srv: &ServerHandle,
-    name: &str,
-    is_array: bool,
-    ty: WireType,
-    writable: bool,
-    val: &str,
-) -> bool {
-    if app.rows.iter().any(|r| r.name == name) || srv.exists(name) {
-        app.status = format!("name {name:?} already exists");
-        return false;
-    }
-    let display;
-    let spec;
-    if is_array {
-        match parse_array(ty, val) {
-            Ok(v) => {
-                display = format_array(&v);
-                srv.add_array(name, v, writable);
-                spec = PvSpec::Array(ty);
-            }
-            Err(e) => {
-                app.status = e;
-                return false;
-            }
-        }
-    } else {
-        match parse_scalar(ty, val) {
-            Ok(v) => {
-                display = format_scalar(&v);
-                srv.add_scalar(name, v, writable);
-                spec = PvSpec::Scalar(ty);
-            }
-            Err(e) => {
-                app.status = e;
-                return false;
-            }
-        }
-    }
-    app.status = format!("added {name}");
-    app.rows.push(PvRow { name: name.to_string(), writable, display, spec });
-    app.table.select(Some(app.rows.len() - 1));
-    true
 }
 
 fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
@@ -819,6 +771,7 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
             KeyCode::Char('a') => {
                 app.mode = Mode::AddType { name, kind: AddKind::Array, idx: 0 }
             }
+            KeyCode::Char('e') => app.mode = Mode::AddChoices { name, buf: String::new() },
             _ => app.mode = Mode::AddKind { name },
         },
         Mode::AddType { name, kind, mut idx } => match code {
@@ -853,16 +806,39 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
                 writable = true;
                 app.mode = Mode::AddAccess { name, spec_kind, ty, choices, index, writable };
             }
-            KeyCode::Enter => {
-                let is_array = matches!(spec_kind, AddKind::Array);
-                app.mode = Mode::AddValue { name, ty, is_array, writable, buf: String::new() }
-            }
+            KeyCode::Enter => match spec_kind {
+                AddKind::Enum => {
+                    if row_index(app, &name).is_some() || srv.exists(&name) {
+                        app.status = format!("name {name:?} already exists");
+                    } else {
+                        srv.add_enum(&name, choices.clone(), index, writable);
+                        let disp = choices.get(index.max(0) as usize).cloned().unwrap_or_else(|| "?".into());
+                        app.rows.push(PvRow {
+                            name: name.clone(),
+                            writable,
+                            display: format!("{index} ({disp})"),
+                            spec: PvSpec::Enum { choices },
+                        });
+                        app.table.select(Some(app.rows.len() - 1));
+                        app.status = format!("added {name}");
+                    }
+                }
+                AddKind::Scalar | AddKind::Array => {
+                    let is_array = matches!(spec_kind, AddKind::Array);
+                    app.mode = Mode::AddValue { name, ty, is_array, writable, buf: String::new() };
+                }
+            },
             _ => app.mode = Mode::AddAccess { name, spec_kind, ty, choices, index, writable },
         },
         Mode::AddValue { name, ty, is_array, writable, mut buf } => match code {
             KeyCode::Esc => {}
             KeyCode::Enter => {
-                if !commit_add(app, srv, &name, is_array, ty, writable, &buf) {
+                let spec = if is_array { SpecInput::Array(ty) } else { SpecInput::Scalar(ty) };
+                // Reuse exec_add's single-name path via a one-shot pattern.
+                let before = app.rows.len();
+                exec_add(app, srv, &name, spec, writable, &buf);
+                if app.rows.len() == before {
+                    // add failed (parse error) — keep the value prompt open
                     app.mode = Mode::AddValue { name, ty, is_array, writable, buf };
                 }
             }
@@ -876,12 +852,43 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
             }
             _ => app.mode = Mode::AddValue { name, ty, is_array, writable, buf },
         },
-        Mode::AddChoices { name, buf } => match code {
+        Mode::AddChoices { name, mut buf } => match code {
             KeyCode::Esc => {}
+            KeyCode::Enter if !buf.trim().is_empty() => {
+                let choices: Vec<String> = buf.split(',').map(|c| c.trim().to_string()).collect();
+                app.mode = Mode::AddIndex { name, choices, buf: String::new() };
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.mode = Mode::AddChoices { name, buf };
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                app.mode = Mode::AddChoices { name, buf };
+            }
             _ => app.mode = Mode::AddChoices { name, buf },
         },
-        Mode::AddIndex { name, choices, buf } => match code {
+        Mode::AddIndex { name, choices, mut buf } => match code {
             KeyCode::Esc => {}
+            KeyCode::Enter => {
+                let index: i32 = buf.trim().parse().unwrap_or(0);
+                app.mode = Mode::AddAccess {
+                    name,
+                    spec_kind: AddKind::Enum,
+                    ty: WireType::I32,
+                    choices,
+                    index,
+                    writable: true,
+                };
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                app.mode = Mode::AddIndex { name, choices, buf };
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                app.mode = Mode::AddIndex { name, choices, buf };
+            }
             _ => app.mode = Mode::AddIndex { name, choices, buf },
         },
         Mode::Edit { row, mut buf } => match code {
