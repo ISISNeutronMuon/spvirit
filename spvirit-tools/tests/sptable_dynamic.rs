@@ -71,3 +71,59 @@ async fn dynamic_add_edit_remove_over_wire() {
 
     server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_enum_add_and_set_over_wire() {
+    let (Some(tcp), Some(udp)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("Skipping: cannot bind ports");
+        return;
+    };
+    let server = PvaServer::serve(Vec::<AnyPv>::new())
+        .port(tcp)
+        .udp_port(udp)
+        .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .start()
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    server
+        .add_enum("DYN:ENUM", vec!["OFF".into(), "ON".into(), "TRIP".into()], 0, true)
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let r = pvget(&opts("DYN:ENUM", tcp, udp, Duration::from_secs(5)))
+        .await
+        .expect("pvget enum");
+    // NOTE: format_compact_value renders NTEnum as `value={index=N,
+    // choices=[...]}` — the choices array always lists every choice
+    // string regardless of the selected index, so asserting `contains`
+    // on a choice string (e.g. "TRIP") would pass unconditionally and
+    // never actually test which index is selected. Assert on the
+    // rendered `index=N` field instead, which does vary with the value.
+    assert!(
+        format_compact_value(&r.value).contains("index=0"),
+        "expected index=0, got {}",
+        format_compact_value(&r.value)
+    );
+
+    // set index 2 via put_nt
+    server
+        .store()
+        .put_nt(
+            "DYN:ENUM",
+            spvirit_types::NtPayload::Enum(spvirit_types::NtEnum::new(
+                2,
+                vec!["OFF".into(), "ON".into(), "TRIP".into()],
+            )),
+        )
+        .await;
+    let r = pvget(&opts("DYN:ENUM", tcp, udp, Duration::from_secs(5)))
+        .await
+        .expect("pvget enum 2");
+    assert!(
+        format_compact_value(&r.value).contains("index=2"),
+        "expected index=2, got {}",
+        format_compact_value(&r.value)
+    );
+
+    server.abort();
+}

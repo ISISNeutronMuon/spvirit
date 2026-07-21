@@ -114,7 +114,38 @@ the `argparse` crate, and `block_on` a manually built tokio runtime.
 | `spsearch` | 1094 | ratatui TUI: **passive** search-traffic sniffer; decodes frames directly with `PvaPacket` |
 | `spserver` | 4185 | Full PVA server binary: `.db` loading, hot-reload, beacons, MDEL, `__pvlist`/discovery modes; record logic comes from the spvirit-server crate |
 | `spdodeca` | 1179 | Self-contained single-PV server streaming a rotating dodecahedron as NTNDArray (does *not* use spvirit-server) |
-| `sptable` | ~600 | ratatui TUI: spreadsheet IOC — each row is a dynamically added PV (12 scalar types + arrays), served live via `RunningServer::add_scalar`/`add_array`; `a` add / `e` edit / `d` delete; reflects external PUTs on scalar rows |
+| `sptable` | ~1200 | ratatui TUI spreadsheet IOC. Rows are dynamically added PVs: 12 scalar types, arrays, **NTEnum**, **NTTable**. Modal `a` wizard **plus a vim-style `:` command line** (`:add/:set/:del/:mv/:ro/:rw/:anim/:stop/:source`, shorthands, `:help`). Bash-style **pattern expansion** (`RING:BPM{01..99}`, products) for bulk ops. **Animation** generators (sine/ramp/triangle/square/noise/walk/count, enum `cycle`) driven by a server-side tick (`--rate`, default 10 Hz). |
+
+#### sptable command reference
+
+Mirrors `help_text()` in `spvirit_table/main.rs` — keep in sync.
+
+| Verb | Shorthand | Args | Effect |
+|---|---|---|---|
+| `add` | `a` | `<name> <type> [ro\|rw] <value>` | add PV(s) |
+| `set` | `s` | `<name> <value>` | set value (choice name or index for enum) |
+| `del` | `d` | `[name]` | delete (blank = selected row) |
+| `rename` | `mv` | `<old> <new>` | rename (scalar/enum) |
+| — | `ro`/`rw` | `<name>` | set advertised access |
+| `anim` | — | `<name> <gen> [k=v ...]` | animate |
+| `stop` | — | `[name]` | stop animation (blank = selected) |
+| `source` | `so` | `<file>` | run a file of commands |
+| `rate` | — | `<hz>` | set tick rate (also `--rate` at startup) |
+| `help`/`quit` | `h`/`q` | | show help / quit |
+
+Typespec aliases: `bool int8 int16 int32(int) int64(long) uint8 uint16
+uint32 uint64 float(f32) double(f64) string(s)`; arrays via `int32[]`
+suffix; plus `enum` and `table`.
+
+Pattern forms (bash-brace style, expanded before every name verb):
+`{1..8}`, `{8..1}` (descending), `{0..100..10}` (step), `{01..12}`
+(zero-padded), `{A,B,C}` (list), and products like `S{1..4}:{A,B}`.
+
+Generators: `sine ramp triangle square noise walk count` for scalars,
+`cycle` for enums — e.g. `:anim RING:BPM{01..99} noise min=-1 max=1`.
+
+Value forms: enum accepts a choice name or index (`OFF`, `ON`, `TRIP`, or
+`1`); table accepts per-column `id:i32=1,2,3 x:f64=0.5,1.5`.
 
 Known spserver limitations: ACL_CHANGE/MESSAGE/MULTIPLE_DATA/CANCEL_REQUEST/
 ORIGIN_TAG return "not supported"; NtTable/NtNdArray DOL output links are
