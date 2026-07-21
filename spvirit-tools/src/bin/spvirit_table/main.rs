@@ -16,6 +16,8 @@ use spvirit_types::{ScalarArrayValue, ScalarValue};
 mod parse;
 use parse::{WireType, format_array, format_scalar, parse_array, parse_scalar};
 
+mod pattern;
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Kind {
     Scalar,
