@@ -202,7 +202,7 @@ pub enum Command {
     Del { pattern: Option<String> },
     Rename { old: String, new: String },
     Access { pattern: String, writable: bool },
-    Anim { pattern: String, r#gen: String, params: Vec<(String, String)> },
+    Anim { pattern: String, generator: String, params: Vec<(String, String)> },
     Stop { pattern: Option<String> },
     Rate { hz: f64 },
     Source { path: String },
@@ -251,13 +251,13 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
         }
         "anim" => {
             let name = rest.first().ok_or("anim: missing name")?;
-            let r#gen = rest.get(1).ok_or("anim: missing generator")?;
+            let generator = rest.get(1).ok_or("anim: missing generator")?;
             let mut params = Vec::new();
             for kv in &rest[2..] {
                 let (k, v) = kv.split_once('=').ok_or_else(|| format!("anim: bad param {kv:?} (want key=value)"))?;
                 params.push((k.to_string(), v.to_string()));
             }
-            Ok(Command::Anim { pattern: name.to_string(), r#gen: r#gen.to_string(), params })
+            Ok(Command::Anim { pattern: name.to_string(), generator: generator.to_string(), params })
         }
         "stop" => Ok(Command::Stop { pattern: rest.first().map(|s| s.to_string()) }),
         "rate" => {
@@ -382,9 +382,9 @@ mod tests {
             Command::Access { writable: true, .. }));
         // anim
         match parse_command("anim SIM:X sine amp=5 period=2").unwrap() {
-            Command::Anim { pattern, r#gen, params } => {
+            Command::Anim { pattern, generator, params } => {
                 assert_eq!(pattern, "SIM:X");
-                assert_eq!(r#gen, "sine");
+                assert_eq!(generator, "sine");
                 assert_eq!(params, vec![("amp".to_string(), "5".to_string()),
                                         ("period".to_string(), "2".to_string())]);
             }
