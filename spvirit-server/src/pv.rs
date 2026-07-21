@@ -539,7 +539,7 @@ impl Pv<i32> {
 /// Family record type for a dynamically typed scalar: the record *shape*
 /// (RTYP, writability) comes from the value family, while the `NtScalar`
 /// payload's `ScalarValue` variant carries the precise wire type.
-fn scalar_family_record_type(v: &ScalarValue, writable: bool) -> RecordType {
+pub(crate) fn scalar_family_record_type(v: &ScalarValue, writable: bool) -> RecordType {
     match (v, writable) {
         (ScalarValue::F32(_) | ScalarValue::F64(_), false) => RecordType::Ai,
         (ScalarValue::F32(_) | ScalarValue::F64(_), true) => RecordType::Ao,

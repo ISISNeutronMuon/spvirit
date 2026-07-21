@@ -30,6 +30,7 @@ use spvirit_types::{
 use crate::db::{load_db, parse_db};
 use crate::handler::PvListMode;
 use crate::monitor::MonitorRegistry;
+use crate::pv::scalar_family_record_type;
 use crate::pvstore::{Source, SourceRegistry};
 use crate::server::{PvaServerConfig, run_pva_server_with_registry};
 use crate::simple_store::{LinkDef, OnPutCallback, ScanCallback, SimplePvStore};
@@ -855,6 +856,51 @@ impl RunningServer {
         crate::pv::PvArray::attach(&self.store, name).await
     }
 
+    /// Add a scalar record to the running server at runtime. The wire type is
+    /// taken from the `ScalarValue` variant; `writable` selects an output
+    /// record family (client PUTs allowed) vs an input family (read-only).
+    /// Returns a bound handle to the new record. Replaces any existing record
+    /// with the same name.
+    pub async fn add_scalar(
+        &self,
+        name: &str,
+        value: ScalarValue,
+        writable: bool,
+    ) -> crate::pv::Pv<ScalarValue> {
+        let rt = scalar_family_record_type(&value, writable);
+        let record = if writable {
+            make_output_record(name, rt, value)
+        } else {
+            make_scalar_record(name, rt, value)
+        };
+        self.store.insert(name.to_string(), record).await;
+        crate::pv::Pv::attach(&self.store, name)
+            .await
+            .expect("record just inserted")
+    }
+
+    /// Add an array record to the running server at runtime. `writable`
+    /// selects `aao` (client PUTs allowed) vs `aai` (read-only). Element type
+    /// comes from the `ScalarArrayValue` variant. Returns a bound handle.
+    /// Replaces any existing record with the same name.
+    pub async fn add_array(
+        &self,
+        name: &str,
+        value: ScalarArrayValue,
+        writable: bool,
+    ) -> crate::pv::PvArray {
+        let rt = if writable {
+            RecordType::Aao
+        } else {
+            RecordType::Aai
+        };
+        let record = make_array_record(name, rt, value);
+        self.store.insert(name.to_string(), record).await;
+        crate::pv::PvArray::attach(&self.store, name)
+            .await
+            .expect("record just inserted")
+    }
+
     pub fn store(&self) -> &Arc<SimplePvStore> {
         &self.store
     }
@@ -1027,6 +1073,45 @@ pub(crate) fn make_array_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_server_add_scalar_and_array() {
+        use spvirit_types::{ScalarArrayValue, ScalarValue};
+
+        let server = PvaServer::serve(Vec::<crate::pv::AnyPv>::new())
+            .port(0)
+            .udp_port(0)
+            .start()
+            .await;
+
+        // add a writable u32 scalar
+        let h = server.add_scalar("RT:U32", ScalarValue::U32(7), true).await;
+        assert_eq!(h.get().await.unwrap(), ScalarValue::U32(7));
+        // exact wire type preserved
+        assert!(matches!(
+            server.store().get_value("RT:U32").await,
+            Some(ScalarValue::U32(7))
+        ));
+
+        // add a read-only i16 scalar; family maps to an input record
+        let _ = server.add_scalar("RT:I16", ScalarValue::I16(-3), false).await;
+        assert!(matches!(
+            server.store().get_value("RT:I16").await,
+            Some(ScalarValue::I16(-3))
+        ));
+
+        // add a writable f64 array
+        let a = server
+            .add_array("RT:ARR", ScalarArrayValue::F64(vec![1.0, 2.0, 3.0]), true)
+            .await;
+        a.set(ScalarArrayValue::F64(vec![4.0, 5.0])).await.unwrap();
+        assert!(matches!(
+            server.store().get_nt("RT:ARR").await,
+            Some(spvirit_types::NtPayload::ScalarArray(_))
+        ));
+
+        server.abort();
+    }
 
     #[test]
     fn builder_creates_records() {
