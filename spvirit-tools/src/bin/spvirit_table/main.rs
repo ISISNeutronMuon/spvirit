@@ -321,37 +321,42 @@ fn exec_add(app: &mut App, srv: &ServerHandle, pattern: &str, spec: SpecInput, w
         Err(e) => { app.status = e; return; }
     };
     let (mut added, mut skipped, mut last) = (0usize, 0usize, None);
+    let mut errs: Vec<String> = Vec::new();
     for name in names {
         if row_index(app, &name).is_some() || srv.exists(&name) {
             skipped += 1;
             continue;
         }
-        let (pvspec, display) = match &spec {
+        let result = match &spec {
             SpecInput::Scalar(ty) => match parse_scalar(*ty, value) {
-                Ok(v) => { srv.add_scalar(&name, v.clone(), writable); (PvSpec::Scalar(*ty), format_scalar(&v)) }
-                Err(e) => { app.status = e; return; }
+                Ok(v) => { srv.add_scalar(&name, v.clone(), writable); Ok((PvSpec::Scalar(*ty), format_scalar(&v))) }
+                Err(e) => Err(e),
             },
             SpecInput::Array(ty) => match parse_array(*ty, value) {
-                Ok(v) => { srv.add_array(&name, v.clone(), writable); (PvSpec::Array(*ty), format_array(&v)) }
-                Err(e) => { app.status = e; return; }
+                Ok(v) => { srv.add_array(&name, v.clone(), writable); Ok((PvSpec::Array(*ty), format_array(&v))) }
+                Err(e) => Err(e),
             },
             SpecInput::Enum => match parse_enum_value(value) {
                 Ok((choices, index)) => {
                     srv.add_enum(&name, choices.clone(), index, writable);
                     let disp = choices.get(index.max(0) as usize).cloned().unwrap_or_else(|| "?".into());
-                    (PvSpec::Enum { choices }, format!("{index} ({disp})"))
+                    Ok((PvSpec::Enum { choices }, format!("{index} ({disp})")))
                 }
-                Err(e) => { app.status = e; return; }
+                Err(e) => Err(e),
             },
             SpecInput::Table => match parse_table_value(value) {
                 Ok((columns, types)) => {
                     let ncols = columns.len();
                     let nrows = columns.first().map(|(_, a)| a.len()).unwrap_or(0);
                     srv.add_table(&name, columns);
-                    (PvSpec::Table { columns: types }, format!("{ncols} cols × {nrows} rows"))
+                    Ok((PvSpec::Table { columns: types }, format!("{ncols} cols × {nrows} rows")))
                 }
-                Err(e) => { app.status = e; return; }
+                Err(e) => Err(e),
             },
+        };
+        let (pvspec, display) = match result {
+            Ok(v) => v,
+            Err(e) => { errs.push(format!("{name}: {e}")); continue; }
         };
         // Tables are always RW at the store layer; reflect that in the row.
         let row_writable = if matches!(spec, SpecInput::Table) { true } else { writable };
@@ -361,6 +366,9 @@ fn exec_add(app: &mut App, srv: &ServerHandle, pattern: &str, spec: SpecInput, w
     }
     if let Some(name) = last { select_row(app, &name); }
     app.status = format!("added {added}, skipped {skipped} (exist)");
+    if !errs.is_empty() {
+        app.status = format!("{}, {} errors: {}", app.status, errs.len(), errs.join("; "));
+    }
 }
 
 fn exec_set(app: &mut App, srv: &ServerHandle, pattern: &str, value: &str) {
@@ -369,11 +377,10 @@ fn exec_set(app: &mut App, srv: &ServerHandle, pattern: &str, value: &str) {
         Err(e) => { app.status = e; return; }
     };
     let mut set = 0usize;
+    let mut errs: Vec<String> = Vec::new();
     for name in names {
         let Some(i) = row_index(app, &name) else { continue; };
-        if stop_anim(app, &name) {
-            app.status = format!("{name}: animation stopped by manual set");
-        }
+        stop_anim(app, &name);
         // Reborrow row fields we need, cloning to avoid overlapping borrows.
         let spec_kind = app.rows[i].spec.kind_label();
         match spec_kind {
@@ -381,7 +388,7 @@ fn exec_set(app: &mut App, srv: &ServerHandle, pattern: &str, value: &str) {
                 if let PvSpec::Scalar(ty) = app.rows[i].spec {
                     match parse_scalar(ty, value) {
                         Ok(v) => { srv.set_scalar(&name, v.clone()); app.rows[i].display = format_scalar(&v); set += 1; }
-                        Err(e) => { app.status = e; return; }
+                        Err(e) => { errs.push(format!("{name}: {e}")); continue; }
                     }
                 }
             }
@@ -389,7 +396,7 @@ fn exec_set(app: &mut App, srv: &ServerHandle, pattern: &str, value: &str) {
                 if let PvSpec::Array(ty) = app.rows[i].spec {
                     match parse_array(ty, value) {
                         Ok(v) => { srv.set_array(&name, v.clone()); app.rows[i].display = format_array(&v); set += 1; }
-                        Err(e) => { app.status = e; return; }
+                        Err(e) => { errs.push(format!("{name}: {e}")); continue; }
                     }
                 }
             }
@@ -401,7 +408,7 @@ fn exec_set(app: &mut App, srv: &ServerHandle, pattern: &str, value: &str) {
                         Some(p) => p as i32,
                         None => match value.trim().parse::<i32>() {
                             Ok(n) => n,
-                            Err(_) => { app.status = format!("{name}: {value:?} is not a choice or index"); return; }
+                            Err(_) => { errs.push(format!("{name}: {value:?} is not a choice or index")); continue; }
                         },
                     };
                     srv.set_enum(&name, index, choices.clone());
@@ -410,10 +417,13 @@ fn exec_set(app: &mut App, srv: &ServerHandle, pattern: &str, value: &str) {
                     set += 1;
                 }
             }
-            _ => { app.status = format!("{name}: cannot :set a table (recreate with :add)"); return; }
+            _ => { errs.push(format!("{name}: cannot :set a table (recreate with :add)")); continue; }
         }
     }
     app.status = format!("set {set}");
+    if !errs.is_empty() {
+        app.status = format!("{}, {} errors: {}", app.status, errs.len(), errs.join("; "));
+    }
 }
 
 fn exec_del(app: &mut App, srv: &ServerHandle, pattern: Option<String>) {
@@ -510,18 +520,19 @@ fn exec_access(app: &mut App, srv: &ServerHandle, pattern: &str, writable: bool)
     app.status = format!("access changed on {changed}");
 }
 
-fn exec_anim(app: &mut App, srv: &ServerHandle, pattern: &str, generator: &str, params: &[(String, String)]) {
+fn exec_anim(app: &mut App, _srv: &ServerHandle, pattern: &str, generator: &str, params: &[(String, String)]) {
     let spec = match build_anim(generator, params) { Ok(s) => s, Err(e) => { app.status = e; return; } };
     let names = match expand_pattern(pattern) { Ok(n) => n, Err(e) => { app.status = e; return; } };
     let mut on = 0usize;
     let mut seed: u64 = 0x9E3779B97F4A7C15;
+    let mut errs: Vec<String> = Vec::new();
     for name in names {
         let Some(i) = row_index(app, &name) else { continue; };
         let target = match &app.rows[i].spec {
             PvSpec::Scalar(ty) if *ty != WireType::Str => Target::Scalar(*ty),
             PvSpec::Enum { choices } if is_enum_only(&spec.generator) => Target::Enum(choices.clone()),
-            PvSpec::Enum { .. } => { app.status = format!("{name}: enum takes only the 'cycle' generator"); return; }
-            _ => { app.status = format!("{name}: only numeric scalars (and enum+cycle) are animatable"); return; }
+            PvSpec::Enum { .. } => { errs.push(format!("{name}: enum takes only the 'cycle' generator")); continue; }
+            _ => { errs.push(format!("{name}: only numeric scalars (and enum+cycle) are animatable")); continue; }
         };
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64 + 1);
         let live = Live { spec, state: AnimState::new(seed), start: Instant::now(), target };
@@ -529,6 +540,9 @@ fn exec_anim(app: &mut App, srv: &ServerHandle, pattern: &str, generator: &str, 
         on += 1;
     }
     app.status = format!("animating {on} ({generator})");
+    if !errs.is_empty() {
+        app.status = format!("{}, {} skipped: {}", app.status, errs.len(), errs.join("; "));
+    }
 }
 
 fn exec_stop(app: &mut App, _srv: &ServerHandle, pattern: Option<String>) {
