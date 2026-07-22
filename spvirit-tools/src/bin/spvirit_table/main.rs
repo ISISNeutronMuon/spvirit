@@ -10,7 +10,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 
 use spvirit_tools::spvirit_server::pv::AnyPv;
 use spvirit_tools::spvirit_server::pva_server::{PvaServer, RunningServer};
@@ -113,6 +113,7 @@ struct App {
     udp_port: u16,
     animators: Animators,
     rate: RateHz,
+    help_scroll: u16,
 }
 
 /// Owns the runtime + running server; all async store calls go through here.
@@ -325,7 +326,7 @@ fn exec_command(app: &mut App, srv: &ServerHandle, line: &str) {
     };
     match cmd {
         Command::Quit => { /* handled by caller via a sentinel below */ }
-        Command::Help => { app.mode = Mode::Help; }
+        Command::Help => { app.help_scroll = 0; app.mode = Mode::Help; }
         Command::Rate { hz } => {
             app.rate.store(hz.to_bits(), Ordering::Relaxed);
             app.status = format!("tick rate -> {hz} Hz");
@@ -737,18 +738,22 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .block(Block::default().borders(Borders::ALL).title(" status "));
     frame.render_widget(status, chunks[1]);
 
-    // Modal prompt overlay for add/edit.
+    // Modal prompt overlay for add/edit/command/help.
     if let Some((title, content)) = prompt_text(&app.mode) {
-        let area = if matches!(app.mode, Mode::Help) {
-            centered(80, 70, frame.area())
+        let is_help = matches!(app.mode, Mode::Help);
+        let area = if is_help {
+            centered(90, 90, frame.area())
         } else {
-            centered(60, 20, frame.area())
+            centered(64, 30, frame.area())
         };
         frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(content).block(Block::default().borders(Borders::ALL).title(title)),
-            area,
-        );
+        let mut para = Paragraph::new(content)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false });
+        if is_help {
+            para = para.scroll((app.help_scroll, 0));
+        }
+        frame.render_widget(para, area);
     }
 }
 
@@ -771,8 +776,45 @@ fn prompt_text(mode: &Mode) -> Option<(&'static str, String)> {
             format!("[{}] {buf}", ty.label()),
         )),
         Mode::Edit { buf, .. } => Some((" new value (Enter) ", buf.clone())),
-        Mode::Command { buf } => Some((" :command (Enter run · Esc cancel) ", format!(":{buf}"))),
-        Mode::Help => Some((" help (Esc to close) ", help_text())),
+        Mode::Command { buf } => {
+            let hint = command_hint(buf);
+            let content = if hint.is_empty() {
+                format!(":{buf}")
+            } else {
+                format!(":{buf}\n {hint}")
+            };
+            Some((" :command (Enter run · Esc cancel) ", content))
+        }
+        Mode::Help => Some((" help (↑/↓ scroll · Esc close) ", help_text())),
+    }
+}
+
+/// A live usage hint for the verb currently being typed in `:command` mode.
+/// For `anim`, once a valid generator name is present it shows *that*
+/// generator's params (with defaults) — the args the user actually needs.
+fn command_hint(buf: &str) -> String {
+    let toks: Vec<&str> = buf.split_whitespace().collect();
+    let verb = toks.first().copied().unwrap_or("");
+    match verb {
+        "" => "verbs: add set del rename ro rw anim stop source write rate help quit".to_string(),
+        "add" | "a" => "<name> <type> [ro|rw] <value>   type: i32 f64 bool string i32[] enum table".to_string(),
+        "set" | "s" => "<name> <value>   enum: choice name or index".to_string(),
+        "del" | "d" => "[name]   blank = selected row".to_string(),
+        "rename" | "mv" => "<old> <new>   scalar/enum".to_string(),
+        "ro" | "rw" => "<name>   set advertised access".to_string(),
+        "anim" => match toks
+            .get(2)
+            .and_then(|t| anim::Generator::ALL.into_iter().find(|g| g.name() == *t))
+        {
+            Some(g) => format!("{} params: {}", g.name(), g.param_help()),
+            None => "<name> <gen> [k=v ...]   gen: sine ramp triangle square noise walk count | cycle".to_string(),
+        },
+        "stop" => "[name]   blank = selected row".to_string(),
+        "source" | "so" => "<file>   run a script of commands".to_string(),
+        "write" | "w" => "<file>   dump the session as a loadable script".to_string(),
+        "rate" => "<hz>   retune the animation tick (live)".to_string(),
+        "help" | "h" | "quit" | "q" => String::new(),
+        _ => "unknown verb — :help for the list".to_string(),
     }
 }
 
@@ -831,7 +873,7 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Char('a') => app.mode = Mode::AddName { buf: String::new() },
             KeyCode::Char(':') => app.mode = Mode::Command { buf: String::new() },
-            KeyCode::Char('?') => app.mode = Mode::Help,
+            KeyCode::Char('?') => { app.help_scroll = 0; app.mode = Mode::Help; }
             KeyCode::Char('e') | KeyCode::Enter => {
                 if let Some(i) = app.table.selected() {
                     app.mode = Mode::Edit { row: i, buf: String::new() };
@@ -1064,10 +1106,31 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
             KeyCode::Backspace => { buf.pop(); app.mode = Mode::Command { buf }; }
             _ => app.mode = Mode::Command { buf },
         },
-        Mode::Help => match code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
-            _ => app.mode = Mode::Help,
-        },
+        Mode::Help => {
+            // Clamp scroll to the help text's line count so it can't run off
+            // into empty space on a tall terminal.
+            let max = help_text().lines().count().saturating_sub(1) as u16;
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {}
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.help_scroll = (app.help_scroll + 1).min(max);
+                    app.mode = Mode::Help;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.help_scroll = app.help_scroll.saturating_sub(1);
+                    app.mode = Mode::Help;
+                }
+                KeyCode::PageDown => {
+                    app.help_scroll = (app.help_scroll + 10).min(max);
+                    app.mode = Mode::Help;
+                }
+                KeyCode::PageUp => {
+                    app.help_scroll = app.help_scroll.saturating_sub(10);
+                    app.mode = Mode::Help;
+                }
+                _ => app.mode = Mode::Help,
+            }
+        }
     }
     false
 }
@@ -1147,9 +1210,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         udp_port,
         animators: srv.animators().clone(),
         rate: srv.rate().clone(),
+        help_scroll: 0,
     };
     let result = run_ui(terminal, app, &srv);
     ratatui::restore();
     srv.abort();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn bare_app(mode: Mode) -> App {
+        App {
+            rows: Vec::new(),
+            table: TableState::default(),
+            mode,
+            status: String::new(),
+            tcp_port: 5075,
+            udp_port: 5076,
+            animators: Arc::new(Mutex::new(HashMap::new())),
+            rate: Arc::new(AtomicU64::new(10.0_f64.to_bits())),
+            help_scroll: 0,
+        }
+    }
+
+    /// Render a bare `App` to an off-screen buffer and return its flat text.
+    fn rendered(mode: Mode, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let app = bare_app(mode);
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn help_modal_shows_every_generator() {
+        // The reported bug: not all generators were visible in `:help`.
+        let text = rendered(Mode::Help, 100, 44);
+        for g in ["sine", "ramp", "triangle", "square", "noise", "walk", "count", "cycle"] {
+            assert!(text.contains(g), "help modal is missing generator {g:?}");
+        }
+        // and the value forms line below the generators is reachable too
+        assert!(text.contains("Value forms"), "help modal truncates before value forms");
+    }
+
+    #[test]
+    fn help_modal_tail_reachable_by_scroll_on_short_terminal() {
+        // On a terminal too short to show all of help at once, scrolling must
+        // still reach the tail (the fix for "generators not all visible").
+        let mut terminal = Terminal::new(TestBackend::new(90, 16)).unwrap();
+        let mut app = bare_app(Mode::Help);
+        app.help_scroll = 18;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Value forms"), "scroll should reveal the help tail");
+    }
+
+    #[test]
+    fn command_hint_guides_each_verb() {
+        // empty buffer lists the verbs
+        assert!(command_hint("").contains("anim"));
+        // add shows its arg shape
+        assert!(command_hint("add").contains("<name>") && command_hint("a").contains("<type>"));
+        // anim without a generator shows the generator list...
+        assert!(command_hint("anim X").contains("sine"));
+        // ...and once a generator is typed, shows THAT generator's params
+        let h = command_hint("anim X sine");
+        assert!(h.contains("amp=") && h.contains("offset="), "sine hint should show its params: {h}");
+        assert!(command_hint("anim X noise").contains("min="));
+        // write/w hint
+        assert!(command_hint("w").contains("<file>"));
+        // unknown verb is called out
+        assert!(command_hint("frobnicate").contains("unknown"));
+    }
 }
