@@ -234,6 +234,25 @@ impl ServerHandle {
             _ => None,
         }
     }
+    /// Read a table row back as a `:add`-compatible value string:
+    /// `col:type=v,v col2:type=v,v` (columns space-separated, values
+    /// comma-separated, no spaces inside a column so `:source` re-parses it).
+    fn read_table(&self, name: &str) -> Option<String> {
+        match self.rt.block_on(self.server.store().get_nt(name)) {
+            Some(NtPayload::Table(t)) => {
+                let cols: Vec<String> = t
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let (ty, vals) = array_type_and_values(&c.values);
+                        format!("{}:{}={}", c.name, ty, vals)
+                    })
+                    .collect();
+                Some(cols.join(" "))
+            }
+            _ => None,
+        }
+    }
     fn animators(&self) -> &Animators {
         &self.animators
     }
@@ -319,6 +338,7 @@ fn exec_command(app: &mut App, srv: &ServerHandle, line: &str) {
         Command::Anim { pattern, generator, params } => exec_anim(app, srv, &pattern, &generator, &params),
         Command::Stop { pattern } => exec_stop(app, srv, pattern),
         Command::Source { path } => exec_source(app, srv, &path),
+        Command::Write { path } => exec_write(app, srv, &path),
     }
 }
 
@@ -588,6 +608,91 @@ fn exec_source(app: &mut App, srv: &ServerHandle, path: &str) {
     };
 }
 
+/// A typespec token + comma-joined values (no spaces) for one array/table
+/// column, e.g. `("int32", "1,2,3")`. Tokens are the long labels accepted by
+/// `WireType::from_token`.
+fn array_type_and_values(a: &ScalarArrayValue) -> (&'static str, String) {
+    macro_rules! join {
+        ($v:expr) => {
+            $v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")
+        };
+    }
+    match a {
+        ScalarArrayValue::Bool(v) => ("bool", join!(v)),
+        ScalarArrayValue::I8(v) => ("int8", join!(v)),
+        ScalarArrayValue::I16(v) => ("int16", join!(v)),
+        ScalarArrayValue::I32(v) => ("int32", join!(v)),
+        ScalarArrayValue::I64(v) => ("int64", join!(v)),
+        ScalarArrayValue::U8(v) => ("uint8", join!(v)),
+        ScalarArrayValue::U16(v) => ("uint16", join!(v)),
+        ScalarArrayValue::U32(v) => ("uint32", join!(v)),
+        ScalarArrayValue::U64(v) => ("uint64", join!(v)),
+        ScalarArrayValue::F32(v) => ("float", join!(v)),
+        ScalarArrayValue::F64(v) => ("double", join!(v)),
+        ScalarArrayValue::Str(v) => ("string", v.join(",")),
+    }
+}
+
+/// Dump the whole session as a `:source`-compatible script: a `rate` line,
+/// one `add` per PV (current value, read back so edits/tables survive), then
+/// one `anim` per animated PV — all in row order. Loading it rebuilds state.
+fn exec_write(app: &mut App, srv: &ServerHandle, path: &str) {
+    let mut out = String::from("# sptable session dump\n");
+    let rate_hz = f64::from_bits(app.rate.load(Ordering::Relaxed));
+    out.push_str(&format!("rate {rate_hz}\n"));
+
+    for r in &app.rows {
+        let access = if r.writable { "rw" } else { "ro" };
+        let line = match &r.spec {
+            PvSpec::Scalar(ty) => {
+                let val = srv.read_scalar(&r.name).unwrap_or_else(|| r.display.clone());
+                format!("add {} {} {} {}", r.name, ty.label(), access, val)
+            }
+            PvSpec::Array(ty) => {
+                // row.display is the last-set array, "1, 2, 3" — parse_array
+                // trims, so the spaces are harmless in a scalar-position value.
+                format!("add {} {}[] {} {}", r.name, ty.label(), access, r.display)
+            }
+            PvSpec::Enum { choices } => {
+                let index = srv
+                    .read_enum(&r.name)
+                    .and_then(|d| d.split_whitespace().next().map(str::to_string))
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
+                format!("add {} enum {} {} {}", r.name, access, choices.join(","), index)
+            }
+            PvSpec::Table { .. } => match srv.read_table(&r.name) {
+                // table is always RW; omit the access token (its value never
+                // starts with an exact `ro`/`rw` token).
+                Some(cols) => format!("add {} table {}", r.name, cols),
+                None => continue,
+            },
+        };
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    // Animations, in row order, reconstructed from resolved params.
+    {
+        let animated = app.animators.lock().unwrap();
+        for r in &app.rows {
+            if let Some(live) = animated.get(&r.name) {
+                out.push_str(&format!(
+                    "anim {} {} {}\n",
+                    r.name,
+                    live.spec.generator.name(),
+                    live.spec.dump_params()
+                ));
+            }
+        }
+    }
+
+    match std::fs::write(path, out) {
+        Ok(()) => app.status = format!("wrote {} PVs to {path}", app.rows.len()),
+        Err(e) => app.status = format!("write {path}: {e}"),
+    }
+}
+
 fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -672,7 +777,13 @@ fn prompt_text(mode: &Mode) -> Option<(&'static str, String)> {
 }
 
 fn help_text() -> String {
-    "\
+    let mut gens = String::from("Generators (params shown with defaults):\n");
+    for g in anim::Generator::ALL {
+        let note = if anim::is_enum_only(&g) { "   (enum only)" } else { "" };
+        gens.push_str(&format!("  {:<9} {}{}\n", g.name(), g.param_help(), note));
+    }
+    format!(
+        "\
 Commands (prefix :) — shorthands in ( )
   add|a  <name> <type> [ro|rw] <value>   add PV(s)
   set|s  <name> <value>                  set value (choice name or index for enum)
@@ -681,17 +792,17 @@ Commands (prefix :) — shorthands in ( )
   ro|rw  <name>                          set advertised access
   anim   <name> <gen> [k=v ...]          animate
   stop   [name]                          stop animation (blank = selected)
-  source|so <file>                       run a file of commands
-  rate   <hz>                            (set at startup via --rate)
+  source|so <file>                       run a script of commands
+  write|w  <file>                        dump the session as a loadable script
+  rate   <hz>                            retune the animation tick (live)
   help|h    quit|q
 
 Types: bool int8 int16 int32(int) int64(long) uint8 uint16 uint32 uint64
        float(f32) double(f64) string(s) ; arrays: int32[]  ; enum ; table
-Patterns: {1..8} {8..1} {0..100..10} {01..12} {A,B,C}  and products S{1..4}:{A,B}
-Generators: sine ramp triangle square noise walk count  (enum: cycle)
-  e.g. :anim RING:BPM{01..99} noise min=-1 max=1
+Patterns: {{1..8}} {{8..1}} {{0..100..10}} {{01..12}} {{A,B,C}}  and products S{{1..4}}:{{A,B}}
+{gens}  e.g. :anim RING:BPM{{01..99}} noise min=-1 max=1
 Value forms: enum -> OFF,ON,TRIP 1   table -> id:i32=1,2,3 x:f64=0.5,1.5"
-        .to_string()
+    )
 }
 
 fn centered(pct_w: u16, pct_h: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {

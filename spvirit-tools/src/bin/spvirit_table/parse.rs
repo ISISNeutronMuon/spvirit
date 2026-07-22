@@ -208,6 +208,7 @@ pub enum Command {
     Stop { pattern: Option<String> },
     Rate { hz: f64 },
     Source { path: String },
+    Write { path: String },
     Help,
     Quit,
 }
@@ -271,6 +272,10 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
         "source" | "so" => {
             let path = rest.first().ok_or("source: missing path")?;
             Ok(Command::Source { path: path.to_string() })
+        }
+        "write" | "w" => {
+            let path = rest.first().ok_or("write: missing path")?;
+            Ok(Command::Write { path: path.to_string() })
         }
         "help" | "h" => Ok(Command::Help),
         "quit" | "q" => Ok(Command::Quit),
@@ -397,6 +402,11 @@ mod tests {
         assert!(matches!(parse_command("rate 20").unwrap(), Command::Rate { hz } if (hz - 20.0).abs() < 1e-9));
         assert!(matches!(parse_command("so layout.txt").unwrap(),
             Command::Source { path } if path == "layout.txt"));
+    assert!(matches!(parse_command("write session.sp").unwrap(),
+        Command::Write { path } if path == "session.sp"));
+    assert!(matches!(parse_command("w session.sp").unwrap(),
+        Command::Write { path } if path == "session.sp"));
+    assert!(parse_command("write").is_err());
         assert!(matches!(parse_command("h").unwrap(), Command::Help));
         assert!(matches!(parse_command("help").unwrap(), Command::Help));
         assert!(matches!(parse_command("q").unwrap(), Command::Quit));

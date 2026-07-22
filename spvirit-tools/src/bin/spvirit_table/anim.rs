@@ -86,7 +86,55 @@ pub fn is_enum_only(g: &Generator) -> bool {
     matches!(g, Generator::Cycle)
 }
 
+impl Params {
+    /// Look up a resolved param value by its key (the inverse of the assignment
+    /// in `build_anim`). Panics on an unknown key — callers only ever pass keys
+    /// from `Generator::param_keys`, so a bad key is a programming error.
+    fn get(&self, key: &str) -> f64 {
+        match key {
+            "amp" => self.amp,
+            "offset" => self.offset,
+            "period" => self.period,
+            "phase" => self.phase,
+            "min" => self.min,
+            "max" => self.max,
+            "lo" => self.lo,
+            "hi" => self.hi,
+            "duty" => self.duty,
+            "start" => self.start,
+            "step" => self.step,
+            other => panic!("Params::get: unknown key {other:?}"),
+        }
+    }
+}
+
 impl Generator {
+    /// Every generator, in a stable display order (used by help + dumps).
+    pub const ALL: [Generator; 8] = [
+        Generator::Sine,
+        Generator::Ramp,
+        Generator::Triangle,
+        Generator::Square,
+        Generator::Noise,
+        Generator::Walk,
+        Generator::Count,
+        Generator::Cycle,
+    ];
+
+    /// The canonical command-line name (inverse of `build_anim`'s match).
+    pub fn name(self) -> &'static str {
+        match self {
+            Generator::Sine => "sine",
+            Generator::Ramp => "ramp",
+            Generator::Triangle => "triangle",
+            Generator::Square => "square",
+            Generator::Noise => "noise",
+            Generator::Walk => "walk",
+            Generator::Count => "count",
+            Generator::Cycle => "cycle",
+        }
+    }
+
     /// The parameter keys this generator actually reads in `sample`. A key
     /// outside this set is rejected by `build_anim` (rather than silently
     /// ignored) so that e.g. `sine min=-2` — which does nothing, since sine's
@@ -102,6 +150,41 @@ impl Generator {
             Generator::Count => &["start", "step"],
             Generator::Cycle => &["period"],
         }
+    }
+
+    /// The default `Params` for this generator — `Params::default` with the
+    /// per-generator overrides `build_anim` applies (currently only cycle's
+    /// `period=1`). Single source of truth for help text and `build_anim`.
+    fn default_params(self) -> Params {
+        let mut p = Params::default();
+        if self == Generator::Cycle {
+            p.period = 1.0;
+        }
+        p
+    }
+
+    /// One-line `key=default` reference for this generator's params (for help).
+    pub fn param_help(self) -> String {
+        let p = self.default_params();
+        self.param_keys()
+            .iter()
+            .map(|k| format!("{k}={}", p.get(k)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+impl AnimSpec {
+    /// Render this animation's resolved params as `key=value ...` for exactly
+    /// the keys its generator uses — the inverse of `build_anim`, so a dumped
+    /// `anim <name> <gen> <dump_params>` round-trips back to the same spec.
+    pub fn dump_params(&self) -> String {
+        self.generator
+            .param_keys()
+            .iter()
+            .map(|k| format!("{k}={}", self.p.get(k)))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -122,11 +205,7 @@ pub fn build_anim(generator: &str, params: &[(String, String)]) -> Result<AnimSp
         other => return Err(format!("unknown generator {other:?}")),
     };
     let keys = g.param_keys();
-    let mut p = Params::default();
-    // `period` for cycle defaults to 1.0
-    if g == Generator::Cycle {
-        p.period = 1.0;
-    }
+    let mut p = g.default_params();
     for (k, v) in params {
         if !keys.contains(&k.as_str()) {
             return Err(format!(
@@ -262,6 +341,32 @@ mod tests {
     fn unknown_generator_and_bad_param() {
         assert!(build_anim("bogus", &[]).is_err());
         assert!(build_anim("sine", &[("amp".into(), "x".into())]).is_err());
+    }
+
+    #[test]
+    fn param_help_and_dump_params_round_trip() {
+        // Every generator's help lists exactly its param keys with real defaults.
+        for g in Generator::ALL {
+            let help = g.param_help();
+            for k in g.param_keys() {
+                assert!(help.contains(&format!("{k}=")), "{} help missing {k}: {help}", g.name());
+            }
+        }
+        // cycle's period default is 1 (the build_anim override), not 10.
+        assert_eq!(Generator::Cycle.param_help(), "period=1");
+        assert_eq!(Generator::Sine.param_help(), "amp=1 offset=0 period=10 phase=0");
+
+        // dump_params of a built spec round-trips back through build_anim.
+        let spec = build_anim("sine", &[("amp".into(), "1.5".into()), ("offset".into(), "-0.5".into())]).unwrap();
+        let dumped = spec.dump_params(); // e.g. "amp=1.5 offset=-0.5 period=10 phase=0"
+        assert!(dumped.contains("amp=1.5") && dumped.contains("offset=-0.5"));
+        let kvs: Vec<(String, String)> = dumped
+            .split_whitespace()
+            .map(|kv| { let (k, v) = kv.split_once('=').unwrap(); (k.to_string(), v.to_string()) })
+            .collect();
+        let rebuilt = build_anim("sine", &kvs).unwrap();
+        assert_eq!(rebuilt.p.amp, 1.5);
+        assert_eq!(rebuilt.p.offset, -0.5);
     }
 
     #[test]
