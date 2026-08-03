@@ -27,13 +27,13 @@ jobs:
             runner: windows-latest
             target: x64
           - name: macos-x86_64
-            runner: macos-13
+            runner: macos-latest
             target: x86_64
           - name: macos-aarch64
             runner: macos-latest
             target: aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v5
         with:
