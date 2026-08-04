@@ -47,6 +47,13 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
     // Tracks whether the next `-`/`+` is unary. True at the start of an
     // expression and immediately after any operator or `(`.
     let mut expect_operand = true;
+    // Parallel stack of in-progress argument counts for nested function
+    // calls, pushed when a `(` immediately follows a `Frame::Func` and
+    // popped when that call's `)` closes. Only `MIN`/`MAX` (`Op::Min`/
+    // `Op::Max`) actually use the final count (task-4-brief.md, RULINGS.md
+    // trap 3), but every function call tracks one uniformly so the stack
+    // stays in sync regardless of which function it is.
+    let mut arg_counts: Vec<usize> = Vec::new();
 
     for tok in &tokens {
         match tok {
@@ -58,8 +65,19 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                 out.push(Op::Lit(*v));
                 expect_operand = false;
             }
-            Token::Ident(name) => return Err(CalcError::UnknownIdent(name.clone())),
+            Token::Ident(name) => {
+                let op = ident_to_op(name)?;
+                stack.push(Frame::Func(op));
+                expect_operand = true;
+            }
             Token::Op("(") => {
+                // A `(` that immediately follows a bare function name opens
+                // that function's argument list; start counting arguments
+                // (1, since a call always has at least one argument until
+                // proven otherwise by a comma - CALC has no zero-arg calls).
+                if matches!(stack.last(), Some(Frame::Func(_))) {
+                    arg_counts.push(1);
+                }
                 stack.push(Frame::Paren);
                 expect_operand = true;
             }
@@ -71,8 +89,23 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                         // A pending `?` with no matching `:` (e.g. `"(A?B)"`)
                         // is a malformed conditional, not a paren mismatch.
                         Some(Frame::Cond) => return Err(CalcError::BadConditional),
+                        Some(Frame::Func(_)) => return Err(CalcError::Unbalanced),
                         None => return Err(CalcError::Unbalanced),
                     }
+                }
+                // If the paren we just closed belonged to a function call,
+                // pop the function frame too and emit its op, fixing up
+                // `Min`/`Max`'s arity from the comma count collected above.
+                if matches!(stack.last(), Some(Frame::Func(_))) {
+                    let Some(Frame::Func(op)) = stack.pop() else {
+                        unreachable!()
+                    };
+                    let count = arg_counts.pop().unwrap_or(1);
+                    out.push(match op {
+                        Op::Min(_) => Op::Min(count),
+                        Op::Max(_) => Op::Max(count),
+                        other => other,
+                    });
                 }
                 expect_operand = false;
             }
@@ -90,10 +123,32 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                     match stack.pop() {
                         Some(Frame::Op(op)) => out.push(op),
                         Some(Frame::Cond) => break,
-                        Some(Frame::Paren) | None => return Err(CalcError::BadConditional),
+                        Some(Frame::Paren) | Some(Frame::Func(_)) | None => {
+                            return Err(CalcError::BadConditional);
+                        }
                     }
                 }
                 stack.push(Frame::Op(Op::Cond));
+                expect_operand = true;
+            }
+            Token::Op(",") => {
+                // A comma separates arguments within the innermost open
+                // function call: pop pending operators down to that call's
+                // `(` (same shape as `)`, but without closing the call) and
+                // bump its argument count.
+                loop {
+                    match stack.last() {
+                        Some(Frame::Op(_)) => {
+                            let Some(Frame::Op(op)) = stack.pop() else {
+                                unreachable!()
+                            };
+                            out.push(op);
+                        }
+                        Some(Frame::Paren) => break,
+                        _ => return Err(CalcError::Unbalanced),
+                    }
+                }
+                *arg_counts.last_mut().ok_or(CalcError::Unbalanced)? += 1;
                 expect_operand = true;
             }
             Token::Op(sym) => {
@@ -114,6 +169,11 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
             Frame::Op(op) => out.push(op),
             Frame::Paren => return Err(CalcError::Unbalanced),
             Frame::Cond => return Err(CalcError::BadConditional),
+            // An unclosed function call, e.g. `"MIN(A,B"`: the `Frame::Paren`
+            // above it on the stack is popped (and erred on) first, so this
+            // arm is unreachable in practice, but the match must stay
+            // exhaustive.
+            Frame::Func(_) => return Err(CalcError::Unbalanced),
         }
     }
 
@@ -125,6 +185,8 @@ enum Frame {
     Op(Op),
     Paren,
     Cond,
+    /// A pending function call, between the identifier and its `)`.
+    Func(Op),
 }
 
 /// Pop operators that bind at least as tightly as the incoming one.
@@ -163,6 +225,38 @@ fn to_op(sym: &str, unary_position: bool) -> Result<Op, CalcError> {
         // placeholder, not a considered error for those symbols; don't read
         // it as meaning "expected an operand and got one of these".
         _ => return Err(CalcError::MissingOperand),
+    })
+}
+
+/// Map a CALC function name to its operation.
+///
+/// `SQR` is square *root*, matching EPICS - not squaring
+/// (`refs/postfix.c:137-138`). `MIN`/`MAX` are seeded with a placeholder
+/// count of 0; the caller fixes it up from the comma-counted argument list
+/// when the matching `)` is reached.
+fn ident_to_op(name: &str) -> Result<Op, CalcError> {
+    Ok(match name {
+        "ABS" => Op::Abs,
+        "SQR" | "SQRT" => Op::Sqrt,
+        "EXP" => Op::Exp,
+        "LOG" => Op::Log10,
+        "LOGE" | "LN" => Op::Ln,
+        "CEIL" => Op::Ceil,
+        "FLOOR" => Op::Floor,
+        "NINT" => Op::Nint,
+        "SIN" => Op::Sin,
+        "COS" => Op::Cos,
+        "TAN" => Op::Tan,
+        "ASIN" => Op::Asin,
+        "ACOS" => Op::Acos,
+        "ATAN" => Op::Atan,
+        "ATAN2" => Op::Atan2,
+        "SINH" => Op::Sinh,
+        "COSH" => Op::Cosh,
+        "TANH" => Op::Tanh,
+        "MIN" => Op::Min(0),
+        "MAX" => Op::Max(0),
+        _ => return Err(CalcError::UnknownIdent(name.to_string())),
     })
 }
 

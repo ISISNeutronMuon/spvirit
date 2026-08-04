@@ -27,6 +27,48 @@ pub enum Op {
 
     // Conditional (Task 5)
     Cond,
+
+    // Algebraic and transcendental (Task 4)
+    Abs,
+    /// Square root. Covers both `SQR` and `SQRT` (`refs/postfix.c:137-138`
+    /// alias the same `SQU_RT` opcode) - `SQR` is square *root*, not
+    /// squaring.
+    Sqrt,
+    Exp,
+    /// Base-10 log (`LOG` -> `LOG_10`, `refs/calcPerform.c:183-184`).
+    Log10,
+    /// Natural log. Covers both `LOGE` and `LN` (`refs/postfix.c:117,119`
+    /// both alias `LOG_E`, `refs/calcPerform.c:187-188`).
+    Ln,
+    Ceil,
+    Floor,
+    /// Round half-away-from-zero via a truncating `epicsInt32` cast
+    /// (`refs/calcPerform.c:291-294`), not `f64::round`'s general behavior
+    /// and not banker's rounding. See the `eval.rs` arm for the exact
+    /// divergence from C's cast on overflow.
+    Nint,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    /// `refs/calcPerform.c:225-228`, commented by Base itself as
+    /// "Ouch!: Args backwards!": `ATAN2(A,B)` evaluates to `atan2(B, A)`,
+    /// not the mathematically expected `atan2(A, B)`. Do not "fix" this.
+    Atan2,
+    Sinh,
+    Cosh,
+    Tanh,
+    /// Variadic minimum over the given operand count
+    /// (`refs/postfix.c:122`, `VARARG_OPERATOR`). NaN-propagating: any NaN
+    /// argument, at any position, makes the whole result NaN
+    /// (`refs/calcPerform.c:200-207`) - the opposite of `f64::min`.
+    Min(usize),
+    /// Variadic maximum over the given operand count
+    /// (`refs/postfix.c:121`, `VARARG_OPERATOR`). NaN-propagating, mirroring
+    /// `Min` (`refs/calcPerform.c:191-198`).
+    Max(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +124,34 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
         Op::Pow => (6, Assoc::Left),
         Op::Neg => (7, Assoc::Right),
         Op::Arg(_) | Op::Lit(_) => (0, Assoc::Left),
+        // Functions never sit on the operator stack as a `Frame::Op` (the
+        // parser tracks a pending call via `Frame::Func` instead, and emits
+        // the op directly at the closing `)` - see `parse.rs`), so
+        // `pop_while` never actually compares against these. They're given
+        // the tightest possible binding here purely so this match stays
+        // exhaustive as new `Op` variants land; postfix.c:74,90-144 puts
+        // every function and unary operator at priority 7 (same as `Neg`),
+        // not a distinct level 13, but nothing depends on the exact number.
+        Op::Abs
+        | Op::Sqrt
+        | Op::Exp
+        | Op::Log10
+        | Op::Ln
+        | Op::Ceil
+        | Op::Floor
+        | Op::Nint
+        | Op::Sin
+        | Op::Cos
+        | Op::Tan
+        | Op::Asin
+        | Op::Acos
+        | Op::Atan
+        | Op::Atan2
+        | Op::Sinh
+        | Op::Cosh
+        | Op::Tanh
+        | Op::Min(_)
+        | Op::Max(_) => (13, Assoc::Right),
     }
 }
 
@@ -89,8 +159,31 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
 pub(crate) fn arity(op: &Op) -> usize {
     match op {
         Op::Arg(_) | Op::Lit(_) => 0,
-        Op::Neg => 1,
-        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Modulo | Op::Pow => 2,
+        Op::Neg
+        | Op::Abs
+        | Op::Sqrt
+        | Op::Exp
+        | Op::Log10
+        | Op::Ln
+        | Op::Ceil
+        | Op::Floor
+        | Op::Nint
+        | Op::Sin
+        | Op::Cos
+        | Op::Tan
+        | Op::Asin
+        | Op::Acos
+        | Op::Atan
+        | Op::Sinh
+        | Op::Cosh
+        | Op::Tanh => 1,
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Modulo | Op::Pow | Op::Atan2 => 2,
         Op::Cond => 3,
+        // Variadic: arity is carried in the variant itself. `check_arity`
+        // (parse.rs) reads this the same way as any other op, so the
+        // `.expect("arity checked at compile time")` pops in `eval.rs`
+        // stay a sound invariant as long as `parse.rs` populates the count
+        // correctly (see the comma-counting logic there).
+        Op::Min(n) | Op::Max(n) => *n,
     }
 }
