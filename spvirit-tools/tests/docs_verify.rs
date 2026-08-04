@@ -323,3 +323,83 @@ fn allow_list_has_no_stale_entries() {
         stale.join("\n  ")
     );
 }
+
+// ─── generated badges ────────────────────────────────────────────────────
+
+const BADGE_BEGIN: &str = "<!-- verify:begin -->";
+const BADGE_END: &str = "<!-- verify:end -->";
+const BLOB: &str = "https://github.com/ISISNeutronMuon/spvirit/blob/main";
+const CI: &str = "https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml";
+
+/// Renders the verification badge for a chapter. Deterministic: the same
+/// manifest entry always produces byte-identical output.
+fn badge_block(spec: &Chapter) -> String {
+    let mut parts = Vec::new();
+    for file in spec.rust_examples.iter().chain(spec.py_examples.iter()) {
+        let name = file.rsplit('/').next().unwrap_or(file);
+        parts.push(format!("[`{name}`]({BLOB}/{file})"));
+    }
+    parts.push(format!(
+        "check [`docs_verify`]({BLOB}/spvirit-tools/tests/docs_verify.rs)"
+    ));
+
+    let sources = if parts.len() == 1 {
+        String::from("no code on this page")
+    } else {
+        parts.join(" · ")
+    };
+
+    format!(
+        "{BADGE_BEGIN}\n\
+         > ✅ **Verified** · {sources} · \
+         [![docs-verify]({CI}/badge.svg)]({CI})\n\
+         >\n\
+         > The badge reports the whole `docs-verify` suite, not this chapter alone.\n\
+         {BADGE_END}"
+    )
+}
+
+fn splice_badge(text: &str, badge: &str) -> Option<String> {
+    let start = text.find(BADGE_BEGIN)?;
+    let end = text.find(BADGE_END)? + BADGE_END.len();
+    Some(format!("{}{}{}", &text[..start], badge, &text[end..]))
+}
+
+#[test]
+fn badges_match_the_manifest() {
+    let verify = load_verify();
+    let src_dir = repo_root().join("docs/book/src");
+    let update = std::env::var_os("UPDATE_DOCS").is_some();
+    let mut wrong = Vec::new();
+
+    for (chapter, spec) in &verify.chapters {
+        let path = src_dir.join(chapter);
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let expected = badge_block(spec);
+
+        if !text.contains(BADGE_BEGIN) || !text.contains(BADGE_END) {
+            wrong.push(format!(
+                "{chapter}: missing the verify:begin/verify:end markers"
+            ));
+            continue;
+        }
+        if text.contains(&expected) {
+            continue;
+        }
+        if update {
+            let fixed = splice_badge(&text, &expected).expect("markers present");
+            fs::write(&path, fixed).expect("rewrite chapter");
+        } else {
+            wrong.push(format!("{chapter}: badge is stale"));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "badge blocks disagree with verify.toml:\n  {}\n\n\
+         Regenerate with:  UPDATE_DOCS=1 cargo test -p spvirit-tools --test docs_verify",
+        wrong.join("\n  ")
+    );
+}
