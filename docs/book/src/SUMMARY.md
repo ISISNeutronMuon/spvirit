@@ -13,6 +13,13 @@
 
 ---
 
+# Getting started
+
+- [Installation](02-getting-started/install.md)
+- [Your first PV](02-getting-started/first-pv.md)
+
+---
+
 # Developer guide
 
 - [Overview](06-dev-guide/README.md)

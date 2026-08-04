@@ -79,5 +79,5 @@ TLS support and structured put payloads to the client.
 ## Where to go next
 
 - New to EPICS? [EPICS in 10 minutes](epics-in-10-minutes.md).
-- Know EPICS, want it running? [Installation](../02-getting-started/installation.md).
+- Know EPICS, want it running? [Installation](../02-getting-started/install.md).
 - Want the internals? The [Developer guide](../06-dev-guide/README.md).
