@@ -18,7 +18,7 @@ monitor fire on every tick".
 | You create them with | `Pv<T>` handles (`Pv::ai(...)` …), builder methods (`.ai()`, `.waveform()` …), `.db` files | `NtScalar`/`NtScalarArray`/… built by hand; hand-built `RecordInstance`; custom `Source` impls |
 | You read/write | plain values: `pv.set(21.5)`, `store.set_value(...)` | whole payloads: `store.put_nt(...)` / `get_nt(...)`, `Notifier` posts |
 | Alarm state | computed for you from HIHI/HIGH/LOW/LOLO limits (`compute_alarms`), or `pv.set_alarm(...)` | you set `alarm` on every payload yourself |
-| Timestamps | stamped automatically on every post | yours to fill in — an explicit `timeStamp` is honoured, a zero one is stamped for you |
+| Timestamps | stamped automatically on every *server-side* update; **not** on a client PUT | yours to fill in — an explicit `timeStamp` is honoured, a zero one is stamped for you |
 | Display/control metadata (EGU, PREC, limits) | record fields, visible QSRV-style (`PV.EGU`, `PV.DESC`, …) | whatever you put in the payload, each update |
 | Monitor deadbands (MDEL/ADEL) | applied by the server | not applied — every `put_nt`/notify posts |
 | Best for | soft IOCs, simulators, anything that should feel like an EPICS record | gateways/bridges, tables, images, PVs whose metadata changes per update |
@@ -42,11 +42,19 @@ that entirely: every post goes out. If you have a 1 kHz raw-NT source and a
 monitor client, you are sending 1000 updates a second, and no amount of
 `MDEL` in a `.db` file will change that.
 
-**Timestamps are only automatic at the record level** — though the raw level
-is forgiving. Post a payload with a zero `timeStamp` and the server stamps it
-for you; post one with a real `timeStamp` and it is honoured. That is
-deliberate, so a gateway can forward the *originating* timestamp rather than
-the time it happened to relay the value.
+**Timestamps are automatic at the record level, with one exception** — and
+the raw level is forgiving. Post a payload with a zero `timeStamp` and the
+server stamps it for you; post one with a real `timeStamp` and it is
+honoured. That is deliberate, so a gateway can forward the *originating*
+timestamp rather than the time it happened to relay the value.
+
+The exception is worth stating on its own: a **client PUT does not restamp
+the record**. Server-side updates do — `set_value`, a `scan` callback, a
+`.link()` recomputation — but a value that arrived over the wire from a
+client keeps whatever timestamp the record already had. EPICS Base would
+restamp on record processing, so this is a divergence, not a design
+choice. [Reading and writing](../03-progressive/read-write.md) shows it
+happening.
 
 **Alarms are only computed at the record level.** `compute_alarms` walks the
 `HIHI`/`HIGH`/`LOW`/`LOLO` thresholds and sets severity. Raw payloads get the

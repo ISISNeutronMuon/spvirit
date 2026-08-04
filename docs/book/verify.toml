@@ -9,7 +9,6 @@
 
 [allow]
 undocumented_tools = [
-  "spmonitor",
   "spsine",
   "spinfo",
   "spexplore",
@@ -21,8 +20,6 @@ undocumented_tools = [
   "sptable",
 ]
 undocumented_examples = [
-  "spvirit-client/examples/pvmonitor.rs",
-  "spvirit-client/examples/pvput.rs",
   "spvirit-codec/examples/decode_packet.rs",
   "spvirit-server/examples/aggregate_source.rs",
   "spvirit-server/examples/custom_pvstore.rs",
@@ -73,4 +70,41 @@ anchors = [
   "spvirit-client/examples/pvget.rs:core",
   "spvirit-py/examples/demo_first_pv.py:serve",
   "spvirit-py/examples/demo_get.py:get",
+]
+
+# --- Part III: Progressive examples -------------------------------------
+
+[chapters."03-progressive/scalars.md"]
+tools = ["spget", "spput"]
+rust_examples = ["spvirit-server/examples/scalar_metadata.rs"]
+py_examples = ["spvirit-py/examples/demo_scalars.py"]
+anchors = [
+  "spvirit-server/examples/scalar_metadata.rs:meta",
+  "spvirit-py/examples/demo_scalars.py:meta",
+]
+
+[chapters."03-progressive/read-write.md"]
+tools = ["spget", "spput"]
+rust_examples = [
+  "spvirit-client/examples/pvget.rs",
+  "spvirit-client/examples/pvput.rs",
+]
+py_examples = [
+  "spvirit-py/examples/demo_get.py",
+  "spvirit-py/examples/demo_put.py",
+]
+anchors = [
+  "spvirit-client/examples/pvget.rs:core",
+  "spvirit-client/examples/pvput.rs:core",
+  "spvirit-py/examples/demo_get.py:get",
+  "spvirit-py/examples/demo_put.py:put",
+]
+
+[chapters."03-progressive/monitors.md"]
+tools = ["spmonitor"]
+rust_examples = ["spvirit-client/examples/pvmonitor.rs"]
+py_examples = ["spvirit-py/examples/demo_monitor.py"]
+anchors = [
+  "spvirit-client/examples/pvmonitor.rs:core",
+  "spvirit-py/examples/demo_monitor.py:monitor",
 ]

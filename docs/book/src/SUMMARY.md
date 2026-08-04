@@ -20,6 +20,14 @@
 
 ---
 
+# Progressive examples
+
+- [Serving scalars](03-progressive/scalars.md)
+- [Reading and writing](03-progressive/read-write.md)
+- [Monitoring changes](03-progressive/monitors.md)
+
+---
+
 # Developer guide
 
 - [Overview](06-dev-guide/README.md)
