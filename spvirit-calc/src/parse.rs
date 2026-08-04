@@ -68,7 +68,10 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                     match stack.pop() {
                         Some(Frame::Op(op)) => out.push(op),
                         Some(Frame::Paren) => break,
-                        Some(Frame::Cond) | None => return Err(CalcError::Unbalanced),
+                        // A pending `?` with no matching `:` (e.g. `"(A?B)"`)
+                        // is a malformed conditional, not a paren mismatch.
+                        Some(Frame::Cond) => return Err(CalcError::BadConditional),
+                        None => return Err(CalcError::Unbalanced),
                     }
                 }
                 expect_operand = false;
@@ -153,6 +156,12 @@ fn to_op(sym: &str, unary_position: bool) -> Result<Op, CalcError> {
         ("/", false) => Op::Div,
         ("%", false) => Op::Rem,
         ("^" | "**", false) => Op::Pow,
+        // Real operators the lexer already tokenizes (`&`, `AND`, `<<`, the
+        // relationals, etc. — see `lex.rs`'s `OPS` table) but that this
+        // task doesn't implement yet land here too, since there's no `Op`
+        // variant for them until Tasks 5/6 add one. `MissingOperand` is a
+        // placeholder, not a considered error for those symbols; don't read
+        // it as meaning "expected an operand and got one of these".
         _ => return Err(CalcError::MissingOperand),
     })
 }
@@ -245,12 +254,114 @@ mod tests {
         );
     }
 
+    // RULINGS.md-adjacent boundary the existing Pow tests all missed: every
+    // prior Pow case was Pow-vs-Pow or Pow-vs-unary, so a slip that set
+    // Pow's priority equal to Mul/Div's (5) instead of above it (6) would
+    // have passed the whole suite. `refs/postfix.c:151,155,156,160,177`:
+    // `*`/`/`/`%` are priority 5, `**`/`^` priority 6.
+    #[test]
+    fn power_binds_tighter_than_multiplication() {
+        assert_eq!(
+            ops("A*B^C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::Arg(2), Op::Pow, Op::Mul]
+        );
+    }
+
+    // `**` is an alias for `^` (`refs/postfix.c:156,177`, both `POWER`) but
+    // every other test here only exercises `^`; a typo in `to_op`'s `"**"`
+    // arm would otherwise go uncaught.
+    #[test]
+    fn double_star_is_an_alias_for_caret() {
+        assert_eq!(ops("A**B"), vec![Op::Arg(0), Op::Arg(1), Op::Pow]);
+    }
+
     #[test]
     fn conditional_compiles_to_branch() {
         assert_eq!(
             ops("A?B:C"),
             vec![Op::Arg(0), Op::Arg(1), Op::Arg(2), Op::Cond]
         );
+    }
+
+    // The ternary interacting with an operator of different precedence on
+    // each side: `+` (prio 4) binds tighter than `?:` (prio 0) on both the
+    // condition and the else-branch, so this is `(A+B) ? C : (D+E)`, not
+    // `A + (B?C:D) + E` or similar. Hand-traced against the `pop_while`
+    // priority-0 rule for `?` (`refs/postfix.c:161,173`).
+    #[test]
+    fn conditional_interacts_with_lower_precedence_operators() {
+        assert_eq!(
+            ops("A+B?C:D+E"),
+            vec![
+                Op::Arg(0),
+                Op::Arg(1),
+                Op::Add,
+                Op::Arg(2),
+                Op::Arg(3),
+                Op::Arg(4),
+                Op::Add,
+                Op::Cond,
+            ]
+        );
+    }
+
+    // Chained (right-associative) ternary in the else-branch:
+    // `A ? B : (C ? D : E)`.
+    #[test]
+    fn chained_ternary_in_else_branch() {
+        assert_eq!(
+            ops("A?B:C?D:E"),
+            vec![
+                Op::Arg(0),
+                Op::Arg(1),
+                Op::Arg(2),
+                Op::Arg(3),
+                Op::Arg(4),
+                Op::Cond,
+                Op::Cond,
+            ]
+        );
+    }
+
+    // Nested ternary in the then-branch: `A ? (B?C:D) : E`.
+    #[test]
+    fn nested_ternary_in_then_branch() {
+        assert_eq!(
+            ops("A?B?C:D:E"),
+            vec![
+                Op::Arg(0),
+                Op::Arg(1),
+                Op::Arg(2),
+                Op::Arg(3),
+                Op::Cond,
+                Op::Arg(4),
+                Op::Cond,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_dangling_question_mark() {
+        assert_eq!(compile("A?B"), Err(CalcError::BadConditional));
+    }
+
+    // A second `:` with no matching `?` to pair it with (the first `:`
+    // already consumed the one `?`).
+    #[test]
+    fn rejects_dangling_colon() {
+        assert_eq!(compile("A?B:C:D"), Err(CalcError::BadConditional));
+    }
+
+    #[test]
+    fn rejects_colon_without_question_mark() {
+        assert_eq!(compile("A:B"), Err(CalcError::BadConditional));
+    }
+
+    // Minor 3: a `)` closing over a pending `?` with no matching `:` is a
+    // malformed conditional, not a paren mismatch.
+    #[test]
+    fn rejects_paren_closing_over_dangling_conditional() {
+        assert_eq!(compile("(A?B)"), Err(CalcError::BadConditional));
     }
 
     #[test]
@@ -281,5 +392,14 @@ mod tests {
     #[test]
     fn empty_expression_compiles_to_nothing() {
         assert_eq!(ops(""), vec![]);
+    }
+
+    // Generated, not a literal: 600 repetitions of `"A+"` plus a trailing
+    // `A` pushes well over `MAX_OPS` (1000) operands/operators before the
+    // expression ends, tripping the guard mid-loop.
+    #[test]
+    fn rejects_expression_exceeding_max_ops() {
+        let src = format!("{}A", "A+".repeat(600));
+        assert_eq!(compile(&src), Err(CalcError::TooLong));
     }
 }
