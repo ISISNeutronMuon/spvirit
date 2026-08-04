@@ -84,7 +84,7 @@ Two independent release tracks:
 - Planning workflow: substantial features get a design spec and a task-by-task
   TDD plan (checkbox steps, exact commands, per-task commit messages) before
   any code is written. Those working documents stay local and are not
-  committed — the durable record is `docs/dev-guide/`, the commit history, and
+  committed — the durable record is `docs/book/src/06-dev-guide/`, the commit history, and
   the tests.
 - README has a **GenAI Usage Log** table documenting which parts were
   AI-assisted — keep it updated (transparency requirement).

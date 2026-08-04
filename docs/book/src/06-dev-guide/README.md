@@ -7,8 +7,8 @@ codec, CLI tools, Python bindings).
 This guide covers **internals**: architecture, per-crate deep dives with
 file/line references, testing, release process, and the exact state of
 in-flight work. For the *user-facing* API story, read the top-level
-[`README.md`](../../README.md) (Rust) and
-[`spvirit-py/README.md`](../../spvirit-py/README.md) (Python) first — both
+[`README.md`](../../../../README.md) (Rust) and
+[`spvirit-py/README.md`](../../../../spvirit-py/README.md) (Python) first — both
 are comprehensive and kept current.
 
 ## Chapters
