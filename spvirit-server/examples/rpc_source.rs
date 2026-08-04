@@ -95,6 +95,7 @@ impl Source for RpcAddSource {
         Box::pin(async { None })
     }
 
+    // ANCHOR: rpc
     fn rpc(
         &self,
         name: &str,
@@ -117,6 +118,7 @@ impl Source for RpcAddSource {
             ))))
         })
     }
+    // ANCHOR_END: rpc
 
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
         Box::pin(async { vec!["RPC:add".to_string()] })

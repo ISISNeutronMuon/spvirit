@@ -32,6 +32,8 @@
 - [Alarms and severity](03-progressive/alarms.md)
 - [Serving a .db file](03-progressive/db-files.md)
 - [Tables and images](03-progressive/tables-and-images.md)
+- [Custom data sources](03-progressive/sources.md)
+- [A complete IOC](03-progressive/complete-ioc.md)
 
 ---
 

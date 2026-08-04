@@ -21,15 +21,11 @@ undocumented_examples = [
   "spvirit-server/examples/custom_pvstore.rs",
   "spvirit-server/examples/custom_record.rs",
   "spvirit-server/examples/get_snapshot.rs",
-  "spvirit-server/examples/json_source.rs",
   "spvirit-server/examples/mailbox.rs",
-  "spvirit-server/examples/multi_source.rs",
   "spvirit-server/examples/nt_put_get.rs",
   "spvirit-server/examples/passthrough_source.rs",
-  "spvirit-server/examples/rpc_source.rs",
   "spvirit-server/examples/snake.rs",
   "spvirit-server/examples/store_runtime.rs",
-  "spvirit-server/examples/wildcard_source.rs",
 ]
 
 # ─── Part I: Fundamentals ───────────────────────────────────────────────
@@ -175,4 +171,27 @@ anchors = [
   "spvirit-server/examples/exotic_nt.rs:table",
   "spvirit-server/examples/exotic_nt.rs:ndarray",
   "spvirit-py/examples/demo_table.py:table",
+]
+
+[chapters."03-progressive/sources.md"]
+tools = ["spget", "spput", "splist"]
+rust_examples = [
+  "spvirit-server/examples/multi_source.rs",
+  "spvirit-server/examples/wildcard_source.rs",
+  "spvirit-server/examples/json_source.rs",
+  "spvirit-server/examples/rpc_source.rs",
+]
+anchors = [
+  "spvirit-server/examples/multi_source.rs:register",
+  "spvirit-server/examples/wildcard_source.rs:claim",
+  "spvirit-server/examples/json_source.rs:impl",
+  "spvirit-server/examples/rpc_source.rs:rpc",
+]
+
+[chapters."03-progressive/complete-ioc.md"]
+tools = ["spget", "spput", "splist", "spmonitor"]
+rust_examples = ["spvirit-server/examples/complete_ioc.rs"]
+anchors = [
+  "spvirit-server/examples/complete_ioc.rs:build",
+  "spvirit-server/examples/complete_ioc.rs:drive",
 ]

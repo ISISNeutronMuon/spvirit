@@ -167,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let counter = Arc::new(AtomicU64::new(0));
     let c = counter.clone();
 
+    // ANCHOR: register
     let server = PvaServer::builder()
         .ai("SIM:COUNTER", 0.0)
         // ConstSource at order -10 — checked before the built-in store
@@ -174,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ComputedSource at order 10 — checked after the built-in store
         .source("computed", 10, Arc::new(ComputedSource))
         .build();
+    // ANCHOR_END: register
 
     let store = server.store().clone();
 

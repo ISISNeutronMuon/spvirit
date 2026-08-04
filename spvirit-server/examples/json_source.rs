@@ -97,6 +97,7 @@ fn f64_desc() -> StructureDesc {
     }
 }
 
+// ANCHOR: impl
 impl Source for JsonSource {
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
@@ -162,6 +163,7 @@ impl Source for JsonSource {
             Ok(vec![(name, payload)])
         })
     }
+    // ANCHOR_END: impl
 
     fn subscribe(
         &self,

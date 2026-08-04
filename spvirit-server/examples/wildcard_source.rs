@@ -74,6 +74,7 @@ fn f64_scalar_desc() -> StructureDesc {
 }
 
 impl Source for WildcardSource {
+    // ANCHOR: claim
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
@@ -87,6 +88,7 @@ impl Source for WildcardSource {
             })
         })
     }
+    // ANCHOR_END: claim
 
     fn get(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
         let name = name.to_string();
