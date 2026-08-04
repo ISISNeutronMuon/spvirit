@@ -1,0 +1,49 @@
+# Chapter -> code citation manifest for docs/book.
+#
+# Enforced by spvirit-tools/tests/docs_verify.rs. Every chapter declares
+# the example files, anchors, and CLI tools it cites; the test checks they
+# exist and that every shipped tool and example is cited somewhere.
+#
+# The [allow] lists below are a migration aid: they name tools and examples
+# that no chapter documents yet. They must shrink to empty. Do not add to them.
+
+[allow]
+undocumented_tools = [
+  "spget",
+  "spmonitor",
+  "spput",
+  "spsine",
+  "spinfo",
+  "spexplore",
+  "splist",
+  "spserver",
+  "spdodeca",
+  "spsearch",
+  "spget_compare",
+  "sptable",
+]
+undocumented_examples = [
+  "spvirit-client/examples/pvget.rs",
+  "spvirit-client/examples/pvmonitor.rs",
+  "spvirit-client/examples/pvput.rs",
+  "spvirit-codec/examples/decode_packet.rs",
+  "spvirit-server/examples/aggregate_source.rs",
+  "spvirit-server/examples/custom_pvstore.rs",
+  "spvirit-server/examples/custom_record.rs",
+  "spvirit-server/examples/exotic_nt.rs",
+  "spvirit-server/examples/get_snapshot.rs",
+  "spvirit-server/examples/json_source.rs",
+  "spvirit-server/examples/linked_calc.rs",
+  "spvirit-server/examples/mailbox.rs",
+  "spvirit-server/examples/multi_source.rs",
+  "spvirit-server/examples/nt_put_get.rs",
+  "spvirit-server/examples/on_put.rs",
+  "spvirit-server/examples/passthrough_source.rs",
+  "spvirit-server/examples/rpc_source.rs",
+  "spvirit-server/examples/scan_callback.rs",
+  "spvirit-server/examples/simple_server.rs",
+  "spvirit-server/examples/snake.rs",
+  "spvirit-server/examples/store_runtime.rs",
+  "spvirit-server/examples/waveform.rs",
+  "spvirit-server/examples/wildcard_source.rs",
+]
