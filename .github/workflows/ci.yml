@@ -35,6 +35,26 @@ jobs:
       - name: Run tests
         run: cargo test --all
 
+      # The docs suite runs above as part of `cargo test --all`; naming it
+      # separately makes a documentation drift failure obvious in the log.
+      - name: Verify documentation
+        run: cargo test -p spvirit-tools --test docs_verify
+
+      - name: Cache mdbook binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-mdbook-0.4-mermaid-0.14
+
+      - name: Install mdbook
+        run: |
+          which mdbook || cargo install mdbook --version ^0.4 --locked
+          which mdbook-mermaid || cargo install mdbook-mermaid --version ^0.14 --locked
+
+      # create-missing = false, so a SUMMARY.md entry with no file fails here.
+      - name: Build the book
+        run: mdbook build docs/book
+
   p4p-interop:
     runs-on: ubuntu-latest
     steps:

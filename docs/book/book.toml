@@ -1,0 +1,24 @@
+[book]
+title = "Spvirit"
+description = "EPICS PVAccess in pure Rust — client, server, tools, and Python bindings"
+authors = ["Mateusz Leputa", "ISIS Neutron and Muon Source"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/ISISNeutronMuon/spvirit"
+edit-url-template = "https://github.com/ISISNeutronMuon/spvirit/edit/main/docs/book/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.fold]
+enable = true
+level = 1

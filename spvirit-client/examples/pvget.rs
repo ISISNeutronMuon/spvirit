@@ -8,6 +8,7 @@ use spvirit_client::PvaClient;
 /// cargo run --example pvget -- MY:PV
 /// cargo run --example pvget -- MY:PV --fields value,alarm.severity
 /// ```
+// ANCHOR: main
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -30,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let pv = pv.unwrap_or_else(|| "MY:PV:NAME".into());
+    // ANCHOR: core
     let client = PvaClient::builder().build();
     let result = if fields.is_empty() {
         client.pvget(&pv).await?
@@ -38,5 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.pvget_fields(&pv, &refs).await?
     };
     println!("{}: {}", result.pv_name, result.value);
+    // ANCHOR_END: core
     Ok(())
 }
+// ANCHOR_END: main

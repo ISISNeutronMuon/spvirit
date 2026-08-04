@@ -10,6 +10,7 @@ use std::ops::ControlFlow;
 /// cargo run --example pvmonitor -- MY:PV --fields value,alarm.severity
 /// cargo run --example pvmonitor -- MY:PV --pipeline 4
 /// ```
+// ANCHOR: main
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -37,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let pv = pv.unwrap_or_else(|| "MY:PV:NAME".into());
+    // ANCHOR: core
     let client = PvaClient::builder().build();
     let cb = |value: &spvirit_codec::spvd_decode::DecodedValue| {
         println!("{value}");
@@ -52,5 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         client.pvmonitor_fields(&pv, &refs, cb).await?;
     }
+    // ANCHOR_END: core
     Ok(())
 }
+// ANCHOR_END: main

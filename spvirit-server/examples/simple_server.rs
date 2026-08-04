@@ -5,11 +5,13 @@ use spvirit_types::ScalarValue;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ANCHOR: records
     let server = PvaServer::builder()
         .ai("SIM:TEMPERATURE", 22.5)
         .ao("SIM:SETPOINT", 25.0)
         .bo("SIM:ENABLE", false)
         .build();
+    // ANCHOR_END: records
 
     // First-order smoothing: SIM:TEMPERATURE tracks SIM:SETPOINT when
     // SIM:ENABLE is true.  Each tick moves 10 % of the way toward the
