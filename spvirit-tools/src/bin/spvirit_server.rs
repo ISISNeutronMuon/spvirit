@@ -200,7 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ap.refer(&mut pvlist_mode_raw).add_option(
             &["--pvlist-mode"],
             Store,
-            "PV list mode: off|discover|list (default discover)",
+            "PV list mode: off|discover|list (default list)",
         );
         ap.refer(&mut pvlist_max).add_option(
             &["--pvlist-max"],

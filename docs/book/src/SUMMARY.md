@@ -37,6 +37,24 @@
 
 ---
 
+# Command-line tools
+
+- [Overview](04-tools/index.md)
+- [spget](04-tools/spget.md)
+- [spput](04-tools/spput.md)
+- [spmonitor](04-tools/spmonitor.md)
+- [spinfo](04-tools/spinfo.md)
+- [splist](04-tools/splist.md)
+- [spexplore](04-tools/spexplore.md)
+- [spsearch](04-tools/spsearch.md)
+- [spsine](04-tools/spsine.md)
+- [spget_compare](04-tools/spget-compare.md)
+- [spserver](04-tools/spserver.md)
+- [sptable](04-tools/sptable.md)
+- [spdodeca](04-tools/spdodeca.md)
+
+---
+
 # Developer guide
 
 - [Overview](06-dev-guide/README.md)

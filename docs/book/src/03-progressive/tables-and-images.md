@@ -88,8 +88,11 @@ The `ubyteValue` field name is not decoration — NTNDArray's `value` is a
 union, and the field name identifies which arm is populated. An `int16`
 image would come back as `shortValue`.
 
-**`sptable` renders tables properly.** It is the interactive viewer for
-`NtTable` PVs; `spget` is only useful for a quick shape check.
+**There is no table *viewer* in the toolbox.** `spget` prints the shape,
+and that is the extent of it. [`sptable`](../04-tools/sptable.md) is a
+server, not a client — an interactive spreadsheet IOC that *serves* an
+`NtTable` — so it is the right tool for producing test data, not for
+inspecting someone else's PV.
 
 **Element types are fixed at creation.** Writing an `f64` column into a
 table created with `int` columns coerces to the record's type rather than
@@ -107,7 +110,6 @@ cargo run -p spvirit-server --example exotic_nt
 
 # Terminal 2
 spget SIM:TBL
-sptable SIM:TBL      # interactive table viewer
 spget SIM:IMG
 ```
 

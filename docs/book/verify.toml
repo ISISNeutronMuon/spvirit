@@ -8,13 +8,7 @@
 # that no chapter documents yet. They must shrink to empty. Do not add to them.
 
 [allow]
-undocumented_tools = [
-  "spsine",
-  "spexplore",
-  "spdodeca",
-  "spsearch",
-  "spget_compare",
-]
+undocumented_tools = []
 undocumented_examples = [
   "spvirit-codec/examples/decode_packet.rs",
   "spvirit-server/examples/aggregate_source.rs",
@@ -195,3 +189,49 @@ anchors = [
   "spvirit-server/examples/complete_ioc.rs:build",
   "spvirit-server/examples/complete_ioc.rs:drive",
 ]
+
+# --- Part IV: Command-line tools ----------------------------------------
+# One page per binary. Each page's `tools` list is the tool it documents;
+# the index cites all twelve so the table's links stay honest.
+
+[chapters."04-tools/index.md"]
+tools = [
+  "spget", "spput", "spmonitor", "spinfo", "splist", "spexplore",
+  "spsearch", "spsine", "spget_compare", "spserver", "sptable", "spdodeca",
+]
+
+[chapters."04-tools/spget.md"]
+tools = ["spget"]
+
+[chapters."04-tools/spput.md"]
+tools = ["spput"]
+
+[chapters."04-tools/spmonitor.md"]
+tools = ["spmonitor"]
+
+[chapters."04-tools/spinfo.md"]
+tools = ["spinfo"]
+
+[chapters."04-tools/splist.md"]
+tools = ["splist"]
+
+[chapters."04-tools/spexplore.md"]
+tools = ["spexplore"]
+
+[chapters."04-tools/spsearch.md"]
+tools = ["spsearch"]
+
+[chapters."04-tools/spsine.md"]
+tools = ["spsine"]
+
+[chapters."04-tools/spget-compare.md"]
+tools = ["spget_compare"]
+
+[chapters."04-tools/spserver.md"]
+tools = ["spserver"]
+
+[chapters."04-tools/sptable.md"]
+tools = ["sptable"]
+
+[chapters."04-tools/spdodeca.md"]
+tools = ["spdodeca"]
