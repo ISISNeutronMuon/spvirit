@@ -149,5 +149,5 @@ You now have every building block. The remaining parts of this book are
 reference rather than tutorial:
 
 - [Command-line tools](../04-tools/index.md) — the `sp*` family in detail
-- [Developer guide](../06-dev-guide/README.md) — internals, protocol notes,
+- [Developer guide](../06-dev-guide/index.md) — internals, protocol notes,
   and the crate-level API

@@ -76,7 +76,7 @@ declare no features.
 
 ## Where to read further
 
-The [Developer guide](../06-dev-guide/README.md) walks each crate's internals
+The [Developer guide](../06-dev-guide/index.md) walks each crate's internals
 with file-and-line citations —
 [Types and Codec](../06-dev-guide/02-types-and-codec.md),
 [Server](../06-dev-guide/03-server.md),

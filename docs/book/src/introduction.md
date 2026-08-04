@@ -25,7 +25,7 @@ EPICS and want a soft IOC running, jump to
   [record-type matrix](05-reference/record-types.md),
   [troubleshooting](05-reference/troubleshooting.md), and the
   [known gaps](05-reference/known-gaps.md).
-- **[Developer guide](06-dev-guide/README.md)** — internals, with
+- **[Developer guide](06-dev-guide/index.md)** — internals, with
   file-and-line citations, for people changing spvirit itself.
 
 Every code sample on this site is included verbatim from a file in the

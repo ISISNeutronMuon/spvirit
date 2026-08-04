@@ -67,7 +67,7 @@
 
 # Developer guide
 
-- [Overview](06-dev-guide/README.md)
+- [Overview](06-dev-guide/index.md)
 - [Architecture Overview](06-dev-guide/01-architecture.md)
 - [Types and Codec](06-dev-guide/02-types-and-codec.md)
 - [Server](06-dev-guide/03-server.md)

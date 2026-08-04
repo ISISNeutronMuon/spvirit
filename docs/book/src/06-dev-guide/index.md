@@ -9,9 +9,10 @@ file/line references, testing, release process, and the exact state of
 in-flight work. For the *user-facing* API story, read
 [Part I](../01-fundamentals/what-is-spvirit.md) through
 [Part III](../03-progressive/scalars.md) of this site first, and
-[`spvirit-py/README.md`](../../../../spvirit-py/README.md) for the full Python
-reference. The top-level [`README.md`](../../../../README.md) is a landing page
-that points here.
+[`spvirit-py/README.md`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md)
+for the full Python reference. The top-level
+[`README.md`](https://github.com/ISISNeutronMuon/spvirit/blob/main/README.md) is
+a landing page that points here.
 
 ## Chapters
 

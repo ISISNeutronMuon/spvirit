@@ -56,8 +56,8 @@ fn repo_root() -> PathBuf {
 
 fn load_verify() -> Verify {
     let path = repo_root().join("docs/book/verify.toml");
-    let text = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     toml::from_str(&text).unwrap_or_else(|e| panic!("cannot parse {}: {e}", path.display()))
 }
 
