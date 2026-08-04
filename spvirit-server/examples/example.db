@@ -1,0 +1,45 @@
+# A minimal EPICS database, loadable by both `spserver --db` and
+# `PvaServer::builder().db_file(...)`. Field names are the ordinary EPICS
+# ones; fields spvirit does not model are ignored rather than rejected.
+#
+# Note: mbbi/mbbo are NOT loadable from .db in spvirit today - build enum
+# records in code instead. See the Enums chapter.
+
+# Read-only analog input. Clients can get and monitor it; puts are refused.
+record(ai, "DEMO:TEMP") {
+    field(DESC, "Sample block temperature")
+    field(VAL,  "22.5")
+    field(EGU,  "degC")
+    field(PREC, "2")
+    field(LOPR, "0")      # display low - a hint for GUIs
+    field(HOPR, "50")     # display high
+    field(MDEL, "0.5")    # monitor deadband
+}
+
+# Writable analog output, with alarm limits the server evaluates.
+record(ao, "DEMO:SETPOINT") {
+    field(DESC, "Demanded temperature")
+    field(VAL,  "25.0")
+    field(EGU,  "degC")
+    field(PREC, "1")
+    field(LOW,  "10")     # MINOR below this
+    field(HIGH, "40")     # MINOR above this
+    field(LOLO, "5")      # MAJOR below this
+    field(HIHI, "45")     # MAJOR above this
+    field(DRVL, "0")      # advisory only - spvirit does not clamp
+    field(DRVH, "100")
+}
+
+record(bo, "DEMO:ENABLE") {
+    field(DESC, "Master enable")
+    field(VAL,  "0")
+    field(ZNAM, "DISABLED")
+    field(ONAM, "ENABLED")
+}
+
+record(waveform, "DEMO:SPECTRUM") {
+    field(DESC, "8-point detector trace")
+    field(FTVL, "DOUBLE")
+    field(NELM, "8")
+    field(VAL,  "0, 1, 4, 9, 16, 9, 4, 1")
+}

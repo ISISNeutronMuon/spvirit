@@ -28,6 +28,10 @@
 - [Reacting to writes](03-progressive/reacting-to-writes.md)
 - [Simulating a device](03-progressive/simulating.md)
 - [Arrays and waveforms](03-progressive/arrays.md)
+- [Enums and binary records](03-progressive/enums.md)
+- [Alarms and severity](03-progressive/alarms.md)
+- [Serving a .db file](03-progressive/db-files.md)
+- [Tables and images](03-progressive/tables-and-images.md)
 
 ---
 

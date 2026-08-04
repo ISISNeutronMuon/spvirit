@@ -10,21 +10,16 @@
 [allow]
 undocumented_tools = [
   "spsine",
-  "spinfo",
   "spexplore",
-  "splist",
-  "spserver",
   "spdodeca",
   "spsearch",
   "spget_compare",
-  "sptable",
 ]
 undocumented_examples = [
   "spvirit-codec/examples/decode_packet.rs",
   "spvirit-server/examples/aggregate_source.rs",
   "spvirit-server/examples/custom_pvstore.rs",
   "spvirit-server/examples/custom_record.rs",
-  "spvirit-server/examples/exotic_nt.rs",
   "spvirit-server/examples/get_snapshot.rs",
   "spvirit-server/examples/json_source.rs",
   "spvirit-server/examples/mailbox.rs",
@@ -143,4 +138,41 @@ anchors = [
   "spvirit-server/examples/waveform.rs:serve",
   "spvirit-server/examples/waveform.rs:update",
   "spvirit-py/examples/demo_waveform.py:serve",
+]
+
+[chapters."03-progressive/enums.md"]
+tools = ["spget", "spput", "spmonitor"]
+rust_examples = ["spvirit-server/examples/exotic_nt.rs"]
+py_examples = ["spvirit-py/examples/demo_enums.py"]
+anchors = [
+  "spvirit-server/examples/exotic_nt.rs:enums",
+  "spvirit-py/examples/demo_enums.py:enums",
+]
+
+[chapters."03-progressive/alarms.md"]
+tools = ["spget", "spput", "spmonitor", "spinfo"]
+rust_examples = ["spvirit-server/examples/alarms.rs"]
+py_examples = ["spvirit-py/examples/demo_alarms.py"]
+anchors = [
+  "spvirit-server/examples/alarms.rs:limits",
+  "spvirit-server/examples/alarms.rs:manual",
+  "spvirit-py/examples/demo_alarms.py:manual",
+]
+
+[chapters."03-progressive/db-files.md"]
+tools = ["spget", "spput", "splist", "spserver"]
+rust_examples = [
+  "spvirit-server/examples/db_file.rs",
+  "spvirit-server/examples/example.db",
+]
+anchors = ["spvirit-server/examples/db_file.rs:load"]
+
+[chapters."03-progressive/tables-and-images.md"]
+tools = ["spget", "sptable"]
+rust_examples = ["spvirit-server/examples/exotic_nt.rs"]
+py_examples = ["spvirit-py/examples/demo_table.py"]
+anchors = [
+  "spvirit-server/examples/exotic_nt.rs:table",
+  "spvirit-server/examples/exotic_nt.rs:ndarray",
+  "spvirit-py/examples/demo_table.py:table",
 ]

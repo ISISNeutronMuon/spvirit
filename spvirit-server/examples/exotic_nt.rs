@@ -12,6 +12,7 @@ use spvirit_types::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Build using the high-level builder for NtEnum and Generic ────────
 
+    // ANCHOR: enums
     let server = PvaServer::builder()
         .mbbi(
             "SIM:STATE",
@@ -44,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ],
         )
         .build();
+    // ANCHOR_END: enums
 
     let store = server.store().clone();
 
@@ -107,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|v| (v * 0.7 + tick as f64 * 0.15).sin())
                 .collect::<Vec<_>>();
+            // ANCHOR: table
             let table_nt = NtTable {
                 labels: vec!["X".to_string(), "Y".to_string()],
                 columns: vec![
@@ -124,11 +127,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 time_stamp: None,
             };
             store.put_nt("SIM:TBL", NtPayload::Table(table_nt)).await;
+            // ANCHOR_END: table
 
             // ── NTNDArray — tiny 4x4 image ───────────────────────────
             let pixels = (0..16)
                 .map(|i| (((i as i32 + tick as i32) % 16) * 16) as u8)
                 .collect::<Vec<_>>();
+            // ANCHOR: ndarray
             let ndarray_nt = NtNdArray {
                 value: ScalarArrayValue::U8(pixels),
                 codec: NdCodec {
@@ -164,6 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store
                 .put_nt("SIM:IMG", NtPayload::NdArray(ndarray_nt))
                 .await;
+            // ANCHOR_END: ndarray
 
             // ── Print snapshots ──────────────────────────────────────
             if let Some(snapshot) = store.get_nt("SIM:MODE").await {
