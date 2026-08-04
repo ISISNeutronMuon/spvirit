@@ -36,9 +36,7 @@ Purpose: make static/NTTable PVs archivable by the EPICS Archiver Appliance
 
 ### Effort B — Python NT value-type selection (landed)
 
-Spec: `docs/superpowers/specs/2026-07-16-python-nt-value-types-design.md`
-Plan: `docs/superpowers/plans/2026-07-16-python-nt-value-types.md` (10 tasks,
-TDD, per-task commits).
+Delivered as a 10-task TDD plan with per-task commits.
 
 Goal (achieved): let Python select any of the twelve NTScalar wire types
 instead of collapsing `int→I64`/`float→F64`. Architecture: shared
@@ -65,8 +63,7 @@ exists and exercises the full surface: `NtScalar`/`NtScalarArray`
 
 ## Known gaps and latent bugs (triage list)
 
-Cross-referenced from the per-crate chapters; also check
-`.superpowers/sdd/progress.md`, which tracks follow-ups.
+Cross-referenced from the per-crate chapters.
 
 **Protocol/codec**
 - No TLS anywhere (top roadmap item in README).

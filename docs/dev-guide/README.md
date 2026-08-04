@@ -46,9 +46,7 @@ Then:
 
 1. Read chapter 08 and run `git status` / `git log origin/main..main` —
    there is uncommitted work and unpushed commits at handover.
-2. Read `.superpowers/sdd/progress.md` — the ledger of known follow-ups and
-   latent bugs from previous development rounds.
-3. Skim the top-level README's "Key Concepts" if EPICS/PVAccess is new to
+2. Skim the top-level README's "Key Concepts" if EPICS/PVAccess is new to
    you, then chapter 01 here.
 
 ## Orientation in 60 seconds
@@ -63,20 +61,21 @@ PVAccessJava.
 
 ## How work is planned here
 
-Substantial features follow a spec → plan → TDD execution workflow:
-design specs in [`docs/superpowers/specs/`](../superpowers/specs/), checkbox
-implementation plans in [`docs/superpowers/plans/`](../superpowers/plans/)
-(exact commands, per-task commits, Conventional Commit messages). One such
-plan — Python NT value-type selection — is mid-flight; see chapter 08 before
-touching `spvirit-py` or `spvirit-server/src/pv.rs`.
+Substantial features follow a spec → plan → TDD execution workflow: a design
+spec, then a checkbox implementation plan (exact commands, per-task commits,
+Conventional Commit messages), then task-by-task execution. Those working
+documents are kept out of the repository — the durable record is this guide,
+the commit history, and the tests. One such plan — Python NT value-type
+selection — is mid-flight; see chapter 08 before touching `spvirit-py` or
+`spvirit-server/src/pv.rs`.
 
 ## Where to get answers
 
 - Protocol questions: the [pvAccess Protocol Specification](https://docs.epics-controls.org/en/latest/pv-access/protocol.html)
   and [pvxs](https://epics-base.github.io/pvxs/) (the reference
   implementation this project most closely mirrors).
-- "Why is this code like this": `.superpowers/sdd/` contains per-task briefs,
-  reports and review diffs from previous development — good archaeology.
+- "Why is this code like this": the commit history is the archaeology —
+  commits are per-task and carry the reasoning in their messages.
 - Wire debugging: `spsearch` (search traffic TUI), `spget --raw` /
   `spmonitor --raw` (hex dumps), `spget_compare` (byte-compare against
   captures), and the related

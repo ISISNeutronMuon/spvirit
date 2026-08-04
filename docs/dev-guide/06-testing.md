@@ -76,9 +76,8 @@ a `main()` loop at the bottom of the file. Conventions:
 
 ## Conventions for new work
 
-- TDD is the house style: the plan documents in `docs/superpowers/plans/`
-  write failing tests first, verify failure, implement, verify pass, commit
-  per task. Follow the same rhythm.
+- TDD is the house style: write the failing test first, verify it fails,
+  implement, verify it passes, commit per task. Follow the same rhythm.
 - Timestamps in tests: always set explicit `NtTimeStamp`s on payloads you
   assert against — a `None` timestamp is stamped at *encode* time and makes
   monitor-delta assertions flaky (see chapter 02).

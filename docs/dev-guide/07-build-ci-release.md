@@ -81,12 +81,11 @@ Two independent release tracks:
 
 - **Conventional Commits**: `feat(py):`, `fix(server):`, `docs:`, `chore:
   Release`, `!` for breaking changes. Merges via GitHub PRs.
-- Planning workflow: substantial features get a design spec in
-  `docs/superpowers/specs/` and a task-by-task TDD plan in
-  `docs/superpowers/plans/` (checkbox steps, exact commands, per-task commit
-  messages). `.superpowers/sdd/` holds per-task briefs/reports and a
-  `progress.md` ledger — **read `progress.md` when picking up work; it lists
-  known latent bugs and deferred follow-ups.**
+- Planning workflow: substantial features get a design spec and a task-by-task
+  TDD plan (checkbox steps, exact commands, per-task commit messages) before
+  any code is written. Those working documents stay local and are not
+  committed — the durable record is `docs/dev-guide/`, the commit history, and
+  the tests.
 - README has a **GenAI Usage Log** table documenting which parts were
   AI-assisted — keep it updated (transparency requirement).
 - License: BSD-3-Clause, ISIS Neutron and Muon Source.
