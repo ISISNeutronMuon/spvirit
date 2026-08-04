@@ -34,6 +34,7 @@ fn f64_of(v: &ScalarValue) -> f64 {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ANCHOR: links
     let server = PvaServer::builder()
         // Writable inputs
         .ao("CALC:A", 0.0)
@@ -53,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ScalarValue::F64((f64_of(&v[0]) + f64_of(&v[1])) / 2.0)
         })
         .build();
+    // ANCHOR_END: links
 
     server.run().await
 }

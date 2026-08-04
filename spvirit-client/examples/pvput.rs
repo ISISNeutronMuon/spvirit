@@ -8,6 +8,7 @@ use spvirit_client::PvaClient;
 /// cargo run --example pvput -- MY:PV 42.0
 /// cargo run --example pvput -- MY:PV 42.0 --fields value
 /// ```
+// ANCHOR: main
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -38,6 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "42.0".into())
         .parse()?;
 
+    // ANCHOR: core
     let client = PvaClient::builder().build();
     if fields.is_empty() {
         client.pvput(&pv, value).await?;
@@ -46,5 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.pvput_fields(&pv, value, &refs).await?;
     }
     println!("OK");
+    // ANCHOR_END: core
     Ok(())
 }
+// ANCHOR_END: main

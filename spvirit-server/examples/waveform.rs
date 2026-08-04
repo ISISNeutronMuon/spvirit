@@ -3,12 +3,15 @@ use spvirit_types::ScalarArrayValue;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ANCHOR: serve
     let server = PvaServer::builder()
         .waveform("SIM:SPECTRUM", ScalarArrayValue::F64(vec![0.0; 1024]))
         .build();
+    // ANCHOR_END: serve
 
     let store = server.store().clone();
 
+    // ANCHOR: update
     tokio::spawn(async move {
         const N: usize = 1024;
         let mut tick = 0u64;
@@ -27,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     });
+    // ANCHOR_END: update
 
     server.run().await
 }

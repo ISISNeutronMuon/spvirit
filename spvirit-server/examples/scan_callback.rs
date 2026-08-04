@@ -7,6 +7,7 @@ use std::time::Duration;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     static TICK: AtomicU64 = AtomicU64::new(0);
 
+    // ANCHOR: sim
     let server = PvaServer::builder()
         .ai("SIM:TEMPERATURE", 22.5)
         .scan("SIM:TEMPERATURE", Duration::from_millis(100), |_pv| {
@@ -14,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ScalarValue::F64(22.5 + (t * 0.1).sin())
         })
         .build();
+    // ANCHOR_END: sim
 
     server.run().await
 }
