@@ -1,0 +1,13 @@
+[package]
+name = "spvirit-calc"
+version = "0.1.18"
+edition = "2024"
+description = "EPICS CALC expression compiler and evaluator"
+license = "BSD-3-Clause"
+repository = "https://github.com/ISISNeutronMuon/spvirit"
+readme = "../README.md"
+keywords = ["epics", "calc"]
+categories = ["science"]
+authors = ["Mateusz Leputa for ISIS Neutron and Muon Source Copyright 2026"]
+
+[dependencies]
