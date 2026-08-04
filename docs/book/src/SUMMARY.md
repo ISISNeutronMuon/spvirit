@@ -25,6 +25,9 @@
 - [Serving scalars](03-progressive/scalars.md)
 - [Reading and writing](03-progressive/read-write.md)
 - [Monitoring changes](03-progressive/monitors.md)
+- [Reacting to writes](03-progressive/reacting-to-writes.md)
+- [Simulating a device](03-progressive/simulating.md)
+- [Arrays and waveforms](03-progressive/arrays.md)
 
 ---
 

@@ -27,17 +27,13 @@ undocumented_examples = [
   "spvirit-server/examples/exotic_nt.rs",
   "spvirit-server/examples/get_snapshot.rs",
   "spvirit-server/examples/json_source.rs",
-  "spvirit-server/examples/linked_calc.rs",
   "spvirit-server/examples/mailbox.rs",
   "spvirit-server/examples/multi_source.rs",
   "spvirit-server/examples/nt_put_get.rs",
-  "spvirit-server/examples/on_put.rs",
   "spvirit-server/examples/passthrough_source.rs",
   "spvirit-server/examples/rpc_source.rs",
-  "spvirit-server/examples/scan_callback.rs",
   "spvirit-server/examples/snake.rs",
   "spvirit-server/examples/store_runtime.rs",
-  "spvirit-server/examples/waveform.rs",
   "spvirit-server/examples/wildcard_source.rs",
 ]
 
@@ -107,4 +103,44 @@ py_examples = ["spvirit-py/examples/demo_monitor.py"]
 anchors = [
   "spvirit-client/examples/pvmonitor.rs:core",
   "spvirit-py/examples/demo_monitor.py:monitor",
+]
+
+[chapters."03-progressive/reacting-to-writes.md"]
+tools = ["spput", "spget"]
+rust_examples = [
+  "spvirit-server/examples/on_put.rs",
+  "spvirit-server/examples/on_put_reject.rs",
+]
+py_examples = ["spvirit-py/examples/demo_on_put.py"]
+anchors = [
+  "spvirit-server/examples/on_put.rs:callback",
+  "spvirit-server/examples/on_put_reject.rs:reject",
+  "spvirit-py/examples/demo_on_put.py:callback",
+]
+
+[chapters."03-progressive/simulating.md"]
+tools = ["spput", "spget", "spmonitor"]
+rust_examples = [
+  "spvirit-server/examples/scan_callback.rs",
+  "spvirit-server/examples/linked_calc.rs",
+]
+py_examples = [
+  "spvirit-py/examples/demo_scan.py",
+  "spvirit-py/examples/demo_calc.py",
+]
+anchors = [
+  "spvirit-server/examples/scan_callback.rs:sim",
+  "spvirit-server/examples/linked_calc.rs:links",
+  "spvirit-py/examples/demo_scan.py:sim",
+  "spvirit-py/examples/demo_calc.py:links",
+]
+
+[chapters."03-progressive/arrays.md"]
+tools = ["spget", "spmonitor"]
+rust_examples = ["spvirit-server/examples/waveform.rs"]
+py_examples = ["spvirit-py/examples/demo_waveform.py"]
+anchors = [
+  "spvirit-server/examples/waveform.rs:serve",
+  "spvirit-server/examples/waveform.rs:update",
+  "spvirit-py/examples/demo_waveform.py:serve",
 ]
