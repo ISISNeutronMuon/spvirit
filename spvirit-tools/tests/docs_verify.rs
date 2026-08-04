@@ -403,3 +403,40 @@ fn badges_match_the_manifest() {
         wrong.join("\n  ")
     );
 }
+
+/// Python examples are syntax-checked, not executed — running them needs a
+/// built wheel, which the docs job does not have.
+#[test]
+fn python_examples_compile() {
+    let verify = load_verify();
+    let root = repo_root();
+    let mut files: Vec<&String> = verify
+        .chapters
+        .values()
+        .flat_map(|c| c.py_examples.iter())
+        .collect();
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return;
+    }
+
+    let mut cmd = std::process::Command::new("python");
+    cmd.arg("-m").arg("py_compile").current_dir(&root);
+    for f in &files {
+        cmd.arg(f);
+    }
+
+    match cmd.output() {
+        Ok(out) => assert!(
+            out.status.success(),
+            "py_compile failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        // No python on this machine — skip rather than fail the whole suite.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping python_examples_compile: no `python` on PATH");
+        }
+        Err(e) => panic!("failed to run python: {e}"),
+    }
+}
