@@ -1,7 +1,3 @@
-// Not yet consumed outside this file's own tests: the parser (Task 2) wires
-// `lex`/`Token` into `compile`. Remove this once that lands.
-#![allow(dead_code)]
-
 use crate::parse::CalcError;
 
 #[derive(Debug, Clone, PartialEq)]
