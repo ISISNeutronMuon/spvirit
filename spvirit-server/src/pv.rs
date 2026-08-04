@@ -169,6 +169,37 @@ impl PvScalar for String {
     }
 }
 
+impl PvScalar for ScalarValue {
+    const TYPE_NAME: &'static str = "scalar";
+    fn into_scalar(self) -> ScalarValue {
+        self
+    }
+    fn from_scalar(v: ScalarValue) -> Option<Self> {
+        Some(v)
+    }
+    /// Faithful 1:1 structural mapping — deliberately NOT the generic
+    /// `decoded_to_scalar_value`, whose truthy-check-first order turns any
+    /// nonzero numeric into `Bool` (see the trait doc above). Callers that
+    /// need a specific wire type re-coerce the returned variant themselves.
+    fn from_decoded(dv: &DecodedValue) -> Option<Self> {
+        Some(match dv {
+            DecodedValue::Boolean(b) => ScalarValue::Bool(*b),
+            DecodedValue::Int8(n) => ScalarValue::I8(*n),
+            DecodedValue::Int16(n) => ScalarValue::I16(*n),
+            DecodedValue::Int32(n) => ScalarValue::I32(*n),
+            DecodedValue::Int64(n) => ScalarValue::I64(*n),
+            DecodedValue::UInt8(n) => ScalarValue::U8(*n),
+            DecodedValue::UInt16(n) => ScalarValue::U16(*n),
+            DecodedValue::UInt32(n) => ScalarValue::U32(*n),
+            DecodedValue::UInt64(n) => ScalarValue::U64(*n),
+            DecodedValue::Float32(f) => ScalarValue::F32(*f),
+            DecodedValue::Float64(f) => ScalarValue::F64(*f),
+            DecodedValue::String(s) => ScalarValue::Str(s.clone()),
+            _ => return None,
+        })
+    }
+}
+
 pub(crate) struct PendingDef {
     pub(crate) record: RecordInstance,
     pub(crate) validator: Option<crate::simple_store::PutValidator>,
@@ -505,6 +536,38 @@ impl Pv<i32> {
     }
 }
 
+/// Family record type for a dynamically typed scalar: the record *shape*
+/// (RTYP, writability) comes from the value family, while the `NtScalar`
+/// payload's `ScalarValue` variant carries the precise wire type.
+pub(crate) fn scalar_family_record_type(v: &ScalarValue, writable: bool) -> RecordType {
+    match (v, writable) {
+        (ScalarValue::F32(_) | ScalarValue::F64(_), false) => RecordType::Ai,
+        (ScalarValue::F32(_) | ScalarValue::F64(_), true) => RecordType::Ao,
+        (ScalarValue::Bool(_), false) => RecordType::Bi,
+        (ScalarValue::Bool(_), true) => RecordType::Bo,
+        (ScalarValue::Str(_), false) => RecordType::StringIn,
+        (ScalarValue::Str(_), true) => RecordType::StringOut,
+        (_, false) => RecordType::LongIn,
+        (_, true) => RecordType::LongOut,
+    }
+}
+
+impl Pv<ScalarValue> {
+    /// Dynamically typed scalar record, read-only over the wire. The wire
+    /// value type is whatever `ScalarValue` variant `initial` holds.
+    pub fn scalar_in(name: impl Into<String>, initial: ScalarValue) -> Self {
+        let name = name.into();
+        let rt = scalar_family_record_type(&initial, false);
+        Self::from_record(make_scalar_record(&name, rt, initial))
+    }
+    /// Dynamically typed scalar record, writable over the wire.
+    pub fn scalar_out(name: impl Into<String>, initial: ScalarValue) -> Self {
+        let name = name.into();
+        let rt = scalar_family_record_type(&initial, true);
+        Self::from_record(make_output_record(&name, rt, initial))
+    }
+}
+
 impl<T: PvScalar> Pv<T> {
     fn store(&self) -> Result<Arc<SimplePvStore>, PvError> {
         match &*self.shared.state.lock().unwrap() {
@@ -523,10 +586,11 @@ impl<T: PvScalar> Pv<T> {
         {
             Ok(())
         } else if store.get_value(&self.shared.name).await.is_some() {
-            // Record exists — the write was a no-op (value unchanged). This
-            // existence check is a benign TOCTOU: records are never removed
-            // from SimplePvStore, so a `Some` here can't go stale by the time
-            // we return `Ok`.
+            // Record exists — the write was a no-op (value unchanged). Records
+            // CAN now be removed at runtime (`SimplePvStore::remove`), so this
+            // is a genuine (benign) TOCTOU: if the record were removed between
+            // the failed set and this check we would fall through to the
+            // `NotFound` arm, which is the correct outcome.
             Ok(())
         } else {
             Err(PvError::NotFound(self.shared.name.clone()))
@@ -1296,5 +1360,113 @@ mod tests {
         let res = validator("SIM:WRAP", &dv);
         assert_eq!(res, Ok(()));
         assert_eq!(*seen.lock().unwrap(), Some(42.0));
+    }
+
+    #[test]
+    fn scalar_value_handle_constructors() {
+        let p = Pv::<ScalarValue>::scalar_out("S:U16", ScalarValue::U16(7));
+        let rec = p.pending_record().unwrap();
+        assert_eq!(rec.record_type, crate::types::RecordType::LongOut);
+        assert_eq!(rec.current_value(), ScalarValue::U16(7));
+        assert!(rec.writable());
+
+        let q = Pv::<ScalarValue>::scalar_in("S:F32", ScalarValue::F32(1.5));
+        let rec = q.pending_record().unwrap();
+        assert_eq!(rec.record_type, crate::types::RecordType::Ai);
+        assert!(!rec.writable());
+
+        let s = Pv::<ScalarValue>::scalar_in("S:STR", ScalarValue::Str("x".into()));
+        assert_eq!(
+            s.pending_record().unwrap().record_type,
+            crate::types::RecordType::StringIn
+        );
+
+        let b = Pv::<ScalarValue>::scalar_out("S:B", ScalarValue::Bool(true));
+        assert_eq!(
+            b.pending_record().unwrap().record_type,
+            crate::types::RecordType::Bo
+        );
+    }
+
+    #[tokio::test]
+    async fn scalar_value_handle_set_get_preserves_variant() {
+        let store = empty_store();
+        let pv = Pv::<ScalarValue>::scalar_out("S:U64", ScalarValue::U64(1));
+        let any: AnyPv = pv.clone().into();
+        let rec = any.take_record().unwrap();
+        store.insert(rec.name.clone(), rec).await;
+        any.bind(&store);
+
+        pv.set(ScalarValue::U64(u64::MAX)).await.unwrap();
+        assert_eq!(pv.get().await, Ok(ScalarValue::U64(u64::MAX)));
+    }
+
+    #[test]
+    fn set_scalar_value_same_variant_u64_is_exact() {
+        let mut rec = make_output_record("S:U64", RecordType::LongOut, ScalarValue::U64(1));
+        let changed = rec.set_scalar_value(ScalarValue::U64(u64::MAX), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::U64(u64::MAX));
+    }
+
+    #[test]
+    fn set_scalar_value_same_variant_f32_is_exact() {
+        let mut rec = make_output_record("S:F32", RecordType::LongOut, ScalarValue::F32(1.5));
+        let changed = rec.set_scalar_value(ScalarValue::F32(2.5), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::F32(2.5));
+    }
+
+    #[test]
+    fn set_scalar_value_same_variant_i64_is_exact() {
+        let mut rec = make_output_record("S:I64", RecordType::LongOut, ScalarValue::I64(1));
+        let changed = rec.set_scalar_value(ScalarValue::I64(i64::MIN), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::I64(i64::MIN));
+    }
+
+    #[test]
+    fn set_scalar_value_cross_variant_preserves_target_variant_from_i32() {
+        let mut rec = make_output_record("S:U16", RecordType::LongOut, ScalarValue::U16(5));
+        let changed = rec.set_scalar_value(ScalarValue::I32(42), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::U16(42));
+    }
+
+    #[test]
+    fn set_scalar_value_cross_variant_preserves_target_variant_from_f64() {
+        let mut rec = make_output_record("S:U16", RecordType::LongOut, ScalarValue::U16(5));
+        let changed = rec.set_scalar_value(ScalarValue::F64(7.0), true);
+        assert!(changed);
+        assert_eq!(rec.current_value(), ScalarValue::U16(7));
+    }
+
+    #[test]
+    fn set_scalar_value_unchanged_u64_returns_false() {
+        let mut rec = make_output_record("S:U64B", RecordType::LongOut, ScalarValue::U64(5));
+        let changed = rec.set_scalar_value(ScalarValue::U64(5), true);
+        assert!(!changed);
+        assert_eq!(rec.current_value(), ScalarValue::U64(5));
+    }
+
+    #[test]
+    fn scalar_value_from_decoded_maps_one_to_one() {
+        assert_eq!(
+            ScalarValue::from_decoded(&DecodedValue::UInt32(7)),
+            Some(ScalarValue::U32(7))
+        );
+        assert_eq!(
+            ScalarValue::from_decoded(&DecodedValue::Int8(-3)),
+            Some(ScalarValue::I8(-3))
+        );
+        assert_eq!(
+            ScalarValue::from_decoded(&DecodedValue::Boolean(true)),
+            Some(ScalarValue::Bool(true))
+        );
+        assert_eq!(
+            ScalarValue::from_decoded(&DecodedValue::String("hi".into())),
+            Some(ScalarValue::Str("hi".into()))
+        );
+        assert!(ScalarValue::from_decoded(&DecodedValue::Null).is_none());
     }
 }

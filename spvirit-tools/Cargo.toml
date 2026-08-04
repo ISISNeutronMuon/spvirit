@@ -90,3 +90,8 @@ required-features = ["client", "tui"]
 name = "spget_compare"
 path = "src/bin/spvirit_get_compare.rs"
 required-features = ["client"]
+
+[[bin]]
+name = "sptable"
+path = "src/bin/spvirit_table/main.rs"
+required-features = ["server", "tui"]

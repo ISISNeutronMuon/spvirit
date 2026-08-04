@@ -3,11 +3,14 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use spvirit_types::{
-    NtAlarm, NtControl, NtDisplay, NtNdArray, NtPayload, NtScalar, NtScalarArray, NtTable,
-    NtTimeStamp, PvValue,
+    NdCodec, NdDimension, NtAlarm, NtControl, NtDisplay, NtNdArray, NtPayload, NtScalar,
+    NtScalarArray, NtTable, NtTableColumn, NtTimeStamp, PvValue,
 };
 
-use crate::convert::{py_to_scalar, py_to_scalar_array, scalar_array_to_py, scalar_to_py};
+use crate::convert::{
+    py_to_scalar_array_maybe_typed, py_to_scalar_maybe_typed, scalar_array_to_py,
+    scalar_array_type_code, scalar_to_py, scalar_value_type_code, wire_type_name,
+};
 
 // ─── PyAlarm ─────────────────────────────────────────────────────────────────
 
@@ -234,7 +237,8 @@ impl PyNtScalar {
 impl PyNtScalar {
     /// Create an NtScalar from a Python value with optional metadata.
     #[new]
-    #[pyo3(signature = (value, units=String::new(), display_low=0.0, display_high=0.0, display_description=String::new(), display_precision=0, control_low=0.0, control_high=0.0, control_min_step=0.0, alarm_severity=0, alarm_status=0, alarm_message=String::new()))]
+    #[pyo3(signature = (value, units=String::new(), display_low=0.0, display_high=0.0, display_description=String::new(), display_precision=0, control_low=0.0, control_high=0.0, control_min_step=0.0, alarm_severity=0, alarm_status=0, alarm_message=String::new(), r#type=None))]
+    #[allow(clippy::too_many_arguments)]
     fn py_new(
         value: &Bound<'_, PyAny>,
         units: String,
@@ -248,8 +252,9 @@ impl PyNtScalar {
         alarm_severity: i32,
         alarm_status: i32,
         alarm_message: String,
+        r#type: Option<String>,
     ) -> PyResult<Self> {
-        let sv = py_to_scalar(value)?;
+        let sv = py_to_scalar_maybe_typed(value, r#type.as_deref())?;
         let mut nt = NtScalar::from_value(sv);
         nt.units = units;
         nt.display_low = display_low;
@@ -269,6 +274,12 @@ impl PyNtScalar {
     #[getter]
     fn value(&self, py: Python<'_>) -> PyObject {
         scalar_to_py(py, &self.inner.value)
+    }
+
+    /// Canonical wire value-type name, e.g. "double", "ushort", "string".
+    #[getter]
+    fn value_type(&self) -> &'static str {
+        wire_type_name(scalar_value_type_code(&self.inner.value))
     }
 
     /// Alarm severity: 0=NO_ALARM, 1=MINOR, 2=MAJOR, 3=INVALID.
@@ -362,8 +373,9 @@ impl PyNtScalarArray {
 impl PyNtScalarArray {
     /// Create an NtScalarArray from a Python list/bytes.
     #[new]
-    fn py_new(value: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let arr = py_to_scalar_array(value)?;
+    #[pyo3(signature = (value, r#type=None))]
+    fn py_new(value: &Bound<'_, PyAny>, r#type: Option<String>) -> PyResult<Self> {
+        let arr = py_to_scalar_array_maybe_typed(value, r#type.as_deref())?;
         Ok(Self {
             inner: NtScalarArray::from_value(arr),
         })
@@ -373,6 +385,12 @@ impl PyNtScalarArray {
     #[getter]
     fn value(&self, py: Python<'_>) -> PyObject {
         scalar_array_to_py(py, &self.inner.value)
+    }
+
+    /// Canonical wire element-type name, e.g. "double", "ushort".
+    #[getter]
+    fn value_type(&self) -> &'static str {
+        wire_type_name(scalar_array_type_code(&self.inner.value))
     }
 
     /// Alarm substructure.
@@ -407,8 +425,10 @@ impl PyNtScalarArray {
 
 // ─── PyNtTable ───────────────────────────────────────────────────────────────
 
-/// NTTable payload: column labels, columns, and optional metadata. Has no
-/// Python constructor — returned by reads such as `Store.get_nt`.
+/// NTTable payload: column labels, columns, and optional metadata.
+/// Create an NTTable from a `{name: list|bytes}` dict of columns.
+/// `types` optionally maps column names to value-type strings; `labels`
+/// defaults to the column names.
 #[pyclass(name = "NtTable")]
 pub struct PyNtTable {
     inner: NtTable,
@@ -468,12 +488,69 @@ impl PyNtTable {
             self.inner.columns.len()
         )
     }
+
+    #[new]
+    #[pyo3(signature = (columns, *, labels=None, types=None, descriptor=None))]
+    fn py_new(
+        columns: &Bound<'_, PyDict>,
+        labels: Option<Vec<String>>,
+        types: Option<&Bound<'_, PyDict>>,
+        descriptor: Option<String>,
+    ) -> PyResult<Self> {
+        let mut cols = Vec::with_capacity(columns.len());
+        for (key, val) in columns.iter() {
+            let name: String = key.extract()?;
+            let ty: Option<String> = match types {
+                Some(d) => match d.get_item(&name)? {
+                    Some(t) => Some(t.extract()?),
+                    None => None,
+                },
+                None => None,
+            };
+            let values = crate::convert::py_to_scalar_array_maybe_typed(&val, ty.as_deref())?;
+            cols.push(NtTableColumn { name, values });
+        }
+        if let Some(d) = types {
+            let valid: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+            for key in d.keys().iter() {
+                let key: String = key.extract()?;
+                if !valid.contains(&key.as_str()) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "types: unknown column {key:?} (valid columns: {valid:?})"
+                    )));
+                }
+            }
+        }
+        let labels = labels.unwrap_or_else(|| cols.iter().map(|c| c.name.clone()).collect());
+        let nt = NtTable {
+            labels,
+            columns: cols,
+            descriptor,
+            alarm: None,
+            time_stamp: None,
+        };
+        nt.validate()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        Ok(Self { inner: nt })
+    }
+
+    /// Return `{column_name: wire_type_name}` for every column.
+    fn column_types(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let dict = PyDict::new(py);
+        for col in &self.inner.columns {
+            dict.set_item(
+                &col.name,
+                crate::convert::wire_type_name(crate::convert::scalar_array_type_code(&col.values)),
+            )?;
+        }
+        Ok(dict.into_any().unbind())
+    }
 }
 
 // ─── PyNtNdArray ─────────────────────────────────────────────────────────────
 
 /// NTNDArray payload: flat array data plus dimensions and image metadata.
-/// Has no Python constructor — returned by reads such as `Store.get_nt`.
+/// Create an NTNDArray from flat data and per-dimension sizes (offsets 0).
 #[pyclass(name = "NtNdArray")]
 pub struct PyNtNdArray {
     inner: NtNdArray,
@@ -535,6 +612,48 @@ impl PyNtNdArray {
     #[getter]
     fn data_time_stamp(&self) -> PyTimeStamp {
         PyTimeStamp::from(&self.inner.data_time_stamp)
+    }
+
+    #[new]
+    #[pyo3(signature = (value, dims, *, r#type=None))]
+    fn py_new(value: &Bound<'_, PyAny>, dims: Vec<i32>, r#type: Option<String>) -> PyResult<Self> {
+        let arr = crate::convert::py_to_scalar_array_maybe_typed(value, r#type.as_deref())?;
+        let uncompressed = (arr.len() * arr.element_size_bytes().max(1)) as i64;
+        let dimension: Vec<NdDimension> = dims
+            .into_iter()
+            .map(|size| NdDimension {
+                size,
+                offset: 0,
+                full_size: size,
+                binning: 1,
+                reverse: false,
+            })
+            .collect();
+        Ok(Self {
+            inner: NtNdArray {
+                value: arr,
+                codec: NdCodec {
+                    name: String::new(),
+                    parameters: Default::default(),
+                },
+                compressed_size: uncompressed,
+                uncompressed_size: uncompressed,
+                dimension,
+                unique_id: 0,
+                data_time_stamp: NtTimeStamp::default(),
+                attribute: vec![],
+                descriptor: None,
+                alarm: None,
+                time_stamp: None,
+                display: None,
+            },
+        })
+    }
+
+    /// Canonical wire element-type name, e.g. "ubyte", "ushort".
+    #[getter]
+    fn value_type(&self) -> &'static str {
+        crate::convert::wire_type_name(crate::convert::scalar_array_type_code(&self.inner.value))
     }
 
     fn __repr__(&self) -> String {

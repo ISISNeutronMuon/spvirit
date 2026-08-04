@@ -70,7 +70,8 @@ impl SimplePvStore {
     ) -> Self {
         let pvs = records
             .into_iter()
-            .map(|(name, record)| {
+            .map(|(name, mut record)| {
+                record.stamp_missing_timestamps();
                 let last_posted = initial_posted(&record);
                 (
                     name,
@@ -104,7 +105,8 @@ impl SimplePvStore {
     }
 
     /// Insert or replace a PV record at runtime.
-    pub async fn insert(&self, name: String, record: RecordInstance) {
+    pub async fn insert(&self, name: String, mut record: RecordInstance) {
+        record.stamp_missing_timestamps();
         let mut pvs = self.pvs.write().await;
         let last_posted = initial_posted(&record);
         pvs.insert(
@@ -115,6 +117,14 @@ impl SimplePvStore {
                 last_posted,
             },
         );
+    }
+
+    /// Remove a PV record at runtime. Returns `true` if a record was removed,
+    /// `false` if no record with that name existed. Dropping the entry drops
+    /// its subscriber senders, which closes any active monitor channels for
+    /// that PV.
+    pub async fn remove(&self, name: &str) -> bool {
+        self.pvs.write().await.remove(name).is_some()
     }
 
     /// Read the current [`ScalarValue`] of a PV.
@@ -1068,6 +1078,54 @@ record(ao, "DB:AO") {
     }
 
     #[tokio::test]
+    async fn store_stamps_initial_timestamps_on_static_records() {
+        // Records that are never updated after creation (e.g. a static
+        // NTTable) must still carry a valid timestamp — clients like the
+        // EPICS Archiver Appliance reject epoch-0 events.
+        let mut records = HashMap::new();
+        records.insert("TEST:TBL".into(), make_nt_table("TEST:TBL"));
+        records.insert("TEST:NDA".into(), make_nt_ndarray("TEST:NDA"));
+        records.insert(
+            "TEST:ENUM".into(),
+            make_mbbo("TEST:ENUM", vec!["A".into(), "B".into()], 0),
+        );
+        records.insert(
+            "TEST:WF".into(),
+            make_waveform("TEST:WF", ScalarArrayValue::F64(vec![0.0])),
+        );
+        records.insert("TEST:AI".into(), make_ai("TEST:AI", 1.0));
+        let store = SimplePvStore::new(records, HashMap::new(), vec![], false);
+
+        match store.get_nt("TEST:TBL").await.unwrap() {
+            NtPayload::Table(nt) => {
+                assert!(nt.time_stamp.expect("table stamped").seconds_past_epoch > 0)
+            }
+            _ => panic!("expected table"),
+        }
+        match store.get_nt("TEST:NDA").await.unwrap() {
+            NtPayload::NdArray(nt) => {
+                assert!(nt.time_stamp.expect("ndarray stamped").seconds_past_epoch > 0);
+                assert!(nt.data_time_stamp.seconds_past_epoch > 0);
+            }
+            _ => panic!("expected ndarray"),
+        }
+        match store.get_nt("TEST:ENUM").await.unwrap() {
+            NtPayload::Enum(nt) => assert!(nt.time_stamp.seconds_past_epoch > 0),
+            _ => panic!("expected enum"),
+        }
+        match store.get_nt("TEST:WF").await.unwrap() {
+            NtPayload::ScalarArray(nt) => assert!(nt.time_stamp.seconds_past_epoch > 0),
+            _ => panic!("expected scalar array"),
+        }
+        match store.get_nt("TEST:AI").await.unwrap() {
+            NtPayload::Scalar(nt) => {
+                assert!(nt.time_stamp.expect("scalar stamped").seconds_past_epoch > 0)
+            }
+            _ => panic!("expected scalar"),
+        }
+    }
+
+    #[tokio::test]
     async fn has_pv_returns_true_for_existing() {
         let mut records = HashMap::new();
         records.insert("TEST:AI".into(), make_ai("TEST:AI", 1.0));
@@ -1418,6 +1476,22 @@ record(ao, "DB:AO") {
         assert_eq!(res, Err("nope".to_string()));
         // value unchanged — validator ran BEFORE apply
         assert_eq!(store.get_value("V").await, Some(ScalarValue::F64(1.0)));
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_record_and_is_idempotent() {
+        let mut records = std::collections::HashMap::new();
+        records.insert(
+            "T:GONE".to_string(),
+            crate::pva_server::make_scalar_record("T:GONE", RecordType::Ai, ScalarValue::F64(1.0)),
+        );
+        let store = SimplePvStore::new(records, Default::default(), Vec::new(), false);
+
+        assert!(store.get_value("T:GONE").await.is_some());
+        assert!(store.remove("T:GONE").await, "first remove returns true");
+        assert!(store.get_value("T:GONE").await.is_none(), "record is gone");
+        assert!(!store.remove("T:GONE").await, "second remove returns false");
+        assert!(store.claim("T:GONE").await.is_none(), "claim no longer matches");
     }
 
     #[tokio::test]

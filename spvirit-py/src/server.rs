@@ -9,9 +9,13 @@ use pyo3::prelude::*;
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::SimplePvStore;
 use spvirit_server::pva_server::PvaServer;
-use spvirit_types::{ScalarArrayValue, ScalarValue};
+use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
-use crate::convert::{decoded_to_py, py_to_scalar, py_to_scalar_array, scalar_to_py};
+use crate::convert::{
+    coerce_scalar_array_value, coerce_scalar_value, decoded_to_py, parse_scalar_type, py_to_scalar,
+    py_to_scalar_array, py_to_scalar_array_maybe_typed, py_to_scalar_array_typed,
+    py_to_scalar_typed, scalar_array_type_code, scalar_to_py, scalar_value_type_code,
+};
 use crate::nt::{nt_payload_to_py, py_to_nt_payload};
 use crate::runtime::{RUNTIME, block_on_py};
 use crate::source::{PyNotifier, PySourceAdapter};
@@ -108,52 +112,63 @@ impl PyServerBuilder {
     }
 
     /// Add a `waveform` NTScalarArray record — writable over the wire.
+    /// `type=` selects the element type explicitly.
+    #[pyo3(signature = (name, data, *, r#type=None))]
     fn waveform<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data: &Bound<'py, PyAny>,
+        r#type: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let arr = py_to_scalar_array(data)?;
+        let arr = py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.waveform(name, arr));
         Ok(slf)
     }
 
     /// Add an `aai` (analog array input) NTScalarArray record — read-only over the wire.
+    /// `type=` selects the element type explicitly.
+    #[pyo3(signature = (name, data, *, r#type=None))]
     fn aai<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data: &Bound<'py, PyAny>,
+        r#type: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let arr = py_to_scalar_array(data)?;
+        let arr = py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.aai(name, arr));
         Ok(slf)
     }
 
     /// Add an `aao` (analog array output) NTScalarArray record — writable over the wire.
+    /// `type=` selects the element type explicitly.
+    #[pyo3(signature = (name, data, *, r#type=None))]
     fn aao<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data: &Bound<'py, PyAny>,
+        r#type: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let arr = py_to_scalar_array(data)?;
+        let arr = py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.aao(name, arr));
         Ok(slf)
     }
 
     /// Add a `subArray` record serving a `nelm`-element window of `data`
-    /// starting at `indx` (defaults to the full array).
-    #[pyo3(signature = (name, data, indx=0, nelm=None))]
+    /// starting at `indx` (defaults to the full array). `type=` selects the
+    /// element type explicitly.
+    #[pyo3(signature = (name, data, indx=0, nelm=None, *, r#type=None))]
     fn sub_array<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data: &Bound<'py, PyAny>,
         indx: usize,
         nelm: Option<usize>,
+        r#type: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let arr = py_to_scalar_array(data)?;
+        let arr = py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
         let n = nelm.unwrap_or(arr.len());
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.sub_array(name, arr, indx, n));
@@ -161,10 +176,13 @@ impl PyServerBuilder {
     }
 
     /// Add an NTTable record from a `{column_name: list}` dict of columns.
+    /// `types=` selects per-column element types explicitly.
+    #[pyo3(signature = (name, columns, *, types=None))]
     fn nt_table<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         columns: &Bound<'py, PyAny>,
+        types: Option<&Bound<'py, pyo3::types::PyDict>>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let dict = columns.downcast::<pyo3::types::PyDict>().map_err(|_| {
             pyo3::exceptions::PyTypeError::new_err("columns must be a dict of {name: list}")
@@ -172,8 +190,26 @@ impl PyServerBuilder {
         let mut cols: Vec<(String, ScalarArrayValue)> = Vec::new();
         for (key, val) in dict.iter() {
             let col_name: String = key.extract()?;
-            let col_data = py_to_scalar_array(&val)?;
+            let ty: Option<String> = match types {
+                Some(d) => match d.get_item(&col_name)? {
+                    Some(t) => Some(t.extract()?),
+                    None => None,
+                },
+                None => None,
+            };
+            let col_data = py_to_scalar_array_maybe_typed(&val, ty.as_deref())?;
             cols.push((col_name, col_data));
+        }
+        if let Some(d) = types {
+            let valid: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+            for key in d.keys().iter() {
+                let key: String = key.extract()?;
+                if !valid.contains(&key.as_str()) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "types: unknown column {key:?} (valid columns: {valid:?})"
+                    )));
+                }
+            }
         }
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.nt_table(name, cols));
@@ -181,14 +217,16 @@ impl PyServerBuilder {
     }
 
     /// Add an NTNDArray record from flat array data and `(size, full_size)`
-    /// dimension pairs.
+    /// dimension pairs. `type=` selects the element type explicitly.
+    #[pyo3(signature = (name, data, dims, *, r#type=None))]
     fn nt_ndarray<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         data: &Bound<'py, PyAny>,
         dims: Vec<(i32, i32)>,
+        r#type: Option<String>,
     ) -> PyResult<PyRefMut<'py, Self>> {
-        let arr = py_to_scalar_array(data)?;
+        let arr = py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.nt_ndarray(name, arr, dims));
         Ok(slf)
@@ -221,18 +259,42 @@ impl PyServerBuilder {
     }
 
     /// Add a generic structure record with the given struct ID and a
-    /// `{field_name: value}` dict (scalars or lists).
+    /// `{field_name: value}` dict (scalars or lists). `types=` selects
+    /// per-field types explicitly (e.g. `"short"`, `"short[]"`).
+    #[pyo3(signature = (name, struct_id, fields, *, types=None))]
     fn generic<'py>(
         mut slf: PyRefMut<'py, Self>,
         name: String,
         struct_id: String,
         fields: &Bound<'py, pyo3::types::PyDict>,
+        types: Option<&Bound<'py, pyo3::types::PyDict>>,
     ) -> PyResult<PyRefMut<'py, Self>> {
         let mut field_vec: Vec<(String, spvirit_types::PvValue)> = Vec::new();
         for (key, val) in fields.iter() {
             let field_name: String = key.extract()?;
-            let pv_val = py_to_pv_value(&val)?;
+            let ty: Option<String> = match types {
+                Some(d) => match d.get_item(&field_name)? {
+                    Some(t) => Some(t.extract()?),
+                    None => None,
+                },
+                None => None,
+            };
+            let pv_val = match ty {
+                Some(t) => py_to_pv_value_typed(&val, &t)?,
+                None => py_to_pv_value(&val)?,
+            };
             field_vec.push((field_name, pv_val));
+        }
+        if let Some(d) = types {
+            let valid: Vec<&str> = field_vec.iter().map(|(n, _)| n.as_str()).collect();
+            for key in d.keys().iter() {
+                let key: String = key.extract()?;
+                if !valid.contains(&key.as_str()) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "types: unknown field {key:?} (valid fields: {valid:?})"
+                    )));
+                }
+            }
         }
         let b = take_builder(&mut slf)?;
         slf.builder = Some(b.generic(name, struct_id, field_vec));
@@ -550,10 +612,11 @@ impl PyServer {
                     let h = block_on_py(py, server.pv::<String>(&name)).map_err(pv_err)?;
                     PvKind::Str(h)
                 }
+                // long / ubyte / ushort / uint / ulong — dynamically typed handle.
                 other => {
-                    return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                        "PV '{name}' has unsupported value type {other:?} for typed handles"
-                    )));
+                    let code = crate::convert::scalar_value_type_code(&other);
+                    let h = block_on_py(py, server.pv::<ScalarValue>(&name)).map_err(pv_err)?;
+                    PvKind::Typed(h, code)
                 }
             },
             Some(NtPayload::Enum(_)) => {
@@ -673,30 +736,59 @@ impl PyStore {
         })
     }
 
-    /// Set a scalar value on a PV. Returns True if the PV exists.
+    /// Set a scalar value on a PV, strictly coerced to the record's current
+    /// wire type (the record is the authority — writes never retype it).
+    /// Returns True if the PV exists.
     fn set_value(&self, py: Python<'_>, name: String, value: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let sv = py_to_scalar(value)?;
         let store = self.inner.clone();
+        let sv = match block_on_py(py, store.get_value(&name)) {
+            Some(current) => py_to_scalar_typed(value, scalar_value_type_code(&current))?,
+            None => return Ok(false),
+        };
         Ok(block_on_py(py, store.set_value(&name, sv)))
     }
 
-    /// Set an array value on a PV. Returns True if the PV exists.
+    /// Set an array value on a PV, strictly coerced to the record's current
+    /// element type. Returns True if the PV exists.
     fn set_array_value(
         &self,
         py: Python<'_>,
         name: String,
         value: &Bound<'_, PyAny>,
     ) -> PyResult<bool> {
-        let arr = py_to_scalar_array(value)?;
         let store = self.inner.clone();
+        let code = match block_on_py(py, store.get_nt(&name)) {
+            Some(NtPayload::ScalarArray(nt)) => Some(scalar_array_type_code(&nt.value)),
+            Some(NtPayload::NdArray(nt)) => Some(scalar_array_type_code(&nt.value)),
+            Some(_) => None, // non-array record: keep inference, core decides
+            None => return Ok(false),
+        };
+        let arr = match code {
+            Some(c) => py_to_scalar_array_typed(value, c)?,
+            None => py_to_scalar_array(value)?,
+        };
         Ok(block_on_py(py, store.set_array_value(&name, arr)))
     }
 
-    /// Write a full NT payload (NtScalar, NtScalarArray, etc.) to a PV.
+    /// Write a full NT payload (NtScalar, NtScalarArray, etc.) to a PV. The
+    /// payload's value is strictly coerced to the record's current wire type.
     /// Returns True if the PV exists.
     fn put_nt(&self, py: Python<'_>, name: String, nt: &Bound<'_, PyAny>) -> PyResult<bool> {
         let payload = py_to_nt_payload(nt)?;
         let store = self.inner.clone();
+        let payload = match (block_on_py(py, store.get_nt(&name)), payload) {
+            (None, _) => return Ok(false),
+            (Some(NtPayload::Scalar(current)), NtPayload::Scalar(mut new)) => {
+                new.value = coerce_scalar_value(new.value, scalar_value_type_code(&current.value))?;
+                NtPayload::Scalar(new)
+            }
+            (Some(NtPayload::ScalarArray(current)), NtPayload::ScalarArray(mut new)) => {
+                new.value =
+                    coerce_scalar_array_value(new.value, scalar_array_type_code(&current.value))?;
+                NtPayload::ScalarArray(new)
+            }
+            (_, p) => p, // table/ndarray/enum/generic or kind mismatch: core decides
+        };
         Ok(block_on_py(py, store.put_nt(&name, payload)))
     }
 
@@ -726,5 +818,18 @@ fn py_to_pv_value(obj: &Bound<'_, PyAny>) -> PyResult<spvirit_types::PvValue> {
     } else {
         let sv = py_to_scalar(obj)?;
         Ok(spvirit_types::PvValue::Scalar(sv))
+    }
+}
+
+/// Typed variant of `py_to_pv_value`: `"short"` coerces a scalar,
+/// `"short[]"` coerces an array.
+fn py_to_pv_value_typed(obj: &Bound<'_, PyAny>, ty: &str) -> PyResult<spvirit_types::PvValue> {
+    let t = ty.trim();
+    if let Some(base) = t.strip_suffix("[]") {
+        let code = parse_scalar_type(base)?;
+        Ok(spvirit_types::PvValue::ScalarArray(py_to_scalar_array_typed(obj, code)?))
+    } else {
+        let code = parse_scalar_type(t)?;
+        Ok(spvirit_types::PvValue::Scalar(py_to_scalar_typed(obj, code)?))
     }
 }

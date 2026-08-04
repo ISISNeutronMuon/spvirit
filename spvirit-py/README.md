@@ -146,18 +146,54 @@ Scalar records (each is served as an NTScalar with the given value type):
 | `spvirit.longout(name, initial, **opts)` | `int` | NTScalar `int` (32-bit) | yes | long output |
 | `spvirit.string_in(name, initial, **opts)` | `str` | NTScalar `string` | no | string input |
 | `spvirit.string_out(name, initial, **opts)` | `str` | NTScalar `string` | yes | string output |
+| `spvirit.scalar(name, initial, *, type, writable=False, **opts)` | per type | NTScalar `<type>` | `writable=` flag | — |
 
 "Read-only over the wire" means network clients cannot PUT the value; your
-Python code can always `set()` it.
+Python code can always `set()` it. For the remaining NTScalar wire types
+(`long`, unsigned, `float`) use `spvirit.scalar(...)`, which covers all
+twelve.
 
 #### NT scalar type coverage
 
 PVAccess defines twelve NTScalar value types: `boolean`, `byte`, `short`,
 `int`, `long`, their unsigned variants (`ubyte`, `ushort`, `uint`, `ulong`),
-`float`, `double`, and `string`. Handles reduce these to four Python value
-kinds, and `server.pv(name)` — which can attach to *any* served record,
-including `.db`-loaded and classic-builder ones — maps wire types onto
-handles as follows:
+`float`, `double`, and `string`. All twelve are creatable:
+
+- **Scalars** — `spvirit.scalar(name, initial, *, type, writable=False, **opts)`
+  selects the wire type explicitly by name (or alias, e.g. `"i32"`/`"u16"`/
+  `"f64"`); `writable=True` serves the output flavor, `False` (default) the
+  input flavor.
+- **Arrays** — `waveform`/`aai`/`aao(name, data, *, type=None)` take the same
+  `type=` for the element type; see below for the inference behavior when
+  `type=` is omitted.
+
+```python
+counter = spvirit.scalar("SIM:COUNT", 0, type="long", writable=True)
+gain    = spvirit.scalar("SIM:GAIN", 1, type="ushort")
+level   = spvirit.scalar("SIM:LEVEL", 3.3, type="float", units="V")
+```
+
+The type string follows the `PvInfo` convention used throughout the API:
+`"boolean"|"bool"`, `"byte"|"int8"|"i8"`, `"short"`, `"int"`, `"long"`,
+`"ubyte"`, `"ushort"`, `"uint"`, `"ulong"`, `"float"|"f32"`,
+`"double"|"f64"`, `"string"|"str"`. An unrecognized type string raises
+`ValueError`.
+
+**Coercion is strict.** Converting a Python initial value (or a later `set()`
+through a typed handle) to the target wire type follows these rules:
+
+- Out-of-range values (e.g. `300` into `"byte"`, `-1` into `"ushort"`) raise
+  `OverflowError`.
+- Wrong-kind values (`str` into an int/float type, a fractional `float` like
+  `1.5` into an int type, a `bool` into a non-boolean type) raise `TypeError`.
+- Widening is always allowed: `int` → `float`/`double`, and an *integral*
+  float (`2.0`) → any int type.
+- Narrowing `double` → `float` is allowed and may lose precision (lossy
+  f64→f32 rounding), same as an EPICS `float` field.
+
+`server.pv(name)` — which can attach to *any* served record, including
+`.db`-loaded and classic-builder ones — no longer raises `KeyError` for
+`long`/unsigned records. It maps wire types onto handles as follows:
 
 | Wire NT scalar type | Handle kind | Notes |
 |---|---|---|
@@ -167,20 +203,28 @@ handles as follows:
 | `string` | `str` | |
 | NTEnum | `int` | the value is the choice index |
 | NTScalarArray (any element type) | array | see element notes below |
-| `long`, `ubyte`, `ushort`, `uint`, `ulong` | — | `server.pv()` raises `KeyError` |
+| `long`, `ubyte`, `ushort`, `uint`, `ulong` | dynamically typed handle | `repr(pv)` shows the wire type, e.g. `<spvirit.Pv 'SIM:COUNT' (long)>` |
 
-64-bit and unsigned scalar records cannot currently be created from the
-handle factories either — `longin`/`longout` are 32-bit. If you need those
-wire types today, serve them via a [dynamic source](#dynamic-sources), whose
-`PvInfo` accepts the full type-string set (e.g. `"long"`, `"ulong"`,
-`"ushort"`), and read/write them through source `get`/`put` rather than a
-typed handle.
+A dynamically typed handle's `set()`/`get()` still uses plain Python `int`
+values, coerced with the same strict rules as above (an out-of-range write
+raises `OverflowError`).
+
+**Widened `int` handles are not range-checked.** A `byte`/`short`/`int`
+record maps onto the plain Python `int` handle kind above, which is *not*
+the same code path as `spvirit.scalar()`'s typed handles or
+`store.set_value` — writes through it use the core's C-style narrowing cast
+instead of strict coercion, so an out-of-range write silently wraps (e.g.
+`300` written to a `byte` record stores `44`) rather than raising
+`OverflowError`. Use `spvirit.scalar(name, initial, type="byte", ...)` or
+`store.set_value` when you need strict range enforcement on these types.
 
 Array element types: `waveform`/`aai`/`aao` infer the element type from the
-data — `bytes` becomes an unsigned-byte (`ubyte[]`) array and reads back as
-`bytes`; lists become `boolean[]`/`long[]`/`double[]`/`string[]` from the
-first element (int lists are stored as 64-bit elements) and read back as
-lists. Mixed-type lists raise `TypeError`.
+data when `type=` is omitted — `bytes` becomes an unsigned-byte (`ubyte[]`)
+array and reads back as `bytes`; lists become `boolean[]`/`long[]`/
+`double[]`/`string[]` from the first element (int lists are stored as 64-bit
+elements) and read back as lists. Mixed-type lists raise `TypeError`. Passing
+`type=` overrides inference and coerces every element strictly (same
+OverflowError/TypeError rules as scalars).
 
 Enum records (served as NTEnum, value is the choice index):
 
@@ -195,14 +239,17 @@ out-of-range index are rejected. Only the `desc` option applies to enums.
 Array records (served as NTScalarArray):
 
 ```python
-wf    = spvirit.waveform("SIM:WF", [0.0] * 1024)     # writable
-raw   = spvirit.aai("SIM:RAW", bytes(512))            # read-only, U8 array
-table = spvirit.aao("SIM:TBL", [1, 2, 3])             # writable
+wf    = spvirit.waveform("SIM:WF", [0.0] * 1024)                # writable
+raw   = spvirit.aai("SIM:RAW", bytes(512))                       # read-only, U8 array
+table = spvirit.aao("SIM:TBL", [1, 2, 3])                        # writable
+counts = spvirit.waveform("SIM:CNT", [0] * 1024, type="ushort")  # explicit element type
 ```
 
 `data` may be a list of `bool`/`int`/`float`/`str` (element type inferred from
-the first element; an empty list defaults to `double[]`) or `bytes` (stored
-as an unsigned-byte array, returned to Python as `bytes`).
+the first element; an empty list defaults to `double[]` *only when `type=` is
+omitted*) or `bytes` (stored as an unsigned-byte array, returned to Python as
+`bytes`). Pass `type=` to pick any of the twelve wire element types
+explicitly, overriding inference.
 
 Type-inferred creation — `spvirit.pv(name, initial, **opts)` picks the record
 type from the initial value:
@@ -217,7 +264,11 @@ type from the initial value:
 | anything else | `TypeError` |
 
 Inference always produces the *writable* flavor; use the explicit factories
-when you need read-only records.
+when you need read-only records. Pass `type=` to `spvirit.pv(...)` to override
+inference and pick the wire type explicitly: `double`/`boolean`/`int`/
+`string` map onto the same native handle kinds as above, any other type
+(`long`, unsigned, `float`) produces a dynamically typed handle, and a
+`list`/`bytes` initial value with `type=` produces a typed waveform.
 
 ### Common options
 
@@ -257,6 +308,10 @@ value = await temp.get_async()
 
 - All four release the GIL; blocking calls are safe from any Python thread.
 - Writing the wrong Python type raises `TypeError`.
+- On an array handle, `set()` coerces the given list/bytes to the record's
+  current element type — a plain Python `int` list written to a `ushort[]`
+  record stays `ushort[]` on the wire, and an out-of-range element raises
+  `OverflowError`. `set()` never changes an array's element type.
 - Calling `set`/`get` on a handle that has not been given to a `Server` yet
   raises `RuntimeError` ("unbound").
 - `pv.name` is the PV name; `repr(pv)` shows the name and value kind,
@@ -461,10 +516,13 @@ server = (
     .ao("DEMO:SP", 20.0)
     .mbbo("DEMO:MODE", ["Off", "On", "Auto"], 0)
     .waveform("DEMO:WF", [0.0] * 100)
+    .waveform("DEMO:CNT", [0] * 100, type="ushort")
     .sub_array("DEMO:WF10", [0.0] * 100, indx=5, nelm=10)
-    .nt_table("DEMO:TBL", {"name": ["a", "b"], "value": [1.0, 2.0]})
+    .nt_table("DEMO:TBL", {"name": ["a", "b"], "value": [1.0, 2.0]},
+              types={"value": "float"})
     .nt_ndarray("DEMO:IMG", bytes(64 * 48), dims=[(64, 0), (48, 0)])
-    .generic("DEMO:CFG", "my:struct:1.0", {"gain": 2.5, "taps": [1, 2, 3]})
+    .generic("DEMO:CFG", "my:struct:1.0", {"gain": 2.5, "taps": [1, 2, 3]},
+             types={"taps": "short[]"})
     .db_file("extra.db")
     .on_put("DEMO:SP", lambda name, value: print(name, "<-", value))
     .scan("DEMO:TEMP", 1.0, lambda name: read_sensor())
@@ -497,8 +555,14 @@ Differences from the handle API:
 - `build()` returns the same `Server` class described above, so `server.pv(name)`
   works to obtain typed handles onto builder-defined records afterwards.
 - A builder is single-use: any method after `build()` raises `RuntimeError`.
-- The builder's record methods take no metadata kwargs (`units=`, `prec=`, …);
-  set fields via a `.db` file or use the handle factories.
+- The builder's record methods take no *metadata* kwargs (`units=`, `prec=`,
+  …); set fields via a `.db` file or use the handle factories. Value types
+  are selectable, though: `waveform`/`aai`/`aao`/`sub_array`/`nt_ndarray`
+  take `type=` for the element type, and `nt_table`/`generic` take `types=` —
+  a dict mapping column/field name to a type string (e.g.
+  `{"taps": "short[]"}` for an array-typed generic field). Omitting
+  `type=`/`types=` falls back to the same inference as the handle
+  factories.
 
 ---
 
@@ -522,6 +586,16 @@ store.put_nt("DEMO:TEMP", nt)         # write a full NT payload
 `get_nt`/`put_nt` round-trip complete Normative Type payloads including alarm,
 timestamp, display, and control substructures — see
 [Normative Type classes](#normative-type-classes).
+
+`set_value` and `set_array_value` coerce the incoming value strictly to the
+record's *existing* wire type (the same OverflowError/TypeError rules as
+elsewhere) and never retype a record — there is no way to change a scalar or
+scalar-array record's wire type after creation through the store. `put_nt`
+follows the same never-retype rule for `NtScalar`/`NtScalarArray` payloads;
+for `NtTable`/`NtNdArray` payloads, `put_nt` replaces the record's stored
+payload wholesale — columns, element types, and all — since the whole
+structure comes from the payload you supply. Writing to a name that isn't
+served returns `False` (or, for `get_value`, `None`) rather than raising.
 
 ---
 
@@ -610,19 +684,35 @@ nt = spvirit.NtScalar(
 nt.value            # 42.5   (all properties are read-only)
 nt.units            # "mm"
 nt.alarm_severity   # 0
+nt.value_type       # "double"
+
+count = spvirit.NtScalar(1000, type="long")
+count.value_type    # "long"
 ```
 
 - `NtScalar(value, units="", display_low=0.0, display_high=0.0,
   display_description="", display_precision=0, control_low=0.0,
   control_high=0.0, control_min_step=0.0, alarm_severity=0, alarm_status=0,
-  alarm_message="")` — scalar with display/control/alarm metadata.
-- `NtScalarArray(value)` — array payload (list or bytes); exposes `.value`,
+  alarm_message="", type=None)` — scalar with display/control/alarm metadata.
+  `type=` picks the wire value type explicitly (same type-string convention
+  and strict coercion as `spvirit.scalar(...)`); omitted, the type is
+  inferred from `value` the same way `spvirit.pv(...)` infers it. `.value_type`
+  returns the canonical wire type name, e.g. `"double"`, `"ushort"`.
+- `NtScalarArray(value, type=None)` — array payload (list or bytes); `type=`
+  picks the element type explicitly. Exposes `.value`, `.value_type`,
   `.alarm`, `.time_stamp`, `.display`, `.control`.
-- `NtTable` — returned by reads (no Python constructor); `.labels`,
-  `.columns() -> dict[str, list]`, `.descriptor`, `.alarm`, `.time_stamp`.
-- `NtNdArray` — returned by reads; `.value`, `.dimensions()` (list of dicts
-  with `size`/`offset`/`full_size`/`binning`/`reverse`), `.unique_id`,
-  `.compressed_size`, `.uncompressed_size`, `.data_time_stamp`.
+- `NtTable(columns, *, labels=None, types=None, descriptor=None)` — build a
+  table from a `{column_name: list}` dict; `labels` defaults to the column
+  names, `types` optionally maps column name to a value-type string.
+  `.labels`, `.columns() -> dict[str, list]`, `.column_types() -> dict[str, str]`,
+  `.descriptor`, `.alarm`, `.time_stamp` (the latter two `None` unless the
+  table came from a read).
+- `NtNdArray(value, dims, *, type=None)` — build an N-D array from flat data
+  and a list of per-dimension sizes (offset 0, binning 1, not reversed);
+  `type=` picks the element type explicitly. `.value`, `.value_type`,
+  `.dimensions()` (list of dicts with `size`/`offset`/`full_size`/`binning`/
+  `reverse`), `.unique_id`, `.compressed_size`, `.uncompressed_size`,
+  `.data_time_stamp`.
 - Substructure classes, each with read-only properties matching their
   constructor arguments:
   - `Alarm(severity=0, status=0, message="")`
@@ -883,8 +973,9 @@ fit:
 |---|---|
 | `RuntimeError` | handle not yet bound to a server; `ServerBuilder` method after `build()` |
 | `KeyError` | `server.pv(name)` for an unknown or unsupported record |
-| `TypeError` | wrong value type; `on_put`/`scan` on an array PV; bad `calc` inputs; metadata options on an array `pv()` |
-| `ValueError` | invalid address strings; non-finite floats in client puts |
+| `TypeError` | wrong value type; wrong-kind value for a `type=`-selected wire type (e.g. `str` into an int type, a fractional `float` into an int type, `bool` into a non-boolean type); `on_put`/`scan` on an array PV; bad `calc` inputs; metadata options on an array `pv()` |
+| `ValueError` | invalid address strings; non-finite floats in client puts; unknown `type=`/`types=` value-type string |
+| `OverflowError` | a `type=`-coerced value is out of range for the target wire type |
 
 ## Examples
 

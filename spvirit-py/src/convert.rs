@@ -1,9 +1,10 @@
 //! Conversion between Rust PVAccess value types and Python objects.
 
+use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
 use serde_json::Value as JsonValue;
-use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_codec::spvd_decode::{DecodedValue, TypeCode};
 use spvirit_types::{ScalarArrayValue, ScalarValue};
 
 // ─── DecodedValue → Python ───────────────────────────────────────────────────
@@ -244,5 +245,361 @@ pub fn py_to_scalar_array(obj: &Bound<'_, PyAny>) -> PyResult<ScalarArrayValue> 
         Err(pyo3::exceptions::PyTypeError::new_err(
             "array elements must be bool, int, float, or str",
         ))
+    }
+}
+
+// ─── Typed (strict) conversion ───────────────────────────────────────────────
+
+/// Parse a value-type string per the PvInfo convention. Shared with
+/// `source.rs` (PvInfo field types) — keep the vocabulary in one place.
+pub(crate) fn parse_type_code(s: &str) -> Option<TypeCode> {
+    Some(match s {
+        "boolean" | "bool" => TypeCode::Boolean,
+        "byte" | "int8" | "i8" => TypeCode::Int8,
+        "short" | "int16" | "i16" => TypeCode::Int16,
+        "int" | "int32" | "i32" => TypeCode::Int32,
+        "long" | "int64" | "i64" => TypeCode::Int64,
+        "ubyte" | "uint8" | "u8" => TypeCode::UInt8,
+        "ushort" | "uint16" | "u16" => TypeCode::UInt16,
+        "uint" | "uint32" | "u32" => TypeCode::UInt32,
+        "ulong" | "uint64" | "u64" => TypeCode::UInt64,
+        "float" | "float32" | "f32" => TypeCode::Float32,
+        "double" | "float64" | "f64" => TypeCode::Float64,
+        "string" | "str" => TypeCode::String,
+        _ => return None,
+    })
+}
+
+/// Parse a scalar value-type string, raising ValueError on unknown names.
+pub(crate) fn parse_scalar_type(s: &str) -> PyResult<TypeCode> {
+    parse_type_code(s.trim()).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "unknown value type {s:?}; expected one of boolean, byte, short, int, \
+             long, ubyte, ushort, uint, ulong, float, double, string \
+             (or aliases like bool/i32/u16/f64)"
+        ))
+    })
+}
+
+/// Canonical wire-type name for a TypeCode (`"ushort"`, `"double"`, ...).
+pub(crate) fn wire_type_name(code: TypeCode) -> &'static str {
+    match code {
+        TypeCode::Boolean => "boolean",
+        TypeCode::Int8 => "byte",
+        TypeCode::Int16 => "short",
+        TypeCode::Int32 => "int",
+        TypeCode::Int64 => "long",
+        TypeCode::UInt8 => "ubyte",
+        TypeCode::UInt16 => "ushort",
+        TypeCode::UInt32 => "uint",
+        TypeCode::UInt64 => "ulong",
+        TypeCode::Float32 => "float",
+        TypeCode::Float64 => "double",
+        TypeCode::String => "string",
+        _ => "?",
+    }
+}
+
+pub(crate) fn scalar_value_type_code(v: &ScalarValue) -> TypeCode {
+    match v {
+        ScalarValue::Bool(_) => TypeCode::Boolean,
+        ScalarValue::I8(_) => TypeCode::Int8,
+        ScalarValue::I16(_) => TypeCode::Int16,
+        ScalarValue::I32(_) => TypeCode::Int32,
+        ScalarValue::I64(_) => TypeCode::Int64,
+        ScalarValue::U8(_) => TypeCode::UInt8,
+        ScalarValue::U16(_) => TypeCode::UInt16,
+        ScalarValue::U32(_) => TypeCode::UInt32,
+        ScalarValue::U64(_) => TypeCode::UInt64,
+        ScalarValue::F32(_) => TypeCode::Float32,
+        ScalarValue::F64(_) => TypeCode::Float64,
+        ScalarValue::Str(_) => TypeCode::String,
+    }
+}
+
+pub(crate) fn scalar_array_type_code(v: &ScalarArrayValue) -> TypeCode {
+    match v {
+        ScalarArrayValue::Bool(_) => TypeCode::Boolean,
+        ScalarArrayValue::I8(_) => TypeCode::Int8,
+        ScalarArrayValue::I16(_) => TypeCode::Int16,
+        ScalarArrayValue::I32(_) => TypeCode::Int32,
+        ScalarArrayValue::I64(_) => TypeCode::Int64,
+        ScalarArrayValue::U8(_) => TypeCode::UInt8,
+        ScalarArrayValue::U16(_) => TypeCode::UInt16,
+        ScalarArrayValue::U32(_) => TypeCode::UInt32,
+        ScalarArrayValue::U64(_) => TypeCode::UInt64,
+        ScalarArrayValue::F32(_) => TypeCode::Float32,
+        ScalarArrayValue::F64(_) => TypeCode::Float64,
+        ScalarArrayValue::Str(_) => TypeCode::String,
+    }
+}
+
+fn overflow_err(v: impl std::fmt::Display, code: TypeCode) -> PyErr {
+    PyOverflowError::new_err(format!(
+        "value {v} out of range for {}",
+        wire_type_name(code)
+    ))
+}
+
+fn kind_err(got: &str, code: TypeCode) -> PyErr {
+    PyTypeError::new_err(format!(
+        "cannot convert {got} to {}",
+        wire_type_name(code)
+    ))
+}
+
+/// Range-check an integer into the requested numeric TypeCode.
+fn int_to_code(v: i128, code: TypeCode) -> PyResult<ScalarValue> {
+    Ok(match code {
+        TypeCode::Int8 => ScalarValue::I8(i8::try_from(v).map_err(|_| overflow_err(v, code))?),
+        TypeCode::Int16 => ScalarValue::I16(i16::try_from(v).map_err(|_| overflow_err(v, code))?),
+        TypeCode::Int32 => ScalarValue::I32(i32::try_from(v).map_err(|_| overflow_err(v, code))?),
+        TypeCode::Int64 => ScalarValue::I64(i64::try_from(v).map_err(|_| overflow_err(v, code))?),
+        TypeCode::UInt8 => ScalarValue::U8(u8::try_from(v).map_err(|_| overflow_err(v, code))?),
+        TypeCode::UInt16 => {
+            ScalarValue::U16(u16::try_from(v).map_err(|_| overflow_err(v, code))?)
+        }
+        TypeCode::UInt32 => {
+            ScalarValue::U32(u32::try_from(v).map_err(|_| overflow_err(v, code))?)
+        }
+        TypeCode::UInt64 => {
+            ScalarValue::U64(u64::try_from(v).map_err(|_| overflow_err(v, code))?)
+        }
+        // i128 always fits an f32/f64 range (with precision loss, like Python).
+        TypeCode::Float32 => ScalarValue::F32(v as f32),
+        TypeCode::Float64 => ScalarValue::F64(v as f64),
+        _ => return Err(kind_err("int", code)),
+    })
+}
+
+/// Coerce an f64 into the requested numeric TypeCode (strict rules).
+fn float_to_code(f: f64, code: TypeCode) -> PyResult<ScalarValue> {
+    match code {
+        TypeCode::Float64 => Ok(ScalarValue::F64(f)),
+        TypeCode::Float32 => {
+            // Precision loss is fine; magnitude overflow is not. NaN/±inf
+            // pass through unchanged.
+            let narrowed = f as f32;
+            if f.is_finite() && narrowed.is_infinite() {
+                Err(overflow_err(f, code))
+            } else {
+                Ok(ScalarValue::F32(narrowed))
+            }
+        }
+        TypeCode::Int8
+        | TypeCode::Int16
+        | TypeCode::Int32
+        | TypeCode::Int64
+        | TypeCode::UInt8
+        | TypeCode::UInt16
+        | TypeCode::UInt32
+        | TypeCode::UInt64 => {
+            if !f.is_finite() || f.fract() != 0.0 {
+                return Err(PyTypeError::new_err(format!(
+                    "cannot convert non-integral float {f} to {}",
+                    wire_type_name(code)
+                )));
+            }
+            // Out-of-i128-range floats saturate on cast and then fail the
+            // integer range check with OverflowError, which is what we want.
+            int_to_code(f as i128, code)
+        }
+        _ => Err(kind_err("float", code)),
+    }
+}
+
+/// Strictly convert a Python object to a `ScalarValue` of the requested type.
+pub(crate) fn py_to_scalar_typed(
+    obj: &Bound<'_, PyAny>,
+    code: TypeCode,
+) -> PyResult<ScalarValue> {
+    // bool is an int subclass in Python — check it first and only ever
+    // accept it for `boolean`.
+    if let Ok(b) = obj.downcast::<PyBool>() {
+        return if code == TypeCode::Boolean {
+            Ok(ScalarValue::Bool(b.is_true()))
+        } else {
+            Err(kind_err("bool", code))
+        };
+    }
+    match code {
+        TypeCode::Boolean => Err(kind_err(&obj.get_type().name()?.to_string_lossy(), code)),
+        TypeCode::String => {
+            if obj.is_instance_of::<PyString>() {
+                Ok(ScalarValue::Str(obj.extract()?))
+            } else {
+                Err(kind_err(&obj.get_type().name()?.to_string_lossy(), code))
+            }
+        }
+        _ => {
+            if obj.is_instance_of::<PyInt>() {
+                // extract::<i128> covers u64; a Python int beyond i128 raises
+                // OverflowError from pyo3 itself, consistent with our rules.
+                int_to_code(obj.extract::<i128>()?, code)
+            } else if obj.is_instance_of::<PyFloat>() {
+                float_to_code(obj.extract::<f64>()?, code)
+            } else {
+                Err(kind_err(&obj.get_type().name()?.to_string_lossy(), code))
+            }
+        }
+    }
+}
+
+/// Strictly convert a Python list/bytes to a `ScalarArrayValue` of the
+/// requested element type.
+pub(crate) fn py_to_scalar_array_typed(
+    obj: &Bound<'_, PyAny>,
+    code: TypeCode,
+) -> PyResult<ScalarArrayValue> {
+    if let Ok(bytes) = obj.downcast::<PyBytes>() {
+        return match code {
+            TypeCode::UInt8 => Ok(ScalarArrayValue::U8(bytes.as_bytes().to_vec())),
+            TypeCode::Int8 => Ok(ScalarArrayValue::I8(
+                bytes.as_bytes().iter().map(|b| *b as i8).collect(),
+            )),
+            _ => Err(PyTypeError::new_err(format!(
+                "bytes only convert to byte[]/ubyte[] arrays, not {}[]",
+                wire_type_name(code)
+            ))),
+        };
+    }
+    let list = obj.downcast::<PyList>().map_err(|_| {
+        PyTypeError::new_err("expected list or bytes for array value")
+    })?;
+
+    macro_rules! collect {
+        ($variant:ident, $sv:ident) => {{
+            let mut out = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                match py_to_scalar_typed(&item, code)? {
+                    ScalarValue::$sv(x) => out.push(x),
+                    _ => unreachable!("py_to_scalar_typed returned wrong variant"),
+                }
+            }
+            ScalarArrayValue::$variant(out)
+        }};
+    }
+    Ok(match code {
+        TypeCode::Boolean => collect!(Bool, Bool),
+        TypeCode::Int8 => collect!(I8, I8),
+        TypeCode::Int16 => collect!(I16, I16),
+        TypeCode::Int32 => collect!(I32, I32),
+        TypeCode::Int64 => collect!(I64, I64),
+        TypeCode::UInt8 => collect!(U8, U8),
+        TypeCode::UInt16 => collect!(U16, U16),
+        TypeCode::UInt32 => collect!(U32, U32),
+        TypeCode::UInt64 => collect!(U64, U64),
+        TypeCode::Float32 => collect!(F32, F32),
+        TypeCode::Float64 => collect!(F64, F64),
+        TypeCode::String => collect!(Str, Str),
+        _ => {
+            return Err(PyTypeError::new_err(format!(
+                "unsupported array element type code {code:?}"
+            )));
+        }
+    })
+}
+
+/// `type=`-kwarg helper: typed conversion when a type string is given,
+/// today's inference otherwise.
+pub(crate) fn py_to_scalar_maybe_typed(
+    obj: &Bound<'_, PyAny>,
+    ty: Option<&str>,
+) -> PyResult<ScalarValue> {
+    match ty {
+        Some(t) => py_to_scalar_typed(obj, parse_scalar_type(t)?),
+        None => py_to_scalar(obj),
+    }
+}
+
+/// `type=`-kwarg helper for arrays.
+pub(crate) fn py_to_scalar_array_maybe_typed(
+    obj: &Bound<'_, PyAny>,
+    ty: Option<&str>,
+) -> PyResult<ScalarArrayValue> {
+    match ty {
+        Some(t) => py_to_scalar_array_typed(obj, parse_scalar_type(t)?),
+        None => py_to_scalar_array(obj),
+    }
+}
+
+/// Value-level strict coercion of an existing `ScalarValue` to a TypeCode —
+/// used by store put paths where the record's current type is the authority.
+pub(crate) fn coerce_scalar_value(v: ScalarValue, code: TypeCode) -> PyResult<ScalarValue> {
+    if scalar_value_type_code(&v) == code {
+        return Ok(v);
+    }
+    match v {
+        ScalarValue::Bool(_) => Err(kind_err("boolean", code)),
+        ScalarValue::Str(_) => Err(kind_err("string", code)),
+        ScalarValue::F32(f) => float_to_code(f as f64, code),
+        ScalarValue::F64(f) => float_to_code(f, code),
+        ScalarValue::I8(n) => int_to_code(n as i128, code),
+        ScalarValue::I16(n) => int_to_code(n as i128, code),
+        ScalarValue::I32(n) => int_to_code(n as i128, code),
+        ScalarValue::I64(n) => int_to_code(n as i128, code),
+        ScalarValue::U8(n) => int_to_code(n as i128, code),
+        ScalarValue::U16(n) => int_to_code(n as i128, code),
+        ScalarValue::U32(n) => int_to_code(n as i128, code),
+        ScalarValue::U64(n) => int_to_code(n as i128, code),
+    }
+}
+
+/// Value-level strict coercion of an array to an element TypeCode.
+pub(crate) fn coerce_scalar_array_value(
+    v: ScalarArrayValue,
+    code: TypeCode,
+) -> PyResult<ScalarArrayValue> {
+    if scalar_array_type_code(&v) == code {
+        return Ok(v);
+    }
+    macro_rules! recollect {
+        ($items:expr, $to_scalar:expr, $variant:ident, $sv:ident) => {{
+            let mut out = Vec::with_capacity($items.len());
+            for item in $items {
+                match coerce_scalar_value($to_scalar(item), code)? {
+                    ScalarValue::$sv(x) => out.push(x),
+                    _ => unreachable!("coerce_scalar_value returned wrong variant"),
+                }
+            }
+            ScalarArrayValue::$variant(out)
+        }};
+    }
+    macro_rules! dispatch_target {
+        ($items:expr, $to_scalar:expr) => {
+            Ok(match code {
+                TypeCode::Boolean => recollect!($items, $to_scalar, Bool, Bool),
+                TypeCode::Int8 => recollect!($items, $to_scalar, I8, I8),
+                TypeCode::Int16 => recollect!($items, $to_scalar, I16, I16),
+                TypeCode::Int32 => recollect!($items, $to_scalar, I32, I32),
+                TypeCode::Int64 => recollect!($items, $to_scalar, I64, I64),
+                TypeCode::UInt8 => recollect!($items, $to_scalar, U8, U8),
+                TypeCode::UInt16 => recollect!($items, $to_scalar, U16, U16),
+                TypeCode::UInt32 => recollect!($items, $to_scalar, U32, U32),
+                TypeCode::UInt64 => recollect!($items, $to_scalar, U64, U64),
+                TypeCode::Float32 => recollect!($items, $to_scalar, F32, F32),
+                TypeCode::Float64 => recollect!($items, $to_scalar, F64, F64),
+                TypeCode::String => recollect!($items, $to_scalar, Str, Str),
+                _ => {
+                    return Err(PyTypeError::new_err(format!(
+                        "unsupported array element type code {code:?}"
+                    )));
+                }
+            })
+        };
+    }
+    match v {
+        ScalarArrayValue::Bool(a) => dispatch_target!(a, ScalarValue::Bool),
+        ScalarArrayValue::I8(a) => dispatch_target!(a, ScalarValue::I8),
+        ScalarArrayValue::I16(a) => dispatch_target!(a, ScalarValue::I16),
+        ScalarArrayValue::I32(a) => dispatch_target!(a, ScalarValue::I32),
+        ScalarArrayValue::I64(a) => dispatch_target!(a, ScalarValue::I64),
+        ScalarArrayValue::U8(a) => dispatch_target!(a, ScalarValue::U8),
+        ScalarArrayValue::U16(a) => dispatch_target!(a, ScalarValue::U16),
+        ScalarArrayValue::U32(a) => dispatch_target!(a, ScalarValue::U32),
+        ScalarArrayValue::U64(a) => dispatch_target!(a, ScalarValue::U64),
+        ScalarArrayValue::F32(a) => dispatch_target!(a, ScalarValue::F32),
+        ScalarArrayValue::F64(a) => dispatch_target!(a, ScalarValue::F64),
+        ScalarArrayValue::Str(a) => dispatch_target!(a, ScalarValue::Str),
     }
 }
