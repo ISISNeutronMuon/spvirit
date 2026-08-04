@@ -15,7 +15,13 @@ pub enum Op {
     Sub,
     Mul,
     Div,
-    Rem,
+    /// Integer modulo, matching `calcPerform.c`'s `MODULO` case (both
+    /// operands truncate to `epicsInt32`, C's `%` applies, zero divisor
+    /// yields `NaN`). Named `Modulo` rather than `Rem` per RULINGS.md
+    /// Ruling 5's suggestion, since `Rem` invites readers to assume f64
+    /// remainder/fmod semantics, which is exactly the mistake the
+    /// original task-3-brief.md test made.
+    Modulo,
     Pow,
     Neg,
 
@@ -72,7 +78,7 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
         // `:` and the closing point of the ternary.
         Op::Cond => (0, Assoc::Right),
         Op::Add | Op::Sub => (4, Assoc::Left),
-        Op::Mul | Op::Div | Op::Rem => (5, Assoc::Left),
+        Op::Mul | Op::Div | Op::Modulo => (5, Assoc::Left),
         Op::Pow => (6, Assoc::Left),
         Op::Neg => (7, Assoc::Right),
         Op::Arg(_) | Op::Lit(_) => (0, Assoc::Left),
@@ -84,7 +90,7 @@ pub(crate) fn arity(op: &Op) -> usize {
     match op {
         Op::Arg(_) | Op::Lit(_) => 0,
         Op::Neg => 1,
-        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem | Op::Pow => 2,
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Modulo | Op::Pow => 2,
         Op::Cond => 3,
     }
 }

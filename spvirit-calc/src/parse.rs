@@ -154,7 +154,7 @@ fn to_op(sym: &str, unary_position: bool) -> Result<Op, CalcError> {
         ("-", false) => Op::Sub,
         ("*", false) => Op::Mul,
         ("/", false) => Op::Div,
-        ("%", false) => Op::Rem,
+        ("%", false) => Op::Modulo,
         ("^" | "**", false) => Op::Pow,
         // Real operators the lexer already tokenizes (`&`, `AND`, `<<`, the
         // relationals, etc. — see `lex.rs`'s `OPS` table) but that this
