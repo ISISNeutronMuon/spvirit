@@ -172,3 +172,154 @@ fn chapters_declare_every_include() {
         undeclared.join("\n  ")
     );
 }
+
+// ─── reverse coverage ────────────────────────────────────────────────────
+
+/// Every `[[bin]]` name declared in spvirit-tools/Cargo.toml.
+fn shipped_tools() -> Vec<String> {
+    let text = fs::read_to_string(repo_root().join("spvirit-tools/Cargo.toml"))
+        .expect("read spvirit-tools/Cargo.toml");
+    let manifest: toml::Value = text.parse().expect("parse spvirit-tools/Cargo.toml");
+    manifest
+        .get("bin")
+        .and_then(|b| b.as_array())
+        .expect("spvirit-tools/Cargo.toml has [[bin]] entries")
+        .iter()
+        .filter_map(|b| b.get("name")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Every example target in the workspace, as repo-relative paths.
+fn shipped_examples() -> Vec<String> {
+    let root = repo_root();
+    let mut found = Vec::new();
+    for crate_dir in [
+        "spvirit-client",
+        "spvirit-server",
+        "spvirit-codec",
+        "spvirit-types",
+    ] {
+        let dir = root.join(crate_dir).join("examples");
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                found.push(format!(
+                    "{crate_dir}/examples/{}",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn every_tool_is_documented() {
+    let verify = load_verify();
+    let documented: Vec<&str> = verify
+        .chapters
+        .values()
+        .flat_map(|c| c.tools.iter().map(String::as_str))
+        .collect();
+
+    let mut undocumented = Vec::new();
+    for tool in shipped_tools() {
+        if documented.contains(&tool.as_str()) {
+            continue;
+        }
+        if verify.allow.undocumented_tools.contains(&tool) {
+            continue;
+        }
+        undocumented.push(tool);
+    }
+
+    assert!(
+        undocumented.is_empty(),
+        "these tools ship but no chapter documents them: {undocumented:?}\n\
+         Write a chapter for each, or add it to [allow].undocumented_tools in \
+         docs/book/verify.toml with a reason."
+    );
+}
+
+#[test]
+fn every_example_is_documented() {
+    let verify = load_verify();
+    let documented: Vec<&str> = verify
+        .chapters
+        .values()
+        .flat_map(|c| c.rust_examples.iter().map(String::as_str))
+        .collect();
+
+    let mut undocumented = Vec::new();
+    for example in shipped_examples() {
+        if documented.contains(&example.as_str()) {
+            continue;
+        }
+        if verify.allow.undocumented_examples.contains(&example) {
+            continue;
+        }
+        undocumented.push(example);
+    }
+
+    assert!(
+        undocumented.is_empty(),
+        "these examples ship but no chapter documents them: {undocumented:?}\n\
+         Cite each from a chapter, or add it to [allow].undocumented_examples in \
+         docs/book/verify.toml with a reason."
+    );
+}
+
+/// The [allow] lists are a migration aid and must shrink to empty. This test
+/// fails if an entry is stale — either the thing no longer exists, or a
+/// chapter now documents it and the entry should have been deleted.
+#[test]
+fn allow_list_has_no_stale_entries() {
+    let verify = load_verify();
+    let tools = shipped_tools();
+    let examples = shipped_examples();
+    let mut stale = Vec::new();
+
+    let documented_tools: Vec<&str> = verify
+        .chapters
+        .values()
+        .flat_map(|c| c.tools.iter().map(String::as_str))
+        .collect();
+    let documented_examples: Vec<&str> = verify
+        .chapters
+        .values()
+        .flat_map(|c| c.rust_examples.iter().map(String::as_str))
+        .collect();
+
+    for tool in &verify.allow.undocumented_tools {
+        if !tools.contains(tool) {
+            stale.push(format!(
+                "allow.undocumented_tools has {tool:?}, which is not a [[bin]]"
+            ));
+        } else if documented_tools.contains(&tool.as_str()) {
+            stale.push(format!(
+                "{tool:?} is now documented — delete it from allow.undocumented_tools"
+            ));
+        }
+    }
+    for example in &verify.allow.undocumented_examples {
+        if !examples.contains(example) {
+            stale.push(format!(
+                "allow.undocumented_examples has {example:?}, which does not exist"
+            ));
+        } else if documented_examples.contains(&example.as_str()) {
+            stale.push(format!(
+                "{example:?} is now documented — delete it from allow.undocumented_examples"
+            ));
+        }
+    }
+
+    assert!(
+        stale.is_empty(),
+        "stale [allow] entries:\n  {}",
+        stale.join("\n  ")
+    );
+}
