@@ -47,3 +47,12 @@ undocumented_examples = [
   "spvirit-server/examples/waveform.rs",
   "spvirit-server/examples/wildcard_source.rs",
 ]
+
+# ─── Part I: Fundamentals ───────────────────────────────────────────────
+# Concept chapters. No {{#include}}s, so their badges read
+# "no code on this page".
+
+[chapters."01-fundamentals/what-is-spvirit.md"]
+[chapters."01-fundamentals/epics-in-10-minutes.md"]
+[chapters."01-fundamentals/normative-types.md"]
+[chapters."01-fundamentals/records-vs-raw-nt.md"]

@@ -4,6 +4,15 @@
 
 ---
 
+# Fundamentals
+
+- [What is Spvirit?](01-fundamentals/what-is-spvirit.md)
+- [EPICS in 10 minutes](01-fundamentals/epics-in-10-minutes.md)
+- [Normative Types](01-fundamentals/normative-types.md)
+- [Records vs raw NT](01-fundamentals/records-vs-raw-nt.md)
+
+---
+
 # Developer guide
 
 - [Overview](06-dev-guide/README.md)
