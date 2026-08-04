@@ -56,15 +56,15 @@ value). Key paths:
 
 - **Public writers** `set_value` / `set_array_value` / `put_nt` bypass
   on_put/validators; each calls an `_inner` writer then `evaluate_links`.
-- **`Source::put`** (simple_store.rs:406) — the wire PUT path: run the PUT
+- **`Source::put`** (simple_store.rs:414) — the wire PUT path: run the PUT
   validator (cloned out of the lock first, so user callbacks can't hold the
   lock across `.await`), apply via `apply_put_to_record`, MDEL-gate the post,
   spawn the `on_put` callback as a detached task, evaluate links.
-- **Links/calc**: `evaluate_links` (simple_store.rs:341) is a BFS over
+- **Links/calc**: `evaluate_links` (simple_store.rs:349) is a BFS over
   `LinkDef`s whose inputs include the changed PV, with a `visited` set for
   cycle detection; uses `set_value_inner` to avoid re-triggering.
 - **Descriptor builders** for NTScalar/NTScalarArray live here
-  (simple_store.rs:637–895); Table/NdArray/Enum/Generic delegate to
+  (simple_store.rs:645–903); Table/NdArray/Enum/Generic delegate to
   `spvirit_codec::spvd_encode::nt_payload_desc`.
 
 ## Protocol runtime
@@ -120,13 +120,13 @@ NtPayload (64).
 
 ## Record model and .db parsing
 
-- `RecordType` (types.rs:23): 17 kinds; `from_db_name` maps `.db` strings
+- `RecordType` (types.rs:24): 17 kinds; `from_db_name` maps `.db` strings
   (`mbbi`|`ntenum` both → `Mbbi`); `is_output()` gates writability.
 - `RecordData` (types.rs:128): one variant per record family carrying the NT
   payload + record-specific fields (INP/OUT/DOL/DRVL/DRVH/SIML/…).
   **`nt()`/`nt_mut()` panic** on non-scalar variants (types.rs:244, 256) —
   use `nt_scalar_mut()` (fallible) in generic code.
-- `RecordInstance` (types.rs:293) adds `raw_fields: HashMap<String,String>`
+- `RecordInstance` (types.rs:294) adds `raw_fields: HashMap<String,String>`
   (verbatim `.db` fields — used by the record-fields source and MDEL lookup).
   `set_scalar_value` (types.rs:430) does exhaustive cross-type numeric
   coercion and timestamp stamping.
@@ -152,7 +152,7 @@ docs. `ServeBuilder::build` (pva_server.rs:788) drains each handle's parts
 into the classic builder, builds, then flips handles to `Bound`.
 `Pv::attach`/`RunningServer::pv` mint handles to existing records and refuse
 payload shapes that don't match the requested type (regression test at
-pv.rs:1152).
+pv.rs:1154).
 
 ### Callbacks
 
@@ -174,7 +174,7 @@ pv.rs:1152).
   both; **`Pv::alarm_limits()` (pv.rs:329) sets only the wire fields**, so
   handle-API alarm limits do not drive server-side severity computation. Known
   inconsistency — fix or document before it bites a user.
-- **MDEL** (monitor deadband): `should_post_update` (simple_store.rs:527)
+- **MDEL** (monitor deadband): `should_post_update` (simple_store.rs:535)
   suppresses the *post* (not the store) when the record is a numeric scalar,
   MDEL > 0, severity unchanged, and the delta is under MDEL. **ADEL is parsed
   and exposed via field access but not wired into any posting logic**
@@ -190,7 +190,7 @@ pv.rs:1152).
    (simple_store.rs:74, 109) so static/`.db`-loaded records are stamped too
    (see chapter 08).
 2. **PUT to NtTable/NtNdArray/Generic is not wired** into
-   `apply_put_to_record` (simple_store.rs:600–628 just logs), even though
+   `apply_put_to_record` (simple_store.rs:608–611 just logs), even though
    `apply.rs` has `apply_table_put`/`apply_ndarray_put`. Tables/NdArrays are
    writable only via `put_nt`.
 3. **CANCEL_REQUEST is unimplemented** (returns an error message); some
@@ -199,7 +199,7 @@ pv.rs:1152).
 4. `group.rs::race_all` (group.rs:575) polls members in vec order — first
    ready wins, lower indexes favoured; not starvation-proof.
 5. Default `conn_timeout` is ~64000 s (~17.8 h); the doc comment rounds it to
-   18 h (pva_server.rs:512).
+   18 h (pva_server.rs:513).
 6. The beacon change counter only increments on protocol PUTs, not internal
    scan/set writes (handler.rs:108, 404).
 

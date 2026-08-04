@@ -62,7 +62,7 @@ SIM:SETPOINT OK
 
 `spget` formats the payload for humans; `spget --fields value,alarm.severity`
 narrows it. For everything the tools take, see
-[Command-line tools](../04-tools/README.md).
+[Command-line tools](../04-tools/index.md).
 
 ## What to notice
 

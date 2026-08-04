@@ -27,11 +27,11 @@ validation. No I/O, no wire format.
 |---|---|---|
 | `ScalarValue` | lib.rs:9 | Tagged union of the twelve NTScalar value types (Bool, I8–I64, U8–U64, F32, F64, Str) |
 | `ScalarArrayValue` | lib.rs:25 | Array counterpart; `len()`, `element_size_bytes()`, `type_label()` at lib.rs:40–95 |
-| `NtAlarm` / `NtTimeStamp` / `NtDisplay` / `NtControl` | lib.rs:97–147 | Normative sub-structures |
+| `NtAlarm` / `NtTimeStamp` / `NtDisplay` / `NtControl` | lib.rs:98–147 | Normative sub-structures |
 | `NtScalar` | lib.rs:150 | The big one: value + flattened alarm/display/control/valueAlarm/units + **optional `time_stamp`** (lib.rs:185) |
 | `NtScalarArray` | lib.rs:352 | Array payload |
-| `NtTable` / `NtTableColumn` | lib.rs:372–405 | Table; `validate()` checks column-length equality |
-| `NtNdArray` + `NdCodec`/`NdDimension`/`NtAttribute` | lib.rs:407–504 | Image/detector model; `validate()` checks dims × element size vs `uncompressed_size` |
+| `NtTable` / `NtTableColumn` | lib.rs:373–405 | Table; `validate()` checks column-length equality |
+| `NtNdArray` + `NdCodec`/`NdDimension`/`NtAttribute` | lib.rs:408–504 | Image/detector model; `validate()` checks dims × element size vs `uncompressed_size` |
 | `NtEnum` | lib.rs:524 | index + choices; `selected()` |
 | `PvValue` | lib.rs:560 | **Recursive** value tree (Scalar/ScalarArray/Structure) so this crate can represent arbitrary structures without depending on the codec |
 | `NtPayload` | lib.rs:570 | Top-level union: `Scalar/ScalarArray/Table/NdArray/Enum/Generic{struct_id, fields}` — the primary hand-off type between server/client and codec |
@@ -109,7 +109,7 @@ spec-exact — a likely source of future bugs.** Encode side:
 `encode_nt_payload_delta` (spvd_encode.rs:1916), `compute_changed_bits`:1812,
 `encode_structure_bitset`:464.
 
-**Op payloads.** `PvaOpPayload::new` (epics_decode.rs:1370) handles client vs
+**Op payloads.** `PvaOpPayload::new` (epics_decode.rs:1371) handles client vs
 server field-offset differences, the conditional status prefix, PV-name
 extraction, and parses introspection on INIT responses. `decoded_value` is
 filled later once a `field_desc` is known.

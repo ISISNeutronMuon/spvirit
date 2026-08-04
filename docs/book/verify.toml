@@ -235,3 +235,19 @@ tools = ["sptable"]
 
 [chapters."04-tools/spdodeca.md"]
 tools = ["spdodeca"]
+
+# --- Part V: Reference ---------------------------------------------------
+# Prose reference pages. No {{#include}}s, so their badges read
+# "no code on this page".
+
+[chapters."05-reference/crate-map.md"]
+
+[chapters."05-reference/record-types.md"]
+
+[chapters."05-reference/python-api.md"]
+
+[chapters."05-reference/troubleshooting.md"]
+tools = ["spget", "spput", "spserver"]
+
+[chapters."05-reference/known-gaps.md"]
+tools = ["spput", "spserver"]

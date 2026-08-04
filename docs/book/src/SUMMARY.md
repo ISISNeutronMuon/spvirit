@@ -55,6 +55,16 @@
 
 ---
 
+# Reference
+
+- [Crate map](05-reference/crate-map.md)
+- [Record types](05-reference/record-types.md)
+- [Python API](05-reference/python-api.md)
+- [Troubleshooting](05-reference/troubleshooting.md)
+- [Known gaps](05-reference/known-gaps.md)
+
+---
+
 # Developer guide
 
 - [Overview](06-dev-guide/README.md)

@@ -70,4 +70,4 @@ still on the record level — that is the record API, and it applies deadbands
 and stamps time.
 
 Both are covered in Part III: records throughout, and the raw level in
-[Custom sources](../03-progressive/17-sources.md).
+[Custom data sources](../03-progressive/sources.md).
