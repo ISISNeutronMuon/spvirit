@@ -154,13 +154,25 @@ impl Expression {
                 }
                 // calcPerform.c:291-294 `case NINT`:
                 // `(epicsInt32)(top >= 0 ? top+0.5 : top-0.5)` - round
-                // half-away-from-zero via a truncating int cast, NOT
-                // `f64::round`'s general algorithm and NOT banker's
-                // rounding (task instructions, trap 2). Rust's `as i32`
-                // saturates on out-of-range values instead of C's
-                // undefined-behavior cast, the same deliberate, safer
-                // divergence Task 3 documented for `%` (see `Op::Modulo`
-                // above) - not reachable by any test here.
+                // half-away-from-zero via a truncating int cast (task
+                // instructions, trap 2).
+                //
+                // Correction from an earlier version of this comment
+                // (review Important 2): for every value in bounds,
+                // `top >= 0 ? top+0.5 : top-0.5` truncated to an int is
+                // bit-identical to `top.round()`, since Rust's `f64::round`
+                // already rounds half-away-from-zero rather than banker's
+                // rounding. `nint_rounds_half_away_from_zero_at_boundaries`
+                // (eval.rs tests) only proves this ISN'T banker's rounding
+                // - it does not, by itself, distinguish this cast-based
+                // implementation from a bare `top.round()`. The genuine
+                // discriminator is magnitude large enough to overflow
+                // `epicsInt32`: Rust's `as i32` saturates instead of C's
+                // undefined-behavior cast (the same deliberate, safer
+                // divergence Task 3 documented for `%`, see `Op::Modulo`
+                // above), whereas `top.round()` alone would return the
+                // unsaturated double. See
+                // `nint_saturates_on_i32_overflow_matching_rust_cast_semantics`.
                 Op::Nint => {
                     let a = stack.pop().expect("arity checked at compile time");
                     let shifted = if a >= 0.0 { a + 0.5 } else { a - 0.5 };
@@ -406,6 +418,22 @@ mod tests {
         assert_eq!(ev("NINT(A)", &[2.4]), 2.0);
         assert_eq!(ev("NINT(A)", &[-2.4]), -2.0);
         assert_eq!(ev("NINT(A)", &[0.0]), 0.0);
+    }
+
+    // Review fix (Important 2): the boundary test above only rules out
+    // banker's rounding - Rust's `f64::round` already rounds
+    // half-away-from-zero, so for every in-range value the truncating-cast
+    // implementation and a bare `top.round()` are bit-identical, and the
+    // boundary test alone cannot tell them apart. The genuine discriminator
+    // is a magnitude that overflows `epicsInt32`: Rust's `as i32` cast
+    // saturates (a deliberate, documented divergence from C's
+    // undefined-behavior cast at calcPerform.c:291-294, mirroring Task 3's
+    // `%` divergence), whereas `top.round()` alone would return the
+    // unsaturated double unchanged.
+    #[test]
+    fn nint_saturates_on_i32_overflow_matching_rust_cast_semantics() {
+        assert_eq!(ev("NINT(A)", &[5e9]), i32::MAX as f64);
+        assert_eq!(ev("NINT(A)", &[-5e9]), i32::MIN as f64);
     }
 
     #[test]

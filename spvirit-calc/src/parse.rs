@@ -47,13 +47,23 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
     // Tracks whether the next `-`/`+` is unary. True at the start of an
     // expression and immediately after any operator or `(`.
     let mut expect_operand = true;
-    // Parallel stack of in-progress argument counts for nested function
-    // calls, pushed when a `(` immediately follows a `Frame::Func` and
-    // popped when that call's `)` closes. Only `MIN`/`MAX` (`Op::Min`/
-    // `Op::Max`) actually use the final count (task-4-brief.md, RULINGS.md
-    // trap 3), but every function call tracks one uniformly so the stack
-    // stays in sync regardless of which function it is.
+    // Parallel stack of in-progress comma counts for nested function calls,
+    // pushed when a `(` immediately follows a `Frame::Func` and popped when
+    // that call's `)` closes. Only `MIN`/`MAX` (`Op::Min`/`Op::Max`)
+    // actually use the final count (task-4-brief.md, RULINGS.md trap 3),
+    // but every function call tracks one uniformly so the stack stays in
+    // sync regardless of which function it is. Counts commas seen, NOT
+    // arguments - `)` derives the argument count from this plus whether
+    // the call body was empty (see the `Token::Op(")")` arm below).
     let mut arg_counts: Vec<usize> = Vec::new();
+    // Parallel to `arg_counts`: `out.len()` at the moment each open call's
+    // `(` was pushed, so `)` can tell an empty call (`MIN()`, `ABS()`) -
+    // where `out` gained nothing between `(` and `)` - from a real one.
+    // CALC has no zero-argument calls; without this check `MIN()`/`ABS()`
+    // silently compiled as pop-1-push-1 no-ops, which (see fix review)
+    // exactly canceled the pre-existing missing-operand-adjacency gap for
+    // constructs like `"A MIN()"`.
+    let mut call_starts: Vec<usize> = Vec::new();
 
     for tok in &tokens {
         match tok {
@@ -66,17 +76,29 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                 expect_operand = false;
             }
             Token::Ident(name) => {
+                // A function name is itself a complete operand-producing
+                // construct once its call closes, so it's subject to the
+                // same adjacency rule as any other operand: two in a row
+                // with no operator between them (`"A B"`, `"A SIN(B)"`) is
+                // malformed. Checked explicitly here, rather than relying
+                // solely on `check_arity`'s end-of-parse depth arithmetic,
+                // so the diagnostic doesn't depend on whether the call body
+                // happens to be empty (see the `call_starts` comment above).
+                if !expect_operand {
+                    return Err(CalcError::ExtraOperand);
+                }
                 let op = ident_to_op(name)?;
                 stack.push(Frame::Func(op));
                 expect_operand = true;
             }
             Token::Op("(") => {
                 // A `(` that immediately follows a bare function name opens
-                // that function's argument list; start counting arguments
-                // (1, since a call always has at least one argument until
-                // proven otherwise by a comma - CALC has no zero-arg calls).
+                // that function's argument list; start a comma count (0 -
+                // see `arg_counts` above) and record where `out` stood so
+                // `)` can detect an empty body.
                 if matches!(stack.last(), Some(Frame::Func(_))) {
-                    arg_counts.push(1);
+                    arg_counts.push(0);
+                    call_starts.push(out.len());
                 }
                 stack.push(Frame::Paren);
                 expect_operand = true;
@@ -100,7 +122,25 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                     let Some(Frame::Func(op)) = stack.pop() else {
                         unreachable!()
                     };
-                    let count = arg_counts.pop().unwrap_or(1);
+                    let commas = arg_counts.pop().unwrap_or(0);
+                    let start_len = call_starts.pop().unwrap_or(out.len());
+                    // CALC has no zero-argument calls: `MIN()`/`ABS()` must
+                    // be rejected, not silently compiled as a pop-1-push-1
+                    // no-op (see the `call_starts` comment above).
+                    if out.len() == start_len {
+                        return Err(CalcError::MissingOperand);
+                    }
+                    let count = commas + 1;
+                    // NOTE: fixed-arity functions (everything but
+                    // `Min`/`Max`) discard `count` here - `ABS(A,B)` isn't
+                    // rejected by this arm at all. It's still caught, but
+                    // only incidentally, by `check_arity`'s end-of-parse
+                    // stack-depth arithmetic (the same pre-existing
+                    // mechanism, and the same one this fix's empty-call
+                    // case had to stop relying on). If a future task wants
+                    // a precise "wrong number of arguments to ABS" error,
+                    // this is the place to check `count` against a
+                    // fixed-arity table.
                     out.push(match op {
                         Op::Min(_) => Op::Min(count),
                         Op::Max(_) => Op::Max(count),
@@ -495,5 +535,43 @@ mod tests {
     fn rejects_expression_exceeding_max_ops() {
         let src = format!("{}A", "A+".repeat(600));
         assert_eq!(compile(&src), Err(CalcError::TooLong));
+    }
+
+    // Review fix (Important 1): CALC has no zero-argument calls. Before the
+    // fix, `arg_counts` unconditionally seeded a count of 1 on `(` and
+    // `Token::Ident` never checked `expect_operand`, so an empty-parens call
+    // compiled as a depth-neutral pop-1-push-1 no-op - which, sitting next
+    // to a real operand with no operator between them, exactly canceled the
+    // pre-existing missing-operand-adjacency gap (the same gap
+    // `rejects_extra_operand`/`rejects_adjacent_number_literals` above
+    // exercise for `"A B"`/`"1.2.3"`). `"A MIN()"` compiled to
+    // `Ok([Arg(0), Min(1)])` and evaluated as `MIN(A)`; `"A ABS()"` compiled
+    // to `Ok([Arg(0), Abs])` and evaluated as `ABS(A)`. Both must be
+    // rejected, standalone and in the adjacency shape that used to cancel
+    // out.
+    #[test]
+    fn rejects_empty_argument_list() {
+        assert_eq!(compile("MIN()"), Err(CalcError::MissingOperand));
+        assert_eq!(compile("ABS()"), Err(CalcError::MissingOperand));
+    }
+
+    // These are caught even earlier than the empty-parens check itself: the
+    // `expect_operand` guard added to `Token::Ident` sees the function name
+    // in operand-adjacent position and rejects it before the parser ever
+    // reaches the `(`/`)` pair, so the error is `ExtraOperand` (same
+    // diagnostic as `"A B"`), not `MissingOperand`.
+    #[test]
+    fn rejects_operand_adjacent_to_empty_call() {
+        assert_eq!(compile("A MIN()"), Err(CalcError::ExtraOperand));
+        assert_eq!(compile("A ABS()"), Err(CalcError::ExtraOperand));
+    }
+
+    // The `expect_operand` check added to `Token::Ident` also catches the
+    // adjacency case directly, independent of whether the call body is
+    // empty (e.g. a non-empty call would otherwise only be caught
+    // incidentally by `check_arity`'s end-of-parse depth arithmetic).
+    #[test]
+    fn rejects_operand_adjacent_to_function_call() {
+        assert_eq!(compile("A SIN(B)"), Err(CalcError::ExtraOperand));
     }
 }
