@@ -1,6 +1,6 @@
 [package]
 name = "spvirit-tools"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2024"
 description = "PVAccess client/server tools for EPICS"
 license = "BSD-3-Clause"
@@ -17,10 +17,10 @@ server = []
 tui = ["dep:ratatui", "dep:color-eyre"]
 
 [dependencies]
-spvirit-types = { version = "0.1.18", path = "../spvirit-types" }
-spvirit-codec = { version = "0.1.18", path = "../spvirit-codec" }
-spvirit-client = { version = "0.1.18", path = "../spvirit-client" }
-spvirit-server = { version = "0.1.18", path = "../spvirit-server" }
+spvirit-types = { version = "0.1.19", path = "../spvirit-types" }
+spvirit-codec = { version = "0.1.19", path = "../spvirit-codec" }
+spvirit-client = { version = "0.1.19", path = "../spvirit-client" }
+spvirit-server = { version = "0.1.19", path = "../spvirit-server" }
 
 tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1.41"
