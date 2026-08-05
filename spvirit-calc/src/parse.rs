@@ -22,6 +22,11 @@ pub enum CalcError {
     Unbalanced,
     /// `?` without a matching `:`.
     BadConditional,
+    /// `:=` whose left-hand side is not a bare operand `A`-`U`, or which
+    /// appears where the operator stack is not empty. Mirrors Base's
+    /// `CALC_ERR_BAD_ASSIGNMENT` ("Bad assignment target",
+    /// `refs/postfix.c:299,522`) and its guard at `refs/postfix.c:296-301`.
+    BadAssignment,
     /// Expression exceeds the operation limit.
     TooLong,
 }
@@ -225,9 +230,118 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                 stack.push(Frame::CondHead(if_idx));
                 expect_operand = true;
             }
+            // Task 8a, `refs/postfix.c:296-307` (`case STORE_OPERATOR`). `:=`
+            // is not an ordinary infix operator: it reaches BACKWARDS into
+            // the already-emitted output, un-emits the `FETCH_*` it finds
+            // there, and pushes the corresponding `STORE_*` onto the operator
+            // stack in its place -
+            //   `*--pout < FETCH_A || *pout >= FETCH_A + CALCPERFORM_NARGS`
+            //   ... `pstacktop->code = STORE_A + *pout - FETCH_A;`
+            // - so the left-hand side never contributes a value to the
+            // runtime stack, and the store is emitted only when something
+            // later flushes the operator stack (a `;`, or end-of-input).
+            Token::Op(":=") => {
+                // Base reaches this only in operator position: `get_element`
+                // looks operand-position tokens up in `operands[]`, where
+                // `:=` does not appear, so `"A; := 1"` is `CALC_ERR_SYNTAX`
+                // there (`refs/postfix.c:475-478`). This crate's lexer is
+                // context-free and has one shared symbol table, so the same
+                // rejection is made explicitly here - a divergence in the
+                // error variant only (`MissingOperand` vs Base's syntax
+                // error), never in the accept/reject verdict.
+                if expect_operand {
+                    return Err(CalcError::MissingOperand);
+                }
+                // `pstacktop > stack` (`refs/postfix.c:297`): Base requires
+                // the operator stack to be EMPTY. `Frame::CondHead` is the
+                // one frame with no Base counterpart on that stack - Base's
+                // `?` pushes nothing, tracking an integer `cond_count`
+                // instead (`refs/postfix.c:427`) - so a pending `?` must NOT
+                // count against this test, or `"A ? B := 1 : 2"` (which Base
+                // accepts) would be wrongly rejected. Everything else does
+                // count, including `Frame::CondTail`: that IS on Base's
+                // stack, as the `COND_END` pushed by `:` (`:422-425`), which
+                // is precisely why a store in an ELSE branch is a Base error.
+                if !stack.iter().all(|f| matches!(f, Frame::CondHead(_))) {
+                    return Err(CalcError::BadAssignment);
+                }
+                // `*--pout` must be a `FETCH_A..FETCH_A+21`. Only `Op::Arg`
+                // qualifies: `Op::Lit` covers Base's `LITERAL_*` and the
+                // named constants `PI`/`D2R`/`R2D`/`INF`/`NAN` (all distinct
+                // opcodes in Base, none in the fetch range), and every
+                // function/operator result is likewise a different opcode.
+                let Some(Op::Arg(slot)) = out.last().copied() else {
+                    return Err(CalcError::BadAssignment);
+                };
+                out.pop();
+                stack.push(Frame::Op(Op::Store(slot)));
+                // `refs/postfix.c:306`: `operand_needed = TRUE`.
+                expect_operand = true;
+            }
+            // Task 8a, `refs/postfix.c:433-458` (`case EXPR_TERMINATOR`).
+            // `;` generates NO opcode (`:163`, `NOT_GENERATED`) - hence the
+            // absence of any `case EXPR_TERM` in `refs/calcPerform.c`'s
+            // evaluator switch, and the absence of an `Op` variant here. All
+            // it does is flush the operator stack, so a following expression
+            // starts clean and any pending store lands before it.
+            //
+            // Base additionally checks `runtime_depth > 1` here
+            // (`:452-455`, `CALC_ERR_TOOMANY`). This crate does not track
+            // depth during parsing and relies on `check_arity`'s end-of-parse
+            // check instead. That is not a gap: every `;`-separated segment
+            // has a NET stack effect of >= 0 (a store segment such as
+            // `A := 0` nets exactly 0 - fetch +1, un-emit -1, value +1,
+            // store -1), so a depth that reaches 2 can never come back down
+            // to 1, and the final `depth != 1` check rejects the identical
+            // set of expressions. Only the error variant differs
+            // (`ExtraOperand` vs Base's `CALC_ERR_TOOMANY`).
+            Token::Op(";") => {
+                // As for `:=` above: `;` is absent from Base's `operands[]`,
+                // so it is a syntax error in operand position - which covers
+                // a leading `;`, a doubled `;;`, and (via `:457`'s
+                // `operand_needed = TRUE` plus `:499`'s end check) a trailing
+                // one.
+                if expect_operand {
+                    return Err(CalcError::MissingOperand);
+                }
+                while let Some(frame) = stack.pop() {
+                    match frame {
+                        Frame::Op(op) => out.push(op),
+                        Frame::CondTail { if_idx, else_idx } => {
+                            finalize_cond(&mut out, if_idx, else_idx)
+                        }
+                        // `refs/postfix.c:436-439`: CALC_ERR_PAREN_OPEN.
+                        Frame::Paren | Frame::Func(_) => return Err(CalcError::Unbalanced),
+                        // `refs/postfix.c:448-451`: cond_count != 0 is
+                        // CALC_ERR_CONDITIONAL.
+                        Frame::CondHead(_) => return Err(CalcError::BadConditional),
+                    }
+                }
+                expect_operand = true;
+            }
             Token::Op(":") => {
+                // A pending `Op::Store` is deliberately carried across this
+                // `:` rather than emitted into the then-branch.
+                // `refs/postfix.c:402-403`, the `CONDITIONAL` flush, uses a
+                // STRICT comparison - `while (pstacktop->in_stack_pri >
+                // pel->in_coming_pri)` - and `:=` and `:` both carry
+                // priority 0 (`:162`, `:161`), so `0 > 0` is false and the
+                // store survives on Base's stack UNDERNEATH the `COND_END`
+                // that this `:` is about to push (`:422-425`).
+                //
+                // The consequence is genuinely surprising and is Base's real
+                // behaviour, not an artifact of this transcription: the store
+                // hoists clean out of the conditional, so `A ? B := 1 : 2`
+                // means `B := (A ? 1 : 2)` and writes B on BOTH paths. The
+                // naive alternative (emitting the store here, inside the
+                // then-branch) makes the branch net 0 instead of +1, which
+                // `check_segment` rejects - so the two readings differ on
+                // whether the expression compiles at all, and Base's accepts.
+                // See `store_in_a_then_branch_hoists_out_of_the_conditional`.
+                let mut held: Vec<Op> = Vec::new();
                 loop {
                     match stack.pop() {
+                        Some(Frame::Op(op @ Op::Store(_))) => held.push(op),
                         Some(Frame::Op(op)) => out.push(op),
                         // A completed nested ternary between this `?` and
                         // its `:`, e.g. the inner `B?C:D` in `"A?B?C:D:E"`:
@@ -243,6 +357,19 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                             // ternary as a whole are complete) and carry
                             // both indices forward on the stack until
                             // something finalizes this pair.
+                            // Restore any store held aside above FIRST, so it
+                            // ends up BELOW the `CondTail` and is therefore
+                            // emitted after this ternary's `CondEnd` - the
+                            // position Base leaves it in (`refs/postfix.c`:
+                            // the `COND_END` at `:422-425` is pushed on top
+                            // of the un-flushed store). `held` was filled by
+                            // `pop`, so replaying it in reverse restores the
+                            // original bottom-to-top order; in practice it
+                            // holds at most one entry, since `:=` refuses to
+                            // parse while any `Frame::Op` is on the stack.
+                            for op in std::mem::take(&mut held).into_iter().rev() {
+                                stack.push(Frame::Op(op));
+                            }
                             let else_idx = out.len();
                             out.push(Op::CondElse { end_target: 0 });
                             stack.push(Frame::CondTail { if_idx, else_idx });
@@ -293,6 +420,18 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
         if out.len() > MAX_OPS {
             return Err(CalcError::TooLong);
         }
+    }
+
+    // `refs/postfix.c:499`: `if (operand_needed || runtime_depth != 1)` ->
+    // `CALC_ERR_INCOMPLETE`. `check_arity` below covers the depth half, but
+    // not the `operand_needed` half: a trailing `;` or `:=` leaves the output
+    // in a state whose depth is coincidentally fine (`"A;"` is just `[Arg(0)]`)
+    // while the expression is plainly unfinished. Guarded on a non-empty token
+    // list because `expect_operand` starts `true` and Base's own empty-input
+    // path returns early before this check (`:246-250`) - see
+    // `empty_expression_compiles_to_nothing`.
+    if expect_operand && !tokens.is_empty() {
+        return Err(CalcError::MissingOperand);
     }
 
     while let Some(frame) = stack.pop() {
@@ -667,6 +806,30 @@ fn check_segment(ops: &[Op], start: usize, end: usize, depth_in: usize) -> Resul
             // this being consumed as part of its structured jump handling
             // above - see the doc comment: not reachable from `compile`.
             Op::CondElse { .. } | Op::CondEnd => return Err(CalcError::Unbalanced),
+            // Task 8a. The generic arm below assumes every op pushes exactly
+            // one result (`depth - need + 1`), which is true of all 40-odd
+            // other opcodes but NOT of a store: `refs/calcPerform.c:102-124`
+            // is `parg[op - STORE_A] = *ptop--;` - it pops its value and
+            // pushes nothing, the only opcode in Base with a negative net
+            // stack effect. Routing it through the generic arm would compute
+            // depth 1 where the true depth is 0, which is exactly the class
+            // of error this checker exists to prevent: `compile` would accept
+            // `"A := 0"` and `eval` would then return whatever `stack.pop()`
+            // found - i.e. `.expect("arity checked at compile time")` on an
+            // empty stack, a panic on the public API inside an IOC process.
+            //
+            // `Op::Store` cannot appear inside a ternary arm - `:=` refuses
+            // to parse with a `Frame::CondTail` on the stack, and a store
+            // pending across a `:` is hoisted out below the `CondTail` - so
+            // the arm-by-arm `!= depth_in + 1` checks above are unaffected by
+            // this arm. `store_in_a_then_branch_hoists_out_of_the_conditional`
+            // and `store_in_an_else_branch_is_rejected` pin both halves.
+            Op::Store(_) => {
+                if depth < 1 {
+                    return Err(CalcError::MissingOperand);
+                }
+                depth -= 1;
+            }
             op => {
                 let need = arity(op);
                 if depth < need {
@@ -1415,7 +1578,7 @@ mod tests {
     #[test]
     fn terminator_finalizes_a_completed_ternary() {
         assert_eq!(
-            ops("A?B:C; D"),
+            ops("A?B:C; D := 1"),
             vec![
                 Op::Arg(0),
                 Op::CondIf { else_target: 4 },
@@ -1423,9 +1586,18 @@ mod tests {
                 Op::CondElse { end_target: 6 },
                 Op::Arg(2),
                 Op::CondEnd,
-                Op::Arg(3),
+                Op::Lit(1.0),
+                Op::Store(3),
             ]
         );
+        // The second segment has to be a store, i.e. net zero. `;` does NOT
+        // discard the running stack: Base carries `runtime_depth` straight
+        // across it (`refs/postfix.c:433-458` never resets it) and the
+        // end-of-parse check is `runtime_depth != 1` (`:499`), so `"A?B:C; D"`
+        // finishes at depth 2 and is an error in Base too. Written as a live
+        // assertion rather than a comment because this is the opposite of
+        // what "expression terminator" suggests.
+        assert_eq!(compile("A?B:C; D"), Err(CalcError::ExtraOperand));
     }
 
     // A store whose value is a parenthesised ternary: the store frame sits

@@ -237,6 +237,32 @@ pub enum Op {
     /// EVERY argument is finite; the opposite fold from `IsNan`, which is
     /// the asymmetry the task instructions flag as the trap here.
     Finite(usize),
+
+    // Task 8a: the store operator `:=` (RULINGS.md Ruling 2).
+    /// Pop one value and assign it to operand slot `A`-`U` (index 0-20),
+    /// pushing nothing. `refs/calcPerform.c:102-124`:
+    /// `case STORE_A: ... case STORE_U: parg[op - STORE_A] = *ptop--;`
+    ///
+    /// Base has 21 separate opcodes (`STORE_A`..`STORE_U`) mirroring
+    /// `FETCH_A`..`FETCH_U`; this crate collapses them into one variant
+    /// carrying the slot index, exactly as `Op::Arg(usize)` already collapses
+    /// the 21 `FETCH_*` opcodes. `refs/postfix.c:304` shows Base itself
+    /// treating the pair as a single indexed family
+    /// (`pstacktop->code = STORE_A + *pout - FETCH_A`), so the collapse is
+    /// faithful rather than a reinterpretation.
+    ///
+    /// **This is the only op whose net stack effect is negative** (pops one,
+    /// pushes none). Every other variant either pushes one having popped
+    /// `arity()`, or is pure control flow. `arity()` alone therefore cannot
+    /// describe it, and `parse.rs::check_segment` carries an explicit arm -
+    /// see the note on `arity` below.
+    ///
+    /// There is deliberately no variant for `;`. `refs/postfix.c:163` types it
+    /// `EXPR_TERMINATOR` with opcode `NOT_GENERATED`: it emits nothing into
+    /// the instruction stream, which is why `refs/calcPerform.c`'s evaluator
+    /// switch has no `case EXPR_TERM` at all. It is purely a parse-time
+    /// operator-stack flush (`refs/postfix.c:433-458`).
+    Store(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,6 +352,21 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
         // emits it directly at the identifier (see its `nullary_op` doc), so
         // `pop_while` never compares against it either. The value here is
         // arbitrary for the same reason `Arg`/`Lit`'s is.
+        // `refs/postfix.c:162`: `{":=", 0, 0, -1, STORE_OPERATOR, STORE_A}` -
+        // in-stack and in-coming priority BOTH 0, the loosest level in the
+        // table, shared with `?`/`:` (`:161,173`). Unlike those, a pending
+        // store IS a real `Frame::Op` on this crate's operator stack, so
+        // `pop_while` genuinely does compare against it - and priority 0 is
+        // what makes it never pop: `pop_while`'s only call sites pass
+        // `prec` 1..=7 with `Assoc::Left` (`0 >= 1` is false) or `prec == 0`
+        // with `Assoc::Right` from `?` (`0 > 0` is false). That is exactly
+        // Base's behaviour, and it is load-bearing rather than incidental:
+        // `:`'s flush in Base uses the same strict `>` against priority 0
+        // (`refs/postfix.c:402-403`), which is why a store in a ternary's
+        // then-branch is NOT flushed at the `:` and instead hoists out of the
+        // whole conditional. See `parse.rs`'s
+        // `store_in_a_then_branch_hoists_out_of_the_conditional`.
+        Op::Store(_) => (0, Assoc::Left),
         Op::Arg(_) | Op::Lit(_) | Op::Rndm => (0, Assoc::Left),
         // Functions never sit on the operator stack as a `Frame::Op` (the
         // parser tracks a pending call via `Frame::Func` instead, and emits
@@ -431,6 +472,16 @@ pub(crate) fn arity(op: &Op) -> usize {
         // arity to read off this table.
         Op::CondIf { .. } => 1,
         Op::CondElse { .. } | Op::CondEnd => 0,
+        // `Op::Store` pops one (`refs/calcPerform.c:123`, `*ptop--`) - but
+        // unlike every other op with a nonzero arity, it pushes NOTHING back.
+        // This table only records what an op POPS; `check_segment`'s generic
+        // arm then assumes a push of one (`depth = depth - need + 1`), which
+        // is wrong for `Store`. `check_segment` therefore carries a dedicated
+        // `Op::Store` arm that applies `depth -= 1` instead, and this entry
+        // exists so the count stays in one place and the match stays
+        // exhaustive. Do not add `Store` to a caller that assumes
+        // pops-then-pushes-one without checking that arm first.
+        Op::Store(_) => 1,
         // Variadic: arity is carried in the variant itself. `check_arity`
         // (parse.rs) reads this the same way as any other op, so the
         // `.expect("arity checked at compile time")` pops in `eval.rs`

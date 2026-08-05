@@ -213,6 +213,11 @@ impl Expression {
     /// (Base wins wherever the plan and Base disagree) governs here, so
     /// `eval`'s default stays entropy-seeded and `eval_with_rng` is purely
     /// an opt-in escape hatch, not the normal path.
+    ///
+    /// Identical to [`Expression::eval`] in every other respect, including
+    /// the write-back contract: `args` is `&mut` and an expression containing
+    /// `:=` will assign through it, to any of the 21 slots. See `eval`'s
+    /// "Evaluation may WRITE to `args`" section.
     pub fn eval_with_rng(&self, args: &mut [f64; 21], rng: &mut dyn FnMut() -> f64) -> f64 {
         self.run(args, rng)
     }
@@ -683,6 +688,22 @@ impl Expression {
                     let a = stack.pop().expect("arity checked at compile time");
                     let shift = d2ui(b) & 31;
                     stack.push(d2ui(a).wrapping_shr(shift) as f64);
+                }
+
+                // Task 8a. calcPerform.c:102-124 `case STORE_A: ... case
+                // STORE_U: parg[op - STORE_A] = *ptop--;` - pop one value and
+                // write it into the operand array, pushing nothing. This is
+                // the only arm in this match that writes through `args`, and
+                // the sole reason `eval`/`eval_with_rng`/`run` take
+                // `&mut [f64; 21]` rather than `&`.
+                //
+                // The index is in 0..21 by construction: `parse.rs` only ever
+                // builds `Op::Store(i)` from an `Op::Arg(i)` it had already
+                // emitted, and `lex.rs` produces `Token::Arg` only for the
+                // 21 letters `A`-`U`, so this cannot index out of bounds.
+                Op::Store(i) => {
+                    let v = stack.pop().expect("arity checked at compile time");
+                    args[*i] = v;
                 }
             }
             ip += 1;
@@ -1609,13 +1630,16 @@ mod tests {
     fn untaken_ternary_branch_never_draws_from_the_rng() {
         let e = crate::compile("A ? 1 : RNDM").expect("compile");
 
+        // The closure borrows `calls` mutably, so the call is scoped to end
+        // that borrow before the assertions read it back.
         let mut calls = 0u32;
-        let mut rng = || {
-            calls += 1;
-            0.5
+        let v = {
+            let mut rng = || {
+                calls += 1;
+                0.5
+            };
+            e.eval_with_rng(&mut [1.0; 21], &mut rng)
         };
-        let v = e.eval_with_rng(&mut [1.0; 21], &mut rng);
-        drop(rng);
         assert_eq!(v, 1.0);
         assert_eq!(calls, 0, "else-branch RNDM was evaluated despite A != 0");
 
@@ -1623,13 +1647,14 @@ mod tests {
         // proving the zero above is short-circuiting rather than a
         // never-wired-up generator.
         let mut calls = 0u32;
-        let mut rng = || {
-            calls += 1;
-            0.5
-        };
         let mut args = [0.0f64; 21];
-        let v = e.eval_with_rng(&mut args, &mut rng);
-        drop(rng);
+        let v = {
+            let mut rng = || {
+                calls += 1;
+                0.5
+            };
+            e.eval_with_rng(&mut args, &mut rng)
+        };
         assert_eq!(v, 0.5);
         assert_eq!(calls, 1);
     }
