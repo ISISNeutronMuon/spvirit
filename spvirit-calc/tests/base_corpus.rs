@@ -1031,6 +1031,199 @@ fn slice_conditional_store_precedence(c: &mut Corpus) {
 }
 
 // ---------------------------------------------------------------------------
+// Slice 5a: testArgs (epicsCalcTest.cpp:952-998)
+// ---------------------------------------------------------------------------
+
+fn slice_args(c: &mut Corpus) {
+    c.args("a", A_A, 0);
+    c.args("A", A_A, 0);
+    c.args("B", A_B, 0);
+    c.args("C", A_C, 0);
+    c.args("D", A_D, 0);
+    c.args("E", A_E, 0);
+    c.args("F", A_F, 0);
+    c.args("G", A_G, 0);
+    c.args("H", A_H, 0);
+    c.args("I", A_I, 0);
+    c.args("J", A_J, 0);
+    c.args("K", A_K, 0);
+    c.args("L", A_L, 0);
+    c.args("M", A_M, 0);
+    c.args("N", A_N, 0);
+    c.args("O", A_O, 0);
+    c.args("P", A_P, 0);
+    c.args("Q", A_Q, 0);
+    c.args("R", A_R, 0);
+    c.args("S", A_S, 0);
+    c.args("T", A_T, 0);
+    c.args("U", A_U, 0);
+    c.args(
+        "A+B+C+D+E+F+G+H+I+J+K+L+M+N+O+P+Q+R+S+T+U",
+        A_A | A_B | A_C | A_D | A_E | A_F | A_G | A_H | A_I | A_J | A_K | A_L | A_M | A_N | A_O
+            | A_P | A_Q | A_R | A_S | A_T | A_U,
+        0,
+    );
+    c.args("0.1;A:=0", 0, A_A);
+    c.args("1.1;B:=0", 0, A_B);
+    c.args("2.1;C:=0", 0, A_C);
+    c.args("3.1;D:=0", 0, A_D);
+    c.args("4.1;E:=0", 0, A_E);
+    c.args("5.1;F:=0", 0, A_F);
+    c.args("6.1;G:=0", 0, A_G);
+    c.args("7.1;H:=0", 0, A_H);
+    c.args("8.1;I:=0", 0, A_I);
+    c.args("9.1;J:=0", 0, A_J);
+    c.args("10.1;K:=0", 0, A_K);
+    c.args("11.1;L:=0", 0, A_L);
+    c.args("12.1;M:=0", 0, A_M);
+    c.args("13.1;N:=0", 0, A_N);
+    c.args("14.1;O:=0", 0, A_O);
+    c.args("15.1;P:=0", 0, A_P);
+    c.args("16.1;Q:=0", 0, A_Q);
+    c.args("17.1;R:=0", 0, A_R);
+    c.args("18.1;S:=0", 0, A_S);
+    c.args("19.1;T:=0", 0, A_T);
+    c.args("20.1;U:=0", 0, A_U);
+    // `:997` - chained stores: B:=A reads A, but A was already stored to, so
+    // `calcPerform.c:472-473`'s `& ~stores` suppresses the input claim.
+    c.args("12.1;A:=0;B:=A;C:=B;D:=C", 0, A_A | A_B | A_C | A_D);
+    // `:998` - B:=A reads A *before* A:=B stores it, so A is claimed as an
+    // input; C:=D likewise reads D before D:=C. This pair is the case that
+    // pins the order-dependence of the two masks.
+    c.args("13.1;B:=A;A:=B;C:=D;D:=C", A_A | A_D, A_A | A_B | A_C | A_D);
+}
+
+// ---------------------------------------------------------------------------
+// Slice 5b: testBadExpr (epicsCalcTest.cpp:1000-1021)
+// ---------------------------------------------------------------------------
+
+/// # `CALC_ERR_* -> CalcError` mapping
+///
+/// Base asserts a specific `short` error code; this crate's `CalcError` has a
+/// different, finer-grained partition of the same failure space. The mapping
+/// used below, derived case by case from `refs/postfix.c`:
+///
+/// | Base code | `CalcError` | note |
+/// |---|---|---|
+/// | `CALC_ERR_INCOMPLETE` (`postfix.c:495`, operand still needed at end) | `MissingOperand` | one-to-one |
+/// | `CALC_ERR_CONDITIONAL` (`:504`, unbalanced `?`/`:`) | `BadConditional` | one-to-one |
+/// | `CALC_ERR_PAREN_NOT_OPEN` (`:410`, `)` with no `(`) | `Unbalanced` | one-to-one |
+/// | `CALC_ERR_BAD_SEPERATOR` (`:392`, `,` outside a call) | `Unbalanced` | **many-to-one**: joins `PAREN_NOT_OPEN` in `Unbalanced`, since this crate reports both "a `,` with no enclosing call" and "a `)` with no `(`" as one unbalanced-grouping error |
+/// | `CALC_ERR_SYNTAX` (`:242`, an operand where none was wanted, or an unknown name) | `MissingOperand`, `ExtraOperand`, or `UnknownIdent` | **one-to-many**, see below |
+/// | `CALC_ERR_TOOMANY` (`:499`, depth > 1 at end) | `ExtraOperand` | one-to-one; not reached by any corpus case |
+///
+/// `CALC_ERR_SYNTAX` is Base's catch-all and is the only entry that fans out.
+/// Base reaches it from three distinct situations that this crate keeps
+/// separate, and the split is *finer*, not different - every expression below
+/// is rejected by both, and the crate's variant names the more specific
+/// reason:
+///
+/// - an operand appearing where an operator was expected (`0x0.1`) -> this
+///   crate finishes the parse with two values on the stack: `ExtraOperand`;
+/// - an operator appearing where an operand was expected (`*1`, `:1`,
+///   `MIN()`, `MIN(A,)`) -> `MissingOperand`;
+/// - a name that is not an operand or function (`V`..`Z`) -> `UnknownIdent`.
+///
+/// None of these is a category disagreement: in every case both
+/// implementations reject, and the crate's category is a refinement of Base's
+/// single `SYNTAX` bucket, not a contradiction of it.
+fn slice_bad_exprs(c: &mut Corpus) {
+    // `:1001`. Base: `epicsParseUInt32` consumes "0x0" and leaves ".1", which
+    // is then a LITERAL_OPERAND with `operand_needed == FALSE` -> SYNTAX.
+    // Here: `lex` yields `Num(0), Num(0.1)`, two operands and no operator, so
+    // the parse ends with depth 2.
+    c.bad("0x0.1", "CALC_ERR_SYNTAX", Ec::ExtraOperand);
+    c.bad("1*", "CALC_ERR_INCOMPLETE", Ec::MissingOperand);
+    c.bad("*1", "CALC_ERR_SYNTAX", Ec::MissingOperand);
+    c.bad("MIN", "CALC_ERR_INCOMPLETE", Ec::MissingOperand);
+    c.bad("MIN()", "CALC_ERR_SYNTAX", Ec::MissingOperand);
+    c.bad("MIN(A,)", "CALC_ERR_SYNTAX", Ec::MissingOperand);
+    c.bad("MIN(A,B,)", "CALC_ERR_SYNTAX", Ec::MissingOperand);
+    c.bad("MAX", "CALC_ERR_INCOMPLETE", Ec::MissingOperand);
+    c.bad("MAX()", "CALC_ERR_SYNTAX", Ec::MissingOperand);
+    c.bad("MAX(A,)", "CALC_ERR_SYNTAX", Ec::MissingOperand);
+    c.bad("MAX(A,B,)", "CALC_ERR_SYNTAX", Ec::MissingOperand);
+    c.bad("1?", "CALC_ERR_CONDITIONAL", Ec::BadConditional);
+    c.bad("1?1", "CALC_ERR_CONDITIONAL", Ec::BadConditional);
+    c.bad(":1", "CALC_ERR_SYNTAX", Ec::MissingOperand);
+    c.bad("0,", "CALC_ERR_BAD_SEPERATOR", Ec::Unbalanced);
+    c.bad("0)", "CALC_ERR_PAREN_NOT_OPEN", Ec::Unbalanced);
+    // `:1017-1021`. `V`..`Z` are past `U` (`CALCPERFORM_NARGS` = 21), so they
+    // are not operands. Base has no entry for them at all -> SYNTAX; this
+    // crate's lexer emits `Ident("V")` and the parser rejects the name.
+    // (`VAL` *is* in Base's `operands[]` at `postfix.c:143`, but it is a
+    // calcout-only `FETCH_VAL` and is not exercised by any corpus case.)
+    c.bad("V", "CALC_ERR_SYNTAX", Ec::UnknownIdent);
+    c.bad("W", "CALC_ERR_SYNTAX", Ec::UnknownIdent);
+    c.bad("X", "CALC_ERR_SYNTAX", Ec::UnknownIdent);
+    c.bad("Y", "CALC_ERR_SYNTAX", Ec::UnknownIdent);
+    c.bad("Z", "CALC_ERR_SYNTAX", Ec::UnknownIdent);
+}
+
+// ---------------------------------------------------------------------------
+// Slice 5c: testUInt32Calc (epicsCalcTest.cpp:1023-1077)
+// ---------------------------------------------------------------------------
+
+fn slice_uint32(c: &mut Corpus) {
+    // Bit manipulations wrt bit 31 (Base bug lp:1514520), integer literals
+    c.uint32("0xaaaaaaaa AND 0xffff0000", 0xaaaa0000);
+    c.uint32("0xaaaaaaaa OR 0xffff0000", 0xffffaaaa);
+    c.uint32("0xaaaaaaaa XOR 0xffff0000", 0x5555aaaa);
+    c.uint32("~0xaaaaaaaa", 0x55555555);
+    c.uint32("~~0xaaaaaaaa", 0xaaaaaaaa);
+    c.uint32("0xaaaaaaaa >> 8", 0xffaaaaaa);
+    c.uint32("0x55555555 >> 8", 0x00555555);
+    c.uint32("0xaaaaaaaa >>> 8", 0x00aaaaaa);
+    c.uint32("0x55555555 >>> 8", 0x00555555);
+    c.uint32("0xaaaaaaaa << 8", 0xaaaaaa00);
+    c.uint32("0x55555555 << 8", 0x55555500);
+
+    // ... the same, via variables assigned by `:=`
+    c.uint32("a:=0xaaaaaaaa; b:=0xffff0000; a AND b", 0xaaaa0000);
+    c.uint32("a:=0xaaaaaaaa; b:=0xffff0000; a OR b", 0xffffaaaa);
+    c.uint32("a:=0xaaaaaaaa; b:=0xffff0000; a XOR b", 0x5555aaaa);
+    c.uint32("a:=0xaaaaaaaa; ~a", 0x55555555);
+    c.uint32("a:=0xaaaaaaaa; ~~a", 0xaaaaaaaa);
+    c.uint32("a:=0xaaaaaaaa; a >> 8", 0xffaaaaaa);
+    c.uint32("a:=0xaaaaaaaa; a >>> 8", 0x00aaaaaa);
+    c.uint32("a:=0xaaaaaaaa; a << 8", 0xaaaaaa00);
+    c.uint32("a:=0x55555555; a >> 8", 0x00555555);
+    c.uint32("a:=0x55555555; a >>> 8", 0x00555555);
+    c.uint32("a:=0x55555555; a << 8", 0x55555500);
+
+    // Conversion of double values used as bitwise inputs (`:1049-1077`). The
+    // `+ 0.1` forces a double literal; `0xaaaaaaaa` is -1431655766 signed or
+    // 2863311530 unsigned, and `d2i`/`d2ui` (`calcPerform.c:314-326`) must
+    // reach the same 32 bits from either spelling.
+    c.uint32("-1431655766.1 OR 0", 0xaaaaaaaa);
+    c.uint32("2863311530.1 OR 0", 0xaaaaaaaa);
+    c.uint32("0 OR -1431655766.1", 0xaaaaaaaa);
+    c.uint32("0 OR 2863311530.1", 0xaaaaaaaa);
+    c.uint32("-1431655766.1 XOR 0", 0xaaaaaaaa);
+    c.uint32("2863311530.1 XOR 0", 0xaaaaaaaa);
+    c.uint32("0 XOR -1431655766.1", 0xaaaaaaaa);
+    c.uint32("0 XOR 2863311530.1", 0xaaaaaaaa);
+    c.uint32("-1431655766.1 AND 0xffffffff", 0xaaaaaaaa);
+    c.uint32("2863311530.1 AND 0xffffffff", 0xaaaaaaaa);
+    c.uint32("0xffffffff AND -1431655766.1", 0xaaaaaaaa);
+    c.uint32("0xffffffff AND 2863311530.1", 0xaaaaaaaa);
+    c.uint32("~ -1431655766.1", 0x55555555);
+    c.uint32("~ 2863311530.1", 0x55555555);
+    c.uint32("-1431655766.1 >> 0", 0xaaaaaaaa);
+    c.uint32("-1431655766.1 >>> 0", 0xaaaaaaaa);
+    c.uint32("2863311530.1 >> 0", 0xaaaaaaaa);
+    c.uint32("2863311530.1 >>> 0", 0xaaaaaaaa);
+    c.uint32("-1431655766.1 >> 0.1", 0xaaaaaaaa);
+    c.uint32("-1431655766.1 >>> 0.1", 0xaaaaaaaa);
+    c.uint32("2863311530.1 >> 0.1", 0xaaaaaaaa);
+    c.uint32("2863311530.1 >>> 0.1", 0xaaaaaaaa);
+    c.uint32("-1431655766.1 << 0", 0xaaaaaaaa);
+    c.uint32("2863311530.1 << 0", 0xaaaaaaaa);
+    c.uint32("-1431655766.1 << 0.1", 0xaaaaaaaa);
+    c.uint32("2863311530.1 << 0.1", 0xaaaaaaaa);
+}
+
+// ---------------------------------------------------------------------------
 // The test entry point
 // ---------------------------------------------------------------------------
 
@@ -1042,6 +1235,9 @@ fn base_corpus() {
     slice_max_min(&mut c);
     slice_binary_operators(&mut c);
     slice_conditional_store_precedence(&mut c);
+    slice_args(&mut c);
+    slice_bad_exprs(&mut c);
+    slice_uint32(&mut c);
 
     if !c.skips.is_empty() {
         eprintln!(
