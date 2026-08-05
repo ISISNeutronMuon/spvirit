@@ -107,10 +107,18 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                 loop {
                     match stack.pop() {
                         Some(Frame::Op(op)) => out.push(op),
+                        // A completed ternary (past its `:`) sitting inside
+                        // these parens, e.g. `"(A?B:C)"`: finalize it (emit
+                        // `CondEnd`, backpatch both jump targets) the same
+                        // way `pop_while` does, then keep popping down to
+                        // the `(`.
+                        Some(Frame::CondTail { if_idx, else_idx }) => {
+                            finalize_cond(&mut out, if_idx, else_idx)
+                        }
                         Some(Frame::Paren) => break,
                         // A pending `?` with no matching `:` (e.g. `"(A?B)"`)
                         // is a malformed conditional, not a paren mismatch.
-                        Some(Frame::Cond) => return Err(CalcError::BadConditional),
+                        Some(Frame::CondHead(_)) => return Err(CalcError::BadConditional),
                         Some(Frame::Func(_)) => return Err(CalcError::Unbalanced),
                         None => return Err(CalcError::Unbalanced),
                     }
@@ -155,20 +163,45 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                 // pending operator down to the nearest `(` or enclosing
                 // `Cond` before opening this one.
                 pop_while(&mut stack, &mut out, 0, Assoc::Right);
-                stack.push(Frame::Cond);
+                // Emit a `CondIf` placeholder now (see `op.rs`'s `Op::CondIf`
+                // doc for the layout): its `else_target` field is unknown
+                // until the matching `:` closes and the else-branch is fully
+                // emitted, so it's backpatched in place later by
+                // `finalize_cond`. Remember where it landed via
+                // `Frame::CondHead`.
+                let if_idx = out.len();
+                out.push(Op::CondIf { else_target: 0 });
+                stack.push(Frame::CondHead(if_idx));
                 expect_operand = true;
             }
             Token::Op(":") => {
                 loop {
                     match stack.pop() {
                         Some(Frame::Op(op)) => out.push(op),
-                        Some(Frame::Cond) => break,
+                        // A completed nested ternary between this `?` and
+                        // its `:`, e.g. the inner `B?C:D` in `"A?B?C:D:E"`:
+                        // finalize it before continuing to search for the
+                        // `CondHead` that this `:` actually closes.
+                        Some(Frame::CondTail { if_idx, else_idx }) => {
+                            finalize_cond(&mut out, if_idx, else_idx)
+                        }
+                        Some(Frame::CondHead(if_idx)) => {
+                            // Emit the `CondElse` placeholder (its
+                            // `end_target` is backpatched by
+                            // `finalize_cond` once the else-branch and the
+                            // ternary as a whole are complete) and carry
+                            // both indices forward on the stack until
+                            // something finalizes this pair.
+                            let else_idx = out.len();
+                            out.push(Op::CondElse { end_target: 0 });
+                            stack.push(Frame::CondTail { if_idx, else_idx });
+                            break;
+                        }
                         Some(Frame::Paren) | Some(Frame::Func(_)) | None => {
                             return Err(CalcError::BadConditional);
                         }
                     }
                 }
-                stack.push(Frame::Op(Op::Cond));
                 expect_operand = true;
             }
             Token::Op(",") => {
@@ -184,7 +217,14 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                             };
                             out.push(op);
                         }
+                        Some(Frame::CondTail { .. }) => {
+                            let Some(Frame::CondTail { if_idx, else_idx }) = stack.pop() else {
+                                unreachable!()
+                            };
+                            finalize_cond(&mut out, if_idx, else_idx);
+                        }
                         Some(Frame::Paren) => break,
+                        Some(Frame::CondHead(_)) => return Err(CalcError::BadConditional),
                         _ => return Err(CalcError::Unbalanced),
                     }
                 }
@@ -207,8 +247,12 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
     while let Some(frame) = stack.pop() {
         match frame {
             Frame::Op(op) => out.push(op),
+            // A completed ternary at the very top level, e.g. `"A?B:C"`
+            // itself: finalize it the same way any other consumer of
+            // `Frame::CondTail` does.
+            Frame::CondTail { if_idx, else_idx } => finalize_cond(&mut out, if_idx, else_idx),
             Frame::Paren => return Err(CalcError::Unbalanced),
-            Frame::Cond => return Err(CalcError::BadConditional),
+            Frame::CondHead(_) => return Err(CalcError::BadConditional),
             // An unclosed function call, e.g. `"MIN(A,B"`: the `Frame::Paren`
             // above it on the stack is popped (and erred on) first, so this
             // arm is unreachable in practice, but the match must stay
@@ -224,15 +268,61 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
 enum Frame {
     Op(Op),
     Paren,
-    Cond,
+    /// Between `?` and its matching `:`: the condition and then-branch have
+    /// been parsed (the then-branch is still being parsed while this sits
+    /// on top), holding the index of the `Op::CondIf` placeholder pushed at
+    /// `?` so `:` can backfill it once the else-branch's start is known.
+    CondHead(usize),
+    /// A ternary whose `?` and `:` have both been seen (the else-branch may
+    /// still be in progress): `if_idx`/`else_idx` are the indices of the
+    /// `Op::CondIf`/`Op::CondElse` placeholders in `out`, both still
+    /// carrying dummy targets until something finalizes this frame (a
+    /// tighter-binding-or-equal incoming operator via `pop_while`, a `)`,
+    /// a `,`, an enclosing `:`, or end-of-input) by calling
+    /// `finalize_cond`.
+    CondTail { if_idx: usize, else_idx: usize },
     /// A pending function call, between the identifier and its `)`.
     Func(Op),
 }
 
+/// Backpatch a completed ternary's `CondIf`/`CondElse` placeholders and
+/// emit the trailing `CondEnd` marker.
+///
+/// `else_idx + 1` is the else-branch's first instruction (right after the
+/// `CondElse` placeholder at `else_idx`, whose target this sets on the
+/// `CondIf`), and `out.len()` after pushing `CondEnd` is the first
+/// instruction past the whole conditional (the target `CondElse` gets).
+/// Called from every place a `Frame::CondTail` can be consumed: `pop_while`,
+/// `)`, `,`, a further `:`, and the end-of-tokens unwind.
+fn finalize_cond(out: &mut Vec<Op>, if_idx: usize, else_idx: usize) {
+    out.push(Op::CondEnd);
+    out[if_idx] = Op::CondIf {
+        else_target: else_idx + 1,
+    };
+    out[else_idx] = Op::CondElse {
+        end_target: out.len(),
+    };
+}
+
 /// Pop operators that bind at least as tightly as the incoming one.
+///
+/// A pending `Frame::CondTail` (a completed `?...:` whose else-branch may
+/// still be in progress) behaves like an operator frame at priority 0,
+/// right-associative — the same slot the old `Frame::Op(Op::Cond)` occupied
+/// — so it's handled here alongside `Frame::Op`, finalizing it via
+/// `finalize_cond` instead of pushing a single op. A `Frame::CondHead`
+/// (mid-condition or mid-then-branch, `?` seen but not yet its `:`) is
+/// deliberately NOT matched here — same as the old `Frame::Cond` — so an
+/// unrelated pending outer ternary is never disturbed while parsing a
+/// nested one; see the `chained_ternary_in_else_branch`/
+/// `nested_ternary_in_then_branch` tests below for the shapes this protects.
 fn pop_while(stack: &mut Vec<Frame>, out: &mut Vec<Op>, prec: u8, assoc: Assoc) {
-    while let Some(Frame::Op(top)) = stack.last() {
-        let (top_prec, _) = precedence(top);
+    loop {
+        let top_prec = match stack.last() {
+            Some(Frame::Op(top)) => precedence(top).0,
+            Some(Frame::CondTail { .. }) => 0,
+            _ => break,
+        };
         let should_pop = match assoc {
             Assoc::Left => top_prec >= prec,
             Assoc::Right => top_prec > prec,
@@ -240,10 +330,11 @@ fn pop_while(stack: &mut Vec<Frame>, out: &mut Vec<Op>, prec: u8, assoc: Assoc) 
         if !should_pop {
             break;
         }
-        let Some(Frame::Op(op)) = stack.pop() else {
-            unreachable!()
-        };
-        out.push(op);
+        match stack.pop() {
+            Some(Frame::Op(op)) => out.push(op),
+            Some(Frame::CondTail { if_idx, else_idx }) => finalize_cond(out, if_idx, else_idx),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -258,10 +349,24 @@ fn to_op(sym: &str, unary_position: bool) -> Result<Op, CalcError> {
         ("/", false) => Op::Div,
         ("%", false) => Op::Modulo,
         ("^" | "**", false) => Op::Pow,
+        // Relational and logical (Task 5). `=`/`==` and `#`/`!=` are true
+        // aliases in `refs/postfix.c` (both spellings decode to the same
+        // opcode, `EQUAL`/`NOT_EQ` respectively) — not "==` is equality,
+        // `=` is something else"; CALC has no assignment operator among
+        // these symbols.
+        ("!", true) => Op::NotL,
+        (">", false) => Op::Gt,
+        (">=", false) => Op::Ge,
+        ("<", false) => Op::Lt,
+        ("<=", false) => Op::Le,
+        ("=" | "==", false) => Op::Eq,
+        ("#" | "!=", false) => Op::Ne,
+        ("&&", false) => Op::AndL,
+        ("||", false) => Op::OrL,
         // Real operators the lexer already tokenizes (`&`, `AND`, `<<`, the
-        // relationals, etc. — see `lex.rs`'s `OPS` table) but that this
-        // task doesn't implement yet land here too, since there's no `Op`
-        // variant for them until Tasks 5/6 add one. `MissingOperand` is a
+        // shifts, etc. — see `lex.rs`'s `OPS` table) but that this task
+        // doesn't implement yet land here too, since there's no `Op`
+        // variant for them until Task 6 adds one. `MissingOperand` is a
         // placeholder, not a considered error for those symbols; don't read
         // it as meaning "expected an operand and got one of these".
         _ => return Err(CalcError::MissingOperand),
@@ -306,21 +411,113 @@ fn ident_to_op(name: &str) -> Result<Op, CalcError> {
 /// `"A B"`, or the Task 1 known gap where `lex_number` accepts `"1.2.3"` as
 /// two adjacent `Num` tokens): each pushes without popping, so depth ends
 /// above 1 and this reports `ExtraOperand`.
+///
+/// A flat linear scan (Task 2/3/4's original shape) is no longer sufficient
+/// on its own once `Op::CondIf`/`CondElse`/`CondEnd` exist: those three
+/// opcodes lay out TWO alternative branches back-to-back in `ops`, only one
+/// of which `eval.rs` ever actually executes for a given input. Naively
+/// folding depth straight through both branches in sequence, as if they run
+/// one after the other, doesn't model that — see `check_segment`, which
+/// verifies each branch independently (both starting from the same depth,
+/// both required to net exactly +1) and only advances the "real" depth
+/// past the whole construct once, matching what a single evaluation
+/// actually observes.
 fn check_arity(ops: &[Op]) -> Result<(), CalcError> {
-    let mut depth: usize = 0;
-    for op in ops {
-        let need = arity(op);
-        if depth < need {
-            return Err(CalcError::MissingOperand);
-        }
-        depth = depth - need + 1;
-    }
+    let depth = check_segment(ops, 0, ops.len(), 0)?;
     match depth {
         0 if ops.is_empty() => Ok(()),
         1 => Ok(()),
         0 => Err(CalcError::MissingOperand),
         _ => Err(CalcError::ExtraOperand),
     }
+}
+
+/// Simulate `ops[start..end]` assuming the stack already holds `depth_in`
+/// values, returning the depth left after all of them run, or an error on
+/// underflow.
+///
+/// `CondIf`'s `else_target` and the paired `CondElse`'s `end_target` are
+/// read directly out of the opcodes themselves (rather than re-deriving
+/// them by scanning for markers, the way Base's `cond_search` does) and
+/// used to slice out exactly the then-branch and else-branch sub-ranges,
+/// each checked with its own recursive `check_segment` call starting from
+/// the same `depth_in`. Nesting falls out for free: a `CondIf` found while
+/// checking one of those sub-ranges is handled by the same recursive call
+/// against its OWN stored targets, which can only ever point at its own
+/// matching `CondElse`/`CondEnd` (they were computed from that specific
+/// `?`/`:` pair's positions when `parse.rs` emitted them - see
+/// `finalize_cond`) - there is no shared counter or marker search to
+/// confuse an inner pair with an outer one.
+///
+/// The `Unbalanced` returns on malformed targets are defensive, not reachable
+/// from any public API: `Expression.ops` is `pub(crate)`, so the only
+/// producer of `Op::CondIf`/`CondElse`/`CondEnd` is `parse.rs` itself, and
+/// `finalize_cond` always emits self-consistent targets. Rejecting instead
+/// of panicking or mis-simulating keeps that true even if a future bug
+/// broke the invariant, per the "no panic on the public API" constraint.
+fn check_segment(ops: &[Op], start: usize, end: usize, depth_in: usize) -> Result<usize, CalcError> {
+    let mut depth = depth_in;
+    let mut i = start;
+    while i < end {
+        match &ops[i] {
+            Op::CondIf { else_target } => {
+                let need = arity(&ops[i]); // 1: pops the condition
+                if depth < need {
+                    return Err(CalcError::MissingOperand);
+                }
+                let depth_after_cond = depth - need;
+
+                if *else_target == 0 || *else_target > end || *else_target - 1 <= i {
+                    return Err(CalcError::Unbalanced);
+                }
+                let else_op_idx = *else_target - 1;
+                let Op::CondElse { end_target } = ops[else_op_idx] else {
+                    return Err(CalcError::Unbalanced);
+                };
+                if end_target == 0 || end_target > end || end_target <= else_op_idx {
+                    return Err(CalcError::Unbalanced);
+                }
+                let end_op_idx = end_target - 1;
+                if !matches!(ops.get(end_op_idx), Some(Op::CondEnd)) {
+                    return Err(CalcError::Unbalanced);
+                }
+
+                let then_depth = check_segment(ops, i + 1, else_op_idx, depth_after_cond)?;
+                if then_depth != depth_after_cond + 1 {
+                    return Err(if then_depth < depth_after_cond + 1 {
+                        CalcError::MissingOperand
+                    } else {
+                        CalcError::ExtraOperand
+                    });
+                }
+                let else_depth = check_segment(ops, else_op_idx + 1, end_op_idx, depth_after_cond)?;
+                if else_depth != depth_after_cond + 1 {
+                    return Err(if else_depth < depth_after_cond + 1 {
+                        CalcError::MissingOperand
+                    } else {
+                        CalcError::ExtraOperand
+                    });
+                }
+
+                depth = depth_after_cond + 1;
+                i = end_op_idx + 1;
+                continue;
+            }
+            // Only reachable if a `CondIf` elsewhere pointed here without
+            // this being consumed as part of its structured jump handling
+            // above - see the doc comment: not reachable from `compile`.
+            Op::CondElse { .. } | Op::CondEnd => return Err(CalcError::Unbalanced),
+            op => {
+                let need = arity(op);
+                if depth < need {
+                    return Err(CalcError::MissingOperand);
+                }
+                depth = depth - need + 1;
+            }
+        }
+        i += 1;
+    }
+    Ok(depth)
 }
 
 #[cfg(test)]
@@ -409,11 +606,32 @@ mod tests {
         assert_eq!(ops("A**B"), vec![Op::Arg(0), Op::Arg(1), Op::Pow]);
     }
 
+    // Task 5 replaced the eager, single-opcode `Op::Cond` (pop three,
+    // select one) with Base's real three-opcode short-circuit shape
+    // (`refs/calcPerform.c:400-411`): `CondIf{else_target}` pops the
+    // condition and jumps into the else-branch if it's zero;
+    // `CondElse{end_target}` unconditionally jumps past the else-branch
+    // once the then-branch finishes; `CondEnd` is a no-op landing pad.
+    // `else_target`/`end_target` are absolute indices into this same `ops`
+    // vector, pointing one-past the `CondElse`/`CondEnd` respectively (i.e.
+    // at the first instruction of the branch/continuation they gate) -
+    // see `op.rs`'s `Op::CondIf` doc and `finalize_cond` for how `parse.rs`
+    // computes them. Every test below was hand-traced against that layout;
+    // the evaluated *results* for these same shapes are unchanged (see the
+    // matching tests in `eval.rs`), only the compiled representation moved
+    // from eager to short-circuit.
     #[test]
     fn conditional_compiles_to_branch() {
         assert_eq!(
             ops("A?B:C"),
-            vec![Op::Arg(0), Op::Arg(1), Op::Arg(2), Op::Cond]
+            vec![
+                Op::Arg(0),
+                Op::CondIf { else_target: 4 },
+                Op::Arg(1),
+                Op::CondElse { end_target: 6 },
+                Op::Arg(2),
+                Op::CondEnd,
+            ]
         );
     }
 
@@ -430,46 +648,71 @@ mod tests {
                 Op::Arg(0),
                 Op::Arg(1),
                 Op::Add,
+                Op::CondIf { else_target: 6 },
                 Op::Arg(2),
+                Op::CondElse { end_target: 10 },
                 Op::Arg(3),
                 Op::Arg(4),
                 Op::Add,
-                Op::Cond,
+                Op::CondEnd,
             ]
         );
     }
 
     // Chained (right-associative) ternary in the else-branch:
-    // `A ? B : (C ? D : E)`.
+    // `A ? B : (C ? D : E)`. The inner ternary's `CondIf`/`CondElse` land
+    // entirely inside the outer's else-branch (indices 4-9), and the outer
+    // `CondElse` at index 3 targets index 11 - one past the INNER
+    // `CondEnd`, not the outer's own body - demonstrating that finalizing
+    // the inner pair first (at end-of-input, innermost `Frame::CondTail`
+    // popped first) does not disturb the outer pair's already-fixed
+    // `else_target`.
     #[test]
     fn chained_ternary_in_else_branch() {
         assert_eq!(
             ops("A?B:C?D:E"),
             vec![
                 Op::Arg(0),
+                Op::CondIf { else_target: 4 },
                 Op::Arg(1),
+                Op::CondElse { end_target: 11 },
                 Op::Arg(2),
+                Op::CondIf { else_target: 8 },
                 Op::Arg(3),
+                Op::CondElse { end_target: 10 },
                 Op::Arg(4),
-                Op::Cond,
-                Op::Cond,
+                Op::CondEnd,
+                Op::CondEnd,
             ]
         );
     }
 
-    // Nested ternary in the then-branch: `A ? (B?C:D) : E`.
+    // Nested ternary in the then-branch: `A ? (B?C:D) : E`. The inner
+    // ternary (indices 2-7) sits entirely inside the outer's then-branch;
+    // the inner `CondElse` at index 5 targets index 8, which is the OUTER's
+    // `CondElse` - i.e. finishing the inner ternary (whichever of its two
+    // branches actually ran) falls straight through to the outer's
+    // "skip the else-branch" jump, without re-entering or re-checking
+    // anything. This is the case Base's own `cond_search` comment warns
+    // about (skipping nested conditionals correctly rather than mistaking
+    // an inner marker for an outer one); the fixed absolute targets here
+    // make it correct by construction rather than by careful counting.
     #[test]
     fn nested_ternary_in_then_branch() {
         assert_eq!(
             ops("A?B?C:D:E"),
             vec![
                 Op::Arg(0),
+                Op::CondIf { else_target: 9 },
                 Op::Arg(1),
+                Op::CondIf { else_target: 6 },
                 Op::Arg(2),
+                Op::CondElse { end_target: 8 },
                 Op::Arg(3),
-                Op::Cond,
+                Op::CondEnd,
+                Op::CondElse { end_target: 11 },
                 Op::Arg(4),
-                Op::Cond,
+                Op::CondEnd,
             ]
         );
     }

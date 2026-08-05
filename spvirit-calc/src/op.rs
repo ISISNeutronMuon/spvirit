@@ -26,7 +26,53 @@ pub enum Op {
     Neg,
 
     // Conditional (Task 5)
-    Cond,
+    //
+    // `refs/calcPerform.c:400-411`: Base's `COND_IF`/`COND_ELSE`/`COND_END`
+    // are three opcodes, not one, and the untaken branch is never executed -
+    // `cond_search` scans the instruction stream forward to the matching
+    // marker. Task 3's `Op::Cond` (pop three, select one - see the removed
+    // arm's comment in `eval.rs`'s git history) was an explicitly-flagged
+    // placeholder, correct only because nothing in Task 3/4's feature set
+    // could observe the difference between eager and short-circuit
+    // evaluation.
+    //
+    // This crate represents Base's linear marker-scan as compile-time
+    // jump offsets instead: `else_target`/`end_target` are absolute indices
+    // into the owning `Expression.ops`, computed once by `parse.rs` and
+    // baked into the opcode, so `eval.rs` does an O(1) jump rather than an
+    // O(n) rescan per evaluation. This is a deliberate, documented
+    // divergence from Base's *mechanism* (a linear scan vs. a precomputed
+    // offset), not from its *semantics*: both leave the untaken branch
+    // wholly unexecuted, and `parse.rs`'s `check_arity` proves every
+    // jump target is in range and every branch leaves exactly one value on
+    // the stack, so no malformed offset is ever reachable by public API
+    // (`Expression.ops` is `pub(crate)`, so nothing outside this crate can
+    // construct one anyway).
+    //
+    // Layout emitted by `parse.rs` for `A?B:C`:
+    //   [..cond ops..] CondIf{else_target} [..then ops..]
+    //   CondElse{end_target} [..else ops..] CondEnd
+    // `else_target` points one past the `CondElse` (the first instruction
+    // of the else-branch); `end_target` points one past the matching
+    // `CondEnd` (the first instruction after the whole conditional).
+    // Nesting is handled for free: each `CondIf`/`CondElse` pair's targets
+    // are computed from that specific pair's own position, so a nested
+    // `CondIf` inside a skipped branch can never have its `CondElse`
+    // mistaken for an enclosing one - there is no scanning-for-a-marker
+    // step at eval time to get confused, and the targets are absolute
+    // rather than relative-and-counted.
+    /// Pop the condition; if it's `0.0`, jump to `else_target` (the first op
+    /// of the else-branch). Otherwise fall through into the then-branch.
+    /// Mirrors `calcPerform.c:400-403`'s `*ptop-- == 0.0`.
+    CondIf { else_target: usize },
+    /// Reached only by falling through the end of a then-branch (never by a
+    /// `CondIf` jump, which lands past it): unconditionally jump to
+    /// `end_target` (the first op after the whole conditional), skipping
+    /// the else-branch. Mirrors `calcPerform.c:405-407`.
+    CondElse { end_target: usize },
+    /// No-op marker: the first op after an else-branch, and the jump target
+    /// of the owning `CondElse`. Mirrors `calcPerform.c:409-410`.
+    CondEnd,
 
     // Algebraic and transcendental (Task 4)
     Abs,
@@ -69,6 +115,43 @@ pub enum Op {
     /// (`refs/postfix.c:121`, `VARARG_OPERATOR`). NaN-propagating, mirroring
     /// `Min` (`refs/calcPerform.c:191-198`).
     Max(usize),
+
+    // Relational and logical (Task 5)
+    /// `refs/calcPerform.c:395-398` `GR_THAN`: `*ptop > top`. Every
+    /// comparison against NaN is false in IEEE 754 (and thus in C), so
+    /// `NaN > x` and `x > NaN` are both `0.0` — Rust's `f64::>` already
+    /// matches this, no special-casing needed.
+    Gt,
+    /// `refs/calcPerform.c:390-393` `GR_OR_EQ`: `*ptop >= top`.
+    Ge,
+    /// `refs/calcPerform.c:375-378` `LESS_THAN`: `*ptop < top`.
+    Lt,
+    /// `refs/calcPerform.c:380-383` `LESS_OR_EQ`: `*ptop <= top`.
+    Le,
+    /// `refs/calcPerform.c:385-388` `EQUAL`: `*ptop == top`. `refs/postfix.c`
+    /// aliases `=` and `==` to the same opcode — both spellings map here.
+    /// `NaN == NaN` is `0.0`, matching IEEE 754/C, not the alias's surface
+    /// resemblance to assignment.
+    Eq,
+    /// `refs/calcPerform.c:370-373` `NOT_EQ`: `*ptop != top`. `refs/postfix.c`
+    /// aliases `#` and `!=` to the same opcode. The sole comparison where
+    /// NaN operands yield `1.0` rather than `0.0`: `NaN != x` is true for
+    /// every `x`, NaN included.
+    Ne,
+    /// `refs/calcPerform.c:305-308` `REL_AND`: `*ptop = *ptop && top`. Both
+    /// operands are already on the stack by the time this opcode runs — it
+    /// does NOT short-circuit at the operand-evaluation level (unlike the
+    /// ternary above, which does). C's `&&` treats any non-zero double as
+    /// true, NaN included, so `NaN && 1.0` is `1.0`. See RULINGS.md and
+    /// task-5-brief.md: this is Base's actual behavior, not a shortcut to
+    /// "improve".
+    AndL,
+    /// `refs/calcPerform.c:300-303` `REL_OR`: `*ptop = *ptop || top`. Same
+    /// non-short-circuiting, NaN-is-truthy behavior as `AndL`.
+    OrL,
+    /// `refs/calcPerform.c:310-312` `REL_NOT`: `*ptop = ! *ptop`. `!NaN` is
+    /// `0.0` (NaN is truthy, so its negation is false), matching C.
+    NotL,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,10 +178,12 @@ pub(crate) enum Assoc {
 /// | 6 | `**` `^` (POWER, LEFT-associative)               | 156,177            |
 /// | 7 | unary `-` `!` `~` `NOT`, and all functions        | 74,76,90-144       |
 ///
-/// Only the arithmetic/conditional operators introduced by Task 2 are
-/// implemented here; levels 1-3 belong to later tasks (bitwise: Task 6;
-/// relational: Task 5) and are documented above only so this table stays
-/// the single point of truth as those land.
+/// Levels 3-7 (relational through unary/functions) are implemented as of
+/// Task 5. Level 1 (`|`/`OR`/`XOR`/`||`, minus `||` which Task 5 already
+/// implements) and level 2's bitwise/shift members (`&`/`AND`/`<<`/`>>`/
+/// `>>>`, minus `&&` which Task 5 already implements) belong to Task 6, and
+/// are documented above only so this table stays the single point of truth
+/// as those land.
 ///
 /// Two corrections to the original task brief, both required by the
 /// corpus (RULINGS.md Ruling 4):
@@ -112,17 +197,32 @@ pub(crate) enum Assoc {
 ///   exponentiation, not to the result.
 pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
     match op {
-        // Priority 0: binds loosest of all, matching `postfix.c:161,173`
-        // (`:`/`?` both carry in-stack/in-coming priority 0/0). Handled
-        // structurally by the parser (see `Frame::Cond`), not via a normal
-        // pop_while comparison, but a value is still needed here since a
-        // pending `Frame::Op(Op::Cond)` sits on the operator stack between
-        // `:` and the closing point of the ternary.
-        Op::Cond => (0, Assoc::Right),
+        // `?`/`:` still carry priority 0 (loosest), matching
+        // `postfix.c:161,173`, and are handled structurally by the parser
+        // (see `Frame::CondHead`/`Frame::CondTail` in `parse.rs`) rather
+        // than via a normal `pop_while` comparison against one of these
+        // `Op` variants directly — `CondIf`/`CondElse`/`CondEnd` are never
+        // pushed onto the operator stack as a `Frame::Op` (they're written
+        // straight into the output as placeholders and backpatched), so
+        // this function is never actually called on them at runtime. The
+        // arm exists only so this match stays exhaustive as the enum grows;
+        // the value is arbitrary but chosen to match the old placeholder.
+        Op::CondIf { .. } | Op::CondElse { .. } | Op::CondEnd => (0, Assoc::Right),
+        Op::OrL => (1, Assoc::Left),
+        Op::AndL => (2, Assoc::Left),
+        // RULINGS.md Ruling 3 corrects task-5-brief.md's precedence numbers
+        // (which used a stale 12-level scheme putting relationals at 7,
+        // `&&`/`||` at 2/3, and `NotL` at 11): Base has 7 levels, and this
+        // table's existing 4-7 (Add/Sub..unary) were already built against
+        // Ruling 3's numbering, so relationals slot in at 3, `&&` at 2
+        // (grouped with bitwise `&` and the shifts, Task 6), and `||` at 1
+        // (grouped with bitwise `|`/`OR`/`XOR`, Task 6) rather than getting
+        // levels of their own.
+        Op::Gt | Op::Ge | Op::Lt | Op::Le | Op::Eq | Op::Ne => (3, Assoc::Left),
         Op::Add | Op::Sub => (4, Assoc::Left),
         Op::Mul | Op::Div | Op::Modulo => (5, Assoc::Left),
         Op::Pow => (6, Assoc::Left),
-        Op::Neg => (7, Assoc::Right),
+        Op::Neg | Op::NotL => (7, Assoc::Right),
         Op::Arg(_) | Op::Lit(_) => (0, Assoc::Left),
         // Functions never sit on the operator stack as a `Frame::Op` (the
         // parser tracks a pending call via `Frame::Func` instead, and emits
@@ -176,9 +276,34 @@ pub(crate) fn arity(op: &Op) -> usize {
         | Op::Atan
         | Op::Sinh
         | Op::Cosh
-        | Op::Tanh => 1,
-        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Modulo | Op::Pow | Op::Atan2 => 2,
-        Op::Cond => 3,
+        | Op::Tanh
+        | Op::NotL => 1,
+        Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Modulo
+        | Op::Pow
+        | Op::Atan2
+        | Op::Gt
+        | Op::Ge
+        | Op::Lt
+        | Op::Le
+        | Op::Eq
+        | Op::Ne
+        | Op::AndL
+        | Op::OrL => 2,
+        // `CondIf` pops the condition value (`calcPerform.c:400-401`,
+        // `*ptop--`); `check_arity` (parse.rs) uses this directly when it
+        // simulates the depth just before entering the then/else branches.
+        // `CondElse`/`CondEnd` never touch the stack — they're pure control
+        // flow (`calcPerform.c:405-410`) — so both are 0, even though the
+        // ternary as a whole still nets exactly one value, same as the old
+        // 3-in/1-out `Op::Cond` did; `parse.rs::check_segment` is what
+        // proves that net effect now, since it's no longer a single op's
+        // arity to read off this table.
+        Op::CondIf { .. } => 1,
+        Op::CondElse { .. } | Op::CondEnd => 0,
         // Variadic: arity is carried in the variant itself. `check_arity`
         // (parse.rs) reads this the same way as any other op, so the
         // `.expect("arity checked at compile time")` pops in `eval.rs`

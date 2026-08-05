@@ -10,9 +10,11 @@ impl Expression {
     /// Never fails: numeric edge cases propagate as `inf` or `NaN`, matching
     /// EPICS `calcPerform` (`refs/calcPerform.c`). An empty expression
     /// evaluates to `NaN`. This holds for every input `compile` accepts —
-    /// including `?:`, which is evaluated eagerly below (see the `Op::Cond`
-    /// arm) rather than deferred, precisely so this guarantee is not a lie
-    /// for ternary expressions.
+    /// including `?:`, which genuinely short-circuits as of Task 5 (see the
+    /// `Op::CondIf`/`Op::CondElse`/`Op::CondEnd` arms below): the untaken
+    /// branch's instructions are never reached, matching
+    /// `calcPerform.c:400-411`, not evaluated-then-discarded the way Task
+    /// 3's placeholder `Op::Cond` used to.
     ///
     /// Takes `&[f64; 21]` by shared reference rather than `&mut`. Ruling 2
     /// flags that a later `:=` (store) operator will need write-back to the
@@ -33,8 +35,17 @@ impl Expression {
         // is a compile-time-checked precondition, not a runtime edge case -
         // those (div-by-zero, etc.) are handled below without panicking.
         let mut stack: Vec<f64> = Vec::with_capacity(16);
-
-        for op in &self.ops {
+        let ops = &self.ops;
+        // An instruction-pointer loop rather than a `for op in ops`
+        // iteration, so `Op::CondIf`/`Op::CondElse` can jump `ip` forward
+        // and genuinely skip the untaken branch's instructions - a plain
+        // iterator has no way to skip ahead. `check_arity` (parse.rs) is
+        // what guarantees every jump target driven by `Op::CondIf`'s/
+        // `Op::CondElse`'s stored `usize`s stays within `0..=ops.len()`,
+        // so indexing and the loop bound below never go out of range.
+        let mut ip: usize = 0;
+        while ip < ops.len() {
+            let op = &ops[ip];
             match op {
                 Op::Arg(i) => stack.push(args[*i]),
                 Op::Lit(v) => stack.push(*v),
@@ -94,32 +105,44 @@ impl Expression {
                     let a = stack.pop().expect("arity checked at compile time");
                     stack.push(a.powf(b));
                 }
-                // Eager "pop three, select one" per task-3-brief.md:115-120.
-                // Op::Cond has arity 3 and the parser (parse.rs) always
-                // emits [cond, then, els, Cond], so pop order is
-                // els, then, cond (reverse of push order).
+                // Task 5 replaces Task 3's eager "pop three, select one"
+                // placeholder with Base's real short-circuit shape
+                // (`calcPerform.c:400-411`). `CondIf`/`CondElse`/`CondEnd`
+                // together implement it as a jump over the untaken
+                // branch's instructions - they are never executed, not
+                // evaluated-then-discarded.
                 //
-                // IMPORTANT for whoever implements Task 5: this is
-                // deliberately *not* what Base does. COND_IF/COND_ELSE
-                // (calcPerform.c:400-410) short-circuits by jumping over the
-                // untaken branch in the instruction stream - it never
-                // evaluates both branches and discards one. Eager
-                // evaluation here is behaviorally identical to Base's
-                // short-circuit *only* because, at Task 3's capability
-                // level, there is nothing side-effecting or divergent to
-                // observe (no `:=`, no functions, no relationals). Once
-                // Task 5/6 add side-effecting or trapping constructs (e.g.
-                // `:=`, or anything that could be made to panic/diverge on
-                // an operand the untaken branch was guarding against), this
-                // arm must be replaced with true short-circuit evaluation
-                // that skips the untaken branch's ops entirely rather than
-                // evaluating and discarding it.
-                Op::Cond => {
-                    let els = stack.pop().expect("arity checked at compile time");
-                    let then = stack.pop().expect("arity checked at compile time");
+                // calcPerform.c:400-403 `case COND_IF`:
+                // `if (*ptop-- == 0.0 && cond_search(...)) return -1;` -
+                // pop the condition; a zero condition jumps into the
+                // else-branch (`*else_target`), anything else (including
+                // NaN, which is `!= 0.0`) falls through into the
+                // then-branch that immediately follows this instruction.
+                Op::CondIf { else_target } => {
                     let cond = stack.pop().expect("arity checked at compile time");
-                    stack.push(if cond != 0.0 { then } else { els });
+                    if cond == 0.0 {
+                        ip = *else_target;
+                        continue;
+                    }
                 }
+                // calcPerform.c:405-407 `case COND_ELSE`:
+                // `if (cond_search(...)) return -1;`. Only reached by
+                // falling off the end of a then-branch (a `CondIf` jump
+                // lands past this, at `else_target`, never on it) - and
+                // when reached, unconditionally jumps to `end_target`,
+                // skipping the else-branch that follows. No condition to
+                // check here: by the time control reaches this opcode at
+                // all, the then-branch already ran and its result is the
+                // answer, so the else-branch must not run too.
+                Op::CondElse { end_target } => {
+                    ip = *end_target;
+                    continue;
+                }
+                // calcPerform.c:409-410 `case COND_END`: `break;` - a pure
+                // no-op landing pad, reached either by falling off the end
+                // of an else-branch (normal execution) or by a `CondElse`
+                // jump (see above).
+                Op::CondEnd => {}
 
                 // Unary algebraic/transcendental functions (Task 4). Each
                 // cited line is the corresponding `case` in
@@ -262,7 +285,92 @@ impl Expression {
                     };
                     stack.push(result);
                 }
+
+                // Relational (Task 5): all yield exactly `1.0`/`0.0`. Rust's
+                // `f64` comparison operators already follow IEEE 754 (same
+                // as C's `double` comparisons in `calcPerform.c`), so every
+                // comparison against NaN is false here without any special
+                // casing - including `Eq` with two NaNs, which is `0.0`.
+                Op::Gt => {
+                    // calcPerform.c:395-398 `case GR_THAN`: `*ptop > top`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a > b { 1.0 } else { 0.0 });
+                }
+                Op::Ge => {
+                    // calcPerform.c:390-393 `case GR_OR_EQ`: `*ptop >= top`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a >= b { 1.0 } else { 0.0 });
+                }
+                Op::Lt => {
+                    // calcPerform.c:375-378 `case LESS_THAN`: `*ptop < top`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a < b { 1.0 } else { 0.0 });
+                }
+                Op::Le => {
+                    // calcPerform.c:380-383 `case LESS_OR_EQ`: `*ptop <= top`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a <= b { 1.0 } else { 0.0 });
+                }
+                Op::Eq => {
+                    // calcPerform.c:385-388 `case EQUAL`: `*ptop == top`.
+                    // `NaN == NaN` is `0.0`, matching Base/IEEE 754 - `A=B`
+                    // is equality, not assignment, and this is the sole
+                    // reason `NaN = NaN` is false rather than true.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a == b { 1.0 } else { 0.0 });
+                }
+                Op::Ne => {
+                    // calcPerform.c:370-373 `case NOT_EQ`: `*ptop != top`.
+                    // The one comparison where NaN yields `1.0`: `NaN != x`
+                    // is true for every `x`, NaN included.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a != b { 1.0 } else { 0.0 });
+                }
+                // Logical (Task 5). `refs/calcPerform.c:300-312`: `REL_OR`/
+                // `REL_AND`/`REL_NOT` operate on values already popped off
+                // the stack - by the time these opcodes run, BOTH operands
+                // have already been evaluated. This is deliberately NOT a
+                // short-circuit at the operand-evaluation level (unlike
+                // `Op::CondIf`/`CondElse`/`CondEnd` above, which is): Base's
+                // postfix form has no way to skip evaluating one operand of
+                // `&&`/`||`, so matching that faithfully here means both
+                // sides always run, even though the Rust `&&`/`||` used
+                // below (applied only to the already-computed truthiness of
+                // each) would themselves short-circuit if that mattered
+                // (it doesn't - `!= 0.0` on an already-popped f64 has no
+                // side effects to skip).
+                Op::AndL => {
+                    // calcPerform.c:305-308 `case REL_AND`:
+                    // `*ptop = *ptop && top`. C's `&&` treats any non-zero
+                    // double as true, NaN included (`NaN != 0.0`), so
+                    // `NaN && 1.0` is `1.0`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a != 0.0 && b != 0.0 { 1.0 } else { 0.0 });
+                }
+                Op::OrL => {
+                    // calcPerform.c:300-303 `case REL_OR`:
+                    // `*ptop = *ptop || top`. Same NaN-is-truthy rule as
+                    // `AndL`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a != 0.0 || b != 0.0 { 1.0 } else { 0.0 });
+                }
+                Op::NotL => {
+                    // calcPerform.c:310-312 `case REL_NOT`: `*ptop = ! *ptop`.
+                    // `!NaN` is `0.0`: NaN is truthy, so its negation is
+                    // false, matching C.
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a == 0.0 { 1.0 } else { 0.0 });
+                }
             }
+            ip += 1;
         }
 
         stack.pop().unwrap_or(f64::NAN)
@@ -340,12 +448,13 @@ mod tests {
         assert_eq!(ev("A*-B", &[2.0, 3.0]), -6.0);
     }
 
-    // Op::Cond, evaluated eagerly (task-3-brief.md:115-120). Verified
-    // against calcPerform.c:400-410's COND_IF/COND_ELSE semantics: nonzero
-    // condition selects the `then` branch, zero selects `else` - eager
-    // pop-three-select is behaviorally identical to Base's short-circuit
-    // jump here since Task 3 has no side-effecting constructs to diverge
-    // on (see the Op::Cond match arm's comment).
+    // `Op::CondIf`/`CondElse`/`CondEnd`, evaluated with true short-circuit
+    // as of Task 5 (calcPerform.c:400-411): nonzero condition selects the
+    // `then` branch, zero selects `else`, and the untaken branch's
+    // instructions are never reached (see the `Op::CondIf` match arm's
+    // comment). These result assertions are carried over unchanged from
+    // Task 3's eager "pop three, select one" placeholder - the values were
+    // never expected to differ, only the mechanism producing them did.
     #[test]
     fn conditional_selects_then_branch_on_nonzero_condition() {
         assert_eq!(ev("A?B:C", &[1.0, 2.0, 3.0]), 2.0);
@@ -501,5 +610,150 @@ mod tests {
         assert_eq!(ev("SINH(A)", &[0.0]), 0.0);
         assert_eq!(ev("COSH(A)", &[0.0]), 1.0);
         assert_eq!(ev("TANH(A)", &[0.0]), 0.0);
+    }
+
+    // --- Task 5: relational, logical, and conditional operators ---
+
+    #[test]
+    fn single_equals_is_equality_not_assignment() {
+        assert_eq!(ev("A=B", &[1.0, 1.0]), 1.0);
+        assert_eq!(ev("A==B", &[1.0, 1.0]), 1.0);
+        assert_eq!(ev("A=B", &[1.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn hash_is_not_equal() {
+        assert_eq!(ev("A#B", &[1.0, 2.0]), 1.0);
+        assert_eq!(ev("A!=B", &[1.0, 2.0]), 1.0);
+        assert_eq!(ev("A#B", &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn relational_operators_yield_one_or_zero() {
+        assert_eq!(ev("A>B", &[2.0, 1.0]), 1.0);
+        assert_eq!(ev("A>=B", &[1.0, 1.0]), 1.0);
+        assert_eq!(ev("A<B", &[2.0, 1.0]), 0.0);
+        assert_eq!(ev("A<=B", &[1.0, 1.0]), 1.0);
+    }
+
+    #[test]
+    fn logical_operators_treat_nonzero_as_true() {
+        assert_eq!(ev("A&&B", &[5.0, 3.0]), 1.0);
+        assert_eq!(ev("A&&B", &[5.0, 0.0]), 0.0);
+        assert_eq!(ev("A||B", &[0.0, 3.0]), 1.0);
+        assert_eq!(ev("!A", &[0.0]), 1.0);
+        assert_eq!(ev("!A", &[5.0]), 0.0);
+    }
+
+    // calcPerform.c:300-312 (REL_OR/REL_AND/REL_NOT operate directly on C
+    // `double`s: `||`, `&&`, and `!` all treat non-zero as true, and C's
+    // rule is that ANY non-zero pattern is true, NaN included (NaN != 0.0).
+    // Not an "improvement" to short-circuit or to special-case NaN as
+    // false - that would diverge from Base.
+    #[test]
+    fn logical_operators_treat_nan_as_true() {
+        let nan = f64::NAN;
+        assert_eq!(ev("A&&B", &[nan, 1.0]), 1.0);
+        assert_eq!(ev("A||B", &[nan, 0.0]), 1.0);
+        assert_eq!(ev("!A", &[nan]), 0.0);
+    }
+
+    // Every comparison against NaN is false in IEEE 754 (and thus in C),
+    // including equality of NaN with itself - `A=B` with both NaN is 0.0,
+    // not 1.0. Rust's f64 `==`/`<`/`>`/etc. already follow IEEE 754, so this
+    // is a "does the translation preserve it" check, not new behavior.
+    #[test]
+    fn nan_comparisons_are_always_false_except_not_equal() {
+        let nan = f64::NAN;
+        assert_eq!(ev("A=B", &[nan, nan]), 0.0);
+        assert_eq!(ev("A>B", &[nan, 1.0]), 0.0);
+        assert_eq!(ev("A<B", &[nan, 1.0]), 0.0);
+        assert_eq!(ev("A>=B", &[nan, 1.0]), 0.0);
+        assert_eq!(ev("A<=B", &[nan, 1.0]), 0.0);
+        // `!=`/`#` is the sole exception: NaN is unequal to everything.
+        assert_eq!(ev("A#B", &[nan, nan]), 1.0);
+    }
+
+    #[test]
+    fn conditional_selects_branch() {
+        assert_eq!(ev("A?B:C", &[1.0, 10.0, 20.0]), 10.0);
+        assert_eq!(ev("A?B:C", &[0.0, 10.0, 20.0]), 20.0);
+    }
+
+    #[test]
+    fn conditional_binds_loosest() {
+        // Parses as (A>B) ? (C+1) : (C-1), not A > (B?...)
+        assert_eq!(ev("A>B?C+1:C-1", &[2.0, 1.0, 10.0]), 11.0);
+        assert_eq!(ev("A>B?C+1:C-1", &[1.0, 2.0, 10.0]), 9.0);
+    }
+
+    // Proof that the ternary genuinely short-circuits, not just that it
+    // "looks like" eager pop-three-select happens to agree with it.
+    //
+    // NaN-propagation is *not* a valid demonstration here (as task-5-brief.md
+    // warns): every op in this crate's current feature set is numerically
+    // total (division/log/sqrt/etc. of anything yield inf/NaN, never a
+    // panic), so an eager evaluator that runs both branches and discards one
+    // is numerically indistinguishable from a short-circuiting one - there
+    // is nothing observable through `eval`'s f64 return value alone.
+    //
+    // What *is* observable: `check_arity` (parse.rs) guarantees a
+    // `compile()`-produced `Expression` never underflows the stack, so
+    // `eval`'s `.expect("arity checked at compile time")` pops are provably
+    // sound for anything the public API can produce. But `Expression.ops` is
+    // only `pub(crate)`, not `pub` - nothing outside this crate can violate
+    // that invariant, but code *inside* the crate (i.e. this test) can
+    // construct a hand-built, deliberately-underflowing `Expression`
+    // directly. Doing so here gives a decisive white-box test: the "else"
+    // branch below is a bare `Op::Add` with nothing pushed for it to pop -
+    // executing it *would* panic. If `eval` ever regresses to evaluating
+    // both branches (eagerly, discarding the untaken one, as Task 3's
+    // `Op::Cond` used to), this test panics. Because the real short-circuit
+    // implementation jumps clean over that branch, it doesn't.
+    #[test]
+    fn conditional_never_executes_the_untaken_branch() {
+        use crate::op::Op;
+        use crate::parse::Expression;
+
+        // A ? 1.0 : <panics if reached>
+        //   0: Arg(0)
+        //   1: CondIf { else_target: 4 }   -- pop A; if zero, jump to 4
+        //   2: Lit(1.0)                    -- then-branch
+        //   3: CondElse { end_target: 6 }  -- unconditionally skip to 6
+        //   4: Add                          -- else-branch: pop 2 from an
+        //                                      empty stack -> would panic
+        //   5: CondEnd
+        let taken_then = Expression {
+            ops: vec![
+                Op::Arg(0),
+                Op::CondIf { else_target: 4 },
+                Op::Lit(1.0),
+                Op::CondElse { end_target: 6 },
+                Op::Add,
+                Op::CondEnd,
+            ],
+        };
+        assert_eq!(taken_then.eval(&[1.0; 21]), 1.0);
+
+        // A ? <panics if reached> : 2.0, with A == 0 so the else-branch (the
+        // one that doesn't panic) is the one actually taken - mirrors the
+        // above in the other direction.
+        //   0: Arg(0)
+        //   1: CondIf { else_target: 4 }
+        //   2: Add                          -- then-branch: would panic
+        //   3: CondElse { end_target: 6 }
+        //   4: Lit(2.0)                     -- else-branch
+        //   5: CondEnd
+        let taken_else = Expression {
+            ops: vec![
+                Op::Arg(0),
+                Op::CondIf { else_target: 4 },
+                Op::Add,
+                Op::CondElse { end_target: 6 },
+                Op::Lit(2.0),
+                Op::CondEnd,
+            ],
+        };
+        assert_eq!(taken_else.eval(&[0.0; 21]), 2.0);
     }
 }
