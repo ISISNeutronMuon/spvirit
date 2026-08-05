@@ -884,6 +884,153 @@ fn slice_binary_operators(c: &mut Corpus) {
 }
 
 // ---------------------------------------------------------------------------
+// Slice 4: CONDITIONAL, STORE_OPERATOR/EXPR_TERM, relative precedence,
+// parentheses (epicsCalcTest.cpp:831-950)
+// ---------------------------------------------------------------------------
+
+fn slice_conditional_store_precedence(c: &mut Corpus) {
+    // CONDITIONAL elements (`:831-843`). Note `NaN ? 1 : 2` is 1: C (and
+    // `calcPerform.c:400-403`'s `*ptop-- == 0.0`) treat any non-zero double,
+    // NaN included, as true.
+    c.calc("0 ? 1 : 2", 2.0);
+    c.calc("1 ? 1 : 2", 1.0);
+    c.calc("Inf ? 1 : 2", 1.0);
+    c.calc("NaN ? 1 : 2", 1.0);
+    c.calc("0 ? 0 ? 2 : 3 : 4", 4.0);
+    c.calc("0 ? 1 ? 2 : 3 : 4", 4.0);
+    c.calc("1 ? 0 ? 2 : 3 : 4", 3.0);
+    c.calc("1 ? 1 ? 2 : 3 : 4", 2.0);
+    c.calc("0 ? 2 : 0 ? 3 : 4", 4.0);
+    c.calc("0 ? 2 : 1 ? 3 : 4", 3.0);
+    c.calc("1 ? 2 : 0 ? 3 : 4", 2.0);
+    c.calc("1 ? 2 : 1 ? 3 : 4", 2.0);
+
+    // STORE_OPERATOR and EXPR_TERM elements (`:845-888`).
+    //
+    // Two shapes, 21 letters each. `"x := 0; x"` stores then fetches, so the
+    // result is 0 regardless of the slot's initial value; `"x; x := 0"`
+    // fetches first, so the result is the slot's initial value (a=1 .. u=21).
+    // Both leave runtime depth 1 overall, which is Base's only end-of-parse
+    // requirement (`refs/postfix.c:499`, `runtime_depth != 1`) - note the
+    // second shape's first segment is NOT a store, so "every segment but the
+    // last must be a store" is not Base's rule and these 21 cases are what
+    // show it.
+    c.calc("a := 0; a", 0.0);
+    c.calc("b := 0; b", 0.0);
+    c.calc("c := 0; c", 0.0);
+    c.calc("d := 0; d", 0.0);
+    c.calc("e := 0; e", 0.0);
+    c.calc("f := 0; f", 0.0);
+    c.calc("g := 0; g", 0.0);
+    c.calc("h := 0; h", 0.0);
+    c.calc("i := 0; i", 0.0);
+    c.calc("j := 0; j", 0.0);
+    c.calc("k := 0; k", 0.0);
+    c.calc("l := 0; l", 0.0);
+    c.calc("m := 0; m", 0.0);
+    c.calc("n := 0; n", 0.0);
+    c.calc("o := 0; o", 0.0);
+    c.calc("p := 0; p", 0.0);
+    c.calc("q := 0; q", 0.0);
+    c.calc("r := 0; r", 0.0);
+    c.calc("s := 0; s", 0.0);
+    c.calc("t := 0; t", 0.0);
+    c.calc("u := 0; u", 0.0);
+
+    c.calc("a; a := 0", 1.0);
+    c.calc("b; b := 0", 2.0);
+    c.calc("c; c := 0", 3.0);
+    c.calc("d; d := 0", 4.0);
+    c.calc("e; e := 0", 5.0);
+    c.calc("f; f := 0", 6.0);
+    c.calc("g; g := 0", 7.0);
+    c.calc("h; h := 0", 8.0);
+    c.calc("i; i := 0", 9.0);
+    c.calc("j; j := 0", 10.0);
+    c.calc("k; k := 0", 11.0);
+    c.calc("l; l := 0", 12.0);
+    c.calc("m; m := 0", 13.0);
+    c.calc("n; n := 0", 14.0);
+    c.calc("o; o := 0", 15.0);
+    c.calc("p; p := 0", 16.0);
+    c.calc("q; q := 0", 17.0);
+    c.calc("r; r := 0", 18.0);
+    c.calc("s; s := 0", 19.0);
+    c.calc("t; t := 0", 20.0);
+    c.calc("u; u := 0", 21.0);
+
+    // Relative precedences (`:890-945`). The trailing `// n m` comments in the
+    // corpus name the two priority levels each case pits against each other.
+    c.calc("0 ? 1 : 2 | 4", (2i32 | 4i32) as f64); // 0 1
+    c.calc("1 ? 1 : 2 | 4", 1.0); // 0 1
+    c.calc("0 ? 2 | 4 : 1", 1.0); // 0 1
+    c.calc("1 ? 2 | 4 : 1", (2i32 | 4i32) as f64); // 0 1
+    c.calc("0 ? 1 : 2 & 3", (2i32 & 3i32) as f64); // 0 2
+    c.calc("1 ? 1 : 2 & 3", 1.0); // 0 2
+    c.calc("0 ? 2 & 3 : 1", 1.0); // 0 2
+    c.calc("1 ? 2 & 3 : 1", (2i32 & 3i32) as f64); // 0 2
+    c.calc("0 ? 2 : 3 >= 1", b(3.0 >= 1.0)); // 0 3
+    c.calc("0 ? 3 >= 1 : 2", 2.0); // 0 3
+    c.calc("1 ? 0 == 1 : 2", b(0.0 == 1.0)); // 0 3
+    c.calc("1 ? 2 : 0 == 1", 2.0); // 0 3
+    c.calc("0 ? 1 : 2 + 4", 2.0 + 4.0); // 0 4
+    c.calc("1 ? 1 : 2 + 4", 1.0); // 0 4
+    c.calc("0 ? 2 + 4 : 1", 1.0); // 0 4
+    c.calc("1 ? 2 + 4 : 1", 2.0 + 4.0); // 0 4
+    c.calc("0 ? 1 : 2 * 4", 2.0 * 4.0); // 0 5
+    c.calc("1 ? 1 : 2 * 4", 1.0); // 0 5
+    c.calc("0 ? 2 * 4 : 1", 1.0); // 0 5
+    c.calc("1 ? 2 * 4 : 1", 2.0 * 4.0); // 0 5
+    c.calc("0 ? 1 : 2 ** 3", 8.0); // 0 6
+    c.calc("1 ? 1 : 2 ** 3", 1.0); // 0 6
+    c.calc("0 ? 2 ** 3 : 1", 1.0); // 0 6
+    c.calc("1 ? 2 ** 3 : 1", 8.0); // 0 6
+    // `:915` - the case RULINGS.md Ruling 3 cites for `|` and `XOR` sharing
+    // one priority level, left-associative: `(1|3)^1`, not `1|(3^1)`.
+    c.calc("1 | 3 XOR 1", ((1i32 | 3i32) ^ 1i32) as f64); // 1 1
+    c.calc("1 XOR 3 | 1", ((1i32 ^ 3i32) | 1i32) as f64); // 1 1
+    c.calc("3 | 1 & 2", (3i32 | (1i32 & 2i32)) as f64); // 1 2
+    c.calc("2 | 4 > 3", (2i32 | (4.0 > 3.0) as i32) as f64); // 1 3
+    c.calc("2 OR 4 > 3", (2i32 | (4.0 > 3.0) as i32) as f64); // 1 3
+    c.calc("2 XOR 3 >= 0", (2i32 ^ (3.0 >= 0.0) as i32) as f64); // 1 3
+    c.calc("2 | 1 - 3", (2i32 | (1i32 - 3i32)) as f64); // 1 4
+    c.calc("2 | 4 / 2", (2i32 | (4i32 / 2i32)) as f64); // 1 5
+    c.calc("1 | 2 ** 3", (1i32 | 2.0f64.powf(3.0) as i32) as f64); // 1 6
+    c.calc("3 << 2 & 10", ((3i32 << 2) & 10i32) as f64); // 2 2
+    c.calc("18 & 6 << 2", ((18i32 & 6i32) << 2) as f64); // 2 2
+    c.calc("36 >> 2 & 10", ((36i32 >> 2) & 10i32) as f64); // 2 2
+    c.calc("36 >>> 2 & 10", ((36u32 >> 2u32) & 10u32) as f64); // 2 2
+    c.calc("18 & 20 >> 2", ((18i32 & 20i32) >> 2) as f64); // 2 2
+    c.calc("18 & 20 >>> 2", ((18u32 & 20u32) >> 2) as f64); // 2 2
+    c.calc("3 & 4 == 4", (3i32 & (4.0 == 4.0) as i32) as f64); // 2 3
+    c.calc("3 AND 4 == 4", (3i32 & (4.0 == 4.0) as i32) as f64); // 2 3
+    c.calc("1 << 2 != 4", (1i32 << (2.0 != 4.0) as i32) as f64); // 2 3
+    c.calc("16 >> 2 != 4", (16i32 >> (2.0 != 4.0) as i32) as f64); // 2 3
+    c.calc("16 >>> 2 != 4", (16u32 >> (2.0 != 4.0) as u32) as f64); // 2 3
+    c.calc("3 AND -2", (3i32 & -2i32) as f64); // 2 8
+    c.calc("0 < 1 ? 2 : 3", 2.0); // 3 0
+    c.calc("1 <= 0 ? 2 : 3", 3.0); // 3 0
+    c.calc("0 + -1", 0.0 + -1.0); // 4 8
+    c.calc("0 - -1", 0.0 - -1.0); // 4 8
+    c.calc("10 + 10 * 2", 10.0 + 10.0 * 2.0); // 4 5
+    c.calc("20 + 20 / 2", 20.0 + 20.0 / 2.0); // 4 5
+    c.calc("-1 + 1", -1.0 + 1.0); // 7 4
+    c.calc("-1 - 2", -1.0 - 2.0); // 7 4
+    // `:944-945` - the cases RULINGS.md Ruling 4 cites for unary minus binding
+    // TIGHTER than power: `pow(-2, 2) == +4`, not `-(2**2) == -4`.
+    c.calc("-2 ** 2", (-2.0f64).powf(2.0)); // 7 6
+    c.calc("-2 ^ 2", (-2.0f64).powf(2.0)); // 7 6
+
+    // Parentheses (`:947-950`)
+    c.calc("(1 | 2) ** 3", ((1i32 | 2i32) as f64).powf(3.0)); // 8 6
+    c.calc("1+(1|2)**3", 1.0 + ((1i32 | 2i32) as f64).powf(3.0)); // 8 6
+    c.calc(
+        "1+(1?(1<2):(1>2))*2",
+        1.0 + (if 1.0 != 0.0 { b(1.0 < 2.0) } else { b(1.0 > 2.0) }) * 2.0,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The test entry point
 // ---------------------------------------------------------------------------
 
@@ -894,6 +1041,7 @@ fn base_corpus() {
     slice_literals_and_operands(&mut c);
     slice_max_min(&mut c);
     slice_binary_operators(&mut c);
+    slice_conditional_store_precedence(&mut c);
 
     if !c.skips.is_empty() {
         eprintln!(
