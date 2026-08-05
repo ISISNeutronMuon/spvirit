@@ -1,5 +1,119 @@
+use std::cell::Cell;
+
 use crate::op::Op;
 use crate::parse::Expression;
+
+// Backing generator for `Op::Rndm` (`RNDM`, `refs/calcPerform.c:296-298`
+// `case RANDOM`: `*++ptop = calcRandom();`).
+//
+// # Design: why `thread_local`, not a field on `Expression`
+//
+// `RNDM` needs mutable state to advance between draws, but `eval` is a
+// `&self` method and must stay that way - task instructions are explicit
+// that changing the public signature to `&mut self` here would pre-empt a
+// still-open signature question flagged for `:=` (Ruling 2) in an earlier
+// task, and for the wrong reason (RNDM's laziness, not `:=`'s genuine
+// write-back need). Putting a `Cell<u64>` directly on `Expression` would
+// solve the `&self`-vs-mutation tension too, but at a real cost: it would
+// make `Expression` `!Sync` (shared `&Expression` across threads could race
+// on the `Cell`) and would mean every clone of an `Expression` carries and
+// diverges its own independent RNG stream, which is a strange thing for
+// "the same compiled program" to do.
+//
+// A `thread_local! { Cell<u64> }` keeps the mutable state OUT of
+// `Expression` entirely: `Expression` (`Vec<Op>`, all `Copy`/`Send`/`Sync`
+// payloads) is unaffected and keeps every auto trait it had before this
+// task (`Send`, `Sync`, `Clone`, `PartialEq`, `Debug` - verified by
+// `expression_keeps_its_auto_traits_after_adding_rndm` below). Concurrent
+// `eval()` calls from different threads on the same (or different)
+// `Expression`s never race, because each thread has its own independent
+// copy of `RNDM_STATE` - there is no shared mutable state to race on in the
+// first place, which is a stronger guarantee than merely being panic-free
+// under contention.
+//
+// # Design: the generator itself
+//
+// A small xorshift64* (Marsaglia/Vigna) generator, chosen for being short,
+// dependency-free, and well-distributed enough for this purpose. This is
+// **not cryptographically secure** and makes **no attempt** to be
+// bit-compatible with C's `rand()`/`RAND_MAX` (`calcPerform.c:509-521`):
+// bit-compatibility with a specific libc's `rand()` is neither achievable
+// (`RAND_MAX` and the sequence itself vary by C library and are themselves
+// unspecified beyond a minimum range) nor required by any conformance
+// target this crate has - Base's own output for `RNDM` is
+// platform-dependent for the identical reason. This crate does not claim to
+// reproduce Base's sequence, only its documented value range (see below).
+//
+// Seeded once per thread from `std::time` (part of `std`, not a runtime
+// dependency - the crate stays zero-dependency) the first time `RNDM` is
+// drawn on that thread, mirroring `calcRandom`'s own lazy one-time
+// `srand()` (`calcPerform.c:511-518`) without reproducing its exact seed
+// source (`epicsTimeGetMonotonic`, not part of `std`).
+//
+// # Design: range
+//
+// `calcRandom` returns `rand() / RAND_MAX` (`calcPerform.c:520`), and C's
+// `rand()` can return `RAND_MAX` itself, so Base's documented range is the
+// CLOSED interval `[0, 1]`, not the half-open `[0, 1)` most modern
+// generators (including `rand`-crate-style ones) produce. This
+// implementation deliberately reproduces that inclusivity - scaling into
+// `[0, 1]` rather than `[0, 1)` - because it costs nothing (one constructed
+// as `(2^53 - 1)` instead of `2^53` as the divisor) and matches Base's
+// documented semantic contract, even though the underlying bit sequence is
+// unrelated to Base's. A caller relying on `RNDM` never equaling exactly
+// `1.0` would be relying on an accident of Base's own generator, not a
+// documented guarantee - `calcPerform.c`'s own comment says plainly
+// "between 0 - 1".
+thread_local! {
+    static RNDM_STATE: Cell<u64> = Cell::new(seed_from_time());
+}
+
+/// One-time-per-thread seed, mirroring `calcRandom`'s lazy `srand()` but
+/// sourced from `std::time` rather than `epicsTimeGetMonotonic` (not part of
+/// `std`, and pulling in a dependency for it would violate the
+/// zero-runtime-dependency constraint).
+fn seed_from_time() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // xorshift64* requires a nonzero seed to ever produce nonzero output;
+    // mix in a fixed odd constant and floor at 1 so a `SystemTime` read of
+    // exactly the epoch (or a clock that fails outright, falling back to 0
+    // above) can't zero-lock the generator.
+    (nanos ^ 0x9E37_79B9_7F4A_7C15).max(1)
+}
+
+/// Crate-internal test hook: seed the calling thread's `RNDM` generator
+/// deterministically. `RNDM` is otherwise the one genuinely nondeterministic
+/// part of this crate's public API, which would make it untestable by value
+/// without this - not exported outside the crate, so nothing in the public
+/// API can force a caller's sequence.
+#[cfg(test)]
+pub(crate) fn seed_rndm(seed: u64) {
+    RNDM_STATE.with(|cell| cell.set(seed.max(1)));
+}
+
+/// Draw the next `[0, 1]`-inclusive value and advance this thread's state.
+fn next_rndm() -> f64 {
+    RNDM_STATE.with(|cell| {
+        let mut x = cell.get();
+        // xorshift64* (Marsaglia/Vigna): three shift-xors advance the state,
+        // then a final multiply by an odd constant mixes the output - the
+        // "*" in the name. Not cryptographic; see the module-level doc.
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        cell.set(x);
+        let mixed = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        // Top 53 bits become the mantissa, scaled by `2^53 - 1` (not `2^53`)
+        // so the maximum possible mantissa maps to exactly `1.0` - matching
+        // `calcRandom`'s documented CLOSED `[0, 1]` range (see module doc),
+        // not the half-open `[0, 1)` a `/ 2^53` scaling would give.
+        (mixed >> 11) as f64 / ((1u64 << 53) - 1) as f64
+    })
+}
 
 /// Convert to the signed 32-bit integer EPICS bitwise operators work on.
 ///
@@ -349,6 +463,38 @@ impl Expression {
                     stack.push(result);
                 }
 
+                // calcPerform.c:296-298 `case RANDOM`: `*++ptop =
+                // calcRandom();` - pushes without popping (see `Op::Rndm`'s
+                // doc in op.rs and this module's `RNDM_STATE` doc for the
+                // generator design).
+                Op::Rndm => stack.push(next_rndm()),
+
+                // RULINGS.md Ruling 6 / calcPerform.c:277-279 `case ISINF`:
+                // `*ptop = isinf(*ptop);` - strictly unary, no fold.
+                Op::IsInf => {
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push(if a.is_infinite() { 1.0 } else { 0.0 });
+                }
+                // calcPerform.c:281-289 `case ISNAN`: OR-fold over `n`
+                // arguments - true if ANY is NaN.
+                Op::IsNan(n) => {
+                    let at = stack.len() - n;
+                    let tail = stack.split_off(at);
+                    let result = tail.iter().any(|v| v.is_nan());
+                    stack.push(if result { 1.0 } else { 0.0 });
+                }
+                // calcPerform.c:267-275 `case FINITE`: AND-fold over `n`
+                // arguments - true only if EVERY one is finite. The opposite
+                // fold from `ISNAN` immediately above - this asymmetry is
+                // the trap RULINGS.md Ruling 6 and the task instructions
+                // both flag.
+                Op::Finite(n) => {
+                    let at = stack.len() - n;
+                    let tail = stack.split_off(at);
+                    let result = tail.iter().all(|v| v.is_finite());
+                    stack.push(if result { 1.0 } else { 0.0 });
+                }
+
                 // Relational (Task 5): all yield exactly `1.0`/`0.0`. Rust's
                 // `f64` comparison operators already follow IEEE 754 (same
                 // as C's `double` comparisons in `calcPerform.c`), so every
@@ -532,6 +678,7 @@ impl Expression {
 #[cfg(test)]
 mod tests {
     use crate::compile;
+    use super::seed_rndm;
 
     /// Operand array is 21 wide (A-U), per RULINGS.md Ruling 1 /
     /// `refs/postfix.h:29` (`CALCPERFORM_NARGS` = 21), not the brief's 12.
@@ -1094,6 +1241,169 @@ mod tests {
             let _ = ev("A>>B", &[v, 3.0]);
             let _ = ev("A>>>B", &[v, 3.0]);
         }
+    }
+
+    // --- Task 7: named constants, RNDM, NaN/Inf predicates ---
+
+    // `refs/postfix.c:101,111,125,129,132`: `D2R`, `INF`, `NAN`, `PI`, `R2D`
+    // are all `OPERAND`/`LITERAL_OPERAND` entries with zero stack effect (push
+    // one, pop none) - nullary, not functions. `refs/calcPerform.c:126-136`:
+    // `CONST_PI` pushes `PI`, `CONST_D2R` pushes `PI/180.`, `CONST_R2D` pushes
+    // `180./PI` - computed as divisions of `PI`, not transcribed decimal
+    // literals, so the last bits match exactly.
+    #[test]
+    fn named_constants() {
+        assert_eq!(ev("PI", &[]), std::f64::consts::PI);
+        assert!((ev("D2R", &[]) - std::f64::consts::PI / 180.0).abs() < 1e-15);
+        assert!((ev("R2D", &[]) - 180.0 / std::f64::consts::PI).abs() < 1e-13);
+        assert!(ev("INF", &[]).is_infinite());
+        assert!(ev("NAN", &[]).is_nan());
+    }
+
+    // refs/epicsCalcTest.cpp:336 asserts `testCalc("Infinity", Inf)` -
+    // Base's own test suite compiles and evaluates this spelling
+    // successfully, even though postfix.c's operands[] table has no
+    // distinct "INFINITY" row (see constant()'s doc in parse.rs for the
+    // prefix-match + strtod-delegation mechanism that makes it work in
+    // Base, and why this crate lists "INFINITY" explicitly instead).
+    #[test]
+    fn infinity_spelling_is_accepted_like_base() {
+        assert!(ev("Infinity", &[]).is_infinite());
+        assert!(ev("INFINITY", &[]).is_infinite());
+    }
+
+    #[test]
+    fn nan_and_inf_predicates() {
+        assert_eq!(ev("ISNAN(A)", &[f64::NAN]), 1.0);
+        assert_eq!(ev("ISNAN(A)", &[1.0]), 0.0);
+        assert_eq!(ev("ISINF(A)", &[f64::INFINITY]), 1.0);
+        assert_eq!(ev("ISINF(A)", &[1.0]), 0.0);
+        assert_eq!(ev("FINITE(A)", &[1.0]), 1.0);
+        assert_eq!(ev("FINITE(A)", &[f64::NAN]), 0.0);
+    }
+
+    // `refs/calcPerform.c:267-275` `case FINITE`: `top = finite(*ptop); while
+    // (--nargs) top = top && finite(*--ptop);` - an AND-fold. Every argument
+    // must be finite for the result to be true; one non-finite argument
+    // anywhere makes the whole thing false, regardless of position.
+    #[test]
+    fn finite_is_variadic_and_folds_with_and() {
+        assert_eq!(ev("FINITE(A,B)", &[1.0, f64::NAN]), 0.0);
+        assert_eq!(ev("FINITE(A,B)", &[1.0, f64::INFINITY]), 0.0);
+        assert_eq!(ev("FINITE(A,B)", &[1.0, 2.0]), 1.0);
+        assert_eq!(ev("FINITE(A,B,C)", &[1.0, 2.0, f64::NAN]), 0.0);
+        // Non-finite in the FIRST position, not just the last - the fold
+        // must not be short-circuited by an implementation that only checks
+        // the initial "top" and ignores the rest, nor one that only checks
+        // the tail.
+        assert_eq!(ev("FINITE(A,B,C)", &[f64::NAN, 2.0, 3.0]), 0.0);
+    }
+
+    // `refs/calcPerform.c:281-289` `case ISNAN`: `top = isnan(*ptop); while
+    // (--nargs) top = top || isnan(*--ptop);` - an OR-fold. Any argument
+    // being NaN, at any position, makes the whole result true.
+    #[test]
+    fn isnan_is_variadic_and_folds_with_or() {
+        assert_eq!(ev("ISNAN(A,B)", &[1.0, f64::NAN]), 1.0);
+        assert_eq!(ev("ISNAN(A,B)", &[1.0, 2.0]), 0.0);
+        assert_eq!(ev("ISNAN(A,B,C)", &[f64::NAN, 2.0, 3.0]), 1.0);
+        assert_eq!(ev("ISNAN(A,B,C)", &[1.0, 2.0, 3.0]), 0.0);
+    }
+
+    // RULINGS.md Ruling 6 / `refs/postfix.c:112-113`: `ISINF` is a
+    // `UNARY_OPERATOR`, unlike `ISNAN`/`FINITE` (`VARARG_OPERATOR`) - it
+    // takes exactly one argument, no `nargs` byte, no fold. `ISINF(A,B)`
+    // compiles (fixed-arity functions aren't checked for exact argument
+    // count at the closing `)` - see parse.rs's comment on that match arm),
+    // but leaves the stack 1 too deep (2 pushed, 1 popped by `IsInf`, net
+    // depth 2, not 1) - caught by `check_arity`'s end-of-parse depth check
+    // as `ExtraOperand`. A wrongly-variadic `ISINF` (the brief's original,
+    // pre-Ruling-6 mistake) would instead accept this and evaluate to `0.0`.
+    #[test]
+    fn isinf_is_strictly_unary_not_variadic() {
+        assert_eq!(
+            crate::compile("ISINF(A,B)"),
+            Err(crate::CalcError::ExtraOperand)
+        );
+    }
+
+    // `RNDM` (`refs/postfix.c:133`, opcode `RANDOM`) is nullary - it pushes
+    // without popping, a new shape for `check_segment`'s depth accounting
+    // (Task 7 introduces the first nullary op besides `Arg`/`Lit`). Draw many
+    // times from a freshly (and deterministically, via the crate-internal
+    // `seed_rndm` test hook) seeded generator and require both range and
+    // variation: a stub that always returns e.g. `0.5` would pass a
+    // single-draw range check but fails `seen.len() > 1` here.
+    #[test]
+    fn rndm_is_in_unit_interval_and_varies_across_draws() {
+        seed_rndm(0x1234_5678_9abc_def0);
+        let a = [0.0f64; 21];
+        let e = crate::compile("RNDM").expect("compile");
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            let v = e.eval(&a);
+            assert!((0.0..=1.0).contains(&v), "RNDM out of [0,1]: {v}");
+            seen.insert(v.to_bits());
+        }
+        assert!(seen.len() > 1, "RNDM did not vary across draws");
+    }
+
+    // `RNDM`'s value must genuinely participate in the surrounding
+    // expression's arithmetic, not just evaluate in isolation without
+    // panicking.
+    #[test]
+    fn rndm_participates_in_a_larger_expression() {
+        seed_rndm(42);
+        let e = crate::compile("RNDM*2+A").expect("compile");
+        let v = e.eval(&[3.0; 21]);
+        assert!((3.0..=5.0).contains(&v), "RNDM*2+3 out of [3,5]: {v}");
+    }
+
+    // Reseeding to the same value must reproduce the same draw - the
+    // crate-internal test hook exists precisely so a nondeterministic op can
+    // still be tested deterministically.
+    #[test]
+    fn rndm_is_reproducible_from_a_fixed_seed() {
+        seed_rndm(777);
+        let e = crate::compile("RNDM").expect("compile");
+        let first = e.eval(&[0.0; 21]);
+        seed_rndm(777);
+        let second = e.eval(&[0.0; 21]);
+        assert_eq!(first, second);
+    }
+
+    // A long chain of pure-constant nullary ops exercises `check_segment`'s
+    // depth accounting for the new "+1, pop nothing" shape at a scale near
+    // `MAX_OPS`, guarding against an off-by-one that only manifests once
+    // enough nullary pushes accumulate (e.g. treating `Rndm`/constants as
+    // depth-neutral instead of `+1`, which would silently under/over-count
+    // rather than panic outright).
+    #[test]
+    fn many_chained_nullary_constants_compile_and_evaluate() {
+        let src = format!("{}PI", "PI+".repeat(300));
+        let e = crate::compile(&src).expect("compile");
+        assert!((e.eval(&[0.0; 21]) - 301.0 * std::f64::consts::PI).abs() < 1e-9);
+    }
+
+    // `RNDM`'s generator state lives in a thread-local `Cell<u64>` (see
+    // `RNDM_STATE`'s module-level doc), deliberately kept off `Expression`
+    // itself so `Expression` keeps every auto trait it had before Task 7.
+    // A compile-time-only check: these helper functions never run, but they
+    // fail to compile if `Expression` ever stops implementing one of these
+    // traits (e.g. if a future change moved `RNDM` state onto the struct as
+    // a bare `Cell`, which would make it `!Sync`).
+    #[test]
+    fn expression_keeps_its_auto_traits_after_adding_rndm() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        fn assert_clone<T: Clone>() {}
+        fn assert_partial_eq<T: PartialEq>() {}
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_send::<crate::Expression>();
+        assert_sync::<crate::Expression>();
+        assert_clone::<crate::Expression>();
+        assert_partial_eq::<crate::Expression>();
+        assert_debug::<crate::Expression>();
     }
 
     #[test]

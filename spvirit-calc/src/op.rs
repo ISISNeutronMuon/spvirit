@@ -7,7 +7,15 @@ pub enum Op {
     /// Push operand A-U (index 0-20). `CALCPERFORM_NARGS` is 21
     /// (`postfix.h:29`), see RULINGS.md Ruling 1.
     Arg(usize),
-    /// Push a literal.
+    /// Push a literal. Named constants (`PI`/`D2R`/`R2D`) and the `INF`/`NAN`
+    /// literals (Task 7) all compile straight to this variant rather than
+    /// getting opcodes of their own - `parse.rs`'s `constant()` computes
+    /// their values once at compile time. Caution: `Op` derives `PartialEq`,
+    /// and `f64::NAN != f64::NAN`, so `Op::Lit(f64::NAN) != Op::Lit(f64::NAN)`
+    /// even though both represent the identical `NAN` literal - fine for
+    /// `eval()` (which never compares `Op`s), but it means any *test* that
+    /// compares two compiled `Expression`/`Op` sequences for equality must
+    /// avoid `NAN` literals or it will spuriously fail.
     Lit(f64),
 
     // Arithmetic (Task 3)
@@ -195,6 +203,40 @@ pub enum Op {
     /// `>>>`, required by RULINGS.md Ruling 2 even though
     /// task-6-brief.md's text never mentions it.
     ShrLogic,
+
+    // Task 7: RNDM and the NaN/Inf predicates. Named constants (`PI`/`D2R`/
+    // `R2D`/`INF`/`NAN`) don't get variants of their own - `parse.rs`'s
+    // `constant()` compiles them straight to `Op::Lit` (see its doc).
+    /// `refs/calcPerform.c:296-298` `case RANDOM`: `*++ptop = calcRandom();`.
+    /// Pushes a value without popping anything, the same nullary shape as
+    /// `Arg`/`Lit`. `refs/postfix.c:133` spells this `RNDM` (the opcode's
+    /// internal debug name is `RANDOM`, but that string never appears in
+    /// `operands[]`/`operators[]` as an accepted input spelling; see
+    /// `parse.rs`'s `nullary_op` doc for the divergence this corrects from
+    /// the task instructions' claim that `RANDOM` is also accepted).
+    /// `eval.rs` draws from a thread-local xorshift64* generator rather than
+    /// storing state on `Expression` itself, so this variant carries no
+    /// payload and `Expression` stays plain data (`Clone`/`PartialEq`/
+    /// `Send`/`Sync`); see `eval.rs`'s module doc for why.
+    Rndm,
+    /// `refs/calcPerform.c:277-279` `case ISINF`: `*ptop = isinf(*ptop);`.
+    /// No `nargs` byte, no fold. RULINGS.md Ruling 6 / `refs/postfix.c:112`
+    /// types this `UNARY_OPERATOR`, unlike `ISNAN`/`FINITE` below
+    /// (`VARARG_OPERATOR`, `:113`/`:105`); the plan's Task 7 text wrongly
+    /// made all three variadic; Base disagrees and Base wins.
+    IsInf,
+    /// `refs/calcPerform.c:281-289` `case ISNAN`: `top = isnan(*ptop); while
+    /// (--nargs) top = top || isnan(*--ptop);`. An OR-fold over `n`
+    /// arguments (`refs/postfix.c:113`, `VARARG_OPERATOR`): true if ANY
+    /// argument is NaN. Follows the `Min`/`Max` variadic-count pattern
+    /// (count filled in by the same `)` fix-up in `parse.rs`).
+    IsNan(usize),
+    /// `refs/calcPerform.c:267-275` `case FINITE`: `top = finite(*ptop);
+    /// while (--nargs) top = top && finite(*--ptop);`. An AND-fold over `n`
+    /// arguments (`refs/postfix.c:105`, `VARARG_OPERATOR`): true only if
+    /// EVERY argument is finite; the opposite fold from `IsNan`, which is
+    /// the asymmetry the task instructions flag as the trap here.
+    Finite(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +321,12 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
         // (`refs/postfix.c:144,126` vs `:76,90`). See
         // `bitwise_not_binds_tighter_than_relational` (parse.rs).
         Op::Neg | Op::NotL | Op::NotB => (7, Assoc::Right),
-        Op::Arg(_) | Op::Lit(_) => (0, Assoc::Left),
+        // `Rndm` is nullary and, like `Arg`/`Lit`/the named constants, is
+        // never pushed onto the operator stack as a `Frame::Op` - `parse.rs`
+        // emits it directly at the identifier (see its `nullary_op` doc), so
+        // `pop_while` never compares against it either. The value here is
+        // arbitrary for the same reason `Arg`/`Lit`'s is.
+        Op::Arg(_) | Op::Lit(_) | Op::Rndm => (0, Assoc::Left),
         // Functions never sit on the operator stack as a `Frame::Op` (the
         // parser tracks a pending call via `Frame::Func` instead, and emits
         // the op directly at the closing `)` - see `parse.rs`), so
@@ -307,14 +354,27 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
         | Op::Cosh
         | Op::Tanh
         | Op::Min(_)
-        | Op::Max(_) => (13, Assoc::Right),
+        | Op::Max(_)
+        // `ISINF`/`ISNAN`/`FINITE` are functions too (`refs/postfix.c:105,
+        // 112,113`, priority 7/8, same row shape as every other function
+        // above) - real calls requiring `(...)`, so they sit on the operator
+        // stack via `Frame::Func` exactly like `Min`/`Max`, never compared
+        // here in practice either.
+        | Op::IsInf
+        | Op::IsNan(_)
+        | Op::Finite(_) => (13, Assoc::Right),
     }
 }
 
 /// Number of operands each operation pops.
 pub(crate) fn arity(op: &Op) -> usize {
     match op {
-        Op::Arg(_) | Op::Lit(_) => 0,
+        // `Rndm` pushes without popping (`refs/calcPerform.c:296-298`), the
+        // same nullary shape as `Arg`/`Lit` - the first new nullary shape
+        // besides those two. `check_segment` (parse.rs) reads this arity
+        // table the same way for every op, so `depth = depth - 0 + 1`
+        // already falls out correctly with no special-casing needed there.
+        Op::Arg(_) | Op::Lit(_) | Op::Rndm => 0,
         Op::Neg
         | Op::Abs
         | Op::Sqrt
@@ -334,7 +394,11 @@ pub(crate) fn arity(op: &Op) -> usize {
         | Op::Cosh
         | Op::Tanh
         | Op::NotL
-        | Op::NotB => 1,
+        | Op::NotB
+        // RULINGS.md Ruling 6 / `refs/postfix.c:112`: `ISINF` is
+        // `UNARY_OPERATOR`, unlike `ISNAN`/`FINITE` below - exactly one
+        // argument, no count byte.
+        | Op::IsInf => 1,
         Op::Add
         | Op::Sub
         | Op::Mul
@@ -372,6 +436,9 @@ pub(crate) fn arity(op: &Op) -> usize {
         // `.expect("arity checked at compile time")` pops in `eval.rs`
         // stay a sound invariant as long as `parse.rs` populates the count
         // correctly (see the comma-counting logic there).
-        Op::Min(n) | Op::Max(n) => *n,
+        // `ISNAN`/`FINITE` (`refs/postfix.c:113,105`, `VARARG_OPERATOR`)
+        // follow the same variadic-count pattern as `Min`/`Max` - `parse.rs`
+        // fixes up the count from the comma-counted argument list at `)`.
+        Op::Min(n) | Op::Max(n) | Op::IsNan(n) | Op::Finite(n) => *n,
     }
 }

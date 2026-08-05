@@ -76,13 +76,33 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                 expect_operand = false;
             }
             Token::Ident(name) => {
-                // Task 6: `AND`/`OR`/`XOR`/`NOT` are word-spelled operators
-                // (`refs/postfix.c:126,174,175,176`), not functions - they
-                // must slot into the normal operator-stack machinery (same
-                // as `Token::Op(sym)` below), not be pushed as a
-                // `Frame::Func` awaiting a `(...)` call that will never
-                // come. Checked first, before the function-name path.
-                if let Some(op) = word_operator(name) {
+                // Task 7: named constants (`PI`/`D2R`/`R2D`/`INF`/`NAN`,
+                // `refs/postfix.c:101,111,125,129,132`) compile straight to
+                // an `Op::Lit`, and `RNDM` (`:133`) compiles straight to the
+                // nullary `Op::Rndm` - neither is a function awaiting a
+                // `(...)` call, so both are checked before `word_operator`/
+                // `ident_to_op` below, same adjacency contract as any other
+                // operand-producing token.
+                if let Some(v) = constant(name) {
+                    if !expect_operand {
+                        return Err(CalcError::ExtraOperand);
+                    }
+                    out.push(Op::Lit(v));
+                    expect_operand = false;
+                } else if let Some(op) = nullary_op(name) {
+                    if !expect_operand {
+                        return Err(CalcError::ExtraOperand);
+                    }
+                    out.push(op);
+                    expect_operand = false;
+                } else if let Some(op) = word_operator(name) {
+                    // Task 6: `AND`/`OR`/`XOR`/`NOT` are word-spelled
+                    // operators (`refs/postfix.c:126,174,175,176`), not
+                    // functions - they must slot into the normal
+                    // operator-stack machinery (same as `Token::Op(sym)`
+                    // below), not be pushed as a `Frame::Func` awaiting a
+                    // `(...)` call that will never come.
+                    //
                     // `NotB` (`NOT`/`~`) is unary/prefix; `AndB`/`OrB`/
                     // `XorB` (`AND`/`OR`/`XOR`) are binary/infix - same
                     // adjacency contract as `to_op`'s unary_position
@@ -175,6 +195,14 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                     out.push(match op {
                         Op::Min(_) => Op::Min(count),
                         Op::Max(_) => Op::Max(count),
+                        // `ISNAN`/`FINITE` are variadic too (`refs/postfix.c:
+                        // 113,105`) - same comma-counted fix-up as `Min`/
+                        // `Max`. `ISINF` is deliberately absent here: it's
+                        // `Op::IsInf` with no count field (RULINGS.md
+                        // Ruling 6), so it falls through to `other => other`
+                        // below like any other fixed-arity function.
+                        Op::IsNan(_) => Op::IsNan(count),
+                        Op::Finite(_) => Op::Finite(count),
                         other => other,
                     });
                 }
@@ -413,6 +441,73 @@ fn to_op(sym: &str, unary_position: bool) -> Result<Op, CalcError> {
     })
 }
 
+/// Named constants and literals that compile straight to `Op::Lit`, matching
+/// the exact spelling set in `refs/postfix.c`'s `operands[]` table:
+/// `"D2R"` (`:101`), `"INF"` (`:111`), `"NAN"` (`:125`), `"PI"` (`:129`),
+/// `"R2D"` (`:132`) - all either `OPERAND` (the trig constants) or
+/// `LITERAL_OPERAND`/`LITERAL_DOUBLE` (`INF`/`NAN`), and all zero stack
+/// effect (push one, pop none).
+///
+/// `refs/calcPerform.c:126-136`: `CONST_PI` pushes `PI`, `CONST_D2R` pushes
+/// `PI/180.`, `CONST_R2D` pushes `180./PI` - computed here as the same
+/// divisions of `std::f64::consts::PI`, not transcribed decimal literals, so
+/// the last mantissa bits match exactly.
+///
+/// `"Inf"` is matched case-insensitively for free (this crate's lexer
+/// already uppercases every identifier before it reaches here).
+///
+/// `"INFINITY"` needed a second look rather than a first-glance no. My first
+/// pass over `operands[]` (no distinct `"INFINITY"` row) concluded Base
+/// rejects it - but `refs/epicsCalcTest.cpp:336` asserts
+/// `testCalc("Infinity", Inf)`, i.e. Base's own test suite compiles it
+/// successfully. Reconciling that meant reading `get_element` itself
+/// (`refs/postfix.c:190-215`): it matches only a `strlen(pel->name)`-byte
+/// *prefix* of the source, case-insensitively, so `"INF"` (3 bytes)
+/// prefix-matches the first 3 bytes of `"Infinity"`. For `LITERAL_OPERAND`
+/// rows specifically (`refs/postfix.c:255-267`), the matched prefix is only
+/// used to *recognize the token as a double literal*; the code then rewinds
+/// (`psrc -= strlen(pel->name)`) and hands the *whole* remaining source to
+/// `epicsParseDouble` (a `strtod`-family parser), which independently
+/// understands the `"infinity"` spelling and consumes all 8 bytes. So Base
+/// accepts `"Infinity"` not via a second table row but because the C
+/// standard library's double parser does the real consuming. This crate's
+/// lexer greedily consumes the whole alphabetic run into one `Ident` token
+/// before any of this table logic runs, so the prefix-sniff trick doesn't
+/// carry over structurally - `"INFINITY"` is listed here explicitly instead,
+/// as the pragmatic equivalent that reproduces the one behavior Base's own
+/// tests actually pin.
+fn constant(name: &str) -> Option<f64> {
+    Some(match name {
+        "PI" => std::f64::consts::PI,
+        "D2R" => std::f64::consts::PI / 180.0,
+        "R2D" => 180.0 / std::f64::consts::PI,
+        "INF" | "INFINITY" => f64::INFINITY,
+        "NAN" => f64::NAN,
+        _ => return None,
+    })
+}
+
+/// `RNDM` (`refs/postfix.c:133`, opcode `RANDOM`) is the sole nullary
+/// operator that isn't a compile-time-known literal - it must still be
+/// recognized and emitted directly here (not pushed as a `Frame::Func`
+/// awaiting a `(...)` call, since `RNDM` takes no parentheses at all).
+///
+/// Divergence from the task instructions, verified against `operands[]`
+/// rather than assumed: the instructions claim Base also accepts `"RANDOM"`
+/// as a spelling for `RNDM`. `refs/postfix.c:72-145`'s `operands[]` table has
+/// exactly one row for this opcode - `{"RNDM", 0, 0, 1, OPERAND, RANDOM}`
+/// (`:133`) - and no `"RANDOM"` row; `"RANDOM"` is only the opcode's internal
+/// C enum/debug name (see the `pinst_names`-style string table around
+/// `:599`, used solely for `POSTFIX_DEBUG` tracing), never an accepted input
+/// spelling. So only `"RNDM"` is implemented; `"RANDOM"` correctly falls
+/// through to `ident_to_op` and is rejected as `CalcError::UnknownIdent`.
+fn nullary_op(name: &str) -> Option<Op> {
+    Some(match name {
+        "RNDM" => Op::Rndm,
+        _ => return None,
+    })
+}
+
 /// Map a CALC function name to its operation.
 ///
 /// `SQR` is square *root*, matching EPICS - not squaring
@@ -441,6 +536,13 @@ fn ident_to_op(name: &str) -> Result<Op, CalcError> {
         "TANH" => Op::Tanh,
         "MIN" => Op::Min(0),
         "MAX" => Op::Max(0),
+        // Task 7. `ISINF` (`refs/postfix.c:112`) is fixed-arity (unary) -
+        // no placeholder count, unlike `ISNAN`/`FINITE` (`:113,105`), which
+        // follow `MIN`/`MAX`'s variadic placeholder-then-fix-up pattern
+        // (RULINGS.md Ruling 6).
+        "ISINF" => Op::IsInf,
+        "ISNAN" => Op::IsNan(0),
+        "FINITE" => Op::Finite(0),
         _ => return Err(CalcError::UnknownIdent(name.to_string())),
     })
 }
