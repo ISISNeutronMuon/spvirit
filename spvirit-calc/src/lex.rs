@@ -147,4 +147,22 @@ mod tests {
     fn rejects_unknown_character() {
         assert!(matches!(lex("A $ B"), Err(CalcError::BadChar('$', 2))));
     }
+
+    // Task 6 (RULINGS.md Ruling 2): `>>>` (RIGHT_SHIFT_LOGIC) is a distinct
+    // operator from `>>` (RIGHT_SHIFT_ARITH) followed by `>`. `OPS`'s
+    // longest-match-first ordering (`>>>` before `>>` before `>`) already
+    // guards this - see the `OPS` doc comment - but it was never pinned by a
+    // test until now. A naive `find` order (or one missing the `>>>` entry)
+    // would tokenize `"A>>>B"` as `Arg, Op(">>"), Op(">"), Arg` instead.
+    #[test]
+    fn triple_char_logical_shift_beats_double_and_single() {
+        assert_eq!(lex(">>>").unwrap(), vec![Token::Op(">>>")]);
+        assert_eq!(
+            lex("A>>>B").unwrap(),
+            vec![Token::Arg(0), Token::Op(">>>"), Token::Arg(1)]
+        );
+        // Sanity: a bare `>>` in isolation still lexes as one token, not
+        // dropped or confused with `>>>`'s prefix.
+        assert_eq!(lex(">>").unwrap(), vec![Token::Op(">>")]);
+    }
 }

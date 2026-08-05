@@ -1,6 +1,69 @@
 use crate::op::Op;
 use crate::parse::Expression;
 
+/// Convert to the signed 32-bit integer EPICS bitwise operators work on.
+///
+/// Mirrors `calcPerform.c:325`'s macro exactly:
+/// `#define d2i(x) ((x)<0?(epicsInt32)(x):(epicsInt32)(epicsUInt32)(x))`
+///
+/// The twelve-line comment at `calcPerform.c:314-324` explains why the cast
+/// is asymmetric by SIGN rather than by magnitude: a negative double casts
+/// straight to `epicsInt32`, but a non-negative one casts to `epicsUInt32`
+/// FIRST and is then bit-reinterpreted as signed. This is what lets e.g.
+/// `2_863_311_530.0` - too big for `i32` (max ~2.1e9) but within `u32`
+/// (max ~4.3e9) - become the `u32` bit pattern `0xAAAAAAAA` and then the
+/// *negative* `i32` `-1_431_655_766`, landing on the exact same value a
+/// direct negative double with that bit pattern reaches via the `x < 0`
+/// branch - rather than saturating to `i32::MAX` the way a naive `as i32`
+/// on the positive double would. See
+/// `d2i_bit31_asymmetry_positive_and_negative_agree_where_naive_cast_would_not`
+/// (eval.rs tests) and `refs/epicsCalcTest.cpp:1052-1053`, which assert
+/// exactly this identity.
+///
+/// The result of every bitwise op built on this is a SIGNED `epicsInt32`
+/// widened back to `f64` - a result with bit 31 set comes out negative, by
+/// Base's own design (same twelve-line comment): "so avoid problems when
+/// writing the value to signed integer fields".
+///
+/// Rust-vs-C divergence, deliberately chosen and documented (per task
+/// instructions, since there is no ground truth to match): C's
+/// double->int/uint cast is undefined behavior outside the target type's
+/// range (and for NaN); Rust's `as` saturates instead (`f64::NAN as i32` is
+/// `0`; out-of-range magnitudes clamp to the type's MIN/MAX). x86-64's
+/// `cvttsd2si` instruction - what a real EPICS IOC most likely runs it as -
+/// produces a THIRD, again different, "integer indefinite" answer
+/// (`i32::MIN`) for every out-of-range/NaN input, which Rust's `as` does not
+/// reproduce either. Since Base itself has no defined behavior for these
+/// inputs (the entire point of `d2i`/`d2ui`'s trick is to avoid landing on
+/// an out-of-range *intermediate* magnitude for values that matter - see
+/// `bitwise_ops_never_panic_on_nan_or_infinity`, which only requires no
+/// panic, not agreement with any particular platform), this crate picks
+/// Rust's own saturating `as` behavior: deterministic, panic-free, and the
+/// least surprising choice for a Rust API to make.
+fn d2i(x: f64) -> i32 {
+    if x < 0.0 {
+        x as i32
+    } else {
+        (x as u32) as i32
+    }
+}
+
+/// Mirrors `calcPerform.c:326`'s macro exactly:
+/// `#define d2ui(x) ((x)<0?(epicsUInt32)(epicsInt32)(x):(epicsUInt32)(x))`
+///
+/// The mirror image of `d2i`: a negative double casts to `epicsInt32` first
+/// and is then bit-reinterpreted as unsigned, while a non-negative one casts
+/// directly. Used only by `Op::ShrLogic` (`>>>`), the sole bitwise op that
+/// operates on the unsigned reinterpretation rather than the signed one -
+/// see `d2i`'s doc for the shared Rust-vs-C cast divergence this inherits.
+fn d2ui(x: f64) -> u32 {
+    if x < 0.0 {
+        (x as i32) as u32
+    } else {
+        x as u32
+    }
+}
+
 impl Expression {
     /// Evaluate against operands `A`-`U`.
     ///
@@ -368,6 +431,86 @@ impl Expression {
                     // false, matching C.
                     let a = stack.pop().expect("arity checked at compile time");
                     stack.push(if a == 0.0 { 1.0 } else { 0.0 });
+                }
+
+                // Bitwise (Task 6). Every arm converts through `d2i`/`d2ui`
+                // (see their docs above for the bit-31 asymmetry this
+                // implements) rather than a bare `as i32`/`as u32`, and every
+                // result is widened back to `f64` as a SIGNED `i32` -
+                // `calcPerform.c:314-324`'s comment states this explicitly,
+                // and it's why e.g. `AndB`/`Shl`, which don't "look" signed
+                // at the call site, can still produce a negative `f64`.
+                Op::AndB => {
+                    // calcPerform.c:333-336 `case BIT_AND`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push((d2i(a) & d2i(b)) as f64);
+                }
+                Op::OrB => {
+                    // calcPerform.c:328-331 `case BIT_OR`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push((d2i(a) | d2i(b)) as f64);
+                }
+                Op::XorB => {
+                    // calcPerform.c:338-341 `case BIT_EXCL_OR`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push((d2i(a) ^ d2i(b)) as f64);
+                }
+                Op::NotB => {
+                    // calcPerform.c:343-345 `case BIT_NOT`: `~d2i(*ptop)`.
+                    let a = stack.pop().expect("arity checked at compile time");
+                    stack.push((!d2i(a)) as f64);
+                }
+                // calcPerform.c:347-353's comment: shift counts are masked
+                // to 0..=31 (`d2i(top) & 31` / `d2ui(top) & 31u`) before
+                // shifting a 32-bit value - both because that's what Base
+                // does, and because an unmasked count would be out of range
+                // for a 32-bit shift and panic under Rust's plain `<<`/`>>`
+                // in debug builds (the no-panic invariant this crate
+                // maintains everywhere - see
+                // `shift_count_is_masked_to_five_bits_and_never_panics`).
+                // `wrapping_shl`/`wrapping_shr` are additional defense: they
+                // never panic regardless of shift count (masking the count
+                // to the bit width internally too), so even if the explicit
+                // `& 31` above were ever wrong, this couldn't panic - belt
+                // and suspenders around the same invariant.
+                Op::Shl => {
+                    // calcPerform.c:360-363 `case LEFT_SHIFT_ARITH`:
+                    // `d2i(*ptop) << (d2i(top) & 31)`.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    let shift = (d2i(b) & 31) as u32;
+                    stack.push(d2i(a).wrapping_shl(shift) as f64);
+                }
+                Op::Shr => {
+                    // calcPerform.c:355-358 `case RIGHT_SHIFT_ARITH`:
+                    // `d2i(*ptop) >> (d2i(top) & 31)` - arithmetic
+                    // (sign-extending) shift. Rust's `>>`/`wrapping_shr` on
+                    // `i32` is arithmetic by definition, matching C's on
+                    // every real platform (C's is technically
+                    // implementation-defined for negative operands, but
+                    // arithmetic everywhere that matters) - no divergence
+                    // to paper over here, unlike the cast in `d2i` itself.
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    let shift = (d2i(b) & 31) as u32;
+                    stack.push(d2i(a).wrapping_shr(shift) as f64);
+                }
+                Op::ShrLogic => {
+                    // calcPerform.c:365-368 `case RIGHT_SHIFT_LOGIC`:
+                    // `d2ui(*ptop) >> (d2ui(top) & 31u)` - logical
+                    // (zero-filling) shift of the UNSIGNED reinterpretation.
+                    // The signed-widening-back-to-f64 rule still applies to
+                    // the result afterward, same as every other bitwise op
+                    // (see `logical_shift_right_matches_corpus_examples`,
+                    // whose expected values are themselves negative `i32`
+                    // bit patterns).
+                    let b = stack.pop().expect("arity checked at compile time");
+                    let a = stack.pop().expect("arity checked at compile time");
+                    let shift = d2ui(b) & 31;
+                    stack.push((d2ui(a).wrapping_shr(shift) as i32) as f64);
                 }
             }
             ip += 1;
@@ -773,5 +916,165 @@ mod tests {
             ],
         };
         assert_eq!(taken_else.eval(&[0.0; 21]), 2.0);
+    }
+
+    // --- Task 6: bitwise operators ---
+
+    #[test]
+    fn caret_is_power_and_xor_is_the_word() {
+        assert_eq!(ev("A^B", &[2.0, 3.0]), 8.0);
+        assert_eq!(ev("A XOR B", &[6.0, 3.0]), 5.0);
+    }
+
+    #[test]
+    fn bitwise_and_or_not() {
+        assert_eq!(ev("A&B", &[6.0, 3.0]), 2.0);
+        assert_eq!(ev("A AND B", &[6.0, 3.0]), 2.0);
+        assert_eq!(ev("A|B", &[6.0, 3.0]), 7.0);
+        assert_eq!(ev("A OR B", &[6.0, 3.0]), 7.0);
+        assert_eq!(ev("~A", &[0.0]), -1.0);
+        assert_eq!(ev("NOT A", &[0.0]), -1.0);
+    }
+
+    #[test]
+    fn shifts_operate_on_integers() {
+        assert_eq!(ev("A<<B", &[1.0, 4.0]), 16.0);
+        assert_eq!(ev("A>>B", &[16.0, 4.0]), 1.0);
+    }
+
+    #[test]
+    fn bitwise_truncates_toward_zero() {
+        assert_eq!(ev("A&B", &[6.9, 3.9]), 2.0);
+    }
+
+    // `d2i`/`d2ui` (`calcPerform.c:325-326`) treat non-finite operands the
+    // same as any other out-of-range magnitude: no defined C behavior, and
+    // this crate picks Rust's own saturating `as` cast (see `d2i`'s doc).
+    // `NaN as u32` is `0` in Rust, so `d2i(NaN) == 0`.
+    #[test]
+    fn bitwise_on_non_finite_yields_zero_operand() {
+        assert_eq!(ev("A&B", &[f64::NAN, 3.0]), 0.0);
+    }
+
+    // The flagship bit-31 trap (task instructions / `calcPerform.c:314-324`'s
+    // twelve-line comment): `d2i` is asymmetric by SIGN, not by magnitude.
+    // `2863311530.1` doesn't fit in `i32` (max ~2.1e9) but does fit in `u32`
+    // (max ~4.3e9), so per `d2i`'s positive branch it goes
+    // double -> u32 (2863311530, bit pattern 0xAAAAAAAA) -> reinterpret as
+    // i32 (-1431655766), landing on the SAME i32 a direct negative double
+    // with that bit pattern would. `-1431655766.1` needs no such detour (its
+    // magnitude already fits `i32`) and reaches the identical value via the
+    // negative branch. `refs/epicsCalcTest.cpp:1052-1053` asserts both
+    // (`OR 0`) equal `0xaaaaaaaa` reinterpreted - i.e. this exact identity.
+    //
+    // The naive `as i32` a careless implementation might reach for instead
+    // SATURATES on the positive value (`2147483647`, `i32::MAX`) rather than
+    // wrapping to the bit-reinterpreted `-1431655766` - a different answer,
+    // which is exactly why the task requires implementing `d2i`/`d2ui`
+    // explicitly rather than reaching for `as i32` directly.
+    #[test]
+    fn d2i_bit31_asymmetry_positive_and_negative_agree_where_naive_cast_would_not() {
+        assert_eq!(ev("A|B", &[-1431655766.1, 0.0]), -1431655766.0);
+        assert_eq!(ev("A|B", &[2863311530.1, 0.0]), -1431655766.0);
+        // The naive cast a wrong implementation might use instead:
+        assert_ne!(2863311530.1_f64 as i32, -1431655766);
+        assert_eq!(2863311530.1_f64 as i32, i32::MAX);
+    }
+
+    // `refs/calcPerform.c:355-368`: the result of every bitwise op is a
+    // SIGNED `epicsInt32` widened back to `double` - a result with bit 31
+    // set comes out negative, even for `AndB`/`OrB`/`XorB`/`Shl`/`Shr`/
+    // `ShrLogic`, none of which "look" signed at the call site.
+    #[test]
+    fn bitwise_result_with_bit_31_set_is_negative() {
+        // ~0 == 0xFFFFFFFF, all bits set -> -1, not 4294967295.
+        assert_eq!(ev("~A", &[0.0]), -1.0);
+        // 0xFFFF0000 | 0 == 0xFFFF0000, bit 31 set -> negative.
+        assert_eq!(ev("A|B", &[4294901760.0, 0.0]), -65536.0);
+    }
+
+    // `>>>` (`RIGHT_SHIFT_LOGIC`, `calcPerform.c:365-368`) is the UNSIGNED
+    // shift Ruling 2 requires even though the task-6-brief.md text never
+    // mentions it: `(d2ui(a) >> (d2ui(b) & 31)) as i32 as f64`. Unlike `>>`
+    // (arithmetic, sign-extending), a negative operand's sign bit is treated
+    // as data, not extended - so a negative dividend right-shifted with
+    // `>>>` comes out small and positive-looking in bit pattern (though
+    // still widened back to signed per the rule above), rather than staying
+    // negative the way `>>` would.
+    #[test]
+    fn logical_shift_right_does_not_sign_extend_unlike_arithmetic_shift_right() {
+        // -1 (0xFFFFFFFF) >> 28 (arithmetic, sign-extends) == -1 (still all
+        // bits set: 0xFFFFFFFF).
+        assert_eq!(ev("A>>B", &[-1.0, 28.0]), -1.0);
+        // -1 (0xFFFFFFFF) >>> 28 (logical) == 0xF == 15: the top 28 bits
+        // become zero instead of staying set.
+        assert_eq!(ev("A>>>B", &[-1.0, 28.0]), 15.0);
+    }
+
+    // `refs/epicsCalcTest.cpp:1030-1033`: unsigned shift-right examples,
+    // transcribed directly (`0xaaaaaaaa` as an `i32` bit pattern is
+    // `-1431655766.0`, matching how this crate always returns bitwise
+    // results as signed).
+    #[test]
+    fn logical_shift_right_matches_corpus_examples() {
+        let bits_0xaaaaaaaa = -1431655766.0; // 0xAAAAAAAA reinterpreted i32
+        let bits_0xffaaaaaa = -5592406.0; // 0xFFAAAAAA reinterpreted i32
+        let bits_0x00aaaaaa = 11184810.0; // 0x00AAAAAA reinterpreted i32
+        assert_eq!(ev("A>>B", &[bits_0xaaaaaaaa, 8.0]), bits_0xffaaaaaa);
+        assert_eq!(ev("A>>>B", &[bits_0xaaaaaaaa, 8.0]), bits_0x00aaaaaa);
+    }
+
+    // Shift counts are masked to `0..=31` (`d2i(top) & 31` /
+    // `d2ui(top) & 31u`, `calcPerform.c:357,362,367`) precisely because an
+    // unmasked shift count is out of range for a 32-bit shift and would
+    // panic under Rust's plain `<<`/`>>` in debug builds. `36` masks to `4`
+    // (`36 & 31 == 4`), matching `refs/epicsCalcTest.cpp` shift-with-large-
+    // count patterns; this must not panic and must produce the masked
+    // result, not the unmasked (and undefined in C) one.
+    #[test]
+    fn shift_count_is_masked_to_five_bits_and_never_panics() {
+        assert_eq!(ev("A<<B", &[1.0, 36.0]), ev("A<<B", &[1.0, 4.0]));
+        assert_eq!(ev("A>>B", &[256.0, 36.0]), ev("A>>B", &[256.0, 4.0]));
+        assert_eq!(ev("A>>>B", &[256.0, 36.0]), ev("A>>>B", &[256.0, 4.0]));
+        // A shift count far outside any plausible bit width - still must not
+        // panic (this call itself, not returning, is the assertion).
+        let _ = ev("A<<B", &[1.0, 1_000_000.0]);
+        let _ = ev("A>>B", &[1.0, -1_000_000.0]);
+    }
+
+    // `d2i`/`d2ui` must not panic on any `f64` input, including NaN and both
+    // infinities - the values the task instructions call out explicitly.
+    #[test]
+    fn bitwise_ops_never_panic_on_nan_or_infinity() {
+        let vals = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for &v in &vals {
+            let _ = ev("A&B", &[v, 3.0]);
+            let _ = ev("A|B", &[3.0, v]);
+            let _ = ev("A XOR B", &[v, 3.0]);
+            let _ = ev("~A", &[v]);
+            let _ = ev("A<<B", &[v, 3.0]);
+            let _ = ev("A<<B", &[3.0, v]);
+            let _ = ev("A>>B", &[v, 3.0]);
+            let _ = ev("A>>>B", &[v, 3.0]);
+        }
+    }
+
+    #[test]
+    fn direct_d2i_d2ui_unit_checks() {
+        use super::{d2i, d2ui};
+        // Base's macro (`calcPerform.c:325-326`), traced by hand:
+        assert_eq!(d2i(-1.0), -1);
+        assert_eq!(d2i(0.0), 0);
+        assert_eq!(d2i(3.9), 3); // truncation, not rounding
+        assert_eq!(d2i(-3.9), -3);
+        // The bit-31 asymmetry itself.
+        assert_eq!(d2i(2863311530.0), -1431655766);
+        assert_eq!(d2i(-1431655766.0), -1431655766);
+        // Non-finite: no defined C answer; this crate picks 0/saturation.
+        assert_eq!(d2i(f64::NAN), 0);
+        assert_eq!(d2ui(f64::NAN), 0);
+        // d2ui mirrors d2i.
+        assert_eq!(d2ui(2863311530.0), 2863311530);
+        assert_eq!(d2ui(-1431655766.0), 2863311530);
     }
 }

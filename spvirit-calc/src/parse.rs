@@ -76,20 +76,41 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                 expect_operand = false;
             }
             Token::Ident(name) => {
-                // A function name is itself a complete operand-producing
-                // construct once its call closes, so it's subject to the
-                // same adjacency rule as any other operand: two in a row
-                // with no operator between them (`"A B"`, `"A SIN(B)"`) is
-                // malformed. Checked explicitly here, rather than relying
-                // solely on `check_arity`'s end-of-parse depth arithmetic,
-                // so the diagnostic doesn't depend on whether the call body
-                // happens to be empty (see the `call_starts` comment above).
-                if !expect_operand {
-                    return Err(CalcError::ExtraOperand);
+                // Task 6: `AND`/`OR`/`XOR`/`NOT` are word-spelled operators
+                // (`refs/postfix.c:126,174,175,176`), not functions - they
+                // must slot into the normal operator-stack machinery (same
+                // as `Token::Op(sym)` below), not be pushed as a
+                // `Frame::Func` awaiting a `(...)` call that will never
+                // come. Checked first, before the function-name path.
+                if let Some(op) = word_operator(name) {
+                    // `NotB` (`NOT`/`~`) is unary/prefix; `AndB`/`OrB`/
+                    // `XorB` (`AND`/`OR`/`XOR`) are binary/infix - same
+                    // adjacency contract as `to_op`'s unary_position
+                    // parameter for `-`/`!`/`~`.
+                    let unary = matches!(op, Op::NotB);
+                    if unary != expect_operand {
+                        return Err(CalcError::MissingOperand);
+                    }
+                    let (prec, assoc) = precedence(&op);
+                    pop_while(&mut stack, &mut out, prec, assoc);
+                    stack.push(Frame::Op(op));
+                    expect_operand = true;
+                } else {
+                    // A function name is itself a complete operand-producing
+                    // construct once its call closes, so it's subject to the
+                    // same adjacency rule as any other operand: two in a row
+                    // with no operator between them (`"A B"`, `"A SIN(B)"`) is
+                    // malformed. Checked explicitly here, rather than relying
+                    // solely on `check_arity`'s end-of-parse depth arithmetic,
+                    // so the diagnostic doesn't depend on whether the call body
+                    // happens to be empty (see the `call_starts` comment above).
+                    if !expect_operand {
+                        return Err(CalcError::ExtraOperand);
+                    }
+                    let op = ident_to_op(name)?;
+                    stack.push(Frame::Func(op));
+                    expect_operand = true;
                 }
-                let op = ident_to_op(name)?;
-                stack.push(Frame::Func(op));
-                expect_operand = true;
             }
             Token::Op("(") => {
                 // A `(` that immediately follows a bare function name opens
@@ -378,12 +399,16 @@ fn to_op(sym: &str, unary_position: bool) -> Result<Op, CalcError> {
         ("#" | "!=", false) => Op::Ne,
         ("&&", false) => Op::AndL,
         ("||", false) => Op::OrL,
-        // Real operators the lexer already tokenizes (`&`, `AND`, `<<`, the
-        // shifts, etc. — see `lex.rs`'s `OPS` table) but that this task
-        // doesn't implement yet land here too, since there's no `Op`
-        // variant for them until Task 6 adds one. `MissingOperand` is a
-        // placeholder, not a considered error for those symbols; don't read
-        // it as meaning "expected an operand and got one of these".
+        // Bitwise (Task 6). `~` is unary (prefix); `&`/`|`/`<<`/`>>`/`>>>`
+        // are binary. The word forms (`AND`/`OR`/`XOR`/`NOT`) are lexed as
+        // identifiers, not symbols, so they're resolved by `word_operator`
+        // in the `Token::Ident` arm below, not here.
+        ("~", true) => Op::NotB,
+        ("&", false) => Op::AndB,
+        ("|", false) => Op::OrB,
+        ("<<", false) => Op::Shl,
+        (">>", false) => Op::Shr,
+        (">>>", false) => Op::ShrLogic,
         _ => return Err(CalcError::MissingOperand),
     })
 }
@@ -417,6 +442,24 @@ fn ident_to_op(name: &str) -> Result<Op, CalcError> {
         "MIN" => Op::Min(0),
         "MAX" => Op::Max(0),
         _ => return Err(CalcError::UnknownIdent(name.to_string())),
+    })
+}
+
+/// Map a word-spelled operator name to its `Op`, distinct from
+/// `ident_to_op`'s function names: `AND`/`OR`/`XOR`/`NOT`
+/// (`refs/postfix.c:174,175,176,126`) are infix/prefix operators, not
+/// functions awaiting a `(...)` call, so they're dispatched through the
+/// normal operator-stack/precedence machinery in the `Token::Ident` arm
+/// above rather than pushed as a `Frame::Func`. Returns `None` for anything
+/// else (including unknown identifiers - `ident_to_op` is what reports
+/// `UnknownIdent` for those).
+fn word_operator(name: &str) -> Option<Op> {
+    Some(match name {
+        "AND" => Op::AndB,
+        "OR" => Op::OrB,
+        "XOR" => Op::XorB,
+        "NOT" => Op::NotB,
+        _ => return None,
     })
 }
 
@@ -905,5 +948,141 @@ mod tests {
     #[test]
     fn rejects_operand_adjacent_to_function_call() {
         assert_eq!(compile("A SIN(B)"), Err(CalcError::ExtraOperand));
+    }
+
+    // --- Task 6: bitwise operators, precedence ---
+    //
+    // RULINGS.md Ruling 3 / `refs/postfix.c` lines 152-178: `|`/`OR`/`XOR`
+    // share priority 1 with `||` (already `Op::OrL`); `&`/`AND`/`<<`/`>>`/
+    // `>>>` share priority 2 with `&&` (already `Op::AndL`); unary `~`/`NOT`
+    // share priority 7 with `Neg`/`NotL`. `op.rs`'s precedence table already
+    // documents these numbers (filled in below); each test here is
+    // hand-traced against `pop_while`'s algorithm to show it would emit a
+    // DIFFERENT op sequence if the corresponding priority were wrong - not
+    // just "some assertion holds under the right value".
+
+    // `epicsCalcTest.cpp:915`: `1 | 3 XOR 1 == (1|3)^1` - `|` and `XOR` are
+    // equal priority (1) and left-associative, so `XOR` pops the pending
+    // `OrB` before pushing itself. If `XorB` were given a TIGHTER priority
+    // (e.g. 2, mistakenly grouped with `&`), `pop_while` would see
+    // `top_prec(OrB=1) >= 2` as false, leave `OrB` on the stack, and the
+    // final unwind would emit `XorB` before `OrB` instead - producing
+    // `[Arg0, Arg1, Arg2, XorB, OrB]` (`A|(B XOR C)`) rather than the
+    // expected `(A|B) XOR C`.
+    #[test]
+    fn bitwise_or_and_xor_are_equal_precedence_left_associative() {
+        assert_eq!(
+            ops("A|B XOR C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::OrB, Op::Arg(2), Op::XorB]
+        );
+    }
+
+    // `|`/`OR`/`XOR` (priority 1) share a level with `||` (already `Op::OrL`,
+    // priority 1): `A||B|C` must pop the pending `OrL` before pushing `OrB`,
+    // same left-associative tie as above. If `OrB` were given a LOOSER
+    // priority than `OrL` (e.g. 0), `pop_while` would leave `OrL` pending and
+    // the final unwind would emit `OrB` before `OrL`, producing
+    // `[Arg0, Arg1, Arg2, OrB, OrL]` (`A||(B|C)`) instead.
+    #[test]
+    fn bitwise_or_shares_precedence_with_logical_or() {
+        assert_eq!(
+            ops("A||B|C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::OrL, Op::Arg(2), Op::OrB]
+        );
+    }
+
+    // `&`/`AND`/shifts (priority 2) share a level with `&&` (already
+    // `Op::AndL`, priority 2): mirrors the `OrL`/`OrB` tie above one level
+    // up. If `AndB` were looser than `AndL`, the pending `AndL` would survive
+    // `pop_while` and the unwind would emit `AndB` first instead.
+    #[test]
+    fn bitwise_and_shares_precedence_with_logical_and() {
+        assert_eq!(
+            ops("A&&B&C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::AndL, Op::Arg(2), Op::AndB]
+        );
+    }
+
+    // `epicsCalcTest.cpp:925`: `"18 & 6 << 2"` == `(18 & 6) << 2` - `&` and
+    // `<<` are equal priority (2), left-associative, so `<<` pops the
+    // pending `AndB` first. If `Shl` were given a TIGHTER priority than
+    // `AndB` (e.g. 3), `pop_while` would leave `AndB` pending and the
+    // unwind would emit `Shl` before `AndB`, producing `[.., Shl, AndB]`
+    // (`A&(B<<C)`) instead of the expected `(A&B)<<C`.
+    #[test]
+    fn bitwise_and_and_left_shift_are_equal_precedence() {
+        assert_eq!(
+            ops("A&B<<C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::AndB, Op::Arg(2), Op::Shl]
+        );
+    }
+
+    // `epicsCalcTest.cpp:924`: `"3 << 2 & 10"` == `(3<<2)&10` - the reverse
+    // order from the previous test, checking the tie the other direction. If
+    // `Shl` were LOOSER than `AndB` (e.g. 1), `pop_while` would leave `Shl`
+    // pending when `&` arrives and the unwind would emit `AndB` before
+    // `Shl`, producing `[.., AndB, Shl]` (`A<<(B&C)`) instead.
+    #[test]
+    fn left_shift_and_bitwise_and_are_equal_precedence() {
+        assert_eq!(
+            ops("A<<B&C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::Shl, Op::Arg(2), Op::AndB]
+        );
+    }
+
+    // `>>>` shares `<<`/`>>`/`&`/`&&`/`AND`'s priority 2 too -
+    // `epicsCalcTest.cpp:927-929` exercises the same tie with `>>>`. Same
+    // failure mode as the two tests above if `ShrLogic` were given a
+    // different priority than `AndB`/`Shl`.
+    #[test]
+    fn logical_right_shift_shares_precedence_with_bitwise_and() {
+        assert_eq!(
+            ops("A&B>>>C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::AndB, Op::Arg(2), Op::ShrLogic]
+        );
+    }
+
+    // `epicsCalcTest.cpp:932-934`: `"1 << 2 != 4"` == `1 << (2 != 4)` -
+    // relational (priority 3) binds TIGHTER than the shifts (priority 2),
+    // the opposite tie-breaking direction from the same-level tests above:
+    // here `!=` must NOT pop the pending `Shl`, since `Shl`'s priority (2)
+    // is looser than the incoming `Ne`'s (3). If `Shl` were priority 3 or
+    // higher (tied with or tighter than relational), `pop_while` would pop
+    // it before pushing `Ne`, producing `[Arg0, Arg1, Shl, Arg2, Ne]`
+    // (`(1<<2) != 4`) instead of the expected `1 << (2!=4)`.
+    #[test]
+    fn relational_binds_tighter_than_left_shift() {
+        assert_eq!(
+            ops("A<<B!=C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::Arg(2), Op::Ne, Op::Shl]
+        );
+    }
+
+    // Unary `~` (priority 7, same level as `Neg`/`NotL`) vs relational
+    // (priority 3), mirroring the existing `not_binds_tighter_than_relational`
+    // test above for `NotL`. If `NotB` were priority 3 or looser (tied with
+    // or looser than relational), `>`'s `pop_while` would fail to pop the
+    // pending `NotB` before combining, producing `[Arg0, Arg1, Gt, NotB]`
+    // (`~(A>B)`) instead of the expected `(~A)>B`.
+    #[test]
+    fn bitwise_not_binds_tighter_than_relational() {
+        assert_eq!(
+            ops("~A>B"),
+            vec![Op::Arg(0), Op::NotB, Op::Arg(1), Op::Gt]
+        );
+    }
+
+    // The word-spelled `NOT`/`AND`/`OR`/`XOR` operators must resolve through
+    // `word_operator`, not be swallowed by `ident_to_op`'s function-name path
+    // (which would push a `Frame::Func` and choke on the missing `(`).
+    #[test]
+    fn word_spelled_bitwise_operators_compile_like_their_symbols() {
+        assert_eq!(ops("A AND B"), ops("A&B"));
+        assert_eq!(ops("A OR B"), ops("A|B"));
+        assert_eq!(
+            ops("A XOR B"),
+            vec![Op::Arg(0), Op::Arg(1), Op::XorB]
+        );
+        assert_eq!(ops("NOT A"), ops("~A"));
     }
 }

@@ -152,6 +152,43 @@ pub enum Op {
     /// `refs/calcPerform.c:310-312` `REL_NOT`: `*ptop = ! *ptop`. `!NaN` is
     /// `0.0` (NaN is truthy, so its negation is false), matching C.
     NotL,
+
+    // Bitwise (Task 6). Every case here converts its `f64` operand(s) to a
+    // 32-bit integer via `d2i`/`d2ui` (`eval.rs`, mirroring
+    // `calcPerform.c:325-326`'s `d2i`/`d2ui` macros), applies the C-integer
+    // operation, and widens the (always signed) result back to `f64` -
+    // `calcPerform.c:314-324`'s twelve-line comment explains why the cast is
+    // asymmetric by sign rather than by magnitude.
+    /// `refs/calcPerform.c:333-336` `BIT_AND`: `d2i(*ptop) & d2i(top)`.
+    /// `refs/postfix.c:152,174` - both `&` and the word form `AND`.
+    AndB,
+    /// `refs/calcPerform.c:328-331` `BIT_OR`: `d2i(*ptop) | d2i(top)`.
+    /// `refs/postfix.c:178,175` - both `|` and the word form `OR`.
+    OrB,
+    /// `refs/calcPerform.c:338-341` `BIT_EXCL_OR`: `d2i(*ptop) ^ d2i(top)`.
+    /// `refs/postfix.c:176` - only the word form `XOR`; `^` is `Pow`
+    /// (exponentiation), not xor, per RULINGS.md.
+    XorB,
+    /// `refs/calcPerform.c:343-345` `BIT_NOT`: `~d2i(*ptop)`.
+    /// `refs/postfix.c:144,126` - both `~` and the word form `NOT`.
+    NotB,
+    /// `refs/calcPerform.c:360-363` `LEFT_SHIFT_ARITH`:
+    /// `d2i(*ptop) << (d2i(top) & 31)`. `refs/postfix.c:165` - `<<`.
+    Shl,
+    /// `refs/calcPerform.c:355-358` `RIGHT_SHIFT_ARITH`:
+    /// `d2i(*ptop) >> (d2i(top) & 31)` - arithmetic (sign-extending) shift.
+    /// `refs/postfix.c:171` - `>>`. Rust's `>>` on `i32` is arithmetic by
+    /// definition, same as C's on every real platform (both note this
+    /// explicitly, since C's is technically implementation-defined) - no
+    /// divergence to paper over here.
+    Shr,
+    /// `refs/calcPerform.c:365-368` `RIGHT_SHIFT_LOGIC`:
+    /// `d2ui(*ptop) >> (d2ui(top) & 31u)` - logical (zero-filling) shift of
+    /// the UNSIGNED reinterpretation, with the signed-widening-back-to-f64
+    /// rule still applying to the result afterward, same as every other
+    /// bitwise op. `refs/postfix.c:172` - `>>>`, required by RULINGS.md
+    /// Ruling 2 even though task-6-brief.md's text never mentions it.
+    ShrLogic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,12 +215,10 @@ pub(crate) enum Assoc {
 /// | 6 | `**` `^` (POWER, LEFT-associative)               | 156,177            |
 /// | 7 | unary `-` `!` `~` `NOT`, and all functions        | 74,76,90-144       |
 ///
-/// Levels 3-7 (relational through unary/functions) are implemented as of
-/// Task 5. Level 1 (`|`/`OR`/`XOR`/`||`, minus `||` which Task 5 already
-/// implements) and level 2's bitwise/shift members (`&`/`AND`/`<<`/`>>`/
-/// `>>>`, minus `&&` which Task 5 already implements) belong to Task 6, and
-/// are documented above only so this table stays the single point of truth
-/// as those land.
+/// Levels 1-7 are fully implemented as of Task 6: level 1 (`|`/`OR`/`XOR`,
+/// alongside `||`) and level 2's remaining members (`&`/`AND`/`<<`/`>>`/
+/// `>>>`, alongside `&&`) land the bitwise operators; level 3-7 (relational
+/// through unary/functions) were already implemented as of Task 5.
 ///
 /// Two corrections to the original task brief, both required by the
 /// corpus (RULINGS.md Ruling 4):
@@ -208,8 +243,20 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
         // arm exists only so this match stays exhaustive as the enum grows;
         // the value is arbitrary but chosen to match the old placeholder.
         Op::CondIf { .. } | Op::CondElse { .. } | Op::CondEnd => (0, Assoc::Right),
-        Op::OrL => (1, Assoc::Left),
-        Op::AndL => (2, Assoc::Left),
+        // `|`/`OR`/`XOR` share priority 1 with `||` (`refs/postfix.c:175,
+        // 176,178` vs `:179`). `epicsCalcTest.cpp:915`: `1 | 3 XOR 1 ==
+        // (1|3)^1` - equal priority, left-associative (see
+        // `bitwise_or_and_xor_are_equal_precedence_left_associative` and
+        // `bitwise_or_shares_precedence_with_logical_or` in parse.rs's tests).
+        Op::OrL | Op::OrB | Op::XorB => (1, Assoc::Left),
+        // `&`/`AND`/`<<`/`>>`/`>>>` share priority 2 with `&&`
+        // (`refs/postfix.c:152,174,165,171,172` vs `:153`).
+        // `epicsCalcTest.cpp:924-929`: same-priority left-associative ties
+        // between `&`/`AND` and each shift; `:932-934`: relational (3) binds
+        // TIGHTER than these (2), the opposite tie-break direction - see
+        // `parse.rs`'s Task 6 precedence tests for both directions,
+        // hand-traced against `pop_while`.
+        Op::AndL | Op::AndB | Op::Shl | Op::Shr | Op::ShrLogic => (2, Assoc::Left),
         // RULINGS.md Ruling 3 corrects task-5-brief.md's precedence numbers
         // (which used a stale 12-level scheme putting relationals at 7,
         // `&&`/`||` at 2/3, and `NotL` at 11): Base has 7 levels, and this
@@ -222,7 +269,10 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
         Op::Add | Op::Sub => (4, Assoc::Left),
         Op::Mul | Op::Div | Op::Modulo => (5, Assoc::Left),
         Op::Pow => (6, Assoc::Left),
-        Op::Neg | Op::NotL => (7, Assoc::Right),
+        // Unary `~`/`NOT` share priority 7 with unary `-`/`!`
+        // (`refs/postfix.c:144,126` vs `:76,90`). See
+        // `bitwise_not_binds_tighter_than_relational` (parse.rs).
+        Op::Neg | Op::NotL | Op::NotB => (7, Assoc::Right),
         Op::Arg(_) | Op::Lit(_) => (0, Assoc::Left),
         // Functions never sit on the operator stack as a `Frame::Op` (the
         // parser tracks a pending call via `Frame::Func` instead, and emits
@@ -277,7 +327,8 @@ pub(crate) fn arity(op: &Op) -> usize {
         | Op::Sinh
         | Op::Cosh
         | Op::Tanh
-        | Op::NotL => 1,
+        | Op::NotL
+        | Op::NotB => 1,
         Op::Add
         | Op::Sub
         | Op::Mul
@@ -292,7 +343,13 @@ pub(crate) fn arity(op: &Op) -> usize {
         | Op::Eq
         | Op::Ne
         | Op::AndL
-        | Op::OrL => 2,
+        | Op::OrL
+        | Op::AndB
+        | Op::OrB
+        | Op::XorB
+        | Op::Shl
+        | Op::Shr
+        | Op::ShrLogic => 2,
         // `CondIf` pops the condition value (`calcPerform.c:400-401`,
         // `*ptop--`); `check_arity` (parse.rs) uses this directly when it
         // simulates the depth just before entering the then/else branches.
