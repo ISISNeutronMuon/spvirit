@@ -36,3 +36,5 @@ demo
 .superpowers/
 docs/superpowers/
 graphify*
+
+__pycache__
