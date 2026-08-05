@@ -40,6 +40,71 @@ pub struct Expression {
     pub(crate) ops: Vec<Op>,
 }
 
+/// The two bitmasks `calcArgUsage` reports: bit `n` of `inputs`/`stores` is
+/// set if operand `n` (`A` = 0, `U` = 20) is fetched/stored by the
+/// expression. Two named fields rather than a `(u32, u32)` tuple, so a call
+/// site can't silently swap which mask is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArgUsage {
+    /// Bitmask of operands read from the argument array.
+    pub inputs: u32,
+    /// Bitmask of operands written by a `:=` store.
+    pub stores: u32,
+}
+
+impl Expression {
+    /// Which operand slots this expression reads from and writes to,
+    /// matching Base's `calcArgUsage(ppostfix, pinputs, pstores)`
+    /// (`refs/calcPerform.c:429-507`, `postfix.h:366`). The `calcout` record
+    /// uses `inputs` to decide which `INPA`-`INPU` links to fetch before
+    /// evaluating - skipping a link Base wouldn't process avoids `PP`
+    /// links processing records the real IOC never would.
+    ///
+    /// This is a flat, linear walk over `self.ops`, mirroring Base's `while
+    /// ((op = *pinst++) != END_EXPRESSION)` loop (`:435`) exactly: it does
+    /// NOT interpret `Op::CondIf`/`CondElse`/`CondEnd`'s jump targets, so
+    /// both arms of a ternary are reported even though only one would run at
+    /// evaluation time (`refs/calcPerform.c` has no `COND_IF`/`COND_ELSE`
+    /// special-casing in `calcArgUsage` either - the untaken branch's opcodes
+    /// are just more entries in the stream it scans). `;` contributes no
+    /// opcode at all (Task 8a, `refs/postfix.c:163`, `EXPR_TERMINATOR` is
+    /// `NOT_GENERATED`), so segment boundaries are as invisible to this walk
+    /// as they are to Base's.
+    ///
+    /// The two masks are NOT independent of instruction order:
+    /// `refs/calcPerform.c:472-473`, `inputs |= (1 << (op - FETCH_A)) &
+    /// ~stores;` ("Don't claim to use an arg we already stored to") means a
+    /// fetch is only counted as an input if no store to that same slot has
+    /// been walked yet. `"A := 1; A"` and `"A; A := 1"` therefore report
+    /// different `inputs` masks despite containing the same two opcodes in
+    /// the other order - see this module's
+    /// `store_then_fetch_of_same_slot_is_not_reported_as_input` and
+    /// `fetch_then_store_of_same_slot_is_reported_as_input`.
+    ///
+    /// Cannot fail: `self.ops` was already validated by `compile`.
+    pub fn arg_usage(&self) -> ArgUsage {
+        let mut inputs: u32 = 0;
+        let mut stores: u32 = 0;
+        for op in &self.ops {
+            match op {
+                // `refs/calcPerform.c:472-473`: mask off any bit already
+                // claimed by `stores` before OR-ing the fetch in, so a
+                // store followed by a same-slot fetch never sets `inputs`.
+                Op::Arg(i) => inputs |= (1u32 << i) & !stores,
+                // `refs/calcPerform.c:497`: `stores |= (1 << (op -
+                // STORE_A))`. Order relative to the line above matters -
+                // this must run in the same left-to-right op order as the
+                // `Op::Arg` arm above it, which it does by construction
+                // (single forward `for` loop, one op examined per
+                // iteration).
+                Op::Store(i) => stores |= 1u32 << i,
+                _ => {}
+            }
+        }
+        ArgUsage { inputs, stores }
+    }
+}
+
 /// Compile an infix CALC expression to postfix.
 ///
 /// An empty or all-whitespace expression compiles to an empty program,
@@ -1650,5 +1715,115 @@ mod tests {
             );
             assert_eq!(ops(&format!("{lower} := 0; {lower}")), ops(&src), "lowercase {lower}");
         }
+    }
+
+    // Task 8. `refs/calcPerform.c:430-506` `calcArgUsage`, corrected to 21
+    // slots (RULINGS.md Ruling 1) and two masks (Ruling 2) - the brief's
+    // `0b1000_0000_0000` for `"L"` was `u16` bit 11 read as "the top bit";
+    // at 21 slots `L` (the 12th letter) is still bit 11, just no longer the
+    // top of anything.
+    #[test]
+    fn arg_usage_reports_referenced_operands() {
+        assert_eq!(
+            compile("A+C").unwrap().arg_usage(),
+            ArgUsage { inputs: 0b101, stores: 0 }
+        );
+        assert_eq!(
+            compile("L").unwrap().arg_usage(),
+            ArgUsage { inputs: 1 << 11, stores: 0 }
+        );
+        assert_eq!(compile("1+2").unwrap().arg_usage(), ArgUsage { inputs: 0, stores: 0 });
+        assert_eq!(compile("").unwrap().arg_usage(), ArgUsage { inputs: 0, stores: 0 });
+    }
+
+    #[test]
+    fn arg_usage_counts_each_operand_once() {
+        assert_eq!(
+            compile("A+A*A").unwrap().arg_usage(),
+            ArgUsage { inputs: 0b1, stores: 0 }
+        );
+    }
+
+    // `refs/calcPerform.c:472-473`: `inputs |= (1 << (op - FETCH_A)) &
+    // ~stores;` - "Don't claim to use an arg we already stored to". A store
+    // followed by a fetch of the SAME slot does not count as an input: the
+    // value read came from the just-stored expression result, not from an
+    // `INPx` link, so `calcout` must not fetch it.
+    #[test]
+    fn store_then_fetch_of_same_slot_is_not_reported_as_input() {
+        assert_eq!(
+            compile("A := 1; A").unwrap().arg_usage(),
+            ArgUsage { inputs: 0, stores: 0b1 }
+        );
+    }
+
+    // The reverse order: a fetch that PRECEDES a store to the same slot is a
+    // genuine input (the value read still came from the link, before the
+    // expression overwrote it), so this is the mirror image of the previous
+    // test, not a duplicate of it - the two masks are not independent of
+    // instruction order.
+    #[test]
+    fn fetch_then_store_of_same_slot_is_reported_as_input() {
+        assert_eq!(
+            compile("A; A := 1").unwrap().arg_usage(),
+            ArgUsage { inputs: 0b1, stores: 0b1 }
+        );
+    }
+
+    // Bit 20 (`U`, the 21st and last slot) on the STORE side specifically -
+    // exercises the top of the store mask, mirroring
+    // `every_operand_letter_has_its_own_store_slot`'s fetch-side coverage.
+    // A bare `"U := 5"` nets zero stack depth (fetch +1, un-emit -1, literal
+    // +1, store -1) and `check_arity` rejects any expression that doesn't
+    // finish at depth 1 (see `depth_may_return_to_zero_between_terminators`),
+    // so a trailing `; 1` segment is needed to make the whole expression
+    // valid without touching either mask.
+    #[test]
+    fn store_to_u_sets_bit_20() {
+        assert_eq!(
+            compile("U := 5; 1").unwrap().arg_usage(),
+            ArgUsage { inputs: 0, stores: 1 << 20 }
+        );
+    }
+
+    // `calcArgUsage`'s walk is a flat linear scan over the opcode stream
+    // (`refs/calcPerform.c:435`, `while ((op = *pinst++) != END_EXPRESSION)`)
+    // with a plain `switch` on each opcode - it never inspects `COND_IF`/
+    // `COND_ELSE`/`COND_END` to skip the untaken branch the way `eval.rs`'s
+    // jump-following interpreter does. This crate's `ops` vector lays both
+    // ternary arms out back-to-back the same way Base's instruction stream
+    // does (see `op.rs`'s `Op::CondIf` doc), and this walk is likewise a
+    // plain `for` over `self.ops` with no jump-target handling, so all three
+    // operands of `A?B:C` are reported even though only one of B/C would
+    // ever actually be read at runtime.
+    #[test]
+    fn ternary_reports_both_untaken_and_taken_arm() {
+        assert_eq!(
+            compile("A?B:C").unwrap().arg_usage(),
+            ArgUsage { inputs: 0b111, stores: 0 }
+        );
+    }
+
+    // An expression that only stores, never fetches: the RHS is a bare
+    // literal, so the only opcode touching either mask is the store itself.
+    // Like `store_to_u_sets_bit_20` above, a lone `"A := 1"` nets stack
+    // depth 0 and `check_arity` rejects it, so `; 1` closes the expression
+    // out with a segment that touches neither mask. `inputs` must stay zero.
+    #[test]
+    fn stores_only_expression_reports_zero_inputs() {
+        assert_eq!(
+            compile("A := 1; 1").unwrap().arg_usage(),
+            ArgUsage { inputs: 0, stores: 0b1 }
+        );
+    }
+
+    // `;` is `NOT_GENERATED` (`refs/postfix.c:163`) and emits no opcode - Task
+    // 8a already established this, and `arg_usage`'s walk is opcode-only (see
+    // `Expression::arg_usage`'s doc), so segment boundaries are invisible to
+    // it exactly as they are to Base's `calcArgUsage`, which walks the same
+    // opcode stream `calcPerform` does.
+    #[test]
+    fn compile_empty_reports_no_usage() {
+        assert_eq!(compile("").unwrap().arg_usage(), ArgUsage { inputs: 0, stores: 0 });
     }
 }

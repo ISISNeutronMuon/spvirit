@@ -15,4 +15,4 @@ mod parse;
 mod op;
 mod eval;
 
-pub use parse::{CalcError, Expression, compile};
+pub use parse::{ArgUsage, CalcError, Expression, compile};
