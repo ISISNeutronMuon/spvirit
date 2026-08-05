@@ -426,10 +426,15 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
     // `CALC_ERR_INCOMPLETE`. `check_arity` below covers the depth half, but
     // not the `operand_needed` half: a trailing `;` or `:=` leaves the output
     // in a state whose depth is coincidentally fine (`"A;"` is just `[Arg(0)]`)
-    // while the expression is plainly unfinished. Guarded on a non-empty token
-    // list because `expect_operand` starts `true` and Base's own empty-input
-    // path returns early before this check (`:246-250`) - see
-    // `empty_expression_compiles_to_nothing`.
+    // while the expression is plainly unfinished. Guarded on a non-empty
+    // token list so `compile("")` still reaches `empty_expression_compiles_
+    // to_nothing`'s `Ok(empty)` rather than this arm - `expect_operand`
+    // starts `true`, so an empty token list would otherwise trip it. This is
+    // a divergence, not a Base-justified path: Base rejects `""` outright at
+    // `refs/postfix.c:235-240` (`*psrc == '\0'` -> `CALC_ERR_NULL_ARG`, before
+    // the `get_element` loop this check mirrors even starts at `:246`), so
+    // `compile("") -> Ok(empty)` is the pre-existing Task 1/2 behaviour, kept
+    // here as-is rather than matched to Base.
     if expect_operand && !tokens.is_empty() {
         return Err(CalcError::MissingOperand);
     }
@@ -1513,6 +1518,13 @@ mod tests {
         // which is why `(A := 1)` cannot be used to get a store into a
         // ternary arm either.
         assert_eq!(compile("(A := 1)"), Err(CalcError::BadAssignment));
+        // A second `:=` with the first still pending: at `B := 0`'s `:=`,
+        // `STORE_A` (from `A :=`) is still on the operator stack, so
+        // `pstacktop > stack` trips the same guard (`refs/postfix.c:297`).
+        // `Frame::Op(Op::Store(_))` is not a `CondHead`, so this crate hits
+        // the identical `BadAssignment` rather than treating `B := 0` as an
+        // operand for the outer `A :=`.
+        assert_eq!(compile("A := B := 0; A"), Err(CalcError::BadAssignment));
     }
 
     // DEPTH ACCOUNTING. A store pops one value and pushes nothing, so a bare

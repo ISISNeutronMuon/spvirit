@@ -357,10 +357,15 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
         // table, shared with `?`/`:` (`:161,173`). Unlike those, a pending
         // store IS a real `Frame::Op` on this crate's operator stack, so
         // `pop_while` genuinely does compare against it - and priority 0 is
-        // what makes it never pop: `pop_while`'s only call sites pass
-        // `prec` 1..=7 with `Assoc::Left` (`0 >= 1` is false) or `prec == 0`
-        // with `Assoc::Right` from `?` (`0 > 0` is false). That is exactly
-        // Base's behaviour, and it is load-bearing rather than incidental:
+        // what makes it never pop. `pop_while`'s call sites (`parse.rs:120`,
+        // `:221`, `:415`) pass one of three shapes: `prec` 1..=6 with
+        // `Assoc::Left` from a binary operator (`0 >= prec` is false for
+        // every `prec >= 1`); `prec == 7` with `Assoc::Right` from unary
+        // `-`/`!`/`~`/`NOT` (`(7, Assoc::Right)` above) (`0 > 7` is false);
+        // or `prec == 0` with `Assoc::Right` from `?` itself (`0 > 0` is
+        // false). None of the three can pop a priority-0 store. That is
+        // exactly Base's behaviour, and it is load-bearing rather than
+        // incidental:
         // `:`'s flush in Base uses the same strict `>` against priority 0
         // (`refs/postfix.c:402-403`), which is why a store in a ternary's
         // then-branch is NOT flushed at the `:` and instead hoists out of the

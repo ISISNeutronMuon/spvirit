@@ -1531,9 +1531,9 @@ mod tests {
     // A fetch BEFORE and a fetch AFTER a store to the same slot, in one
     // expression, pinning the ordering. `A := A + 1` reads the incoming `A`
     // on its right-hand side (5), so the stored value is 6; the fetch in the
-    // next segment then sees 6, not 5. If the store were applied before its
-    // own right-hand side was read, the result would be 10; if the store
-    // never took effect, 50.
+    // next segment then sees 6, not 5: 60. If the store never took effect
+    // (the `;`-segment boundary discarded it instead of writing back to
+    // `args`), the later fetch would still see the original 5: 50.
     #[test]
     fn store_ordering_within_one_expression() {
         // `A := A + 1; A * 10`: reads the incoming A (5), stores 6, then the
