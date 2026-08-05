@@ -161,8 +161,12 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/spvirit-py-v')
     needs: [tools-wheels, tools-sdist]
     runs-on: ubuntu-latest
+    # Same environment as the `spvirit` publish job below: both packages ship
+    # from one tag, so they share its deployment rules and reviewers. The name
+    # must match the environment configured on the PyPI trusted publisher for
+    # spvirit-tools (or that field must be left blank there).
     environment:
-      name: pypi-tools
+      name: pypi
       url: https://pypi.org/p/spvirit-tools
     permissions:
       # Required for PyPI trusted publishing (OIDC).
