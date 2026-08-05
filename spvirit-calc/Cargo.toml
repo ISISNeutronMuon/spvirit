@@ -1,6 +1,6 @@
 [package]
 name = "spvirit-calc"
-version = "0.1.19"
+version.workspace = true
 edition = "2024"
 description = "EPICS CALC expression compiler and evaluator"
 license = "BSD-3-Clause"

@@ -19,11 +19,16 @@ That is the whole story on Linux (x86_64, aarch64), macOS (Intel and Apple
 Silicon), and Windows x86_64: those five platforms get prebuilt `abi3`
 wheels, so there is no compiler involved. Python 3.9 or newer.
 
+It also brings the command-line tools. `spvirit` depends on the
+`spvirit-tools` package, so the twelve binaries below land on your `PATH`
+in the same step — no Rust toolchain, and inside the virtualenv rather than
+in `~/.cargo/bin`.
+
 Check it:
 
 ```console
 $ python -c "from importlib.metadata import version; print(version('spvirit'))"
-0.1.15
+0.1.19
 ```
 
 (The module itself has no `__version__` attribute — ask the package
@@ -34,22 +39,35 @@ which needs a Rust toolchain.
 
 ## Command-line tools
 
+Twelve binaries: `spget`, `spput`, `spmonitor`, `spinfo`, `splist`,
+`spsearch`, `spexplore`, `sptable`, `spserver`, `spsine`, `spdodeca`, and
+`spget_compare`.
+
+```bash
+pip install spvirit-tools
+```
+
+Prebuilt wheels for the same five platforms as above, so no compiler is
+involved. The binaries install into the environment's `bin` (or `Scripts`)
+directory, which puts them on `PATH` whenever that environment is active.
+This package is what `pip install spvirit` pulls in, so if you already have
+the bindings you already have these.
+
+Or, with a Rust toolchain:
+
 ```bash
 cargo install spvirit-tools
 ```
 
-That builds and installs twelve binaries onto your `PATH`: `spget`,
-`spput`, `spmonitor`, `spinfo`, `splist`, `spsearch`, `spexplore`,
-`sptable`, `spserver`, `spsine`, `spdodeca`, and `spget_compare`.
+[rustup](https://rustup.rs) is the usual way to get one. Stable is what CI
+builds against. This route installs into `~/.cargo/bin` and is the one to
+use on platforms without a prebuilt wheel.
 
-Check it:
+Either way, check it:
 
 ```console
 $ spget --help
 ```
-
-You need a Rust toolchain for this — [rustup](https://rustup.rs) is the
-usual way to get one. Stable is what CI builds against.
 
 ## Rust library
 

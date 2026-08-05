@@ -23,6 +23,14 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+# Installing the bindings also installs the command-line tools, so `spget`,
+# `spmonitor`, and the rest land on PATH without a Rust toolchain.
+#
+# The pin is exact and must equal the workspace version in the root Cargo.toml.
+# This file's own version is dynamic, so nothing bumps this line automatically;
+# `spvirit-tools/tests/version_pin.rs` fails the build when it drifts.
+dependencies = ["spvirit-tools == 0.1.19"]
+
 [project.urls]
 Repository = "https://github.com/ISISNeutronMuon/spvirit"
 Issues = "https://github.com/ISISNeutronMuon/spvirit/issues"

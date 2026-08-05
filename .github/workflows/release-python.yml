@@ -1,4 +1,14 @@
-name: Release Python package
+name: Release Python packages
+
+# Two packages ship from one tag, because every crate in the workspace shares
+# a version:
+#
+#   spvirit        -- the PyO3 extension module, built from spvirit-py
+#   spvirit-tools  -- the twelve command-line tools, as wheel scripts
+#
+# `spvirit` depends on `spvirit-tools` by exact version, so `pip install
+# spvirit` puts the tools on PATH. That pin is enforced by
+# spvirit-tools/tests/version_pin.rs.
 
 on:
   push:
@@ -11,7 +21,7 @@ permissions:
 
 jobs:
   wheels:
-    name: Build wheels (${{ matrix.platform.name }})
+    name: Build spvirit wheels (${{ matrix.platform.name }})
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -50,11 +60,11 @@ jobs:
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.platform.name }}
+          name: py-wheels-${{ matrix.platform.name }}
           path: spvirit-py/dist
 
   sdist:
-    name: Build sdist
+    name: Build spvirit sdist
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,25 +79,122 @@ jobs:
       - name: Upload sdist artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sdist
+          name: py-sdist
           path: spvirit-py/dist
 
-  publish:
-    name: Publish to PyPI
+  tools-wheels:
+    name: Build spvirit-tools wheels (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x64
+          - name: macos-x86_64
+            runner: macos-latest
+            target: x86_64
+          - name: macos-aarch64
+            runner: macos-latest
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `bindings = "bin"` in spvirit-tools/pyproject.toml makes this package
+      # the twelve executables rather than an extension module.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: spvirit-tools
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          manylinux: auto
+
+      # A wheel with no binaries in it installs cleanly and does nothing, so
+      # the contents are asserted rather than assumed.
+      - name: Verify the wheel contains every tool
+        shell: bash
+        run: python spvirit-tools/scripts/verify_wheel.py spvirit-tools/dist
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tools-wheels-${{ matrix.platform.name }}
+          path: spvirit-tools/dist
+
+  tools-sdist:
+    name: Build spvirit-tools sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: spvirit-tools
+          command: sdist
+          args: --out dist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tools-sdist
+          path: spvirit-tools/dist
+
+  # spvirit-tools publishes first. `spvirit` depends on it by exact version, so
+  # if the tools upload fails the bindings must not go out either -- a released
+  # `spvirit` whose dependency does not exist on PyPI is uninstallable.
+  publish-tools:
+    name: Publish spvirit-tools to PyPI
     # Only publish on tag pushes; workflow_dispatch runs stop after building.
     if: startsWith(github.ref, 'refs/tags/spvirit-py-v')
-    needs: [wheels, sdist]
+    needs: [tools-wheels, tools-sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-tools
+      url: https://pypi.org/p/spvirit-tools
+    permissions:
+      # Required for PyPI trusted publishing (OIDC).
+      id-token: write
+    steps:
+      - name: Download spvirit-tools artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tools-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish:
+    name: Publish spvirit to PyPI
+    if: startsWith(github.ref, 'refs/tags/spvirit-py-v')
+    needs: [wheels, sdist, publish-tools]
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/spvirit
     permissions:
-      # Required for PyPI trusted publishing (OIDC).
       id-token: write
     steps:
-      - name: Download all artifacts
+      - name: Download spvirit artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: py-*
           path: dist
           merge-multiple: true
 

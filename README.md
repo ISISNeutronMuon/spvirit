@@ -78,9 +78,13 @@ Walked through step by step in
 ## Install
 
 ```bash
-cargo install spvirit-tools     # the sp* command-line tools
-pip install spvirit             # the Python module
+pip install spvirit             # the Python module, plus the sp* tools
+pip install spvirit-tools       # just the sp* command-line tools
+cargo install spvirit-tools     # same tools, via a Rust toolchain
 ```
+
+`spvirit` depends on `spvirit-tools`, so the first line gets you both: the
+importable module and the twelve binaries on your `PATH`, no compiler needed.
 
 To use the libraries from your own Rust project, add the layer you need:
 

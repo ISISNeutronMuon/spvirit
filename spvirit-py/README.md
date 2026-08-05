@@ -69,6 +69,12 @@ Wheels are published for Linux (x86_64, aarch64), Windows (x86_64), and macOS
 (x86_64, arm64) for Python 3.9+ (one abi3 wheel per platform). No EPICS base,
 no compiler needed.
 
+This also installs the `spvirit-tools` package, which puts the twelve
+command-line tools — `spget`, `spput`, `spmonitor`, `splist`, `spinfo`,
+`spexplore`, `spsearch`, `spsine`, `spserver`, `sptable`, `spdodeca`,
+`spget_compare` — on your `PATH` inside the same environment. They are native
+binaries, not Python wrappers, and each takes `--help`.
+
 To build from source instead, see [Building from source](#building-from-source).
 
 ## Core concepts
