@@ -431,6 +431,174 @@ fn slice_literals_and_operands(c: &mut Corpus) {
 }
 
 // ---------------------------------------------------------------------------
+// Slice 2: MAX / MIN (epicsCalcTest.cpp:439-562) and the remaining
+// UNARY_OPERATOR cases (:564-575)
+// ---------------------------------------------------------------------------
+
+fn slice_max_min(c: &mut Corpus) {
+    // MAX (`:439-500`). Every expected value is `emax_n` over exactly the
+    // arguments in the expression text, which is what the test's overload set
+    // (`:211-253`) computes.
+    c.calc("MAX(-99)", emax_n(&[-99.0]));
+    c.calc("MAX( 1., 2.)", emax_n(&[1.0, 2.0]));
+    c.calc("MAX( 1., Inf)", emax_n(&[1.0, INF]));
+    c.calc("MAX( 1.,-Inf)", emax_n(&[1.0, -INF]));
+    c.calc("MAX( 1., NaN)", emax_n(&[1.0, NAN]));
+    c.calc("MAX( Inf, 1.)", emax_n(&[INF, 1.0]));
+    c.calc("MAX(-Inf, 1.)", emax_n(&[-INF, 1.0]));
+    c.calc("MAX( NaN, 1.)", emax_n(&[NAN, 1.0]));
+    c.calc("MAX( 1., 2.,3.)", emax_n(&[1.0, 2.0, 3.0]));
+    c.calc("MAX( 1., 3.,2.)", emax_n(&[1.0, 3.0, 2.0]));
+    c.calc("MAX( 2., 1.,3.)", emax_n(&[2.0, 1.0, 3.0]));
+    c.calc("MAX( 2., 3.,1.)", emax_n(&[2.0, 3.0, 1.0]));
+    c.calc("MAX( 3., 1.,2.)", emax_n(&[3.0, 1.0, 2.0]));
+    c.calc("MAX( 3., 2.,1.)", emax_n(&[3.0, 2.0, 1.0]));
+    c.calc("MAX( 1., 2., Inf)", emax_n(&[1.0, 2.0, INF]));
+    c.calc("MAX( 1., 2.,-Inf)", emax_n(&[1.0, 2.0, -INF]));
+    c.calc("MAX( 1., 2., NaN)", emax_n(&[1.0, 2.0, NAN]));
+    c.calc("MAX( 1., Inf,2.)", emax_n(&[1.0, INF, 2.0]));
+    c.calc("MAX( 1.,-Inf,2.)", emax_n(&[1.0, -INF, 2.0]));
+    c.calc("MAX( 1., NaN,2.)", emax_n(&[1.0, NAN, 2.0]));
+    c.calc("MAX( Inf, 1.,2.)", emax_n(&[INF, 1.0, 2.0]));
+    c.calc("MAX(-Inf, 1.,2.)", emax_n(&[-INF, 1.0, 2.0]));
+    c.calc("MAX( NaN, 1.,2.)", emax_n(&[NAN, 1.0, 2.0]));
+    c.calc("MAX( 1., 2., 3., 4.)", emax_n(&[1.0, 2.0, 3.0, 4.0]));
+    c.calc("MAX( 1., 2., 4., 3.)", emax_n(&[1.0, 2.0, 4.0, 3.0]));
+    c.calc("MAX( 1., 4., 3., 2.)", emax_n(&[1.0, 4.0, 3.0, 2.0]));
+    c.calc("MAX( 4., 2., 3., 1.)", emax_n(&[4.0, 2.0, 3.0, 1.0]));
+    c.calc("MAX( 1., 2., 3.,NaN)", emax_n(&[1.0, 2.0, 3.0, NAN]));
+    c.calc("MAX( 1., 2.,NaN, 3.)", emax_n(&[1.0, 2.0, NAN, 3.0]));
+    c.calc("MAX( 1.,NaN, 3., 2.)", emax_n(&[1.0, NAN, 3.0, 2.0]));
+    c.calc("MAX(NaN, 2., 3., 1.)", emax_n(&[NAN, 2.0, 3.0, 1.0]));
+    c.calc("MAX( 1., 2., 3., 4., 5.)", emax_n(&[1.0, 2.0, 3.0, 4.0, 5.0]));
+    c.calc("MAX( 1., 2., 3., 5., 4.)", emax_n(&[1.0, 2.0, 3.0, 5.0, 4.0]));
+    c.calc("MAX( 1., 2., 5., 4., 3.)", emax_n(&[1.0, 2.0, 5.0, 4.0, 3.0]));
+    c.calc("MAX( 1., 5., 3., 4., 2.)", emax_n(&[1.0, 5.0, 3.0, 4.0, 2.0]));
+    c.calc("MAX( 5., 2., 3., 4., 1.)", emax_n(&[5.0, 2.0, 3.0, 4.0, 1.0]));
+    c.calc("MAX( 1., 2., 3., 4.,NaN)", emax_n(&[1.0, 2.0, 3.0, 4.0, NAN]));
+    c.calc("MAX( 1., 2., 3.,NaN, 4.)", emax_n(&[1.0, 2.0, 3.0, NAN, 4.0]));
+    c.calc("MAX( 1., 2.,NaN, 4., 3.)", emax_n(&[1.0, 2.0, NAN, 4.0, 3.0]));
+    c.calc("MAX( 1.,NaN, 3., 4., 2.)", emax_n(&[1.0, NAN, 3.0, 4.0, 2.0]));
+    c.calc("MAX(NaN, 2., 3., 4., 1.)", emax_n(&[NAN, 2.0, 3.0, 4.0, 1.0]));
+    c.calc("MAX( 1., 2., 3., 4., 5., 6.)", emax_n(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+    c.calc("MAX( 1., 2., 3., 4., 6., 5.)", emax_n(&[1.0, 2.0, 3.0, 4.0, 6.0, 5.0]));
+    c.calc("MAX( 1., 2., 3., 6., 5., 4.)", emax_n(&[1.0, 2.0, 3.0, 6.0, 5.0, 4.0]));
+    c.calc("MAX( 1., 2., 6., 4., 5., 3.)", emax_n(&[1.0, 2.0, 6.0, 4.0, 5.0, 3.0]));
+    c.calc("MAX( 1., 6., 3., 4., 5., 2.)", emax_n(&[1.0, 6.0, 3.0, 4.0, 5.0, 2.0]));
+    c.calc("MAX( 6., 2., 3., 4., 5., 1.)", emax_n(&[6.0, 2.0, 3.0, 4.0, 5.0, 1.0]));
+    c.calc("MAX( 1., 2., 3., 4., 5.,NaN)", emax_n(&[1.0, 2.0, 3.0, 4.0, 5.0, NAN]));
+    c.calc("MAX( 1., 2., 3., 4.,NaN, 5.)", emax_n(&[1.0, 2.0, 3.0, 4.0, NAN, 5.0]));
+    c.calc("MAX( 1., 2., 3.,NaN, 5., 4.)", emax_n(&[1.0, 2.0, 3.0, NAN, 5.0, 4.0]));
+    c.calc("MAX( 1., 2.,NaN, 4., 5., 3.)", emax_n(&[1.0, 2.0, NAN, 4.0, 5.0, 3.0]));
+    c.calc("MAX( 1.,NaN, 3., 4., 5., 2.)", emax_n(&[1.0, NAN, 3.0, 4.0, 5.0, 2.0]));
+    c.calc("MAX(NaN, 2., 3., 4., 5., 1.)", emax_n(&[NAN, 2.0, 3.0, 4.0, 5.0, 1.0]));
+    c.calc("MAX( 1., 2., 3., 4., 5.,Inf)", emax_n(&[1.0, 2.0, 3.0, 4.0, 5.0, INF]));
+    c.calc("MAX( 1., 2., 3., 4.,Inf, 5.)", emax_n(&[1.0, 2.0, 3.0, 4.0, INF, 5.0]));
+    c.calc("MAX( 1., 2., 3.,Inf, 5., 4.)", emax_n(&[1.0, 2.0, 3.0, INF, 5.0, 4.0]));
+    c.calc("MAX( 1., 2.,Inf, 4., 5., 3.)", emax_n(&[1.0, 2.0, INF, 4.0, 5.0, 3.0]));
+    c.calc("MAX( 1.,Inf, 3., 4., 5., 2.)", emax_n(&[1.0, INF, 3.0, 4.0, 5.0, 2.0]));
+    c.calc("MAX(Inf, 2., 3., 4., 5., 1.)", emax_n(&[INF, 2.0, 3.0, 4.0, 5.0, 1.0]));
+    c.calc(
+        "MAX(1,2,3,4,5,6,7,8,9,10,11,12)",
+        emax_n(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+    );
+    c.calc(
+        "MAX(5,4,3,2,1,0,-1,-2,-3,-4,-5,-6)",
+        emax_n(&[5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0]),
+    );
+    c.calc("MAX(-1,1,0)", emax_n(&[-1.0, 1.0, 0.0]));
+
+    // MIN (`:502-562`)
+    c.calc("MIN(99)", emin_n(&[99.0]));
+    c.calc("MIN(1.,2.)", emin_n(&[1.0, 2.0]));
+    c.calc("MIN(1.,Inf)", emin_n(&[1.0, INF]));
+    c.calc("MIN(1.,-Inf)", emin_n(&[1.0, -INF]));
+    c.calc("MIN(1.,NaN)", emin_n(&[1.0, NAN]));
+    c.calc("MIN(NaN,1.)", emin_n(&[NAN, 1.0]));
+    c.calc("MIN( 1., 2.,3.)", emin_n(&[1.0, 2.0, 3.0]));
+    c.calc("MIN( 1., 3.,2.)", emin_n(&[1.0, 3.0, 2.0]));
+    c.calc("MIN( 2., 1.,3.)", emin_n(&[2.0, 1.0, 3.0]));
+    c.calc("MIN( 2., 3.,1.)", emin_n(&[2.0, 3.0, 1.0]));
+    c.calc("MIN( 3., 1.,2.)", emin_n(&[3.0, 1.0, 2.0]));
+    c.calc("MIN( 3., 2.,1.)", emin_n(&[3.0, 2.0, 1.0]));
+    c.calc("MIN( 1., 2., Inf)", emin_n(&[1.0, 2.0, INF]));
+    c.calc("MIN( 1., 2.,-Inf)", emin_n(&[1.0, 2.0, -INF]));
+    c.calc("MIN( 1., 2., NaN)", emin_n(&[1.0, 2.0, NAN]));
+    c.calc("MIN( 1., Inf,2.)", emin_n(&[1.0, INF, 2.0]));
+    c.calc("MIN( 1.,-Inf,2.)", emin_n(&[1.0, -INF, 2.0]));
+    c.calc("MIN( 1., NaN,2.)", emin_n(&[1.0, NAN, 2.0]));
+    c.calc("MIN( Inf, 1.,2.)", emin_n(&[INF, 1.0, 2.0]));
+    c.calc("MIN(-Inf, 1.,2.)", emin_n(&[-INF, 1.0, 2.0]));
+    c.calc("MIN( NaN, 1.,2.)", emin_n(&[NAN, 1.0, 2.0]));
+    c.calc("MIN( 1., 2., 3., 4.)", emin_n(&[1.0, 2.0, 3.0, 4.0]));
+    c.calc("MIN( 1., 2., 4., 3.)", emin_n(&[1.0, 2.0, 4.0, 3.0]));
+    c.calc("MIN( 1., 4., 3., 2.)", emin_n(&[1.0, 4.0, 3.0, 2.0]));
+    c.calc("MIN( 4., 2., 3., 1.)", emin_n(&[4.0, 2.0, 3.0, 1.0]));
+    c.calc("MIN( 1., 2., 3.,NaN)", emin_n(&[1.0, 2.0, 3.0, NAN]));
+    c.calc("MIN( 1., 2.,NaN, 3.)", emin_n(&[1.0, 2.0, NAN, 3.0]));
+    c.calc("MIN( 1.,NaN, 3., 2.)", emin_n(&[1.0, NAN, 3.0, 2.0]));
+    c.calc("MIN(NaN, 2., 3., 1.)", emin_n(&[NAN, 2.0, 3.0, 1.0]));
+    c.calc("MIN( 1., 2., 3., 4., 5.)", emin_n(&[1.0, 2.0, 3.0, 4.0, 5.0]));
+    c.calc("MIN( 1., 2., 3., 5., 4.)", emin_n(&[1.0, 2.0, 3.0, 5.0, 4.0]));
+    c.calc("MIN( 1., 2., 5., 4., 3.)", emin_n(&[1.0, 2.0, 5.0, 4.0, 3.0]));
+    c.calc("MIN( 1., 5., 3., 4., 2.)", emin_n(&[1.0, 5.0, 3.0, 4.0, 2.0]));
+    c.calc("MIN( 5., 2., 3., 4., 1.)", emin_n(&[5.0, 2.0, 3.0, 4.0, 1.0]));
+    c.calc("MIN( 1., 2., 3., 4.,NaN)", emin_n(&[1.0, 2.0, 3.0, 4.0, NAN]));
+    c.calc("MIN( 1., 2., 3.,NaN, 4.)", emin_n(&[1.0, 2.0, 3.0, NAN, 4.0]));
+    c.calc("MIN( 1., 2.,NaN, 4., 3.)", emin_n(&[1.0, 2.0, NAN, 4.0, 3.0]));
+    c.calc("MIN( 1.,NaN, 3., 4., 2.)", emin_n(&[1.0, NAN, 3.0, 4.0, 2.0]));
+    c.calc("MIN(NaN, 2., 3., 4., 1.)", emin_n(&[NAN, 2.0, 3.0, 4.0, 1.0]));
+    c.calc("MIN( 1., 2., 3., 4., 5., 6.)", emin_n(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+    c.calc("MIN( 2., 1., 3., 4., 5., 6.)", emin_n(&[2.0, 1.0, 3.0, 4.0, 5.0, 6.0]));
+    c.calc("MIN( 3., 2., 1., 4., 5., 6.)", emin_n(&[3.0, 2.0, 1.0, 4.0, 5.0, 6.0]));
+    c.calc("MIN( 4., 2., 3., 1., 5., 6.)", emin_n(&[4.0, 2.0, 3.0, 1.0, 5.0, 6.0]));
+    c.calc("MIN( 5., 2., 3., 4., 1., 6.)", emin_n(&[5.0, 2.0, 3.0, 4.0, 1.0, 6.0]));
+    c.calc("MIN( 6., 2., 3., 4., 5., 1.)", emin_n(&[6.0, 2.0, 3.0, 4.0, 5.0, 1.0]));
+    c.calc("MIN( 1., 2., 3., 4., 5.,NaN)", emin_n(&[1.0, 2.0, 3.0, 4.0, 5.0, NAN]));
+    c.calc("MIN( 1., 2., 3., 4.,NaN, 5.)", emin_n(&[1.0, 2.0, 3.0, 4.0, NAN, 5.0]));
+    c.calc("MIN( 1., 2., 3.,NaN, 5., 4.)", emin_n(&[1.0, 2.0, 3.0, NAN, 5.0, 4.0]));
+    c.calc("MIN( 1., 2.,NaN, 4., 5., 3.)", emin_n(&[1.0, 2.0, NAN, 4.0, 5.0, 3.0]));
+    c.calc("MIN( 1.,NaN, 3., 4., 5., 2.)", emin_n(&[1.0, NAN, 3.0, 4.0, 5.0, 2.0]));
+    c.calc("MIN(NaN, 2., 3., 4., 5., 1.)", emin_n(&[NAN, 2.0, 3.0, 4.0, 5.0, 1.0]));
+    c.calc("MIN( 1., 2., 3., 4., 5.,-Inf)", emin_n(&[1.0, 2.0, 3.0, 4.0, 5.0, -INF]));
+    c.calc("MIN( 1., 2., 3., 4.,-Inf, 5.)", emin_n(&[1.0, 2.0, 3.0, 4.0, -INF, 5.0]));
+    c.calc("MIN( 1., 2., 3.,-Inf, 5., 4.)", emin_n(&[1.0, 2.0, 3.0, -INF, 5.0, 4.0]));
+    c.calc("MIN( 1., 2.,-Inf, 4., 5., 3.)", emin_n(&[1.0, 2.0, -INF, 4.0, 5.0, 3.0]));
+    c.calc("MIN( 1.,-Inf, 3., 4., 5., 2.)", emin_n(&[1.0, -INF, 3.0, 4.0, 5.0, 2.0]));
+    c.calc("MIN(-Inf, 2., 3., 4., 5., 1.)", emin_n(&[-INF, 2.0, 3.0, 4.0, 5.0, 1.0]));
+    c.calc(
+        "MIN(1,2,3,4,5,6,7,8,9,10,11,12)",
+        emin_n(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+    );
+    c.calc(
+        "MIN(5,4,3,2,1,0,-1,-2,-3,-4,-5,-6)",
+        emin_n(&[5.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0]),
+    );
+    c.calc("MIN(1,-1,0)", emin_n(&[1.0, -1.0, 0.0]));
+    // `:562` - nested vararg calls, which also pins that each `)` fixes up its
+    // own argument count rather than a shared one.
+    c.calc(
+        "MAX(MIN(0,2),MAX(0),MIN(3,2,1))",
+        emax_n(&[emin_n(&[0.0, 2.0]), emax_n(&[0.0]), emin_n(&[3.0, 2.0, 1.0])]),
+    );
+
+    // Remaining UNARY_OPERATOR cases (`:564-575`)
+    c.calc("NINT(0.4)", nint(0.4));
+    c.calc("NINT(0.6)", nint(0.6));
+    c.calc("NINT(-0.4)", nint(-0.4));
+    c.calc("NINT(-0.6)", nint(-0.6));
+    c.calc("sin(0.5)", 0.5f64.sin());
+    c.calc("sinh(0.5)", 0.5f64.sinh());
+    // `:208`: `#define SQR(x) sqrt(x)` - SQR is square ROOT in CALC.
+    c.calc("SQR(10.)", 10.0f64.sqrt());
+    c.calc("sqrt(16.)", 16.0f64.sqrt());
+    c.calc("tan(0.5)", 0.5f64.tan());
+    c.calc("tanh(0.5)", 0.5f64.tanh());
+    c.calc("~5", !5i32 as f64);
+    c.calc("~~5", !!5i32 as f64);
+}
+
+// ---------------------------------------------------------------------------
 // The test entry point
 // ---------------------------------------------------------------------------
 
@@ -439,6 +607,7 @@ fn base_corpus() {
     let mut c = Corpus::default();
 
     slice_literals_and_operands(&mut c);
+    slice_max_min(&mut c);
 
     if !c.skips.is_empty() {
         eprintln!(
