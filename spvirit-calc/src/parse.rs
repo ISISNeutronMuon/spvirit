@@ -109,9 +109,11 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                         Some(Frame::Op(op)) => out.push(op),
                         // A completed ternary (past its `:`) sitting inside
                         // these parens, e.g. `"(A?B:C)"`: finalize it (emit
-                        // `CondEnd`, backpatch both jump targets) the same
-                        // way `pop_while` does, then keep popping down to
-                        // the `(`.
+                        // `CondEnd`, backpatch both jump targets — see
+                        // `finalize_cond`), then keep popping down to the
+                        // `(`. `pop_while` never does this itself — see its
+                        // doc comment — so `)`/`,`/a further `:`/end-of-input
+                        // are the only finalizers.
                         Some(Frame::CondTail { if_idx, else_idx }) => {
                             finalize_cond(&mut out, if_idx, else_idx)
                         }
@@ -276,10 +278,11 @@ enum Frame {
     /// A ternary whose `?` and `:` have both been seen (the else-branch may
     /// still be in progress): `if_idx`/`else_idx` are the indices of the
     /// `Op::CondIf`/`Op::CondElse` placeholders in `out`, both still
-    /// carrying dummy targets until something finalizes this frame (a
-    /// tighter-binding-or-equal incoming operator via `pop_while`, a `)`,
-    /// a `,`, an enclosing `:`, or end-of-input) by calling
-    /// `finalize_cond`.
+    /// carrying dummy targets until something finalizes this frame by
+    /// calling `finalize_cond` — one of `)`, `,`, an enclosing `:`, or
+    /// end-of-input. NOT `pop_while`: `?:` is the loosest precedence level
+    /// in the table, so no incoming operator can ever out-bind a pending
+    /// `CondTail` — see `pop_while`'s doc comment for the proof.
     CondTail { if_idx: usize, else_idx: usize },
     /// A pending function call, between the identifier and its `)`.
     Func(Op),
@@ -292,8 +295,10 @@ enum Frame {
 /// `CondElse` placeholder at `else_idx`, whose target this sets on the
 /// `CondIf`), and `out.len()` after pushing `CondEnd` is the first
 /// instruction past the whole conditional (the target `CondElse` gets).
-/// Called from every place a `Frame::CondTail` can be consumed: `pop_while`,
-/// `)`, `,`, a further `:`, and the end-of-tokens unwind.
+/// Called from every place a `Frame::CondTail` can actually be consumed:
+/// `)`, `,`, a further `:`, and the end-of-tokens unwind. NOT `pop_while` —
+/// see its doc comment for why a pending `CondTail` can never reach the top
+/// of the stack when `pop_while` is the one looking at it.
 fn finalize_cond(out: &mut Vec<Op>, if_idx: usize, else_idx: usize) {
     out.push(Op::CondEnd);
     out[if_idx] = Op::CondIf {
@@ -306,23 +311,34 @@ fn finalize_cond(out: &mut Vec<Op>, if_idx: usize, else_idx: usize) {
 
 /// Pop operators that bind at least as tightly as the incoming one.
 ///
-/// A pending `Frame::CondTail` (a completed `?...:` whose else-branch may
-/// still be in progress) behaves like an operator frame at priority 0,
-/// right-associative — the same slot the old `Frame::Op(Op::Cond)` occupied
-/// — so it's handled here alongside `Frame::Op`, finalizing it via
-/// `finalize_cond` instead of pushing a single op. A `Frame::CondHead`
-/// (mid-condition or mid-then-branch, `?` seen but not yet its `:`) is
-/// deliberately NOT matched here — same as the old `Frame::Cond` — so an
-/// unrelated pending outer ternary is never disturbed while parsing a
-/// nested one; see the `chained_ternary_in_else_branch`/
-/// `nested_ternary_in_then_branch` tests below for the shapes this protects.
+/// Only matches `Frame::Op` — a pending `Frame::CondTail` (a completed
+/// `?...:` whose else-branch may still be in progress) is deliberately NOT
+/// popped here, and provably can't be, so there's no arm for it at all
+/// rather than an arm that's unreachable but looks load-bearing:
+///
+/// `?`/`:` carry priority 0 in `postfix.c` (`:161,173`) — the loosest level
+/// in the whole table — and `pop_while` has exactly two call sites: `?`
+/// itself, calling `pop_while(.., 0, Assoc::Right)`, and the generic
+/// operator arm below, calling with `prec` equal to some real operator's
+/// precedence (currently `1..=7`, per `op.rs`'s table; Task 6's remaining
+/// operators are levels 1-2 and don't change this). A `Frame::CondTail`'s
+/// effective priority is 0, so `should_pop` for it would be `0 >= prec`
+/// under `Assoc::Left` (false for every `prec >= 1`) or `0 > prec` under
+/// `Assoc::Right` (false for every `prec >= 0`, including `?`'s own call
+/// with `prec == 0`). No call site can ever make it true — a `CondTail` is
+/// only ever finalized by `)`, `,`, an enclosing `:`, or end-of-input (see
+/// `finalize_cond`'s doc), never by an incoming operator, which is exactly
+/// right: `?:` binding loosest means nothing can out-bind it.
+///
+/// A `Frame::CondHead` (mid-condition or mid-then-branch, `?` seen but not
+/// yet its `:`) is likewise never matched here, for the same reason the old
+/// Task-3 `Frame::Cond` wasn't — so an unrelated pending outer ternary is
+/// never disturbed while parsing a nested one; see the
+/// `chained_ternary_in_else_branch`/`nested_ternary_in_then_branch` tests
+/// below for the shapes this protects.
 fn pop_while(stack: &mut Vec<Frame>, out: &mut Vec<Op>, prec: u8, assoc: Assoc) {
-    loop {
-        let top_prec = match stack.last() {
-            Some(Frame::Op(top)) => precedence(top).0,
-            Some(Frame::CondTail { .. }) => 0,
-            _ => break,
-        };
+    while let Some(Frame::Op(top)) = stack.last() {
+        let (top_prec, _) = precedence(top);
         let should_pop = match assoc {
             Assoc::Left => top_prec >= prec,
             Assoc::Right => top_prec > prec,
@@ -330,11 +346,10 @@ fn pop_while(stack: &mut Vec<Frame>, out: &mut Vec<Op>, prec: u8, assoc: Assoc) 
         if !should_pop {
             break;
         }
-        match stack.pop() {
-            Some(Frame::Op(op)) => out.push(op),
-            Some(Frame::CondTail { if_idx, else_idx }) => finalize_cond(out, if_idx, else_idx),
-            _ => unreachable!(),
-        }
+        let Some(Frame::Op(op)) = stack.pop() else {
+            unreachable!()
+        };
+        out.push(op);
     }
 }
 
@@ -604,6 +619,80 @@ mod tests {
     #[test]
     fn double_star_is_an_alias_for_caret() {
         assert_eq!(ops("A**B"), vec![Op::Arg(0), Op::Arg(1), Op::Pow]);
+    }
+
+    // Review fix (Important 2): RULINGS.md Ruling 3's placement of `OrL`
+    // (prio 1), `AndL` (prio 2), the relationals (prio 3), and `NotL` (prio
+    // 7, with unary `Neg`) was, until this fix, entirely unverified — every
+    // existing ternary/precedence test only ever pinned a Task 5 operator
+    // against `?:` or against another Task 5 operator at the SAME level,
+    // never against a different Task 5 or Task 2 level. Swapping `OrL`
+    // and `AndL`'s priorities, moving the relationals to 4 or 5, or moving
+    // `NotL` down to 1 would all still pass the rest of the suite.
+    //
+    // Four boundaries, one test each, each hand-traced to fail if the
+    // corresponding priority number is wrong (see the comment on each):
+
+    // `||` (prio 1) vs `&&` (prio 2): if this compiled as
+    // `(A||B)&&C` instead, the sequence would be
+    // `[Arg0, Arg1, OrL, Arg2, AndL]`, not this. Swapping the two
+    // priorities (`OrL`=2, `AndL`=1) produces exactly that wrong sequence:
+    // `||`'s `pop_while(1, Left)` would then see `&&` pending at Left prio.
+    #[test]
+    fn or_binds_looser_than_and() {
+        assert_eq!(
+            ops("A||B&&C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::Arg(2), Op::AndL, Op::OrL]
+        );
+    }
+
+    // `&&` (prio 2) vs relational (prio 3): `(A>B)&&(C>D)`, not `A>(B&&C)>D`
+    // (which wouldn't even parse, since `&&`'s RHS `Gt` would then see a
+    // fully-reduced boolean, but any wrong priority ordering breaks the
+    // clean split into two `Gt` sub-expressions this asserts). If `AndL`
+    // were priority 3 or higher (tied with or tighter than relational), the
+    // second `>` would fail to pop the pending `Gt` from the first
+    // comparison before combining, producing a different op order.
+    #[test]
+    fn and_binds_looser_than_relational() {
+        assert_eq!(
+            ops("A>B&&C>D"),
+            vec![
+                Op::Arg(0),
+                Op::Arg(1),
+                Op::Gt,
+                Op::Arg(2),
+                Op::Arg(3),
+                Op::Gt,
+                Op::AndL,
+            ]
+        );
+    }
+
+    // Relational (prio 3) vs `+` (prio 4): `(A+B)>C`, not `A+(B>C)`. If
+    // relational were priority 4 or higher (tied with or tighter than
+    // `+`), `>`'s `pop_while` would fail to pop the pending `Add` first,
+    // producing `[Arg0, Arg1, Arg2, Gt, Add]` (`A+(B>C)`) instead.
+    #[test]
+    fn relational_binds_looser_than_addition() {
+        assert_eq!(
+            ops("A+B>C"),
+            vec![Op::Arg(0), Op::Arg(1), Op::Add, Op::Arg(2), Op::Gt]
+        );
+    }
+
+    // Unary `!` (prio 7, same level as `Neg`) vs relational (prio 3):
+    // `(!A)>B`, not `!(A>B)`. If `NotL` were priority 3 or lower (tied with
+    // or looser than relational), `>`'s `pop_while` would pop the pending
+    // `NotL` too early relative to `A`, or (if looser still) never pop it
+    // before combining, producing `[Arg0, Arg1, Gt, NotL]` (`!(A>B)`)
+    // instead.
+    #[test]
+    fn not_binds_tighter_than_relational() {
+        assert_eq!(
+            ops("!A>B"),
+            vec![Op::Arg(0), Op::NotL, Op::Arg(1), Op::Gt]
+        );
     }
 
     // Task 5 replaced the eager, single-opcode `Op::Cond` (pop three,

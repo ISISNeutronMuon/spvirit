@@ -636,6 +636,24 @@ mod tests {
         assert_eq!(ev("A<=B", &[1.0, 1.0]), 1.0);
     }
 
+    // Review fix (Important 3): the brief's own equal-operand coverage only
+    // ever exercised `>=`/`<=` at the boundary (`[1.0, 1.0] -> 1.0`), never
+    // `>`/`<` there. `Op::Gt => a >= b` and `Op::Lt => a <= b` — both wrong,
+    // swallowing the strict/non-strict distinction entirely — would still
+    // pass the whole suite including `relational_operators_yield_one_or_zero`
+    // above (equal operands never appear there for `>`/`<`),
+    // `nan_comparisons_are_always_false_except_not_equal` (NaN operands make
+    // `>` and `>=` agree, so that test can't tell them apart either), and
+    // `conditional_binds_loosest` (no equal-operand case). Equal operands
+    // are the one input that pulls `>` and `>=` (or `<` and `<=`) apart.
+    #[test]
+    fn strict_relational_operators_differ_from_non_strict_at_equal_operands() {
+        assert_eq!(ev("A>B", &[1.0, 1.0]), 0.0);
+        assert_eq!(ev("A<B", &[1.0, 1.0]), 0.0);
+        assert_eq!(ev("A>=B", &[1.0, 1.0]), 1.0);
+        assert_eq!(ev("A<=B", &[1.0, 1.0]), 1.0);
+    }
+
     #[test]
     fn logical_operators_treat_nonzero_as_true() {
         assert_eq!(ev("A&&B", &[5.0, 3.0]), 1.0);
