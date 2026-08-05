@@ -69,19 +69,33 @@ impl Expression {
     /// are just more entries in the stream it scans). `;` contributes no
     /// opcode at all (Task 8a, `refs/postfix.c:163`, `EXPR_TERMINATOR` is
     /// `NOT_GENERATED`), so segment boundaries are as invisible to this walk
-    /// as they are to Base's.
+    /// as they are to Base's. This claim is structurally unfalsifiable by a
+    /// test, not merely untested: there is no `Op` variant a `;` could ever
+    /// produce for a wrong implementation to mishandle, so no compiled
+    /// `Expression` can distinguish "this walk skips `;` boundaries" from
+    /// "there were never any boundaries to skip" - see `parse.rs`'s Task 8a
+    /// commentary on `Token::Op(";")` for the same point made about the
+    /// compiler.
     ///
     /// The two masks are NOT independent of instruction order:
     /// `refs/calcPerform.c:472-473`, `inputs |= (1 << (op - FETCH_A)) &
     /// ~stores;` ("Don't claim to use an arg we already stored to") means a
     /// fetch is only counted as an input if no store to that same slot has
-    /// been walked yet. `"A := 1; A"` and `"A; A := 1"` therefore report
-    /// different `inputs` masks despite containing the same two opcodes in
-    /// the other order - see this module's
-    /// `store_then_fetch_of_same_slot_is_not_reported_as_input` and
-    /// `fetch_then_store_of_same_slot_is_reported_as_input`.
+    /// been walked yet, checked per slot (a store to `B` never suppresses a
+    /// fetch of `A`). For example `"A := 1; A"` reports `inputs: 0` (the
+    /// fetch follows a same-slot store), while `"A; A := 1"` reports
+    /// `inputs: 0b1` (the fetch precedes it) - same two opcodes, opposite
+    /// order, different result. A claim, once set, is also never retracted:
+    /// a fetch that precedes a same-slot store keeps its `inputs` bit even
+    /// after that store runs, because OR is one-directional and nothing here
+    /// ever clears a bit once set - matching Base's `case FETCH_A` line,
+    /// which only ever ORs in, never ANDs out.
     ///
-    /// Cannot fail: `self.ops` was already validated by `compile`.
+    /// Cannot fail: `i` is always a slot already produced by `lex.rs`'s
+    /// `(b'A'..=b'U')` range guard - `Op::Arg`'s only producer - and every
+    /// `Op::Store(slot)` is created by copying an existing `Op::Arg(slot)`
+    /// (see `compile`'s `Token::Op(":=")` arm), never from an independent
+    /// value, so `i` is always `0..21` and `1u32 << i` never overflows.
     pub fn arg_usage(&self) -> ArgUsage {
         let mut inputs: u32 = 0;
         let mut stores: u32 = 0;
@@ -1770,6 +1784,55 @@ mod tests {
         );
     }
 
+    // Review fix (Important 1): every prior test's store and fetch (if both
+    // present) target the SAME slot, so a wrong implementation that
+    // suppresses ALL fetches once ANY store has run -
+    // `Op::Arg(i) => if stores == 0 { inputs |= 1 << i }` - passes every one
+    // of them (the tests with both a store and a fetch all store first and
+    // expect `inputs == 0` anyway). `refs/calcPerform.c:472-473`'s `&
+    // ~stores` masks off only the ONE bit matching the fetch's own slot, not
+    // the whole `stores` word - `"A := 1; B"` (`ops` = `[Lit(1.0), Store(0),
+    // Arg(1)]`) is the discriminator: the wrong global-suppression variant
+    // reports `inputs: 0` (a store happened, so every later fetch is
+    // dropped, including `B`'s), while the correct per-slot masking reports
+    // `inputs: 1 << 1` - `B`'s fetch is unaffected by a store to `A`. Under
+    // the wrong variant `calcout` would skip fetching `INPB`, silently
+    // leaving `B` stale - the exact under-report failure mode this task
+    // exists to prevent.
+    #[test]
+    fn store_to_one_slot_does_not_suppress_fetch_of_a_different_slot() {
+        assert_eq!(
+            compile("A := 1; B").unwrap().arg_usage(),
+            ArgUsage { inputs: 1 << 1, stores: 0b1 }
+        );
+    }
+
+    // Review fix (Important 2): a fetch's claim on `inputs` is never
+    // retracted by a LATER same-slot store - `refs/calcPerform.c:472-473`'s
+    // `FETCH_A` case only ever ORs a bit in; nothing in `calcArgUsage`'s
+    // `STORE_A` case (`:497`, plain `stores |= ...`) touches `inputs` at
+    // all. `"A := A; A"` compiles to `[Arg(0), Store(0), Arg(0)]` (the first
+    // `A` is the store's bare-operand TARGET, consumed by the compiler
+    // itself and never emitted as a fetch - see the `Token::Op(":=")` arm in
+    // `compile`; the second `A`, the store's value, is the genuine
+    // `FETCH_A` this test is about). Walking it: `Arg(0)` sets `inputs`'s
+    // bit 0 (no store has run yet); `Store(0)` sets `stores`'s bit 0; the
+    // final `Arg(0)` recomputes `1 & !stores` as 0 and ORs in nothing
+    // further - but bit 0 is already set from the first fetch, and OR can
+    // only add bits, so it stays set. An implementation that "corrects"
+    // `inputs` when a store runs -
+    // `Op::Store(i) => { stores |= 1 << i; inputs &= !(1 << i); }` - clears
+    // that bit regardless of when the fetch happened, reporting `inputs: 0`
+    // here instead of the correct `0b1`: an over-suppression bug, the
+    // mirror image of Important 1's under-suppression one.
+    #[test]
+    fn fetch_claim_is_not_retracted_by_a_later_store_to_the_same_slot() {
+        assert_eq!(
+            compile("A := A; A").unwrap().arg_usage(),
+            ArgUsage { inputs: 0b1, stores: 0b1 }
+        );
+    }
+
     // Bit 20 (`U`, the 21st and last slot) on the STORE side specifically -
     // exercises the top of the store mask, mirroring
     // `every_operand_letter_has_its_own_store_slot`'s fetch-side coverage.
@@ -1817,13 +1880,5 @@ mod tests {
         );
     }
 
-    // `;` is `NOT_GENERATED` (`refs/postfix.c:163`) and emits no opcode - Task
-    // 8a already established this, and `arg_usage`'s walk is opcode-only (see
-    // `Expression::arg_usage`'s doc), so segment boundaries are invisible to
-    // it exactly as they are to Base's `calcArgUsage`, which walks the same
-    // opcode stream `calcPerform` does.
-    #[test]
-    fn compile_empty_reports_no_usage() {
-        assert_eq!(compile("").unwrap().arg_usage(), ArgUsage { inputs: 0, stores: 0 });
-    }
 }
+

@@ -8,7 +8,8 @@
 //!
 //! `Expression`/`compile` (`parse.rs`) wire `lex`/`Token` and the `op`
 //! operator table together; `Expression::eval`/`eval_with_rng` (`eval.rs`)
-//! perform the evaluation.
+//! perform the evaluation; `Expression::arg_usage` (`parse.rs`) reports which
+//! operand slots are read/written, matching Base's `calcArgUsage`.
 
 mod lex;
 mod parse;
