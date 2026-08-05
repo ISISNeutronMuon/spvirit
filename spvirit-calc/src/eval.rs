@@ -6,64 +6,35 @@ use crate::parse::Expression;
 // Backing generator for `Op::Rndm` (`RNDM`, `refs/calcPerform.c:296-298`
 // `case RANDOM`: `*++ptop = calcRandom();`).
 //
-// # Design: why `thread_local`, not a field on `Expression`
+// State lives in a `thread_local! Cell<u64>`, not a field on `Expression`:
+// `eval` must stay `&self`, and a `Cell` field would make `Expression`
+// `!Sync` and give every clone its own diverging stream. A `thread_local`
+// keeps `Expression` plain data (`Vec<Op>`, all `Copy`/`Send`/`Sync`
+// payloads) - see `expression_keeps_its_auto_traits_after_adding_rndm`
+// below - and each thread gets its own independent state, so concurrent
+// `eval()` calls never race. See `Expression::eval`'s doc for what this
+// means for callers: `RNDM` draws from one shared per-thread stream, not
+// per-`Expression` state; `eval_with_rng` exists for callers who need a
+// private, reproducible stream instead.
 //
-// `RNDM` needs mutable state to advance between draws, but `eval` is a
-// `&self` method and must stay that way - task instructions are explicit
-// that changing the public signature to `&mut self` here would pre-empt a
-// still-open signature question flagged for `:=` (Ruling 2) in an earlier
-// task, and for the wrong reason (RNDM's laziness, not `:=`'s genuine
-// write-back need). Putting a `Cell<u64>` directly on `Expression` would
-// solve the `&self`-vs-mutation tension too, but at a real cost: it would
-// make `Expression` `!Sync` (shared `&Expression` across threads could race
-// on the `Cell`) and would mean every clone of an `Expression` carries and
-// diverges its own independent RNG stream, which is a strange thing for
-// "the same compiled program" to do.
+// Generator: xorshift64* (Marsaglia/Vigna) - short, dependency-free, well
+// distributed enough for this purpose. **Not cryptographically secure**,
+// and makes **no attempt** to be bit-compatible with C's `rand()`
+// (`calcPerform.c:509-521`): `rand()`'s algorithm and `RAND_MAX` are
+// libc-specific, so there is no single sequence to match, and Base's own
+// `RNDM` output is equally platform-dependent for the same reason. This
+// crate reproduces Base's documented value *range* only, not its sequence.
 //
-// A `thread_local! { Cell<u64> }` keeps the mutable state OUT of
-// `Expression` entirely: `Expression` (`Vec<Op>`, all `Copy`/`Send`/`Sync`
-// payloads) is unaffected and keeps every auto trait it had before this
-// task (`Send`, `Sync`, `Clone`, `PartialEq`, `Debug` - verified by
-// `expression_keeps_its_auto_traits_after_adding_rndm` below). Concurrent
-// `eval()` calls from different threads on the same (or different)
-// `Expression`s never race, because each thread has its own independent
-// copy of `RNDM_STATE` - there is no shared mutable state to race on in the
-// first place, which is a stronger guarantee than merely being panic-free
-// under contention.
+// Seeded once per thread from `std::time` (part of `std`, so the crate
+// stays zero-dependency), mirroring `calcRandom`'s lazy one-time `srand()`
+// (`calcPerform.c:511-518`) without its exact seed source
+// (`epicsTimeGetMonotonic`, not part of `std`).
 //
-// # Design: the generator itself
-//
-// A small xorshift64* (Marsaglia/Vigna) generator, chosen for being short,
-// dependency-free, and well-distributed enough for this purpose. This is
-// **not cryptographically secure** and makes **no attempt** to be
-// bit-compatible with C's `rand()`/`RAND_MAX` (`calcPerform.c:509-521`):
-// bit-compatibility with a specific libc's `rand()` is neither achievable
-// (`RAND_MAX` and the sequence itself vary by C library and are themselves
-// unspecified beyond a minimum range) nor required by any conformance
-// target this crate has - Base's own output for `RNDM` is
-// platform-dependent for the identical reason. This crate does not claim to
-// reproduce Base's sequence, only its documented value range (see below).
-//
-// Seeded once per thread from `std::time` (part of `std`, not a runtime
-// dependency - the crate stays zero-dependency) the first time `RNDM` is
-// drawn on that thread, mirroring `calcRandom`'s own lazy one-time
-// `srand()` (`calcPerform.c:511-518`) without reproducing its exact seed
-// source (`epicsTimeGetMonotonic`, not part of `std`).
-//
-// # Design: range
-//
-// `calcRandom` returns `rand() / RAND_MAX` (`calcPerform.c:520`), and C's
-// `rand()` can return `RAND_MAX` itself, so Base's documented range is the
-// CLOSED interval `[0, 1]`, not the half-open `[0, 1)` most modern
-// generators (including `rand`-crate-style ones) produce. This
-// implementation deliberately reproduces that inclusivity - scaling into
-// `[0, 1]` rather than `[0, 1)` - because it costs nothing (one constructed
-// as `(2^53 - 1)` instead of `2^53` as the divisor) and matches Base's
-// documented semantic contract, even though the underlying bit sequence is
-// unrelated to Base's. A caller relying on `RNDM` never equaling exactly
-// `1.0` would be relying on an accident of Base's own generator, not a
-// documented guarantee - `calcPerform.c`'s own comment says plainly
-// "between 0 - 1".
+// Range: `calcRandom` returns `rand() / RAND_MAX` (`calcPerform.c:520`),
+// and `rand()` can return `RAND_MAX` itself, so Base's documented range is
+// the CLOSED interval `[0, 1]`, not the half-open `[0, 1)` most Rust RNGs
+// produce. Reproduced here by dividing by `2^53 - 1`, not `2^53`, so the
+// maximum mantissa maps to exactly `1.0`.
 thread_local! {
     static RNDM_STATE: Cell<u64> = Cell::new(seed_from_time());
 }
@@ -200,7 +171,41 @@ impl Expression {
     /// `eval` will need updating. Task 3 doesn't build `:=` yet, so this
     /// method takes the narrower, safer `&` for now rather than
     /// pre-committing to a mutation strategy Task 5/6 haven't motivated.
+    ///
+    /// `RNDM` makes this method's output nondeterministic in three ways a
+    /// caller can't see from the signature: (1) draws come from a
+    /// thread-local generator, invisible here; (2) that generator is shared
+    /// per-thread, not per-`Expression` - evaluating one `Expression`
+    /// advances the stream that every other `Expression` on the same thread
+    /// also draws from; (3) each draw lies in the CLOSED interval `[0, 1]`
+    /// (matching `calcRandom`'s documented range), unlike the half-open
+    /// `[0, 1)` most Rust RNGs produce. Callers who need a reproducible or
+    /// isolated sequence should use [`Expression::eval_with_rng`] instead.
     pub fn eval(&self, args: &[f64; 21]) -> f64 {
+        self.run(args, &mut next_rndm)
+    }
+
+    /// Like [`Expression::eval`], but draws `RNDM` from the caller-supplied
+    /// `rng` instead of the shared thread-local generator - the reproducible
+    /// alternative to `eval`'s entropy-seeded default, for callers (e.g. a
+    /// differential-testing oracle, or a determinism test) that need to pin
+    /// or replay `RNDM`'s output.
+    ///
+    /// Deliberately does NOT make plain `eval` deterministic by seeding a
+    /// generator from the compiled program instead of the clock (a design
+    /// the brief for this feature originally proposed): `calcRandom`
+    /// (`refs/calcPerform.c:509-521`) seeds once from
+    /// `epicsTimeGetMonotonic` and every draw after that genuinely varies -
+    /// an IOC calc record returning the same "random" value on every scan
+    /// would be a behavioral bug, not a feature. RULINGS.md's standing rule
+    /// (Base wins wherever the plan and Base disagree) governs here, so
+    /// `eval`'s default stays entropy-seeded and `eval_with_rng` is purely
+    /// an opt-in escape hatch, not the normal path.
+    pub fn eval_with_rng(&self, args: &[f64; 21], rng: &mut dyn FnMut() -> f64) -> f64 {
+        self.run(args, rng)
+    }
+
+    fn run(&self, args: &[f64; 21], rng: &mut dyn FnMut() -> f64) -> f64 {
         // Stack discipline: `check_arity` (parse.rs) statically proves every
         // well-formed `Expression` never pops below depth 0 or leaves more
         // than one value at the end, so the `.expect()` calls below are a
@@ -467,7 +472,7 @@ impl Expression {
                 // calcRandom();` - pushes without popping (see `Op::Rndm`'s
                 // doc in op.rs and this module's `RNDM_STATE` doc for the
                 // generator design).
-                Op::Rndm => stack.push(next_rndm()),
+                Op::Rndm => stack.push(rng()),
 
                 // RULINGS.md Ruling 6 / calcPerform.c:277-279 `case ISINF`:
                 // `*ptop = isinf(*ptop);` - strictly unary, no fold.
@@ -1253,9 +1258,23 @@ mod tests {
     // literals, so the last bits match exactly.
     #[test]
     fn named_constants() {
-        assert_eq!(ev("PI", &[]), std::f64::consts::PI);
-        assert!((ev("D2R", &[]) - std::f64::consts::PI / 180.0).abs() < 1e-15);
-        assert!((ev("R2D", &[]) - 180.0 / std::f64::consts::PI).abs() < 1e-13);
+        // Bit-identical, not merely close: `constant()` (parse.rs) computes
+        // these as divisions of `std::f64::consts::PI`, so the same
+        // divisions performed here must round to the identical `f64` bit
+        // pattern. A tolerance-based comparison (e.g. `< 1e-15`) would also
+        // pass for a transcribed decimal literal that merely rounds to the
+        // same value, so it pins nothing about "computed vs. transcribed" -
+        // exact bit equality is the only assertion that actually
+        // distinguishes them.
+        assert_eq!(ev("PI", &[]).to_bits(), std::f64::consts::PI.to_bits());
+        assert_eq!(
+            ev("D2R", &[]).to_bits(),
+            (std::f64::consts::PI / 180.0).to_bits()
+        );
+        assert_eq!(
+            ev("R2D", &[]).to_bits(),
+            (180.0 / std::f64::consts::PI).to_bits()
+        );
         assert!(ev("INF", &[]).is_infinite());
         assert!(ev("NAN", &[]).is_nan());
     }
@@ -1370,6 +1389,26 @@ mod tests {
         seed_rndm(777);
         let second = e.eval(&[0.0; 21]);
         assert_eq!(first, second);
+    }
+
+    // `eval_with_rng` is the public, cross-crate-usable determinism hook -
+    // `seed_rndm` is `#[cfg(test)]`/`pub(crate)` and cannot serve callers
+    // outside this crate (e.g. a differential-testing oracle in another
+    // crate, or a `tests/` integration test, neither of which can see
+    // crate-internal items). A caller-supplied closure must be able to pin
+    // `RNDM` to an arbitrary, fully-controlled sequence, independent of the
+    // thread-local state `eval` uses.
+    #[test]
+    fn eval_with_rng_uses_the_caller_supplied_generator_not_the_thread_local() {
+        let e = crate::compile("RNDM+RNDM").expect("compile");
+        let mut calls = 0u32;
+        let mut fixed = || {
+            calls += 1;
+            0.25
+        };
+        let v = e.eval_with_rng(&[0.0; 21], &mut fixed);
+        assert_eq!(v, 0.5);
+        assert_eq!(calls, 2);
     }
 
     // A long chain of pure-constant nullary ops exercises `check_segment`'s
