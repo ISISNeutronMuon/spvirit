@@ -1,5 +1,11 @@
 """A fully described scalar PV: units, precision, limits, deadband.
 
+Also demonstrates picking the NTScalar wire type explicitly via
+``spvirit.scalar(name, initial, type=...)``, for the eight types
+(byte/short/ubyte/ushort/uint/ulong, plus explicit float/bool/long/string)
+the inferring constructors (``ai``/``ao``/``bi``/``bo``/``longin``/
+``longout``/``string_in``/``string_out``) don't reach.
+
 Try it:
     python spvirit-py/examples/demo_scalars.py
 
@@ -7,6 +13,8 @@ Then from another terminal:
     spget SIM:TEMPERATURE
     spget SIM:TEMPERATURE.MDEL     # 0.5
     spput SIM:SETPOINT 500         # accepted — drive limits are advisory
+    spinfo SIM:GAIN                # wire type: ushort
+    spinfo SIM:STATUS              # wire type: byte
 """
 
 import spvirit
@@ -33,6 +41,13 @@ setpoint = spvirit.ao(
     drive_limits=(0.0, 100.0),
 )
 
-server = spvirit.Server(pvs=[temperature, setpoint])
+# ANCHOR: types
+# `type=` picks the wire type by name (or alias, e.g. "u16"); `writable=True`
+# serves the output flavor, `False` (default) the input flavor.
+gain = spvirit.scalar("SIM:GAIN", 1, type="ushort", writable=True)
+status = spvirit.scalar("SIM:STATUS", 0, type="byte")
+# ANCHOR_END: types
+
+server = spvirit.Server(pvs=[temperature, setpoint, gain, status])
 server.run()
 # ANCHOR_END: meta

@@ -83,6 +83,41 @@ set in code goes into the payload, not the field table. The units are still
 there; you just have to read the whole PV to see them. This is the gap
 described in [EPICS in 10 minutes](../01-fundamentals/epics-in-10-minutes.md).
 
+## Choosing the wire type
+
+`ai`/`ao`/`bi`/`bo`/`longin`/`longout`/`string_in`/`string_out` (Rust) and
+`ai`/`ao`/`bo`/`longin`/`longout`/`string_in`/`string_out` (Python) each
+fix the NTScalar wire type to one of `double`, `boolean`, `int` or
+`string`. PVAccess defines twelve NTScalar value types in total —
+`boolean`, `byte`, `short`, `int`, `long`, their unsigned variants
+(`ubyte`, `ushort`, `uint`, `ulong`), `float`, `double`, and `string` — and
+reaching the other eight needs an explicit type selection.
+
+### Rust
+
+```rust
+{{#include ../../../../spvirit-server/examples/scalar_metadata.rs:types}}
+```
+
+`Pv::<ScalarValue>::scalar_out`/`scalar_in` build a record whose wire type
+is whatever `ScalarValue` variant `initial` holds — `scalar_out` for a
+writable PV, `scalar_in` for read-only.
+
+### Python
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_scalars.py:types}}
+```
+
+`spvirit.scalar(name, initial, *, type, writable=False, **opts)` picks the
+wire type by name (or alias, e.g. `"u16"`/`"i32"`); `writable=True` serves
+the output flavor. The full type-name/alias table and the value coercion
+rules (overflow, widening, narrowing) are in
+[`spvirit-py`'s README, *NT scalar type coverage*
+section](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md#nt-scalar-type-coverage)
+— the same reference the [Python API](../05-reference/python-api.md) page
+points to for `pv`/`scalar`.
+
 ## Run it
 
 ```bash
@@ -94,6 +129,8 @@ cargo run -p spvirit-server --example scalar_metadata
 spget SIM:TEMPERATURE
 spget SIM:TEMPERATURE.MDEL
 spput SIM:SETPOINT 30
+spinfo SIM:GAIN
+spinfo SIM:STATUS
 ```
 
 ## Next

@@ -553,14 +553,40 @@ pub(crate) fn scalar_family_record_type(v: &ScalarValue, writable: bool) -> Reco
 }
 
 impl Pv<ScalarValue> {
-    /// Dynamically typed scalar record, read-only over the wire. The wire
-    /// value type is whatever `ScalarValue` variant `initial` holds.
+    /// Dynamically typed scalar record, read-only over the wire.
+    ///
+    /// The wire value type is whatever `ScalarValue` variant `initial`
+    /// holds — this is the route to any of the twelve NTScalar types
+    /// (`boolean`, `byte`, `short`, `int`, `long`, `ubyte`, `ushort`,
+    /// `uint`, `ulong`, `float`, `double`, `string`), including the eight
+    /// (`byte`/`short`/`ubyte`/`ushort`/`uint`/`ulong`, plus explicit
+    /// `float`/`long`) that the fixed-type constructors (`Pv::ai`, `bi`,
+    /// `longin`, `string_in`, ...) cannot produce. See
+    /// `Pv::<ScalarValue>::scalar_out` for the writable flavor.
+    ///
+    /// ```
+    /// use spvirit_server::Pv;
+    /// use spvirit_types::ScalarValue;
+    ///
+    /// let status = Pv::<ScalarValue>::scalar_in("SIM:STATUS", ScalarValue::U8(0));
+    /// ```
     pub fn scalar_in(name: impl Into<String>, initial: ScalarValue) -> Self {
         let name = name.into();
         let rt = scalar_family_record_type(&initial, false);
         Self::from_record(make_scalar_record(&name, rt, initial))
     }
     /// Dynamically typed scalar record, writable over the wire.
+    ///
+    /// Same type coverage as [`Pv::<ScalarValue>::scalar_in`] — the wire
+    /// value type is whatever `ScalarValue` variant `initial` holds, across
+    /// all twelve NTScalar types.
+    ///
+    /// ```
+    /// use spvirit_server::Pv;
+    /// use spvirit_types::ScalarValue;
+    ///
+    /// let gain = Pv::<ScalarValue>::scalar_out("SIM:GAIN", ScalarValue::U16(1));
+    /// ```
     pub fn scalar_out(name: impl Into<String>, initial: ScalarValue) -> Self {
         let name = name.into();
         let rt = scalar_family_record_type(&initial, true);

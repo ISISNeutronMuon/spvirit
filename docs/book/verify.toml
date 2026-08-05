@@ -62,6 +62,8 @@ py_examples = ["spvirit-py/examples/demo_scalars.py"]
 anchors = [
   "spvirit-server/examples/scalar_metadata.rs:meta",
   "spvirit-py/examples/demo_scalars.py:meta",
+  "spvirit-server/examples/scalar_metadata.rs:types",
+  "spvirit-py/examples/demo_scalars.py:types",
 ]
 
 [chapters."03-progressive/read-write.md"]

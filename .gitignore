@@ -35,3 +35,4 @@ demo
 # Local agent workflow scratch (specs/plans/ledger) - not part of the dev docs
 .superpowers/
 docs/superpowers/
+graphify*

@@ -5,6 +5,13 @@
 //! which is the only way to set them in code. The `PvaServer::builder()`
 //! record methods take a name and an initial value and nothing else.
 //!
+//! Also demonstrates picking the NTScalar wire type explicitly via
+//! `Pv::<ScalarValue>::scalar_in`/`scalar_out`, for the eight types
+//! (`byte`/`short`/`ubyte`/`ushort`/`uint`/`ulong`, plus explicit
+//! `float`/`bool`/`long`/`string`) the fixed-type constructors
+//! (`Pv::ai`/`ao`/`bi`/`bo`/`longin`/`longout`/`string_in`/`string_out`)
+//! don't reach.
+//!
 //! Try it:
 //!   cargo run -p spvirit-server --example scalar_metadata
 //!
@@ -16,8 +23,11 @@
 //!                              # advertised to clients, not enforced by
 //!                              # the server. Reject out-of-range writes
 //!                              # yourself with `.on_put(...)`.
+//!   spinfo SIM:GAIN            # wire type: ushort
+//!   spinfo SIM:STATUS          # wire type: byte
 
-use spvirit_server::{Pv, PvaServer};
+use spvirit_server::{AnyPv, Pv, PvaServer};
+use spvirit_types::ScalarValue;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,9 +48,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .desc("Demanded temperature")
         .drive_limits(0.0, 100.0);
 
-    let server = PvaServer::serve([temperature.clone(), setpoint.clone()])
-        .build()
-        .await;
+    // ANCHOR: types
+    // `scalar_out`/`scalar_in` pick the wire type from the `ScalarValue`
+    // variant of `initial` — not from Rust's `u16`/`u8`, which have no
+    // native `Pv<T>` handle of their own. This is the route to the eight
+    // NTScalar types `ai`/`ao`/`bi`/`bo`/`longin`/`longout`/`string_in`/
+    // `string_out` don't cover.
+    let gain = Pv::<ScalarValue>::scalar_out("SIM:GAIN", ScalarValue::U16(1));
+    let status = Pv::<ScalarValue>::scalar_in("SIM:STATUS", ScalarValue::U8(0));
+    // ANCHOR_END: types
+
+    let server = PvaServer::serve([
+        AnyPv::from(temperature.clone()),
+        AnyPv::from(setpoint.clone()),
+        AnyPv::from(gain.clone()),
+        AnyPv::from(status.clone()),
+    ])
+    .build()
+    .await;
     // ANCHOR_END: meta
 
     server.run().await

@@ -164,13 +164,25 @@ impl Expression {
     /// `calcPerform.c:400-411`, not evaluated-then-discarded the way Task
     /// 3's placeholder `Op::Cond` used to.
     ///
-    /// Takes `&[f64; 21]` by shared reference rather than `&mut`. Ruling 2
-    /// flags that a later `:=` (store) operator will need write-back to the
-    /// operand array; when that lands this signature will need to become
-    /// `&mut [f64; 21]` (or return a separate store set) and every caller of
-    /// `eval` will need updating. Task 3 doesn't build `:=` yet, so this
-    /// method takes the narrower, safer `&` for now rather than
-    /// pre-committing to a mutation strategy Task 5/6 haven't motivated.
+    /// # Evaluation may WRITE to `args`
+    ///
+    /// Takes `&mut [f64; 21]`, not `&`. RULINGS.md Ruling 2 left the choice
+    /// between write-back and returning a separate store set; task-8a-brief.md
+    /// settled it on write-back, because Base's own
+    /// `calcPerform(double *parg, ...)` takes a non-const pointer and the
+    /// `STORE_A`..`STORE_U` opcodes assign straight through it
+    /// (`refs/calcPerform.c:102-124`), so write-back is the Base-faithful
+    /// shape and the standing "Base wins" rule selects it.
+    ///
+    /// Which slots can be written: **any** of the 21, determined entirely by
+    /// the compiled expression. Every `:=` in the source compiles to an
+    /// `Op::Store(i)` that assigns `args[i]`. An expression containing no
+    /// `:=` never writes (verified by
+    /// `eval_does_not_write_args_without_a_store`), but the signature cannot
+    /// express that distinction, so callers who need their input preserved
+    /// must copy it themselves. Task 8's `calcArgUsage`-equivalent stores
+    /// mask will let callers learn which slots a given expression can write
+    /// before evaluating it.
     ///
     /// `RNDM` makes this method's output nondeterministic in three ways a
     /// caller can't see from the signature: (1) draws come from a
@@ -181,7 +193,7 @@ impl Expression {
     /// (matching `calcRandom`'s documented range), unlike the half-open
     /// `[0, 1)` most Rust RNGs produce. Callers who need a reproducible or
     /// isolated sequence should use [`Expression::eval_with_rng`] instead.
-    pub fn eval(&self, args: &[f64; 21]) -> f64 {
+    pub fn eval(&self, args: &mut [f64; 21]) -> f64 {
         self.run(args, &mut next_rndm)
     }
 
