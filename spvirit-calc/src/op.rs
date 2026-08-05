@@ -183,11 +183,17 @@ pub enum Op {
     /// divergence to paper over here.
     Shr,
     /// `refs/calcPerform.c:365-368` `RIGHT_SHIFT_LOGIC`:
-    /// `d2ui(*ptop) >> (d2ui(top) & 31u)` - logical (zero-filling) shift of
-    /// the UNSIGNED reinterpretation, with the signed-widening-back-to-f64
-    /// rule still applying to the result afterward, same as every other
-    /// bitwise op. `refs/postfix.c:172` - `>>>`, required by RULINGS.md
-    /// Ruling 2 even though task-6-brief.md's text never mentions it.
+    /// `*ptop = (double)(d2ui(*ptop) >> (d2ui(top) & 31u));` - logical
+    /// (zero-filling) shift of the UNSIGNED reinterpretation. Unlike every
+    /// other bitwise op here, the result is widened to `f64` DIRECTLY from
+    /// `epicsUInt32`, not re-cast to signed first: the "result is always
+    /// signed" rule from the `d2i`/`d2ui` twelve-line comment
+    /// (`calcPerform.c:314-324`) is stated about `d2i`, and
+    /// `RIGHT_SHIFT_LOGIC` is Base's documented exception to it, not
+    /// another instance of it - so this is the one op whose result can be
+    /// as large as `4294967295.0`, never negative. `refs/postfix.c:172` -
+    /// `>>>`, required by RULINGS.md Ruling 2 even though
+    /// task-6-brief.md's text never mentions it.
     ShrLogic,
 }
 

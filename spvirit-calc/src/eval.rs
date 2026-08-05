@@ -500,17 +500,26 @@ impl Expression {
                 }
                 Op::ShrLogic => {
                     // calcPerform.c:365-368 `case RIGHT_SHIFT_LOGIC`:
-                    // `d2ui(*ptop) >> (d2ui(top) & 31u)` - logical
-                    // (zero-filling) shift of the UNSIGNED reinterpretation.
-                    // The signed-widening-back-to-f64 rule still applies to
-                    // the result afterward, same as every other bitwise op
-                    // (see `logical_shift_right_matches_corpus_examples`,
-                    // whose expected values are themselves negative `i32`
-                    // bit patterns).
+                    // `*ptop = (double)(d2ui(*ptop) >> (d2ui(top) & 31u));`
+                    // The C shift expression has type `epicsUInt32` - Base
+                    // widens it to `double` DIRECTLY from `epicsUInt32`, not
+                    // through a re-cast to `epicsInt32` first. This is the
+                    // one bitwise op where the "result is always signed"
+                    // rule from the `d2i`/`d2ui` twelve-line comment
+                    // (`calcPerform.c:314-324`) does NOT apply - that rule
+                    // is stated in the context of `d2i`, and
+                    // `RIGHT_SHIFT_LOGIC` is Base's documented exception to
+                    // it, not another instance of it. So the result stays
+                    // in `[0, 4294967295]`, unlike every other bitwise op
+                    // here (all of which route through `d2i` and do widen
+                    // as signed). See
+                    // `logical_shift_right_result_is_unsigned_unlike_every_other_bitwise_op`
+                    // for the pinning test - a fixed value like
+                    // `-1 >>> 0` must come out `4294967295.0`, not `-1.0`.
                     let b = stack.pop().expect("arity checked at compile time");
                     let a = stack.pop().expect("arity checked at compile time");
                     let shift = d2ui(b) & 31;
-                    stack.push((d2ui(a).wrapping_shr(shift) as i32) as f64);
+                    stack.push(d2ui(a).wrapping_shr(shift) as f64);
                 }
             }
             ip += 1;
@@ -995,12 +1004,14 @@ mod tests {
 
     // `>>>` (`RIGHT_SHIFT_LOGIC`, `calcPerform.c:365-368`) is the UNSIGNED
     // shift Ruling 2 requires even though the task-6-brief.md text never
-    // mentions it: `(d2ui(a) >> (d2ui(b) & 31)) as i32 as f64`. Unlike `>>`
-    // (arithmetic, sign-extending), a negative operand's sign bit is treated
-    // as data, not extended - so a negative dividend right-shifted with
-    // `>>>` comes out small and positive-looking in bit pattern (though
-    // still widened back to signed per the rule above), rather than staying
-    // negative the way `>>` would.
+    // mentions it. Unlike `>>` (arithmetic, sign-extending), a negative
+    // operand's sign bit is treated as data, not extended - so a negative
+    // dividend right-shifted with `>>>` comes out small and
+    // positive-looking in bit pattern. This op's RESULT also stays
+    // unsigned/non-negative (see the fix-round-1 note on `Op::ShrLogic`'s
+    // doc and `logical_shift_right_result_is_unsigned_unlike_every_other_bitwise_op`
+    // below) - `15.0` here happens not to distinguish that, since it has no
+    // sign ambiguity either way; that distinction is pinned separately.
     #[test]
     fn logical_shift_right_does_not_sign_extend_unlike_arithmetic_shift_right() {
         // -1 (0xFFFFFFFF) >> 28 (arithmetic, sign-extends) == -1 (still all
@@ -1012,16 +1023,42 @@ mod tests {
     }
 
     // `refs/epicsCalcTest.cpp:1030-1033`: unsigned shift-right examples,
-    // transcribed directly (`0xaaaaaaaa` as an `i32` bit pattern is
-    // `-1431655766.0`, matching how this crate always returns bitwise
-    // results as signed).
+    // transcribed directly. `>>` (`Op::Shr`) widens its result as signed
+    // (like every op routed through `d2i`), so `0xFFAAAAAA` comes out as the
+    // negative `i32` reinterpretation `-5592406.0`. `>>>` (`Op::ShrLogic`)
+    // is Base's documented exception (`calcPerform.c:365-368`: the shift
+    // expression is `epicsUInt32`, widened to `double` directly, never
+    // re-cast to signed) - `0x00AAAAAA` has bit 31 clear either way here, so
+    // this particular pair doesn't yet distinguish "widened unsigned" from
+    // "widened signed"; see the dedicated test below for a case where it
+    // does (bit 31 set after the logical shift).
     #[test]
     fn logical_shift_right_matches_corpus_examples() {
         let bits_0xaaaaaaaa = -1431655766.0; // 0xAAAAAAAA reinterpreted i32
         let bits_0xffaaaaaa = -5592406.0; // 0xFFAAAAAA reinterpreted i32
-        let bits_0x00aaaaaa = 11184810.0; // 0x00AAAAAA reinterpreted i32
+        let bits_0x00aaaaaa = 11184810.0; // 0x00AAAAAA, no sign bit either way
         assert_eq!(ev("A>>B", &[bits_0xaaaaaaaa, 8.0]), bits_0xffaaaaaa);
         assert_eq!(ev("A>>>B", &[bits_0xaaaaaaaa, 8.0]), bits_0x00aaaaaa);
+    }
+
+    // Critical review fix (Fix round 1): `Op::ShrLogic`'s result must stay
+    // in `[0, 4294967295]` - `calcPerform.c:365-368`'s C shift expression
+    // has type `epicsUInt32` and Base widens it to `double` DIRECTLY, never
+    // re-casting to `epicsInt32` first the way every other bitwise op here
+    // does. A prior version of this crate wrongly reinterpreted the
+    // `wrapping_shr` result as `i32` before widening, which is
+    // indistinguishable from correct on `bits_0x00aaaaaa` above (bit 31
+    // clear) but wrong whenever bit 31 of the shifted result is set - e.g.
+    // `-1 >>> 0` is `0xFFFFFFFF` unshifted, all bits set: Base returns
+    // `4294967295.0`, but the wrong signed-reinterpretation would have
+    // returned `-1.0`. Likewise `2863311530.1 >>> 0` (a value whose `d2ui`
+    // is already `0xAAAAAAAA`, bit 31 set, per the `d2i`/`d2ui` bit-31
+    // asymmetry tests above): Base returns `2863311530.0`, not
+    // `-1431655766.0`.
+    #[test]
+    fn logical_shift_right_result_is_unsigned_unlike_every_other_bitwise_op() {
+        assert_eq!(ev("A>>>B", &[-1.0, 0.0]), 4294967295.0);
+        assert_eq!(ev("A>>>B", &[2863311530.1, 0.0]), 2863311530.0);
     }
 
     // Shift counts are masked to `0..=31` (`d2i(top) & 31` /

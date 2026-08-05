@@ -979,10 +979,17 @@ mod tests {
 
     // `|`/`OR`/`XOR` (priority 1) share a level with `||` (already `Op::OrL`,
     // priority 1): `A||B|C` must pop the pending `OrL` before pushing `OrB`,
-    // same left-associative tie as above. If `OrB` were given a LOOSER
-    // priority than `OrL` (e.g. 0), `pop_while` would leave `OrL` pending and
-    // the final unwind would emit `OrB` before `OrL`, producing
-    // `[Arg0, Arg1, Arg2, OrB, OrL]` (`A||(B|C)`) instead.
+    // same left-associative tie as above.
+    //
+    // Fix round 1 (Important 2): a looser `prec` pops MORE under
+    // `Assoc::Left` (`top_prec >= prec`), not less, so a mistakenly LOOSER
+    // `OrB` (e.g. 0) would still satisfy `top_prec(OrL=1) >= 0` and produce
+    // this same expected sequence - this test does not catch that mutation.
+    // What it does catch: a mistakenly TIGHTER `OrB` (e.g. 2, wrongly
+    // grouped with `&`'s level). Then at `|`, `pop_while(2, Left)` sees
+    // `top_prec(OrL=1) >= 2` as false, leaves `OrL` pending, and the final
+    // unwind emits `OrB` before `OrL`: `[Arg0, Arg1, Arg2, OrB, OrL]`
+    // (`A||(B|C)`) instead of the asserted `(A||B)|C`.
     #[test]
     fn bitwise_or_shares_precedence_with_logical_or() {
         assert_eq!(
@@ -993,8 +1000,14 @@ mod tests {
 
     // `&`/`AND`/shifts (priority 2) share a level with `&&` (already
     // `Op::AndL`, priority 2): mirrors the `OrL`/`OrB` tie above one level
-    // up. If `AndB` were looser than `AndL`, the pending `AndL` would survive
-    // `pop_while` and the unwind would emit `AndB` first instead.
+    // up, with the same fix-round-1 correction: a mistakenly LOOSER `AndB`
+    // (e.g. 1) would still satisfy `top_prec(AndL=2) >= 1` and produce this
+    // same expected sequence, so this test does not catch that mutation.
+    // What it catches: a mistakenly TIGHTER `AndB` (e.g. 3, wrongly grouped
+    // with relational). Then at `&`, `pop_while(3, Left)` sees
+    // `top_prec(AndL=2) >= 3` as false, leaves `AndL` pending, and the
+    // unwind emits `AndB` before `AndL`: `[Arg0, Arg1, Arg2, AndB, AndL]`
+    // (`A&&(B&C)`) instead of the asserted `(A&&B)&C`.
     #[test]
     fn bitwise_and_shares_precedence_with_logical_and() {
         assert_eq!(
@@ -1059,16 +1072,41 @@ mod tests {
     }
 
     // Unary `~` (priority 7, same level as `Neg`/`NotL`) vs relational
-    // (priority 3), mirroring the existing `not_binds_tighter_than_relational`
-    // test above for `NotL`. If `NotB` were priority 3 or looser (tied with
-    // or looser than relational), `>`'s `pop_while` would fail to pop the
-    // pending `NotB` before combining, producing `[Arg0, Arg1, Gt, NotB]`
-    // (`~(A>B)`) instead of the expected `(~A)>B`.
+    // (priority 3). `>` is left-associative, so its `pop_while(3, Left)`
+    // pops whenever `top_prec >= 3` -- that includes the tie case, so a
+    // `NotB` priority of exactly 3 would still (correctly, if coincidentally)
+    // pop and pass this test. The boundary this test actually catches is
+    // `NotB` priority *strictly below* 3, which would leave `NotB` stuck on
+    // the stack when `>` fires, producing `[Arg0, Arg1, Gt, NotB]`
+    // (`~(A>B)`) instead of the expected `(~A)>B`. Mirrors
+    // `not_binds_tighter_than_relational` above for `NotL`.
     #[test]
     fn bitwise_not_binds_tighter_than_relational() {
         assert_eq!(
             ops("~A>B"),
             vec![Op::Arg(0), Op::NotB, Op::Arg(1), Op::Gt]
+        );
+    }
+
+    // `~` vs `^` (Pow, priority 6, left-associative -- the tightest binary
+    // level). Pins `ops("~A^B") == (~A)^B` per Base (`~` is `postfix.c`
+    // prio 7/8, `^`/`**` is 6/6, so `~` binds first). Re-derived carefully
+    // rather than assumed: this test does NOT distinguish a `NotB` priority
+    // of exactly 6 from the correct 7. `^`'s `pop_while(6, Left)` pops
+    // whenever `top_prec >= 6`, which holds for both 6 and 7 alike, so both
+    // values produce the identical sequence asserted below. What this test
+    // *does* catch is any `NotB` priority below 6 (e.g. accidentally tied
+    // with `Mul`/`Add`/relational): `pop_while` would then leave `NotB` on
+    // the stack until `^` is pushed, unwinding to `[Arg0, Arg1, Pow, NotB]`
+    // (`~(A^B)`) instead of the expected `(~A)^B`. Since 6 is the tightest
+    // binary level, no expression built from `pop_while` alone can ever
+    // separate 6 from 7 for a right-associative unary prefix op -- that gap
+    // is inherent to the single-number precedence model, not a test gap.
+    #[test]
+    fn bitwise_not_binds_tighter_than_power() {
+        assert_eq!(
+            ops("~A^B"),
+            vec![Op::Arg(0), Op::NotB, Op::Arg(1), Op::Pow]
         );
     }
 
