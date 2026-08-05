@@ -1,0 +1,42 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "spvirit-tools"
+description = "Command-line tools for EPICS PVAccess: get, put, monitor, list, info, and a terminal browser."
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+authors = [
+    { name = "Mateusz Leputa", email = "mateo.leputa@googlemail.com" },
+]
+requires-python = ">=3.9"
+keywords = ["epics", "pvaccess", "ioc", "controls", "instrumentation", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: System :: Hardware",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/ISISNeutronMuon/spvirit"
+Issues = "https://github.com/ISISNeutronMuon/spvirit/issues"
+
+[tool.maturin]
+# Version comes from Cargo.toml, which inherits it from the workspace.
+#
+# `bindings = "bin"` is stated explicitly rather than left to auto-detection:
+# maturin only infers it for a crate with a single binary target and no
+# library, and this crate has a library plus twelve binaries. In this mode the
+# binaries are packaged as wheel scripts, which pip installs into the
+# environment's bin/Scripts directory -- i.e. onto PATH.
+#
+# The build uses the crate's default features (client, server, tui) so all
+# twelve tools are produced. No Python ABI is involved, so the wheel tags as
+# py3-none-<platform>.
+bindings = "bin"
