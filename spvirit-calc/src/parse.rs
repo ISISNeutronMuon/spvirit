@@ -754,6 +754,9 @@ fn ident_to_op(name: &str) -> Result<Op, CalcError> {
         "ACOS" => Op::Acos,
         "ATAN" => Op::Atan,
         "ATAN2" => Op::Atan2,
+        // `{"FMOD", 7, 8, -1, UNARY_OPERATOR, FMOD}` in `refs/postfix.c`'s
+        // `operands[]` table. Two arguments, like `ATAN2`.
+        "FMOD" => Op::Fmod,
         "SINH" => Op::Sinh,
         "COSH" => Op::Cosh,
         "TANH" => Op::Tanh,

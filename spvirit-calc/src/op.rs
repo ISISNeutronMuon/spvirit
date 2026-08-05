@@ -111,6 +111,14 @@ pub enum Op {
     /// "Ouch!: Args backwards!": `ATAN2(A,B)` evaluates to `atan2(B, A)`,
     /// not the mathematically expected `atan2(A, B)`. Do not "fix" this.
     Atan2,
+    /// C `fmod` on the two operands (`refs/calcPerform.c` `case FMOD:
+    /// *ptop = fmod(*ptop, top)`). Distinct from `Op::Modulo` (`%`), which
+    /// Base defines as *integer* modulo (RULINGS.md Ruling 5). Spelled
+    /// `FMOD(a, b)`; the table entry is
+    /// `{"FMOD", 7, 8, -1, UNARY_OPERATOR, FMOD}` in `refs/postfix.c`'s
+    /// `operands[]`, i.e. a two-argument function despite the
+    /// `UNARY_OPERATOR` tag (the tag only controls parse position).
+    Fmod,
     Sinh,
     Cosh,
     Tanh,
@@ -396,6 +404,7 @@ pub(crate) fn precedence(op: &Op) -> (u8, Assoc) {
         | Op::Acos
         | Op::Atan
         | Op::Atan2
+        | Op::Fmod
         | Op::Sinh
         | Op::Cosh
         | Op::Tanh
@@ -452,6 +461,7 @@ pub(crate) fn arity(op: &Op) -> usize {
         | Op::Modulo
         | Op::Pow
         | Op::Atan2
+        | Op::Fmod
         | Op::Gt
         | Op::Ge
         | Op::Lt

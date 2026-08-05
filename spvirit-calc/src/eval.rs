@@ -445,6 +445,17 @@ impl Expression {
                     let a = stack.pop().expect("arity checked at compile time");
                     stack.push(b.atan2(a));
                 }
+                // `refs/calcPerform.c` `case FMOD: *ptop = fmod(*ptop, top)`.
+                // `top` is the second (upper) argument and `*ptop` the first,
+                // so `FMOD(a, b)` is `fmod(a, b)` - argument order is NOT
+                // reversed here, unlike `ATAN2` immediately above. Rust's
+                // `%` on `f64` is defined as C's `fmod`, including the
+                // sign-of-dividend rule and NaN for a zero divisor.
+                Op::Fmod => {
+                    let second = stack.pop().expect("arity checked at compile time");
+                    let first = stack.pop().expect("arity checked at compile time");
+                    stack.push(first % second);
+                }
                 Op::Sinh => {
                     let a = stack.pop().expect("arity checked at compile time");
                     stack.push(a.sinh()); // calcPerform.c:246-248 SINH: sinh

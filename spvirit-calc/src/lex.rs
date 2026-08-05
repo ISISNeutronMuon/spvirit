@@ -87,8 +87,16 @@ fn lex_number(s: &str) -> Option<(f64, usize)> {
         if len == 0 {
             return None;
         }
-        let value = u64::from_str_radix(&rest[..len], 16).ok()?;
-        return Some((value as f64, 2 + len));
+        // Base parses hex with `epicsParseUInt32` and stores the result into
+        // the postfix stream as raw `epicsUInt32` bits under a `LITERAL_INT`
+        // tag (`refs/postfix.c:280-290`); `calcPerform` then reloads those
+        // bits as an `epicsInt32` before widening to double
+        // (`refs/calcPerform.c:68-71`). So bit 31 is a sign bit: `0xffffffff`
+        // is -1, not 4294967295. Values that do not fit in 32 bits are
+        // rejected (Base's `epicsParseUInt32` fails -> `CALC_ERR_BAD_LITERAL`,
+        // which maps to this crate's `BadNumber`).
+        let value = u32::from_str_radix(&rest[..len], 16).ok()?;
+        return Some((value as i32 as f64, 2 + len));
     }
 
     // Longest prefix that parses as a float. Bounded by the literal's length,
