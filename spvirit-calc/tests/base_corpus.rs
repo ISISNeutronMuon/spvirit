@@ -599,6 +599,291 @@ fn slice_max_min(c: &mut Corpus) {
 }
 
 // ---------------------------------------------------------------------------
+// Slice 3: BINARY_OPERATOR elements (epicsCalcTest.cpp:577-829)
+// ---------------------------------------------------------------------------
+
+fn slice_binary_operators(c: &mut Corpus) {
+    // `!=` (`:578-596`). Rust and C agree on every IEEE-754 comparison,
+    // including the NaN rows, so these are direct translations.
+    c.calc("0 != 1", b(0.0 != 1.0));
+    c.calc("0 != 0", b(0.0 != 0.0));
+    c.calc("1 != 0", b(1.0 != 0.0));
+    // C parses this as `(1 != 0) != 2`, left-associative, the int 1 vs 2.
+    c.calc("1 != 0 != 2", b(b(1.0 != 0.0) != 2.0));
+    c.calc("0.0 != Inf", b(0.0 != INF));
+    c.calc("0.0 != -Inf", b(0.0 != -INF));
+    c.calc("0.0 != NaN", b(0.0 != NAN));
+    c.calc("Inf != 0.0", b(INF != 0.0));
+    c.calc("Inf != Inf", b(INF != INF));
+    c.calc("Inf != -Inf", b(INF != -INF));
+    c.calc("Inf != NaN", b(INF != NAN));
+    c.calc("-Inf != 0.0", b(-INF != 0.0));
+    c.calc("-Inf != Inf", b(-INF != INF));
+    c.calc("-Inf != -Inf", b(-INF != -INF));
+    c.calc("-Inf != NaN", b(-INF != NAN));
+    c.calc("NaN != 0.0", b(NAN != 0.0));
+    c.calc("NaN != Inf", b(NAN != INF));
+    c.calc("NaN != -Inf", b(NAN != -INF));
+    c.calc("NaN != NaN", b(NAN != NAN));
+
+    // `#` is Base's second spelling of `!=` (`refs/postfix.c:148`), `:598-601`
+    c.calc("0 # 1", b(0.0 != 1.0));
+    c.calc("0 # 0", b(0.0 != 0.0));
+    c.calc("1 # 0", b(1.0 != 0.0));
+    c.calc("1 # 0 # 2", b(b(1.0 != 0.0) != 2.0));
+
+    // `%` (`:603-606`). RULINGS.md Ruling 5 / `calcPerform.c` `case MODULO`:
+    // integer modulo through `epicsInt32`, NaN on a zero divisor - hence the
+    // expected values are C *int* `%`, not `fmod`. Rust's `i32 %` truncates
+    // toward zero exactly as C99's does, so `-7 % 4 == -3` in both.
+    c.calc("7 % 4", (7i32 % 4i32) as f64);
+    c.calc("-7 % 4", (-7i32 % 4i32) as f64);
+    c.calc("63 % 16 % 6", ((63i32 % 16i32) % 6i32) as f64);
+    c.calc("1 % 0", NAN);
+
+    c.calc("7 & 4", (7i32 & 4i32) as f64);
+
+    // `&&` (`:610-613`)
+    c.calc("0 && 0", b(false));
+    c.calc("0 && 1", b(false));
+    c.calc("1 && 0", b(false));
+    c.calc("1 && 1", b(true));
+
+    // `*` (`:615-630`)
+    c.calc("2 * 2", 2.0 * 2.0);
+    c.calc("0.0 * Inf", 0.0 * INF);
+    c.calc("0.0 * -Inf", 0.0 * -INF);
+    c.calc("0.0 * NaN", 0.0 * NAN);
+    c.calc("Inf * 0.0", INF * 0.0);
+    c.calc("Inf * Inf", INF * INF);
+    c.calc("Inf * -Inf", INF * -INF);
+    c.calc("Inf * NaN", INF * NAN);
+    c.calc("-Inf * 0.0", -INF * 0.0);
+    c.calc("-Inf * Inf", -INF * INF);
+    c.calc("-Inf * -Inf", -INF * -INF);
+    c.calc("-Inf * NaN", -INF * NAN);
+    c.calc("NaN * 0.0", NAN * 0.0);
+    c.calc("NaN * Inf", NAN * INF);
+    c.calc("NaN * -Inf", NAN * -INF);
+    c.calc("NaN * NaN", NAN * NAN);
+
+    // `**` (`:632-636`)
+    c.calc("2 ** 0.2", 2.0f64.powf(0.2));
+    c.calc("2 ** -0.2", 2.0f64.powf(-0.2));
+    c.calc("-0.2 ** 2", (-0.2f64).powf(2.0));
+    c.calc("-0.2 ** -2", (-0.2f64).powf(-2.0));
+    // `:636` - POWER is LEFT-associative (RULINGS.md Ruling 4):
+    // pow(pow(2,2),3) == 64, not pow(2,pow(2,3)) == 256.
+    c.calc("2 ** 2 ** 3", 2.0f64.powf(2.0).powf(3.0));
+
+    // `+` (`:638-661`)
+    c.calc("0 + 1", 0.0 + 1.0);
+    c.calc("0.0 + Inf", 0.0 + INF);
+    c.calc("0.0 + -Inf", 0.0 + -INF);
+    c.calc("0.0 + NaN", 0.0 + NAN);
+    c.calc("Inf + 0.0", INF + 0.0);
+    c.calc("Inf + Inf", INF + INF);
+    // `:644-648`: guarded by `#if defined(_WIN32) && defined(_MSC_VER)`. Both
+    // arms of the `#if` produce the identical expression text "Inf + -Inf" and
+    // the identical expected value NaN (the MSVC arm spells it out because
+    // MSVC's constant folder mishandles the C-side expression, not because the
+    // CALC answer differs), so the two macro invocations collapse to one case
+    // here - which is also why the file has 689 invocations but testPlan(687).
+    c.calc("Inf + -Inf", NAN);
+    c.calc("Inf + NaN", INF + NAN);
+    c.calc("-Inf + 0.0", -INF + 0.0);
+    // `:651-655`, same collapse as above.
+    c.calc("-Inf + Inf", NAN);
+    c.calc("-Inf + -Inf", -INF + -INF);
+    c.calc("-Inf + NaN", -INF + NAN);
+    c.calc("NaN + 0.0", NAN + 0.0);
+    c.calc("NaN + Inf", NAN + INF);
+    c.calc("NaN + -Inf", NAN + -INF);
+    c.calc("NaN + NaN", NAN + NAN);
+
+    // `-` (`:663-679`)
+    c.calc("0 - 1", 0.0 - 1.0);
+    c.calc("0 - 1 - 2", 0.0 - 1.0 - 2.0);
+    c.calc("0.0 - Inf", 0.0 - INF);
+    c.calc("0.0 - -Inf", 0.0 - -INF);
+    c.calc("0.0 - NaN", 0.0 - NAN);
+    c.calc("Inf - 0.0", INF - 0.0);
+    c.calc("Inf - Inf", INF - INF);
+    c.calc("Inf - -Inf", INF - -INF);
+    c.calc("Inf - NaN", INF - NAN);
+    c.calc("-Inf - 0.0", -INF - 0.0);
+    c.calc("-Inf - Inf", -INF - INF);
+    c.calc("-Inf - -Inf", -INF - -INF);
+    c.calc("-Inf - NaN", -INF - NAN);
+    c.calc("NaN - 0.0", NAN - 0.0);
+    c.calc("NaN - Inf", NAN - INF);
+    c.calc("NaN - -Inf", NAN - -INF);
+    c.calc("NaN - NaN", NAN - NAN);
+
+    // `/` (`:681-697`)
+    c.calc("2.0 / 3.0", 2.0 / 3.0);
+    c.calc("1.0 / 2.0 / 3.0", 1.0 / 2.0 / 3.0);
+    c.calc("0.0 / Inf", 0.0 / INF);
+    c.calc("0.0 / -Inf", 0.0 / -INF);
+    c.calc("0.0 / NaN", 0.0 / NAN);
+    c.calc("Inf / 1.0", INF / 1.0);
+    c.calc("Inf / Inf", INF / INF);
+    c.calc("Inf / -Inf", INF / -INF);
+    c.calc("Inf / NaN", INF / NAN);
+    c.calc("-Inf / 1.0", -INF / 1.0);
+    c.calc("-Inf / Inf", -INF / INF);
+    c.calc("-Inf / -Inf", -INF / -INF);
+    c.calc("-Inf / NaN", -INF / NAN);
+    c.calc("NaN / 1.0", NAN / 1.0);
+    c.calc("NaN / Inf", NAN / INF);
+    c.calc("NaN / -Inf", NAN / -INF);
+    c.calc("NaN / NaN", NAN / NAN);
+
+    // `<` (`:699-717`)
+    c.calc("0 < 1", b(0.0 < 1.0));
+    c.calc("0 < 0", b(0.0 < 0.0));
+    c.calc("1 < 0", b(1.0 < 0.0));
+    c.calc("2 < 0 < 2", b(b(2.0 < 0.0) < 2.0));
+    c.calc("0.0 < Inf", b(0.0 < INF));
+    c.calc("0.0 < -Inf", b(0.0 < -INF));
+    c.calc("0.0 < NaN", b(0.0 < NAN));
+    c.calc("Inf < 0.0", b(INF < 0.0));
+    c.calc("Inf < Inf", b(INF < INF));
+    c.calc("Inf < -Inf", b(INF < -INF));
+    c.calc("Inf < NaN", b(INF < NAN));
+    c.calc("-Inf < 0.0", b(-INF < 0.0));
+    c.calc("-Inf < Inf", b(-INF < INF));
+    c.calc("-Inf < -Inf", b(-INF < -INF));
+    c.calc("-Inf < NaN", b(-INF < NAN));
+    c.calc("NaN < 0.0", b(NAN < 0.0));
+    c.calc("NaN < Inf", b(NAN < INF));
+    c.calc("NaN < -Inf", b(NAN < -INF));
+    c.calc("NaN < NaN", b(NAN < NAN));
+
+    // `<<` (`:719-720`)
+    c.calc("1 << 2", (1i32 << 2) as f64);
+    c.calc("1 << 3 << 2", ((1i32 << 3) << 2) as f64);
+
+    // `<=` (`:722-740`)
+    c.calc("0 <= 1", b(0.0 <= 1.0));
+    c.calc("0 <= 0", b(0.0 <= 0.0));
+    c.calc("1 <= 0", b(1.0 <= 0.0));
+    c.calc("3 <= 2 <= 3", b(b(3.0 <= 2.0) <= 3.0));
+    c.calc("0.0 <= Inf", b(0.0 <= INF));
+    c.calc("0.0 <= -Inf", b(0.0 <= -INF));
+    c.calc("0.0 <= NaN", b(0.0 <= NAN));
+    c.calc("Inf <= 0.0", b(INF <= 0.0));
+    c.calc("Inf <= Inf", b(INF <= INF));
+    c.calc("Inf <= -Inf", b(INF <= -INF));
+    c.calc("Inf <= NaN", b(INF <= NAN));
+    c.calc("-Inf <= 0.0", b(-INF <= 0.0));
+    c.calc("-Inf <= Inf", b(-INF <= INF));
+    c.calc("-Inf <= -Inf", b(-INF <= -INF));
+    c.calc("-Inf <= NaN", b(-INF <= NAN));
+    c.calc("NaN <= 0.0", b(NAN <= 0.0));
+    c.calc("NaN <= Inf", b(NAN <= INF));
+    c.calc("NaN <= -Inf", b(NAN <= -INF));
+    c.calc("NaN <= NaN", b(NAN <= NAN));
+
+    // `=` is Base's second spelling of `==` (`refs/postfix.c:167`), `:742-745`
+    c.calc("0 = 1", b(0.0 == 1.0));
+    c.calc("0 = 0", b(0.0 == 0.0));
+    c.calc("1 = 0", b(1.0 == 0.0));
+    c.calc("2 = 2 = 1", b(b(2.0 == 2.0) == 1.0));
+
+    // `==` (`:747-765`)
+    c.calc("0 == 1", b(0.0 == 1.0));
+    c.calc("0 == 0", b(0.0 == 0.0));
+    c.calc("1 == 0", b(1.0 == 0.0));
+    c.calc("2 == 2 == 1", b(b(2.0 == 2.0) == 1.0));
+    c.calc("0.0 == Inf", b(0.0 == INF));
+    c.calc("0.0 == -Inf", b(0.0 == -INF));
+    c.calc("0.0 == NaN", b(0.0 == NAN));
+    c.calc("Inf == 0.0", b(INF == 0.0));
+    c.calc("Inf == Inf", b(INF == INF));
+    c.calc("Inf == -Inf", b(INF == -INF));
+    c.calc("Inf == NaN", b(INF == NAN));
+    c.calc("-Inf == 0.0", b(-INF == 0.0));
+    c.calc("-Inf == Inf", b(-INF == INF));
+    c.calc("-Inf == -Inf", b(-INF == -INF));
+    c.calc("-Inf == NaN", b(-INF == NAN));
+    c.calc("NaN == 0.0", b(NAN == 0.0));
+    c.calc("NaN == Inf", b(NAN == INF));
+    c.calc("NaN == -Inf", b(NAN == -INF));
+    c.calc("NaN == NaN", b(NAN == NAN));
+
+    // `>` (`:767-785`)
+    c.calc("0 > 1", b(0.0 > 1.0));
+    c.calc("0 > 0", b(0.0 > 0.0));
+    c.calc("1 > 0", b(1.0 > 0.0));
+    c.calc("2 > 0 > 2", b(b(2.0 > 0.0) > 2.0));
+    c.calc("0.0 > Inf", b(0.0 > INF));
+    c.calc("0.0 > -Inf", b(0.0 > -INF));
+    c.calc("0.0 > NaN", b(0.0 > NAN));
+    c.calc("Inf > 0.0", b(INF > 0.0));
+    c.calc("Inf > Inf", b(INF > INF));
+    c.calc("Inf > -Inf", b(INF > -INF));
+    c.calc("Inf > NaN", b(INF > NAN));
+    c.calc("-Inf > 0.0", b(-INF > 0.0));
+    c.calc("-Inf > Inf", b(-INF > INF));
+    c.calc("-Inf > -Inf", b(-INF > -INF));
+    c.calc("-Inf > NaN", b(-INF > NAN));
+    c.calc("NaN > 0.0", b(NAN > 0.0));
+    c.calc("NaN > Inf", b(NAN > INF));
+    c.calc("NaN > -Inf", b(NAN > -INF));
+    c.calc("NaN > NaN", b(NAN > NAN));
+
+    // `>=` (`:787-805`)
+    c.calc("0 >= 1", b(0.0 >= 1.0));
+    c.calc("0 >= 0", b(0.0 >= 0.0));
+    c.calc("1 >= 0", b(1.0 >= 0.0));
+    c.calc("3 >= 2 >= 3", b(b(3.0 >= 2.0) >= 3.0));
+    c.calc("0.0 >= Inf", b(0.0 >= INF));
+    c.calc("0.0 >= -Inf", b(0.0 >= -INF));
+    c.calc("0.0 >= NaN", b(0.0 >= NAN));
+    c.calc("Inf >= 0.0", b(INF >= 0.0));
+    c.calc("Inf >= Inf", b(INF >= INF));
+    c.calc("Inf >= -Inf", b(INF >= -INF));
+    c.calc("Inf >= NaN", b(INF >= NAN));
+    c.calc("-Inf >= 0.0", b(-INF >= 0.0));
+    c.calc("-Inf >= Inf", b(-INF >= INF));
+    c.calc("-Inf >= -Inf", b(-INF >= -INF));
+    c.calc("-Inf >= NaN", b(-INF >= NAN));
+    c.calc("NaN >= 0.0", b(NAN >= 0.0));
+    c.calc("NaN >= Inf", b(NAN >= INF));
+    c.calc("NaN >= -Inf", b(NAN >= -INF));
+    c.calc("NaN >= NaN", b(NAN >= NAN));
+
+    // `>>` / `>>>` (`:807-810`). `>>` is arithmetic (i32), `>>>` logical (u32).
+    c.calc("8 >> 1", (8i32 >> 1) as f64);
+    c.calc("8 >>> 1", (8u32 >> 1u32) as f64);
+    c.calc("64 >> 2 >> 1", ((64i32 >> 2) >> 1) as f64);
+    c.calc("64 >>> 2 >>> 1", ((64u32 >> 2u32) >> 1u32) as f64);
+
+    // Word forms (`:812-816`). `:201,207,209`: `AND`->`&`, `OR`->`|`,
+    // `XOR`->`^` (C's xor; in CALC `^` is POWER and `XOR` is the xor).
+    c.calc("7 AND 4", (7i32 & 4i32) as f64);
+    c.calc("1 OR 8", (1i32 | 8i32) as f64);
+    c.calc("3 XOR 9", (3i32 ^ 9i32) as f64);
+
+    // `^` == POWER (`:818-822`)
+    c.calc("2 ^ 0.2", 2.0f64.powf(0.2));
+    c.calc("2 ^ -0.2", 2.0f64.powf(-0.2));
+    c.calc("(-0.2) ^ 2", (-0.2f64).powf(2.0));
+    c.calc("(-0.2) ^ -2", (-0.2f64).powf(-2.0));
+    // `:822` - the case RULINGS.md Ruling 4 cites: left-associative, 64.
+    c.calc("2 ^ 2 ^ 3", 2.0f64.powf(2.0).powf(3.0));
+
+    c.calc("1 | 8", (1i32 | 8i32) as f64);
+
+    // `||` (`:826-829`)
+    c.calc("0 || 0", b(false));
+    c.calc("0 || 1", b(true));
+    c.calc("1 || 0", b(true));
+    c.calc("1 || 1", b(true));
+}
+
+// ---------------------------------------------------------------------------
 // The test entry point
 // ---------------------------------------------------------------------------
 
@@ -608,6 +893,7 @@ fn base_corpus() {
 
     slice_literals_and_operands(&mut c);
     slice_max_min(&mut c);
+    slice_binary_operators(&mut c);
 
     if !c.skips.is_empty() {
         eprintln!(
