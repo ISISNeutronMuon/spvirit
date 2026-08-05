@@ -1475,4 +1475,217 @@ mod tests {
         assert_eq!(d2ui(2863311530.0), 2863311530);
         assert_eq!(d2ui(-1431655766.0), 2863311530);
     }
+
+    // --- Task 8a: store operator `:=` and expression terminator `;` ---
+
+    /// Like `ev`, but returns the (possibly written-back) operand array
+    /// alongside the result, so a store's effect on `args` is observable.
+    fn ev_args(src: &str, args: &[f64]) -> (f64, [f64; 21]) {
+        let mut a = [0.0f64; 21];
+        a[..args.len()].copy_from_slice(args);
+        let v = crate::compile(src).expect("compile").eval(&mut a);
+        (v, a)
+    }
+
+    // `refs/epicsCalcTest.cpp:846`: `testCalc("a := 0; a", 0)` - the store
+    // takes effect and the later fetch sees it, overwriting the incoming
+    // value.
+    #[test]
+    fn store_then_fetch_sees_the_stored_value() {
+        let (v, a) = ev_args("a := 0; a", &[5.0]);
+        assert_eq!(v, 0.0);
+        assert_eq!(a[0], 0.0);
+    }
+
+    // `refs/epicsCalcTest.cpp:868`: `testCalc("a; a := 0", a)` - the result is
+    // the value left on the stack by the FIRST fetch; the store's own popped
+    // value is not it. The write still happens.
+    #[test]
+    fn fetch_then_store_returns_the_earlier_fetch_not_the_stored_value() {
+        let (v, a) = ev_args("a; a := 0", &[5.0]);
+        assert_eq!(v, 5.0);
+        assert_eq!(a[0], 0.0);
+    }
+
+    // A fetch BEFORE and a fetch AFTER a store to the same slot, in one
+    // expression, pinning the ordering. `A := A + 1` reads the incoming `A`
+    // on its right-hand side (5), so the stored value is 6; the fetch in the
+    // next segment then sees 6, not 5. If the store were applied before its
+    // own right-hand side was read, the result would be 10; if the store
+    // never took effect, 50.
+    #[test]
+    fn store_ordering_within_one_expression() {
+        // `A := A + 1; A * 10`: reads the incoming A (5), stores 6, then the
+        // later fetch sees 6 -> 60.
+        let (v, a) = ev_args("A := A + 1; A * 10", &[5.0]);
+        assert_eq!(v, 60.0);
+        assert_eq!(a[0], 6.0);
+    }
+
+    // Stores across the whole A-U range, including `U` (index 20), read back
+    // through `args` after `eval` returns. RULINGS.md Ruling 1.
+    #[test]
+    fn stores_reach_every_slot_including_u() {
+        for i in 0..21usize {
+            let letter = (b'A' + i as u8) as char;
+            let src = format!("{letter} := {}; {letter}", i as f64 + 100.0);
+            let (v, a) = ev_args(&src, &[]);
+            assert_eq!(v, i as f64 + 100.0, "slot {letter}");
+            assert_eq!(a[i], i as f64 + 100.0, "slot {letter}");
+            // No other slot was touched.
+            for (j, got) in a.iter().enumerate() {
+                if j != i {
+                    assert_eq!(*got, 0.0, "slot {j} written by a store to {letter}");
+                }
+            }
+        }
+    }
+
+    // An expression with no `:=` must leave `args` byte-for-byte untouched.
+    // Referenced by `Expression::eval`'s doc comment.
+    #[test]
+    fn eval_does_not_write_args_without_a_store() {
+        let before = [1.5f64; 21];
+        let mut a = before;
+        let v = crate::compile("A+B*C ? SIN(D) : MAX(E,F)")
+            .expect("compile")
+            .eval(&mut a);
+        assert!(v.is_finite());
+        assert_eq!(a, before);
+    }
+
+    // Multiple `;`-separated expressions where an earlier store feeds a later
+    // one (`refs/epicsCalcTest.cpp:997`'s shape).
+    #[test]
+    fn chained_stores_feed_later_expressions() {
+        let (v, a) = ev_args("A := 2; B := A * 3; C := B + 1; C", &[]);
+        assert_eq!(v, 7.0);
+        assert_eq!(a[0], 2.0);
+        assert_eq!(a[1], 6.0);
+        assert_eq!(a[2], 7.0);
+    }
+
+    // THE TERNARY-STORE TEST, and it does NOT say what task-8a-brief.md
+    // predicted it would.
+    //
+    // The brief asked for "a store inside each arm of a ternary, showing the
+    // untaken arm does not store". That expression does not exist in Base's
+    // grammar. A store in the ELSE arm is a compile error (`COND_END` is on
+    // the operator stack, tripping `refs/postfix.c:297`'s guard - see
+    // parse.rs's `store_in_an_else_branch_is_rejected`), and a store in the
+    // THEN arm is not flushed by the `:` (strict `>` against equal
+    // priority 0, `refs/postfix.c:402-403` vs `:162`), so it HOISTS OUT of
+    // the conditional and runs on BOTH paths.
+    //
+    // So `A ? B := 1 : 2` is `B := (A ? 1 : 2)`: B is written either way,
+    // with whichever arm's value was selected. That is what this test pins,
+    // and it is the opposite of the conditional store the brief expected.
+    // `:=` is therefore NOT a discriminator for short-circuiting - see
+    // `untaken_ternary_branch_never_draws_from_the_rng` below for one that
+    // is.
+    #[test]
+    fn a_store_in_a_ternary_hoists_out_and_runs_on_both_paths() {
+        let (v, a) = ev_args("A ? B := 1 : 2; B", &[1.0, 77.0]);
+        assert_eq!(v, 1.0);
+        assert_eq!(a[1], 1.0);
+
+        let (v, a) = ev_args("A ? B := 1 : 2; B", &[0.0, 77.0]);
+        assert_eq!(v, 2.0);
+        // The "untaken" arm's store still fired - with the ELSE arm's value.
+        assert_eq!(a[1], 2.0);
+    }
+
+    // The black-box short-circuit discriminator Task 5's report said did not
+    // exist at the time. It is not `:=` (see above) - it is `RNDM` under the
+    // public `eval_with_rng`, which lets a caller count draws.
+    //
+    // `A ? 1 : RNDM` with A == 1: the else-branch's `Op::Rndm` must never
+    // execute, so the caller's generator is called ZERO times. Derived
+    // failing output under an eager implementation (Task 3's old "pop three,
+    // select one" `Op::Cond`, which evaluated both arms and discarded one):
+    // the result would still be 1.0, but `calls` would be 1. So the
+    // `calls == 0` assertion, and only that assertion, separates the two.
+    #[test]
+    fn untaken_ternary_branch_never_draws_from_the_rng() {
+        let e = crate::compile("A ? 1 : RNDM").expect("compile");
+
+        let mut calls = 0u32;
+        let mut rng = || {
+            calls += 1;
+            0.5
+        };
+        let v = e.eval_with_rng(&mut [1.0; 21], &mut rng);
+        drop(rng);
+        assert_eq!(v, 1.0);
+        assert_eq!(calls, 0, "else-branch RNDM was evaluated despite A != 0");
+
+        // Control: with A == 0 the else-branch IS taken and the draw happens,
+        // proving the zero above is short-circuiting rather than a
+        // never-wired-up generator.
+        let mut calls = 0u32;
+        let mut rng = || {
+            calls += 1;
+            0.5
+        };
+        let mut args = [0.0f64; 21];
+        let v = e.eval_with_rng(&mut args, &mut rng);
+        drop(rng);
+        assert_eq!(v, 0.5);
+        assert_eq!(calls, 1);
+    }
+
+    // `refs/epicsCalcTest.cpp:1037-1047`, transcribed early because they are
+    // the corpus's only store-plus-bitwise shapes and they exercise the
+    // `;`-flush between two stores. Results are compared as the `epicsUInt32`
+    // reinterpretation the corpus uses, since `d2i` widens back as signed.
+    #[test]
+    fn corpus_uint32_store_shapes() {
+        fn as_u32(v: f64) -> u32 {
+            (v as i64) as u32
+        }
+        let (v, _) = ev_args("a:=0xaaaaaaaa; b:=0xffff0000; a AND b", &[]);
+        assert_eq!(as_u32(v), 0xaaaa0000u32);
+        let (v, _) = ev_args("a:=0xaaaaaaaa; b:=0xffff0000; a OR b", &[]);
+        assert_eq!(as_u32(v), 0xffffaaaau32);
+        let (v, _) = ev_args("a:=0xaaaaaaaa; b:=0xffff0000; a XOR b", &[]);
+        assert_eq!(as_u32(v), 0x5555aaaau32);
+        let (v, _) = ev_args("a:=0xaaaaaaaa; ~a", &[]);
+        assert_eq!(as_u32(v), 0x55555555u32);
+        let (v, _) = ev_args("a:=0xaaaaaaaa; ~~a", &[]);
+        assert_eq!(as_u32(v), 0xaaaaaaaau32);
+        let (v, _) = ev_args("a:=0xaaaaaaaa; a >> 8", &[]);
+        assert_eq!(as_u32(v), 0xffaaaaaau32);
+        let (v, _) = ev_args("a:=0xaaaaaaaa; a >>> 8", &[]);
+        assert_eq!(as_u32(v), 0x00aaaaaau32);
+        let (v, _) = ev_args("a:=0xaaaaaaaa; a << 8", &[]);
+        assert_eq!(as_u32(v), 0xaaaaaa00u32);
+    }
+
+    // The no-panic invariant, extended to the new shapes: `check_segment`
+    // must prove that no input `compile` accepts can underflow `eval`'s
+    // stack. A reachable panic on the public API was the Critical finding on
+    // Task 3. These are all the store/terminator shapes that pass the
+    // checker; each must evaluate to a value.
+    #[test]
+    fn accepted_store_and_terminator_shapes_never_panic() {
+        for src in [
+            "A := 0; A",
+            "A; A := 0",
+            "U := 1; U",
+            "A := B := 0; A",           // rejected or evaluated, never panics
+            "A ? B := 1 : 2; B",
+            "A := (B ? 1 : 2); A",
+            "A := 1; B := A; C := B; C",
+            "A := A; A",
+            "A := NAN; ISNAN(A)",
+            "A := 1/0; A",
+            "MAX(A,B); A := 1; MIN(A,B)",
+        ] {
+            if let Ok(e) = crate::compile(src) {
+                let mut args = [2.0f64; 21];
+                let v = e.eval(&mut args);
+                let _ = v;
+            }
+        }
+    }
 }
