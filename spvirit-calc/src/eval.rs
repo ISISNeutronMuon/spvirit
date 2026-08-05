@@ -213,11 +213,11 @@ impl Expression {
     /// (Base wins wherever the plan and Base disagree) governs here, so
     /// `eval`'s default stays entropy-seeded and `eval_with_rng` is purely
     /// an opt-in escape hatch, not the normal path.
-    pub fn eval_with_rng(&self, args: &[f64; 21], rng: &mut dyn FnMut() -> f64) -> f64 {
+    pub fn eval_with_rng(&self, args: &mut [f64; 21], rng: &mut dyn FnMut() -> f64) -> f64 {
         self.run(args, rng)
     }
 
-    fn run(&self, args: &[f64; 21], rng: &mut dyn FnMut() -> f64) -> f64 {
+    fn run(&self, args: &mut [f64; 21], rng: &mut dyn FnMut() -> f64) -> f64 {
         // Stack discipline: `check_arity` (parse.rs) statically proves every
         // well-formed `Expression` never pops below depth 0 or leaves more
         // than one value at the end, so the `.expect()` calls below are a
@@ -702,7 +702,7 @@ mod tests {
     fn ev(src: &str, args: &[f64]) -> f64 {
         let mut a = [0.0f64; 21];
         a[..args.len()].copy_from_slice(args);
-        compile(src).expect("compile").eval(&a)
+        compile(src).expect("compile").eval(&mut a)
     }
 
     #[test]
@@ -1067,7 +1067,7 @@ mod tests {
                 Op::CondEnd,
             ],
         };
-        assert_eq!(taken_then.eval(&[1.0; 21]), 1.0);
+        assert_eq!(taken_then.eval(&mut [1.0; 21]), 1.0);
 
         // A ? <panics if reached> : 2.0, with A == 0 so the else-branch (the
         // one that doesn't panic) is the one actually taken - mirrors the
@@ -1088,7 +1088,7 @@ mod tests {
                 Op::CondEnd,
             ],
         };
-        assert_eq!(taken_else.eval(&[0.0; 21]), 2.0);
+        assert_eq!(taken_else.eval(&mut [0.0; 21]), 2.0);
     }
 
     // --- Task 6: bitwise operators ---
@@ -1368,11 +1368,11 @@ mod tests {
     #[test]
     fn rndm_is_in_unit_interval_and_varies_across_draws() {
         seed_rndm(0x1234_5678_9abc_def0);
-        let a = [0.0f64; 21];
+        let mut a = [0.0f64; 21];
         let e = crate::compile("RNDM").expect("compile");
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let v = e.eval(&a);
+            let v = e.eval(&mut a);
             assert!((0.0..=1.0).contains(&v), "RNDM out of [0,1]: {v}");
             seen.insert(v.to_bits());
         }
@@ -1386,7 +1386,7 @@ mod tests {
     fn rndm_participates_in_a_larger_expression() {
         seed_rndm(42);
         let e = crate::compile("RNDM*2+A").expect("compile");
-        let v = e.eval(&[3.0; 21]);
+        let v = e.eval(&mut [3.0; 21]);
         assert!((3.0..=5.0).contains(&v), "RNDM*2+3 out of [3,5]: {v}");
     }
 
@@ -1397,9 +1397,9 @@ mod tests {
     fn rndm_is_reproducible_from_a_fixed_seed() {
         seed_rndm(777);
         let e = crate::compile("RNDM").expect("compile");
-        let first = e.eval(&[0.0; 21]);
+        let first = e.eval(&mut [0.0; 21]);
         seed_rndm(777);
-        let second = e.eval(&[0.0; 21]);
+        let second = e.eval(&mut [0.0; 21]);
         assert_eq!(first, second);
     }
 
@@ -1418,7 +1418,7 @@ mod tests {
             calls += 1;
             0.25
         };
-        let v = e.eval_with_rng(&[0.0; 21], &mut fixed);
+        let v = e.eval_with_rng(&mut [0.0; 21], &mut fixed);
         assert_eq!(v, 0.5);
         assert_eq!(calls, 2);
     }
@@ -1433,7 +1433,7 @@ mod tests {
     fn many_chained_nullary_constants_compile_and_evaluate() {
         let src = format!("{}PI", "PI+".repeat(300));
         let e = crate::compile(&src).expect("compile");
-        assert!((e.eval(&[0.0; 21]) - 301.0 * std::f64::consts::PI).abs() < 1e-9);
+        assert!((e.eval(&mut [0.0; 21]) - 301.0 * std::f64::consts::PI).abs() < 1e-9);
     }
 
     // `RNDM`'s generator state lives in a thread-local `Cell<u64>` (see

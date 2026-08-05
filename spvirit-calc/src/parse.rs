@@ -1225,4 +1225,246 @@ mod tests {
         );
         assert_eq!(ops("NOT A"), ops("~A"));
     }
+
+    // --- Task 8a: store operator `:=` and expression terminator `;` ---
+    //
+    // `refs/postfix.c:162`: `{":=", 0, 0, -1, STORE_OPERATOR, STORE_A}`
+    // `refs/postfix.c:163`: `{";",  0, 0,  0, EXPR_TERMINATOR, NOT_GENERATED}`
+    //
+    // `;` is `NOT_GENERATED`: it emits NO opcode (which is why
+    // `refs/calcPerform.c` has no `case EXPR_TERM` in its evaluator switch).
+    // Its whole job at parse time (`refs/postfix.c:433-458`) is to flush the
+    // operator stack. So there is deliberately no `Op` variant for it.
+
+    // The corpus's first pinning shape (`refs/epicsCalcTest.cpp:846`):
+    // `"a := 0; a"` == 0. The `:=` retroactively converts the just-emitted
+    // FETCH into a STORE and moves it onto the operator stack
+    // (`refs/postfix.c:296-307`: `*--pout` un-emits the fetch,
+    // `pstacktop->code = STORE_A + *pout - FETCH_A` pushes the store), so the
+    // `Op::Arg(0)` that `A` produced does NOT survive into the output.
+    #[test]
+    fn store_unemits_the_fetch_and_emits_a_store_after_its_value() {
+        assert_eq!(
+            ops("A := 0; A"),
+            vec![Op::Lit(0.0), Op::Store(0), Op::Arg(0)]
+        );
+    }
+
+    // The corpus's second pinning shape (`refs/epicsCalcTest.cpp:868`):
+    // `"a; a := 0"` == a. The leading fetch survives; the store's own fetch is
+    // un-emitted and the store lands last, popping the literal it was given -
+    // so the value left on the stack is the FIRST fetch, not the stored one.
+    #[test]
+    fn terminator_emits_nothing_and_leaves_the_earlier_value_on_the_stack() {
+        assert_eq!(
+            ops("A; A := 0"),
+            vec![Op::Arg(0), Op::Lit(0.0), Op::Store(0)]
+        );
+    }
+
+    // Lowercase reaches the same place: the lexer uppercases identifiers
+    // before `Token::Arg` is produced, so the corpus's lowercase spellings
+    // compile identically.
+    #[test]
+    fn lowercase_operands_store_to_the_same_slot() {
+        assert_eq!(ops("a := 0; a"), ops("A := 0; A"));
+        assert_eq!(ops("u := 0; u"), vec![Op::Lit(0.0), Op::Store(20), Op::Arg(20)]);
+    }
+
+    // THE SURPRISE, and the single most important compile-shape test here.
+    //
+    // `:=` carries in-stack priority 0 (`refs/postfix.c:162`, column 2), and
+    // `:`'s flush loop (`refs/postfix.c:400-410`, the `CONDITIONAL` case) uses
+    // a STRICT comparison: `while (pstacktop->in_stack_pri > pel->in_coming_pri)`
+    // with `:`'s in-coming priority also 0. `0 > 0` is false, so a pending
+    // store is NOT flushed by the `:` - it stays on the operator stack,
+    // underneath the `COND_END` that `:` pushes (`:422-425`), and is emitted
+    // only when the whole expression (or the next `;`) flushes the stack.
+    //
+    // The store therefore HOISTS OUT of the ternary: `A ? B := 1 : 2` means
+    // `B := (A ? 1 : 2)`, and B is written on BOTH paths. Hand-derived, then
+    // pinned here. The naive alternative - treating `:=` like any other
+    // pending operator and flushing it at the `:` - would instead emit
+    // `[Arg0, CondIf{4}, Lit1, Store(1), CondElse{..}, Lit2, CondEnd, Arg1]`,
+    // whose then-branch nets 0 rather than +1 and which `check_segment` would
+    // reject outright as `MissingOperand`. So this is a real fork in
+    // behaviour, not a cosmetic one: Base ACCEPTS this expression and the
+    // naive reading REJECTS it.
+    #[test]
+    fn store_in_a_then_branch_hoists_out_of_the_conditional() {
+        assert_eq!(
+            ops("A ? B := 1 : 2; B"),
+            vec![
+                Op::Arg(0),
+                Op::CondIf { else_target: 4 },
+                Op::Lit(1.0),
+                Op::CondElse { end_target: 6 },
+                Op::Lit(2.0),
+                Op::CondEnd,
+                // Outside the conditional entirely - runs whichever arm was
+                // taken.
+                Op::Store(1),
+                Op::Arg(1),
+            ]
+        );
+    }
+
+    // The other half of the same rule: once `:` HAS run, it has pushed
+    // `COND_END` onto the operator stack (`refs/postfix.c:422-425`), so the
+    // stack is no longer empty - and `refs/postfix.c:297`'s guard
+    // (`pout == pdest || pstacktop > stack || *--pout is not a FETCH`)
+    // rejects a store whose operator stack is non-empty. A store in an ELSE
+    // branch is therefore a compile error in Base, not a conditional store.
+    #[test]
+    fn store_in_an_else_branch_is_rejected() {
+        assert_eq!(compile("A ? 1 : B := 2"), Err(CalcError::BadAssignment));
+    }
+
+    // `refs/postfix.c:205-214`: `get_element` scans `operators[]` backwards,
+    // so `:=` (row 162) wins over `:` (row 161) and the ternary never gets
+    // its else-marker. cond_count stays 1, and the end-of-parse check
+    // (`refs/postfix.c:495-498`) reports `CALC_ERR_CONDITIONAL`. Matched here.
+    #[test]
+    fn store_swallows_the_colon_of_a_ternary_leaving_it_unbalanced() {
+        assert_eq!(compile("A?B:=C"), Err(CalcError::BadConditional));
+    }
+
+    // `refs/postfix.c:296-301`, the three ways the store guard fires. Each is
+    // a compile error, never a panic.
+    #[test]
+    fn store_requires_a_bare_operand_as_its_target() {
+        // `pout == pdest`: nothing emitted yet.
+        assert_eq!(compile(":= A"), Err(CalcError::MissingOperand));
+        // Last emitted opcode is a literal, not a FETCH. `PI` and a bare
+        // number both compile to `Op::Lit` here (see `constant`), matching
+        // Base's `CONST_PI`/`LITERAL_*`, none of which is in
+        // `FETCH_A..FETCH_A+21`.
+        assert_eq!(compile("PI := 1"), Err(CalcError::BadAssignment));
+        assert_eq!(compile("1 := A"), Err(CalcError::BadAssignment));
+        // Last emitted opcode is a function result, not a FETCH.
+        assert_eq!(compile("SIN(A) := 1"), Err(CalcError::BadAssignment));
+        // `pstacktop > stack`: an operator is still pending, so the trailing
+        // `Op::Arg` in the output is not the whole left-hand side.
+        assert_eq!(compile("A + B := 1"), Err(CalcError::BadAssignment));
+        // Same guard, via an open paren rather than a pending operator -
+        // which is why `(A := 1)` cannot be used to get a store into a
+        // ternary arm either.
+        assert_eq!(compile("(A := 1)"), Err(CalcError::BadAssignment));
+    }
+
+    // DEPTH ACCOUNTING. A store pops one value and pushes nothing, so a bare
+    // `A := 0` ends at depth 0. Base rejects that at `refs/postfix.c:499`
+    // (`if (operand_needed || runtime_depth != 1) CALC_ERR_INCOMPLETE`) - an
+    // expression must leave exactly one value. `check_arity` already reports
+    // `MissingOperand` for a non-empty program ending at depth 0, so this
+    // needs no new machinery, only the `Op::Store` depth arm.
+    #[test]
+    fn a_bare_store_leaves_no_result_and_is_rejected() {
+        assert_eq!(compile("A := 0"), Err(CalcError::MissingOperand));
+        assert_eq!(compile("A := 0; B := 1"), Err(CalcError::MissingOperand));
+    }
+
+    // `;` lets depth return to 0 mid-expression without that being an
+    // underflow: `A := 0` between the terminators nets zero (fetch +1,
+    // un-emit -1, literal +1, store -1) and the depth genuinely sits at 0
+    // right after each store. Nothing here may error.
+    #[test]
+    fn depth_may_return_to_zero_between_terminators() {
+        assert_eq!(
+            ops("A := 1; B := A; C := B; C"),
+            vec![
+                Op::Lit(1.0),
+                Op::Store(0),
+                Op::Arg(0),
+                Op::Store(1),
+                Op::Arg(1),
+                Op::Store(2),
+                Op::Arg(2),
+            ]
+        );
+    }
+
+    // `refs/postfix.c:457`: `EXPR_TERMINATOR` sets `operand_needed = TRUE`,
+    // and `:459`'s end-of-parse check rejects a still-pending operand. So a
+    // trailing `;`, a doubled `;`, and a leading `;` are all errors.
+    //
+    // Base reaches the leading/doubled cases by a different route -
+    // `get_element` looks up an operand-position token in `operands[]`, where
+    // `;` does not appear, giving `CALC_ERR_SYNTAX` (`:475-478`) - but the
+    // accept/reject verdict is the same, which is what matters here (this
+    // crate's lexer is context-free and has one shared symbol table).
+    #[test]
+    fn terminator_in_operand_position_is_rejected() {
+        assert_eq!(compile("A;"), Err(CalcError::MissingOperand));
+        assert_eq!(compile("A;;B"), Err(CalcError::MissingOperand));
+        assert_eq!(compile(";A"), Err(CalcError::MissingOperand));
+    }
+
+    // `refs/postfix.c:436-439`: a `(` still open when `;` flushes the stack
+    // is `CALC_ERR_PAREN_OPEN`; `:448-451`: an unbalanced `?` at a `;` is
+    // `CALC_ERR_CONDITIONAL`.
+    #[test]
+    fn terminator_rejects_an_open_paren_or_dangling_conditional() {
+        assert_eq!(compile("(A;B)"), Err(CalcError::Unbalanced));
+        assert_eq!(compile("A?B; C"), Err(CalcError::BadConditional));
+    }
+
+    // A completed ternary before a `;` is finalized by the flush, exactly as
+    // `)`/`,`/an enclosing `:`/end-of-input already do
+    // (`refs/postfix.c:440-445` flushes the pushed `COND_END`).
+    #[test]
+    fn terminator_finalizes_a_completed_ternary() {
+        assert_eq!(
+            ops("A?B:C; D"),
+            vec![
+                Op::Arg(0),
+                Op::CondIf { else_target: 4 },
+                Op::Arg(1),
+                Op::CondElse { end_target: 6 },
+                Op::Arg(2),
+                Op::CondEnd,
+                Op::Arg(3),
+            ]
+        );
+    }
+
+    // A store whose value is a parenthesised ternary: the store frame sits
+    // BELOW the `(` on the operator stack (it was pushed when the stack was
+    // empty), so neither `:` nor `)` disturbs it, and the conditional's arms
+    // are checked arm-by-arm with no `Op::Store` inside either of them.
+    #[test]
+    fn store_of_a_parenthesised_conditional_keeps_the_store_outside_the_arms() {
+        assert_eq!(
+            ops("A := (B ? 1 : 2); A"),
+            vec![
+                Op::Arg(1),
+                Op::CondIf { else_target: 4 },
+                Op::Lit(1.0),
+                Op::CondElse { end_target: 6 },
+                Op::Lit(2.0),
+                Op::CondEnd,
+                Op::Store(0),
+                Op::Arg(0),
+            ]
+        );
+    }
+
+    // Exhaustive over the 21 slots: every letter A-U must map to its own
+    // store index, in both cases. Catches an off-by-one or a truncated
+    // A-L range (RULINGS.md Ruling 1) in the store path specifically, which
+    // the fetch path's own tests would not.
+    #[test]
+    fn every_operand_letter_has_its_own_store_slot() {
+        for i in 0..21usize {
+            let upper = (b'A' + i as u8) as char;
+            let lower = upper.to_ascii_lowercase();
+            let src = format!("{upper} := 0; {upper}");
+            assert_eq!(
+                ops(&src),
+                vec![Op::Lit(0.0), Op::Store(i), Op::Arg(i)],
+                "uppercase {upper}"
+            );
+            assert_eq!(ops(&format!("{lower} := 0; {lower}")), ops(&src), "lowercase {lower}");
+        }
+    }
 }

@@ -165,4 +165,60 @@ mod tests {
         // dropped or confused with `>>>`'s prefix.
         assert_eq!(lex(">>").unwrap(), vec![Token::Op(">>")]);
     }
+
+    // Task 8a. `:` (the ternary's else-marker, `refs/postfix.c:161`) is a
+    // proper prefix of `:=` (the store operator, `:162`), so `OPS`'s
+    // longest-match-first ordering is load-bearing here in exactly the way it
+    // is for `>>>`/`>>`. Base resolves the same ambiguity the same way and for
+    // the same reason: `get_element` (`refs/postfix.c:205-214`) walks
+    // `operators[]` BACKWARDS from the last row, and the table is sorted
+    // ASCII-ascending, so row 162 (`:=`) is tested before row 161 (`:`).
+    //
+    // Failing output if `":"` preceded `":="` in `OPS`: `"A:=1"` would
+    // tokenize as `[Arg(0), Op(":"), Num(1.0)]` - `compile` would then reject
+    // it as `BadConditional` (a `:` with no `?`), not compile a store.
+    #[test]
+    fn store_operator_beats_the_ternary_colon() {
+        assert_eq!(
+            lex("A:=1").unwrap(),
+            vec![Token::Arg(0), Token::Op(":="), Token::Num(1.0)]
+        );
+        // A bare `:` is still a `:` - the longer match must not swallow it.
+        assert_eq!(
+            lex("A?B:C").unwrap(),
+            vec![
+                Token::Arg(0),
+                Token::Op("?"),
+                Token::Arg(1),
+                Token::Op(":"),
+                Token::Arg(2),
+            ]
+        );
+        // The genuinely ambiguous-looking shape. Base lexes this as `:=`
+        // (backwards table scan, above), so this crate must too; `compile`
+        // then rejects the whole expression as an unbalanced conditional
+        // (the `?` never gets its `:`) - see parse.rs's
+        // `store_swallows_the_colon_of_a_ternary_leaving_it_unbalanced`.
+        assert_eq!(
+            lex("A?B:=C").unwrap(),
+            vec![
+                Token::Arg(0),
+                Token::Op("?"),
+                Token::Arg(1),
+                Token::Op(":="),
+                Token::Arg(2),
+            ]
+        );
+    }
+
+    // `;` (`refs/postfix.c:163`) is a single-character operator with no
+    // prefix relationship to anything else; this just pins that it lexes at
+    // all rather than falling through to `CalcError::BadChar`.
+    #[test]
+    fn expression_terminator_lexes_as_an_operator() {
+        assert_eq!(
+            lex("A;B").unwrap(),
+            vec![Token::Arg(0), Token::Op(";"), Token::Arg(1)]
+        );
+    }
 }
