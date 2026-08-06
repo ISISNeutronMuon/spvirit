@@ -256,6 +256,9 @@ pub fn apply_scalar_array_put(
 }
 
 /// Apply a table PUT update to an `NtTable`.
+///
+/// Does not apply `timeStamp`: stamping is owned by
+/// [`RecordInstance::apply_put`], which restamps every accepted PUT.
 pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
     let DecodedValue::Structure(fields) = value else {
         return false;
@@ -317,6 +320,10 @@ pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
 }
 
 /// Apply an NdArray PUT update to an `NtNdArray`.
+///
+/// Does not apply `timeStamp` or `dataTimeStamp`: stamping is owned by
+/// [`RecordInstance::apply_put`], which restamps every accepted PUT and
+/// honours a client-supplied `dataTimeStamp` itself.
 pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> bool {
     let DecodedValue::Structure(fields) = value else {
         return false;
