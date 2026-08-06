@@ -37,6 +37,7 @@ def main() -> None:
           f"(honours EPICS_PVA_ADDR_LIST / EPICS_PVA_AUTO_ADDR_LIST)")
 
     # ── Discover servers on the LAN ─────────────────────────────────────
+    # ANCHOR: discover
     print("\ndiscover_servers(timeout=1.5) ...")
     try:
         servers = ll.discover_servers(timeout=1.5)
@@ -47,8 +48,10 @@ def main() -> None:
         print(f"  guid={s['guid']}  addr={s['addr']}")
     if not servers:
         print("  (no servers responded — run a spserver locally to see results)")
+    # ANCHOR_END: discover
 
     # ── pvlist against the first discovered server ───────────────────────
+    # ANCHOR: list
     if servers:
         addr = servers[0]["addr"]
         print(f"\npvlist({addr!r}) ...")
@@ -59,8 +62,10 @@ def main() -> None:
                 print(f"    {n}")
         except Exception as e:  # noqa: BLE001
             print(f"  pvlist failed: {e}")
+    # ANCHOR_END: list
 
     # ── Targeted UDP search for a specific PV ───────────────────────────
+    # ANCHOR: search
     if len(sys.argv) > 1:
         pv = sys.argv[1]
         print(f"\nsearch_pv({pv!r}, timeout=2.0) ...")
@@ -69,6 +74,7 @@ def main() -> None:
             print(f"  -> {addr}")
         except Exception as e:  # noqa: BLE001
             print(f"  not found: {e}")
+    # ANCHOR_END: search
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ def main() -> None:
         addr = search_pv(pv_name)
         print(f"found on {addr}")
 
+    # ANCHOR: info
     with Channel.connect(pv_name, addr) as ch:
         desc = ch.introspect()
 
@@ -50,6 +51,7 @@ def main() -> None:
 
         result = ch.get()
         print(f"\ncurrent value: {codec.format_value(result.value)}")
+    # ANCHOR_END: info
 
 
 if __name__ == "__main__":
