@@ -87,22 +87,24 @@ SIM:TEMPERATURE ERROR protocol error: PUT init error: Write access denied
 The refusal comes back on the PUT *init* exchange, before any value is
 sent. The record type alone decides it.
 
-**A client PUT does not restamp the record.** Server-side updates —
+**A client PUT always restamps the record.** Server-side updates —
 `store.set_value()`, a `scan` callback, a `.link()` recomputation — set the
-record's `timeStamp` to now. A PUT arriving from a client changes the value
-and leaves the timestamp where it was:
+record's `timeStamp` to now, and an accepted PUT does exactly the same,
+whether or not the value it carried actually moved:
 
 ```console
 $ spget SIM:SETPOINT
 SIM:SETPOINT 2026-08-04 10:00:31.426 500
 $ spput SIM:SETPOINT 42 && spget SIM:SETPOINT
 SIM:SETPOINT OK
-SIM:SETPOINT 2026-08-04 10:00:31.426  42
+SIM:SETPOINT 2026-08-04 10:02:47.913  42
 ```
 
-EPICS Base would restamp on record processing, so this is a divergence
-worth knowing about — if you are timestamping on the strength of a PUT,
-stamp it yourself in an `on_put` handler.
+This matches EPICS Base, where `recGblGetTimeStampSimm()` runs
+unconditionally in `process()`. The one wrinkle: if the PUT carried its own
+non-zero `timeStamp`, that value is honoured instead of server time — a
+gateway relaying a reading from elsewhere can forward the *originating*
+acquisition time rather than the moment it happened to relay it.
 
 ## Run it
 

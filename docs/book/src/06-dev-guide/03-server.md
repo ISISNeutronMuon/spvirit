@@ -56,10 +56,13 @@ value). Key paths:
 
 - **Public writers** `set_value` / `set_array_value` / `put_nt` bypass
   on_put/validators; each calls an `_inner` writer then `evaluate_links`.
-- **`Source::put`** (simple_store.rs:414) — the wire PUT path: run the PUT
+- **`Source::put`** (simple_store.rs:410) — the wire PUT path: run the PUT
   validator (cloned out of the lock first, so user callbacks can't hold the
-  lock across `.await`), apply via `apply_put_to_record`, MDEL-gate the post,
-  spawn the `on_put` callback as a detached task, evaluate links.
+  lock across `.await`), apply via `RecordInstance::apply_put`
+  (apply.rs:546), which always restamps the record and reports whether the
+  value changed, MDEL-gate the post (or force it when the PUT was
+  client-stamped and the value did not change), spawn the `on_put` callback
+  as a detached task, evaluate links.
 - **Links/calc**: `evaluate_links` (simple_store.rs:349) is a BFS over
   `LinkDef`s whose inputs include the changed PV, with a `visited` set for
   cycle detection; uses `set_value_inner` to avoid re-triggering.
@@ -189,10 +192,11 @@ pv.rs:1154).
    `stamp_missing_timestamps` (types.rs:387) is called on store insert
    (simple_store.rs:74, 109) so static/`.db`-loaded records are stamped too
    (see chapter 08).
-2. **PUT to NtTable/NtNdArray/Generic is not wired** into
-   `apply_put_to_record` (simple_store.rs:608–611 just logs), even though
-   `apply.rs` has `apply_table_put`/`apply_ndarray_put`. Tables/NdArrays are
-   writable only via `put_nt`.
+2. **PUT to `Generic` is not wired.** `RecordInstance::apply_put`
+   (apply.rs:639) returns `false` for `Generic` without looking at the PUT
+   body. `NtTable`/`NtNdArray` dispatch to `apply_table_put`/
+   `apply_ndarray_put` (apply.rs:609–610) and are writable over the wire;
+   `Generic` is writable only via `put_nt`.
 3. **CANCEL_REQUEST is unimplemented** (returns an error message); some
    clients use it. ACL_CHANGE/MESSAGE/MULTIPLE_DATA/ORIGIN_TAG and Op 14/16
    likewise return errors.

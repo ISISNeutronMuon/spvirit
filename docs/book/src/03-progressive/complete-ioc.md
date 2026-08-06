@@ -124,26 +124,29 @@ before the next `spget` arrived.
 
 ## What to notice
 
-**A client PUT does not advance the record's `timeStamp`.** The write
-applies and the new value is served, but the timestamp stays at whatever
-the server last stamped:
+**A client PUT always advances the record's `timeStamp`.** The write
+applies and the record is restamped with server time, distinct from
+whatever it carried before:
 
 ```console
 $ spput VAC:SETPOINT 2e-4 && spget VAC:SETPOINT
 VAC:SETPOINT 2026-08-04 10:35:11.566 0.0002
 
 $ spput VAC:SETPOINT 3e-4 && spget VAC:SETPOINT
-VAC:SETPOINT 2026-08-04 10:35:11.566 0.0003
+VAC:SETPOINT 2026-08-04 10:35:57.902 0.0003
 ```
 
-Both reads carry the record's *creation* time. `apply_put_to_record`
-(`spvirit-server/src/simple_store.rs:558`) updates `value`, `alarm`,
-`display` and `control` from the client's structure and leaves
-`time_stamp` alone; the store only stamps on registration and on
-`put_nt` (`:74`, `:109`). Server-driven updates — `scan`, `calc`, `set` —
-do stamp, which is why `VAC:PRESSURE` and `VAC:ERROR` above move. If
-something downstream keys on timestamps, do not rely on them to detect
-client writes.
+Each read carries the time of its own PUT, not the record's *creation*
+time. `RecordInstance::apply_put`
+(`spvirit-server/src/apply.rs:546`) updates `value`, `alarm`, `display`
+and `control` from the client's structure and then always restamps —
+with the client's `timeStamp` if the PUT carried a non-default one, so a
+gateway can forward the originating acquisition time, otherwise with
+server time — whether or not the value itself changed. That matches
+EPICS Base, where `recGblGetTimeStampSimm()` runs unconditionally in
+`process()`. Server-driven updates — `scan`, `calc`, `set` — stamp too,
+which is why `VAC:PRESSURE` and `VAC:ERROR` above move on the same
+rhythm as the client-written `VAC:SETPOINT`.
 
 **The deadband is doing its job.** `VAC:PRESSURE` scans every 500 ms, but
 a monitor posts roughly once a second:
