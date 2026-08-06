@@ -303,14 +303,13 @@ pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
                     }
                 }
             }
-            "timeStamp" => {
-                if let Some(ts) = decode_nt_timestamp(field_value) {
-                    if nt.time_stamp.as_ref() != Some(&ts) {
-                        nt.time_stamp = Some(ts);
-                        changed = true;
-                    }
-                }
-            }
+            // `timeStamp` is not a data field: `RecordInstance::apply_put`
+            // owns stamping (it always restamps on an accepted PUT) and
+            // treating it here as well would inflate `value_changed` for a
+            // PUT that only carries a timestamp, wrongly triggering
+            // `evaluate_links` (spec rule 5). `put_nt`/`set_nt_payload`
+            // replace the whole `NtTable`/`NtNdArray` directly and never call
+            // this field walk, so removing the arm here does not affect them.
             _ => {}
         }
     }
@@ -432,22 +431,12 @@ pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> bool {
                     }
                 }
             }
-            "timeStamp" => {
-                if let Some(ts) = decode_nt_timestamp(field_value) {
-                    if nt.time_stamp.as_ref() != Some(&ts) {
-                        nt.time_stamp = Some(ts);
-                        changed = true;
-                    }
-                }
-            }
-            "dataTimeStamp" => {
-                if let Some(ts) = decode_nt_timestamp(field_value) {
-                    if nt.data_time_stamp != ts {
-                        nt.data_time_stamp = ts;
-                        changed = true;
-                    }
-                }
-            }
+            // `timeStamp`/`dataTimeStamp` are not data fields here — see the
+            // comment on the matching arm removed from `apply_table_put`.
+            // `apply_put` below honours a client-supplied `dataTimeStamp`
+            // separately from `timeStamp`, since a gateway PUT can carry a
+            // relay `timeStamp` distinct from the acquisition
+            // `dataTimeStamp` and both must survive independently.
             "display" => {
                 if let Some(display) = decode_nt_display(field_value) {
                     if nt.display.as_ref() != Some(&display) {
@@ -535,6 +524,18 @@ fn client_timestamp(value: &DecodedValue) -> Option<NtTimeStamp> {
     (ts != NtTimeStamp::default()).then_some(ts)
 }
 
+/// Pull a usable `dataTimeStamp` out of a decoded PUT body — the NdArray
+/// acquisition time, distinct from the relay `timeStamp`. Same absent/default
+/// handling as [`client_timestamp`].
+fn client_data_timestamp(value: &DecodedValue) -> Option<NtTimeStamp> {
+    let DecodedValue::Structure(fields) = value else {
+        return None;
+    };
+    let (_, field) = fields.iter().find(|(name, _)| name == "dataTimeStamp")?;
+    let ts = decode_nt_timestamp(field)?;
+    (ts != NtTimeStamp::default()).then_some(ts)
+}
+
 impl RecordInstance {
     /// Apply a decoded client PUT to this record.
     ///
@@ -560,6 +561,18 @@ impl RecordInstance {
         let client_ts = client_timestamp(value);
         let client_stamped = client_ts.is_some();
         self.set_time_stamp(client_ts.unwrap_or_else(now_nt_timestamp));
+
+        // NtNdArray's `dataTimeStamp` is the acquisition time and can be
+        // supplied independently of `timeStamp` (the relay time) — e.g. a
+        // gateway forwarding {value, timeStamp: T_relay, dataTimeStamp:
+        // T_acquire}. `set_time_stamp` just set both fields from the chosen
+        // `timeStamp`; override `data_time_stamp` here if the client sent its
+        // own.
+        if let RecordData::NtNdArray { nt, .. } = &mut self.data {
+            if let Some(data_ts) = client_data_timestamp(value) {
+                nt.data_time_stamp = data_ts;
+            }
+        }
 
         PutOutcome {
             value_changed,
@@ -672,6 +685,88 @@ mod tests {
         }
     }
 
+    fn ai_record_with_alarm_limits(
+        val: f64,
+        low: f64,
+        high: f64,
+        lolo: f64,
+        hihi: f64,
+    ) -> RecordInstance {
+        let mut nt = NtScalar::from_value(ScalarValue::F64(val)).with_alarm_limits(
+            Some(low),
+            Some(high),
+            Some(lolo),
+            Some(hihi),
+        );
+        nt.time_stamp = Some(OLD);
+        RecordInstance {
+            name: "ALM".to_string(),
+            record_type: RecordType::Ai,
+            common: DbCommonState::default(),
+            data: RecordData::Ai {
+                nt,
+                inp: None,
+                siml: None,
+                siol: None,
+                simm: false,
+            },
+            raw_fields: HashMap::new(),
+        }
+    }
+
+    fn alarm_of(rec: &RecordInstance) -> (i32, String) {
+        let RecordData::Ai { nt, .. } = &rec.data else {
+            panic!("expected Ai");
+        };
+        (nt.alarm_severity, nt.alarm_message.clone())
+    }
+
+    #[test]
+    fn put_with_compute_alarms_true_sets_hihi_severity() {
+        let mut rec = ai_record_with_alarm_limits(5.0, 0.0, 8.0, -5.0, 15.0);
+        let outcome = rec.apply_put(&put_value(20.0), true);
+
+        assert!(outcome.value_changed);
+        let (severity, message) = alarm_of(&rec);
+        assert_eq!(severity, 2);
+        assert_eq!(message, "HIHI");
+    }
+
+    #[test]
+    fn put_with_compute_alarms_true_sets_high_severity() {
+        let mut rec = ai_record_with_alarm_limits(5.0, 0.0, 8.0, -5.0, 15.0);
+        let outcome = rec.apply_put(&put_value(10.0), true);
+
+        assert!(outcome.value_changed);
+        let (severity, message) = alarm_of(&rec);
+        assert_eq!(severity, 1);
+        assert_eq!(message, "HIGH");
+    }
+
+    #[test]
+    fn put_with_compute_alarms_true_clears_alarm_within_normal_range() {
+        let mut rec = ai_record_with_alarm_limits(20.0, 0.0, 8.0, -5.0, 15.0);
+        // Prime a HIHI alarm, then PUT a value back in range.
+        rec.apply_put(&put_value(20.0), true);
+        assert_eq!(alarm_of(&rec).0, 2);
+
+        let outcome = rec.apply_put(&put_value(4.0), true);
+
+        assert!(outcome.value_changed);
+        let (severity, message) = alarm_of(&rec);
+        assert_eq!(severity, 0);
+        assert_eq!(message, "");
+    }
+
+    #[test]
+    fn put_with_compute_alarms_false_does_not_update_alarm() {
+        let mut rec = ai_record_with_alarm_limits(5.0, 0.0, 8.0, -5.0, 15.0);
+        let outcome = rec.apply_put(&put_value(20.0), false);
+
+        assert!(outcome.value_changed);
+        assert_eq!(alarm_of(&rec).0, 0);
+    }
+
     fn stamp_of(rec: &RecordInstance) -> NtTimeStamp {
         let RecordData::Ai { nt, .. } = &rec.data else {
             panic!("expected Ai");
@@ -681,10 +776,7 @@ mod tests {
 
     fn ts_field(seconds: i64, nanos: i32) -> DecodedValue {
         DecodedValue::Structure(vec![
-            (
-                "secondsPastEpoch".to_string(),
-                DecodedValue::Int64(seconds),
-            ),
+            ("secondsPastEpoch".to_string(), DecodedValue::Int64(seconds)),
             ("nanoseconds".to_string(), DecodedValue::Int32(nanos)),
             ("userTag".to_string(), DecodedValue::Int32(0)),
         ])
@@ -762,10 +854,8 @@ mod tests {
     #[test]
     fn unrecognised_fields_still_restamp() {
         let mut rec = ai_record(1.0);
-        let body = DecodedValue::Structure(vec![(
-            "nosuchfield".to_string(),
-            DecodedValue::Int32(1),
-        )]);
+        let body =
+            DecodedValue::Structure(vec![("nosuchfield".to_string(), DecodedValue::Int32(1))]);
         let outcome = rec.apply_put(&body, false);
 
         assert!(!outcome.value_changed);
@@ -795,10 +885,7 @@ mod tests {
         let mut rec = waveform_record(vec![1.0, 2.0]);
         let body = DecodedValue::Structure(vec![(
             "value".to_string(),
-            DecodedValue::Array(vec![
-                DecodedValue::Float64(3.0),
-                DecodedValue::Float64(4.0),
-            ]),
+            DecodedValue::Array(vec![DecodedValue::Float64(3.0), DecodedValue::Float64(4.0)]),
         )]);
         let outcome = rec.apply_put(&body, false);
 
@@ -814,10 +901,7 @@ mod tests {
         let mut rec = waveform_record(vec![1.0, 2.0]);
         let body = DecodedValue::Structure(vec![(
             "value".to_string(),
-            DecodedValue::Array(vec![
-                DecodedValue::Float64(1.0),
-                DecodedValue::Float64(2.0),
-            ]),
+            DecodedValue::Array(vec![DecodedValue::Float64(1.0), DecodedValue::Float64(2.0)]),
         )]);
         let outcome = rec.apply_put(&body, false);
 
@@ -892,6 +976,102 @@ mod tests {
     }
 
     #[test]
+    fn ndarray_put_honours_client_supplied_data_time_stamp() {
+        // A gateway forwards {value, timeStamp: T_relay, dataTimeStamp:
+        // T_acquire}: the acquisition time must survive, not be overwritten
+        // by the relay's timeStamp (or by now()).
+        let mut rec = ndarray_record();
+        let body = DecodedValue::Structure(vec![
+            (
+                "value".to_string(),
+                DecodedValue::Array(vec![
+                    DecodedValue::UInt8(5),
+                    DecodedValue::UInt8(6),
+                    DecodedValue::UInt8(7),
+                    DecodedValue::UInt8(8),
+                ]),
+            ),
+            ("timeStamp".to_string(), ts_field(5_000, 42)),
+            ("dataTimeStamp".to_string(), ts_field(9_000, 7)),
+        ]);
+        let outcome = rec.apply_put(&body, false);
+
+        assert!(outcome.value_changed);
+        assert!(outcome.client_stamped);
+        let RecordData::NtNdArray { nt, .. } = &rec.data else {
+            panic!("expected NtNdArray");
+        };
+        assert_eq!(
+            nt.time_stamp,
+            Some(NtTimeStamp {
+                seconds_past_epoch: 5_000,
+                nanoseconds: 42,
+                user_tag: 0,
+            }),
+            "timeStamp should be the relay's stamp"
+        );
+        assert_eq!(
+            nt.data_time_stamp,
+            NtTimeStamp {
+                seconds_past_epoch: 9_000,
+                nanoseconds: 7,
+                user_tag: 0,
+            },
+            "dataTimeStamp should be the acquisition time, not overwritten by timeStamp"
+        );
+    }
+
+    #[test]
+    fn ndarray_put_with_only_timestamp_fields_does_not_report_value_changed() {
+        // A client-stamped PUT that touches only timeStamp/dataTimeStamp must
+        // not be reported as a value change: apply_put owns stamping now, so
+        // the field walk must not double-count timeStamp/dataTimeStamp as
+        // data fields (spec rule 5: evaluate_links runs only when the value
+        // actually changed).
+        let mut rec = ndarray_record();
+        let body = DecodedValue::Structure(vec![
+            ("timeStamp".to_string(), ts_field(5_000, 42)),
+            ("dataTimeStamp".to_string(), ts_field(9_000, 7)),
+        ]);
+        let outcome = rec.apply_put(&body, false);
+
+        assert!(!outcome.value_changed);
+        assert!(outcome.client_stamped);
+    }
+
+    #[test]
+    fn table_put_with_only_timestamp_field_does_not_report_value_changed() {
+        let mut nt = NtTable {
+            labels: vec!["a".to_string()],
+            columns: vec![spvirit_types::NtTableColumn {
+                name: "a".to_string(),
+                values: ScalarArrayValue::F64(vec![1.0]),
+            }],
+            descriptor: None,
+            alarm: None,
+            time_stamp: Some(OLD),
+        };
+        nt.time_stamp = Some(OLD);
+        let mut rec = RecordInstance {
+            name: "TBL".to_string(),
+            record_type: RecordType::NtTable,
+            common: DbCommonState::default(),
+            data: RecordData::NtTable {
+                nt,
+                inp: None,
+                out: None,
+                omsl: OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        };
+        let body = DecodedValue::Structure(vec![("timeStamp".to_string(), ts_field(5_000, 42))]);
+        let outcome = rec.apply_put(&body, false);
+
+        assert!(!outcome.value_changed);
+        assert!(outcome.client_stamped);
+    }
+
+    #[test]
     fn ndarray_put_restamps_both_time_stamp_and_data_time_stamp() {
         let mut rec = ndarray_record();
         let body = DecodedValue::Structure(vec![(
@@ -910,11 +1090,7 @@ mod tests {
             panic!("expected NtNdArray");
         };
         assert!(
-            nt.time_stamp
-                .as_ref()
-                .expect("stamped")
-                .seconds_past_epoch
-                > OLD.seconds_past_epoch
+            nt.time_stamp.as_ref().expect("stamped").seconds_past_epoch > OLD.seconds_past_epoch
         );
         assert!(nt.data_time_stamp.seconds_past_epoch > OLD.seconds_past_epoch);
     }

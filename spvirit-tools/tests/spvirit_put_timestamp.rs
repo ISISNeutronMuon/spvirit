@@ -88,7 +88,7 @@ async fn put_advances_timestamp_even_when_value_unchanged() {
 
     // Real wall-clock gap so the second/nanosecond comparison below is not
     // racing clock resolution.
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::time::sleep(Duration::from_millis(25)).await;
 
     // PUT the *same* value again: timeStamp must still advance. This is the
     // assertion that would have failed before the restamp-always fix, since
