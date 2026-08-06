@@ -99,6 +99,24 @@ anchors = [
   "spvirit-py/examples/demo_monitor.py:monitor",
 ]
 
+[chapters."03-progressive/discovery.md"]
+tools = ["splist", "spinfo"]
+rust_examples = ["spvirit-client/examples/pvlist.rs"]
+py_examples = [
+  "spvirit-py/examples/demo_discovery.py",
+  "spvirit-py/examples/demo_pvfind.py",
+]
+anchors = [
+  "spvirit-client/examples/pvlist.rs:discover",
+  "spvirit-client/examples/pvlist.rs:search",
+  "spvirit-client/examples/pvlist.rs:list",
+  "spvirit-client/examples/pvlist.rs:info",
+  "spvirit-py/examples/demo_discovery.py:discover",
+  "spvirit-py/examples/demo_discovery.py:search",
+  "spvirit-py/examples/demo_discovery.py:list",
+  "spvirit-py/examples/demo_pvfind.py:info",
+]
+
 [chapters."03-progressive/reacting-to-writes.md"]
 tools = ["spput", "spget"]
 rust_examples = [
