@@ -48,10 +48,10 @@ def main() -> None:
         for name, ftype, is_array in walk(desc):
             suffix = "[]" if is_array and not ftype.endswith("[]") else ""
             print(f"  {name:<{width}}  {ftype}{suffix}")
+    # ANCHOR_END: info
 
         result = ch.get()
         print(f"\ncurrent value: {codec.format_value(result.value)}")
-    # ANCHOR_END: info
 
 
 if __name__ == "__main__":

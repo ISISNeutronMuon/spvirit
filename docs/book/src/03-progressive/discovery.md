@@ -13,7 +13,10 @@ network, which one has my PV, what else does it serve, and what shape is that
 PV? These are the library forms of [`splist`](../04-tools/splist.md) and
 [`spinfo`](../04-tools/spinfo.md) — the same four calls those tools make.
 
-Nothing here reads a value. Every operation on this page is metadata.
+Discovery, listing, and introspection are metadata-only — none of the Rust
+steps below reads a value. The Python introspection snippet does end with a
+`get()` to show the current value alongside the field table, but that call
+is separate from `introspect()` itself.
 
 ## Rust
 
@@ -83,8 +86,16 @@ same file:
 
 `Channel.introspect()` is the low-level route, and the one to use when you
 want the channel open anyway for a subsequent `get()`. For a one-shot
-description there is also `Client.info(pv_name)`, and `Client.pvlist(addr)`
-mirrors `lowlevel.pvlist`.
+summary there is also `Client.info(pv_name)`, but it is flatter than
+`introspect()`'s result: a top-level dict of `{struct_id, fields: [{name,
+field_type}]}`, with no nesting into sub-structures and no `is_array` flag.
+Reach for `Channel.introspect()` when you need the full recursive
+description; `Client.info` when a flat top-level summary is enough.
+`Client.pvlist(addr)` is the `__pvlist`-only convenience — it returns just
+the name list and has none of `lowlevel.pvlist`'s fallback chain, so it
+fails outright on servers where the fallback would have succeeded. Use
+`lowlevel.pvlist` when you need that fallback chain or want to know which
+route answered.
 
 ## From the command line
 
@@ -106,11 +117,12 @@ explicit `--server`, the lot — rather than a bare broadcast.
 **The second return value names the route that worked.** `pvlist_with_fallback`
 tries four strategies in turn and tells you which answered:
 `PvListSource::PvList`, `GetField`, `ServerRpc`, or `ServerGet`. Python returns
-it as the second element of a `(names, source)` tuple — that is the `source`
-the Python snippet above prints. It matters because the
-routes differ in completeness — a server answering by `ServerGet` may be
-giving you a truncated view. The [`splist`](../04-tools/splist.md) page has
-the detail.
+it as the second element of a `(names, source)` tuple, with `source` spelled
+as one of the strings `"pvlist"`, `"getfield"`, `"server_rpc"`, or
+`"server_get"` — that is the `source` the Python snippet above prints. It
+matters because the routes differ in completeness — a server answering by
+`ServerGet` may be giving you a truncated view. The
+[`splist`](../04-tools/splist.md) page has the detail.
 
 **Introspection transfers no data.** `pvinfo` uses `CMD_GET_FIELD` (`0x11`),
 so the server replies with a type description and no value. That makes it
@@ -123,3 +135,87 @@ channel, not one of your PVs. Filter it out if you are building a UI.
 **Discovery is a UDP broadcast.** On a multi-homed host the search can leave
 by the wrong interface and find nothing. `build_search_targets(Some(ip), None)`
 or `EPICS_PVA_ADDR_LIST` pins it.
+
+## Run it
+
+```bash
+# Terminal 1 — something to talk to
+cargo run -p spvirit-server --example complete_ioc
+
+# Terminal 2
+cargo run -p spvirit-client --example pvlist
+# or, once you have an address from the line above
+cargo run -p spvirit-client --example pvlist -- 127.0.0.1:5075
+# or, to describe one PV
+cargo run -p spvirit-client --example pvlist -- VAC:PRESSURE
+# or, the Python equivalents
+python spvirit-py/examples/demo_discovery.py
+python spvirit-py/examples/demo_pvfind.py VAC:PRESSURE
+```
+
+Bare `pvlist` finds servers:
+
+```console
+$ cargo run -p spvirit-client --example pvlist
+GUID 0x60C70000640AEFC9B42DC918  tcp 10.64.23.134:5075
+```
+
+An address argument lists that server's PVs:
+
+```console
+$ cargo run -p spvirit-client --example pvlist -- 127.0.0.1:5075
+6 PVs via PvList
+  VAC:ERROR
+  VAC:LINK
+  VAC:PRESSURE
+  VAC:RGA
+  VAC:SETPOINT
+  __pvlist
+```
+
+A PV name searches for it, then describes it:
+
+```console
+$ cargo run -p spvirit-client --example pvlist -- VAC:PRESSURE
+VAC:PRESSURE is served by 10.64.23.134:5075
+struct epics:nt/NTScalar:1.0
+value: double
+alarm: structure
+  severity: int
+  status: int
+  message: string
+timeStamp: structure
+  secondsPastEpoch: long
+  nanoseconds: int
+  userTag: int
+display: structure
+  limitLow: double
+  limitHigh: double
+  description: string
+  units: string
+  precision: int
+  form: structure
+    index: int
+    choices: string[]
+control: structure
+  limitLow: double
+  limitHigh: double
+  minStep: double
+valueAlarm: structure
+  active: boolean
+  lowAlarmLimit: double
+  lowWarningLimit: double
+  highWarningLimit: double
+  highAlarmLimit: double
+  lowAlarmSeverity: int
+  lowWarningSeverity: int
+  highWarningSeverity: int
+  highAlarmSeverity: int
+  hysteresis: ubyte
+```
+
+The GUID and address will differ on your machine.
+
+## Next
+
+[Reacting to writes](reacting-to-writes.md).
