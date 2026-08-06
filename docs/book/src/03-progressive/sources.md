@@ -203,6 +203,84 @@ python spvirit-py/examples/demo_source_sensor.py
 python spvirit-py/examples/demo_source_rpc.py
 ```
 
+Each is a server; drive it from a second terminal. `multi_source` registers
+several sources on one server, and `splist` shows them merged into one flat
+namespace — nothing in the listing says which source owns which PV:
+
+```console
+$ splist 127.0.0.1:5075
+COMPUTED:TIME
+CONST:E
+CONST:PI
+SIM:COUNTER
+__pvlist
+
+$ spget CONST:PI
+CONST:PI 2026-08-06 09:19:57.058 3.141593
+
+$ spget COMPUTED:TIME
+COMPUTED:TIME 2026-08-06 09:19:57.139 1786007997.139291
+
+$ spget SIM:COUNTER
+SIM:COUNTER 2026-08-06 09:19:56.859   3
+```
+
+`wildcard_source` claims a whole prefix, so the PV does not exist until you
+write to it:
+
+```console
+$ spput XYZ:MyValue 42.0
+XYZ:MyValue OK
+
+$ spget XYZ:MyValue
+XYZ:MyValue  42
+
+$ spput XYZ:sensor/temp 21.5
+XYZ:sensor/temp OK
+
+$ splist 127.0.0.1:5075
+STATIC:HEARTBEAT
+XYZ:MyValue
+XYZ:sensor/temp
+__pvlist
+```
+
+Two things to notice. `spget XYZ:MyValue` prints **no timestamp** — the
+source returns a bare value and nothing stamped it, unlike a record. And
+`splist` only reports the names created so far; a wildcard source cannot
+enumerate an infinite namespace.
+
+`json_source` writes through to disk, so the value survives a restart:
+
+```console
+$ spput JSON:SETPOINT_A 123.4
+JSON:SETPOINT_A OK
+
+$ spget JSON:SETPOINT_A
+JSON:SETPOINT_A 123.4
+
+# stop the server with Ctrl-C, start it again
+
+$ spget JSON:SETPOINT_A
+JSON:SETPOINT_A 123.4
+```
+
+The server prints its side of that on startup:
+
+```console
+[json_source] loaded 4 PVs from pvstore.json
+JSON file-backed source server running on port 5075
+  Persistent PVs: JSON:SETPOINT_A, JSON:SETPOINT_B, JSON:LIMIT_HI, JSON:LIMIT_LO
+  In-memory PV:   SIM:HEARTBEAT
+  Storage file:   pvstore.json
+```
+
+It creates `pvstore.json` in your working directory — delete it if you want
+to start from the defaults again.
+
+`rpc_source` has no expected output here, because as noted above spvirit
+ships no RPC client; use p4p or `pvcall` from pvxs against it.
+
 ## Next
 
 [A complete IOC](complete-ioc.md).

@@ -116,6 +116,36 @@ cargo run -p spvirit-client --example pvput -- SIM:SETPOINT 30
 python spvirit-py/examples/demo_put.py
 ```
 
+The raw client prints the whole structure; `pvput` prints nothing but
+`OK`; and the Python pair prints just the field each one asked for:
+
+```console
+$ cargo run -p spvirit-client --example pvget -- SIM:TEMPERATURE
+SIM:TEMPERATURE: {value=22.500000, alarm={severity=0, status=0, message=""},
+timeStamp={secondsPastEpoch=1786008647, nanoseconds=984899400, userTag=0},
+display={...}, control={...}, valueAlarm={...}}
+
+$ cargo run -p spvirit-client --example pvput -- SIM:SETPOINT 30
+OK
+
+$ python spvirit-py/examples/demo_put.py
+after put: 30.0
+```
+
+(The `{...}` groups above are elided; see
+[Your first PV](../02-getting-started/first-pv.md) for the untrimmed dump.)
+
+A successful PUT returns no value — if you want to see the new number you
+have to read it back, which is exactly what `demo_put.py` does:
+
+```console
+$ spput SIM:SETPOINT 30
+SIM:SETPOINT OK
+
+$ spget SIM:SETPOINT
+SIM:SETPOINT 2026-08-06 09:30:35.355  30
+```
+
 ## Next
 
 [Monitoring changes](monitors.md).

@@ -123,6 +123,52 @@ spput SIM:SETPOINT 30
 spput SIM:SETPOINT 500
 ```
 
+`on_put` only *observes* — both writes succeed, and the interesting output
+is in terminal 1:
+
+```console
+$ spput SIM:SETPOINT 30
+SIM:SETPOINT OK
+
+$ spput SIM:SETPOINT 500
+SIM:SETPOINT OK
+```
+
+```console
+# terminal 1
+SIM:SETPOINT was set to Structure([("value", Float64(30.0))])
+SIM:SETPOINT was set to Structure([("value", Float64(500.0))])
+```
+
+The callback receives the whole submitted structure, not a bare number —
+a client may write `value` alone or several fields at once.
+
+Now run `on_put_reject` instead, which returns an error for out-of-range
+values:
+
+```bash
+cargo run -p spvirit-server --example on_put_reject
+```
+
+```console
+$ spput SIM:SETPOINT 30
+SIM:SETPOINT OK
+
+$ spput SIM:SETPOINT 500
+SIM:SETPOINT ERROR protocol error: PUT failed: SIM:SETPOINT outside 0..100: 500
+Error: Protocol("PUT failed: SIM:SETPOINT outside 0..100: 500")
+```
+
+Your message crosses the wire verbatim, so write it for whoever is holding
+the terminal. `spput` also exits non-zero, which is why it prints that
+second `Error:` line — useful in a script.
+
+Terminal 1 logs only the write it let through:
+
+```console
+SIM:SETPOINT accepted 30
+```
+
 ## Next
 
 [Simulating a device](simulating.md).

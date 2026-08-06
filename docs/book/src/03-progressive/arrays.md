@@ -94,6 +94,49 @@ spget SIM:SPECTRUM
 spmonitor SIM:SPECTRUM
 ```
 
+Brace yourself: `spget` prints **all 1024 elements** on one line. There is
+no truncation anywhere in the tool chain.
+
+```console
+$ spget SIM:SPECTRUM
+SIM:SPECTRUM 2026-08-06 09:14:04.728 [0.279967, 0.299451, 0.318292, 0.336483,
+0.354022, 0.370907, ... 1.163854, 1.153073]
+```
+
+(Elided here for the page — your terminal shows every value.) Pipe it
+somewhere if you want to keep it: `spget SIM:SPECTRUM > spectrum.txt`.
+
+`spinfo` is the readable view. Note the type ID and the `[]` on `value`:
+
+```console
+$ spinfo SIM:SPECTRUM
+SIM:SPECTRUM:
+struct epics:nt/NTScalarArray:1.0
+value: double[]
+alarm: structure
+  severity: int
+  status: int
+  message: string
+timeStamp: structure
+  secondsPastEpoch: long
+  nanoseconds: int
+  userTag: int
+display: structure
+  limitLow: double
+  limitHigh: double
+  description: string
+  units: string
+  precision: int
+control: structure
+  limitLow: double
+  limitHigh: double
+  minStep: double
+```
+
+There is no `valueAlarm` — array records have no limit checking to do. And
+`spmonitor SIM:SPECTRUM` re-sends the whole 1024-element array on every
+update; PVAccess has no partial-array delta.
+
 ## Next
 
 [Enums and binary records](enums.md).

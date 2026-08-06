@@ -6,8 +6,9 @@
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
 
-Spvirit is six crates in one workspace. They are published separately, so
-you depend on the layer you need and nothing above it.
+Spvirit is seven crates in one workspace. They are published separately, so
+you depend on the layer you need and nothing above it. Six of them form the
+layered stack below; the seventh, `spvirit-calc`, stands apart.
 
 ## The layering
 
@@ -41,18 +42,28 @@ the codec and the type vocabulary underneath it.
 
 ## What each one is for
 
-| Crate | Depends on | You want it when |
-|---|---|---|
-| `spvirit-types` | — | You need the Normative Type structs (`NtScalar`, `NtTable`, `NtNdArray`, `NtEnum`, `ScalarValue`) without any I/O. Pure data and validation. |
-| `spvirit-codec` | `spvirit-types` | You are encoding or decoding PVAccess frames yourself — a proxy, an analyser, a test harness. |
-| `spvirit-client` | `spvirit-codec` | You are reading, writing, or monitoring PVs from Rust. |
-| `spvirit-server` | `spvirit-codec` | You are serving PVs: a soft IOC, a simulator, a gateway. |
-| `spvirit-tools` | client + server | You want the `sp*` command-line programs. Also usable as a library, but it exists mainly to ship binaries. |
-| `spvirit-py` | client + server | The `spvirit` Python module. A PyO3 extension, not a pure-Python package. |
+| Crate | Depends on | You want it when | API docs |
+|---|---|---|---|
+| `spvirit-types` | — | You need the Normative Type structs (`NtScalar`, `NtTable`, `NtNdArray`, `NtEnum`, `ScalarValue`) without any I/O. Pure data and validation. | [docs.rs](https://docs.rs/spvirit-types/latest/spvirit_types/) |
+| `spvirit-codec` | `spvirit-types` | You are encoding or decoding PVAccess frames yourself — a proxy, an analyser, a test harness. | [docs.rs](https://docs.rs/spvirit-codec/latest/spvirit_codec/) |
+| `spvirit-client` | `spvirit-codec` | You are reading, writing, or monitoring PVs from Rust. | [docs.rs](https://docs.rs/spvirit-client/latest/spvirit_client/) |
+| `spvirit-server` | `spvirit-codec` | You are serving PVs: a soft IOC, a simulator, a gateway. | [docs.rs](https://docs.rs/spvirit-server/latest/spvirit_server/) |
+| `spvirit-tools` | client + server | You want the `sp*` command-line programs. Also usable as a library, but it exists mainly to ship binaries. | [docs.rs](https://docs.rs/spvirit-tools/latest/spvirit_tools/) |
+| `spvirit-py` | client + server | The `spvirit` Python module. A PyO3 extension, not a pure-Python package. | [Python API](python-api.md) |
+
+A seventh crate, `spvirit-calc`
+([docs.rs](https://docs.rs/spvirit-calc/latest/spvirit_calc/)), implements
+the EPICS CALC expression language. It is a workspace member and is published
+alongside the rest, but nothing in the diagram above depends on it — it stands
+alone, and you add it explicitly if you want it.
+
+This book is the tutorial; the docs.rs pages are the exhaustive per-item
+reference. They are generated from the same source tree and versioned with
+each release, so `latest` always matches the newest published version.
 
 ## Versions
 
-All six are released together from the workspace, so their version numbers
+All are released together from the workspace, so their version numbers
 move in step. `spvirit-py` is published to PyPI rather than crates.io and
 carries its own version.
 

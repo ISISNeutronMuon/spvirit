@@ -96,10 +96,10 @@ to every subscriber.
 
 ```console
 $ spget SIM:TBL
-SIM:TBL {x=[0.000000, 1.000000, ...], y=[0.863209, 0.334988, ...]}
+SIM:TBL 2026-08-06 09:14:32.958 {x=[0.000000, 1.000000, ...], y=[0.000000, 0.644218, ...]}
 
 $ spget SIM:IMG
-SIM:IMG {ubyteValue=[0, 0, 0, ...]}
+SIM:IMG 2026-08-06 09:14:32.958 {ubyteValue=[0, 16, 32, ...]}
 ```
 
 The `ubyteValue` field name is not decoration — NTNDArray's `value` is a
@@ -130,6 +130,66 @@ cargo run -p spvirit-server --example exotic_nt
 spget SIM:TBL
 spget SIM:IMG
 ```
+
+```console
+$ spget SIM:TBL
+SIM:TBL 2026-08-06 09:14:32.958 {x=[0.000000, 1.000000, 2.000000, 3.000000,
+4.000000, 5.000000, 6.000000, 7.000000], y=[0.000000, 0.644218, 0.985450,
+0.863209, 0.334988, -0.350783, -0.871576, -0.982453]}
+
+$ spget SIM:IMG
+SIM:IMG 2026-08-06 09:14:32.958 {ubyteValue=[0, 16, 32, 48, 64, 80, 96, 112,
+128, 144, 160, 176, 192, 208, 224, 240]}
+```
+
+Both are one long line, wrapped here. `y` is `sin(x)` and the image is a
+4×4 greyscale ramp — small enough to read, which is the whole point of the
+example. Note what `spget` does *not* print: the table's `labels`
+(`["X", "Y"]`), and the image's `dimension` array. Both are on the wire;
+`spget` renders the `value` field only.
+
+`spinfo SIM:IMG` shows why NTNDArray is the most involved normative type in
+the book — `value` is a *union* of twelve typed arrays, and the shape lives
+in a separate `dimension` structure array:
+
+```console
+$ spinfo SIM:IMG
+SIM:IMG:
+struct epics:nt/NTNDArray:1.0
+value: union
+  booleanValue: array
+  byteValue: array
+  shortValue: array
+  intValue: int[]
+  ...
+  stringValue: string[]
+codec: structure
+  name: string
+  parameters: any
+compressedSize: long
+uncompressedSize: long
+dimension: structure[]
+  size: int
+  offset: int
+  fullSize: int
+  binning: int
+  reverse: boolean
+uniqueId: int
+dataTimeStamp: structure
+  ...
+attribute: structure[]
+  name: string
+  value: any
+  descriptor: string
+  sourceType: int
+  source: string
+descriptor: string
+alarm: structure
+  ...
+```
+
+Only the arm you filled in is transmitted, so a `ubyte` image does not pay
+for the eleven other array types.
 
 ## Next
 

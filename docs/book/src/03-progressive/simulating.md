@@ -91,12 +91,59 @@ spget CALC:MEAN      # 6.5
 spmonitor CALC:SUM   # live updates as A or B change
 ```
 
+```console
+$ spput CALC:A 10
+CALC:A OK
+
+$ spput CALC:B 3
+CALC:B OK
+
+$ spget CALC:SUM
+CALC:SUM 2026-08-06 09:13:28.993  13
+
+$ spget CALC:PROD
+CALC:PROD 2026-08-06 09:13:28.993  30
+
+$ spget CALC:MEAN
+CALC:MEAN 2026-08-06 09:13:28.993 6.5
+```
+
+All three derived PVs carry the *same* timestamp, because one write to
+`CALC:B` recomputed all of them in the same pass.
+
+Leave `spmonitor CALC:SUM` running first, then do the two puts from a third
+terminal, and you can watch the recomputation happen:
+
+```console
+$ spmonitor CALC:SUM
+CALC:SUM 2026-08-06 09:27:29.216   0
+CALC:SUM 2026-08-06 09:27:34.375  10
+CALC:SUM 2026-08-06 09:27:35.262  13
+CALC:SUM 2026-08-06 09:27:36.132  23
+```
+
+`0` is the initial value delivered on connect, `10` follows `spput CALC:A
+10`, `13` follows `spput CALC:B 3`, and `23` is a later `spput CALC:A 20`.
+Each input write produces exactly one output update.
+
 Or the scan pair:
 
 ```bash
 python spvirit-py/examples/demo_scan.py     # terminal 1
 spmonitor SIM:TEMPERATURE                   # terminal 2
 ```
+
+```console
+SIM:TEMPERATURE 2026-08-06 09:25:29.221 21.677613
+SIM:TEMPERATURE 21.734644
+SIM:TEMPERATURE 21.8092
+SIM:TEMPERATURE 21.89275
+...
+SIM:TEMPERATURE 2026-08-06 09:25:30.028 22.347997
+```
+
+Ten updates a second, forever, with no client asking for them. The
+timestamp is reprinted only when the wall-clock second rolls over.
 
 ## Next
 

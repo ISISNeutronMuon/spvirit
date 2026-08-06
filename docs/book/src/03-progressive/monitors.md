@@ -103,6 +103,31 @@ python spvirit-py/examples/demo_monitor.py
 spmonitor SIM:TEMPERATURE
 ```
 
+`demo_scan.py` updates ten times a second, so terminal 2 fills immediately:
+
+```console
+$ spmonitor SIM:TEMPERATURE
+SIM:TEMPERATURE 2026-08-06 09:25:29.221 21.677613
+SIM:TEMPERATURE 21.734644
+SIM:TEMPERATURE 21.8092
+SIM:TEMPERATURE 21.89275
+SIM:TEMPERATURE 21.956506
+SIM:TEMPERATURE 22.051046
+SIM:TEMPERATURE 22.151852
+SIM:TEMPERATURE 22.240413
+SIM:TEMPERATURE 2026-08-06 09:25:30.028 22.347997
+SIM:TEMPERATURE 22.440441
+SIM:TEMPERATURE 22.534399
+...
+```
+
+`spmonitor` prints the timestamp only on the first update of each
+wall-clock second — that is a display convenience, not a change in the
+data. Every update carries a full timestamp on the wire. Counting the
+lines between two timestamps is a quick way to see your actual update rate.
+
+Stop it with `Ctrl-C`.
+
 ## Next
 
 [Reacting to writes](reacting-to-writes.md).

@@ -37,18 +37,21 @@ appends severity and status:
 
 ```console
 $ spget DEMO:SETPOINT
-DEMO:SETPOINT  46 MAJOR READ HIHI
+DEMO:SETPOINT 2026-08-06 09:14:58.052  46 MAJOR READ HIHI
 ```
 
 Structured payloads print inline:
 
 ```console
 $ spget SIM:STATE
-SIM:STATE {index=2, choices=["Idle", "Running", "Fault"]}
+SIM:STATE 2026-08-06 09:14:32.958 {index=0, choices=["Idle", "Running", "Error"]}
 
 $ spget VAC:RGA
-VAC:RGA 2026-08-04 10:35:24.531 [0.083089, 0.116549, 0.311541, ...]
+VAC:RGA 2026-08-06 09:35:20.331 [0.909297, 0.808496, 0.675463, ...]
 ```
+
+The array above is elided for the page; `spget` prints **every** element,
+however many there are. A 1024-point waveform is one very long line.
 
 ## Gotchas
 
@@ -56,11 +59,24 @@ VAC:RGA 2026-08-04 10:35:24.531 [0.083089, 0.116549, 0.311541, ...]
 
 ```console
 $ spget VAC:SETPOINT     # the record holds 5e-7
-VAC:SETPOINT 2026-08-04 10:35:11.566   0
+VAC:SETPOINT 2026-08-06 09:35:33.545   0
 ```
 
-The wire value is intact. Use `-F value` or a monitor if you need to see
-the number rather than a display rendering.
+The wire value is intact — but neither `-F value` nor `--json` will show it
+to you, because both go through the same formatter:
+
+```console
+$ spget -F value VAC:SETPOINT
+VAC:SETPOINT   0
+
+$ spget --json VAC:SETPOINT
+{"alarm":"alarm=OK status=NO_ALARM(0)","pv":"VAC:SETPOINT",
+ "timestamp":"2026-08-06 09:35:33.545","units":null,
+ "value":"value=0.000000, ts=1786008933"}
+```
+
+`spget --raw` dumps the payload bytes, which does contain the true double;
+otherwise read the PV from a client library rather than a CLI.
 
 **Search failure looks like a timeout.** If nothing answers, you get
 `Timeout("search response")` — not "PV not found". No server on the

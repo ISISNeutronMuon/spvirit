@@ -98,6 +98,44 @@ spget SIM:STATE
 spmonitor SIM:STATE
 ```
 
+```console
+$ spget SIM:STATE
+SIM:STATE 2026-08-06 09:14:32.958 {index=0, choices=["Idle", "Running", "Error"]}
+
+$ spinfo SIM:STATE
+SIM:STATE:
+struct epics:nt/NTEnum:1.0
+value: structure
+  index: int
+  choices: string[]
+alarm: structure
+  severity: int
+  status: int
+  message: string
+timeStamp: structure
+  secondsPastEpoch: long
+  nanoseconds: int
+  userTag: int
+```
+
+`value` is a *structure*, not a number — that is what makes NTEnum
+different from an NTScalar holding an integer.
+
+Under a monitor the difference shows up on the wire:
+
+```console
+$ spmonitor SIM:STATE
+SIM:STATE 2026-08-06 09:27:05.724 {index=0, choices=["Idle", "Running", "Error"]}
+SIM:STATE 2026-08-06 09:27:06.731 {index=1}
+SIM:STATE 2026-08-06 09:27:07.748 {index=2}
+SIM:STATE 2026-08-06 09:27:08.763 {index=0}
+```
+
+The choice list arrives **once**, in the first update, and is then omitted
+because it did not change. PVAccess sends a change bitset, not a whole
+structure. A client that only reads the field it was given on each update
+will lose the labels after the first one — cache them.
+
 ## Next
 
 [Alarms and severity](alarms.md).

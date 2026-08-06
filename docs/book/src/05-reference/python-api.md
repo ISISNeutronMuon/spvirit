@@ -15,6 +15,19 @@ The complete API reference is
 [`spvirit-py/README.md`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md)
 — around a thousand lines covering every class, method and keyword argument.
 It is not duplicated here; this page tells you which part of it you want.
+Every object also carries a docstring, so `help(spvirit.ai)` and
+`help(spvirit.Server)` work at the interpreter prompt.
+
+For the **Rust** side there is generated reference documentation on docs.rs:
+[types](https://docs.rs/spvirit-types/latest/spvirit_types/) ·
+[codec](https://docs.rs/spvirit-codec/latest/spvirit_codec/) ·
+[client](https://docs.rs/spvirit-client/latest/spvirit_client/) ·
+[server](https://docs.rs/spvirit-server/latest/spvirit_server/) ·
+[tools](https://docs.rs/spvirit-tools/latest/spvirit_tools/) ·
+[calc](https://docs.rs/spvirit-calc/latest/spvirit_calc/). The Python
+module is a thin layer over `spvirit-client` and `spvirit-server`, so when a
+Python docstring is terse the Rust page for the same call is often the
+fuller answer. See the [crate map](crate-map.md).
 
 ## Install
 

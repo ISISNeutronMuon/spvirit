@@ -142,6 +142,40 @@ spget SIM:LINK          # INVALID device unreachable
 spmonitor SIM:PRESSURE
 ```
 
+```console
+$ spget SIM:LINK
+SIM:LINK 2026-08-06 09:14:45.114   0 INVALID SIMM device unreachable
+
+$ spget SIM:PRESSURE
+SIM:PRESSURE 2026-08-06 09:14:45.114  50
+```
+
+`spget` appends severity, status and message after the value when the
+alarm is not `NO_ALARM` — and prints nothing extra when it is, which is why
+`SIM:PRESSURE` at 50 looks like a plain reading.
+
+The Rust `alarms` example is static, so `spmonitor SIM:PRESSURE` shows one
+line and then waits. Use the Python example to watch the limits fire:
+
+```bash
+python spvirit-py/examples/demo_alarms.py   # terminal 1
+spmonitor SIM:PRESSURE                      # terminal 2
+```
+
+```console
+SIM:PRESSURE 2026-08-06 09:26:17.437  50
+SIM:PRESSURE 2026-08-06 09:26:18.438  95
+SIM:PRESSURE {alarm={severity=1, status=4, message="HIGH"}} MINOR HIGH
+SIM:PRESSURE 2026-08-06 09:26:19.439 120
+SIM:PRESSURE {alarm={severity=2, status=4, message="HIHI"}} MAJOR HIGH HIHI
+```
+
+Two things worth pausing on. The value and the alarm arrive as **separate
+updates** — the server changed `value` first, then the record layer
+evaluated the limits and changed `alarm`. And the second line of each pair
+shows only the field that changed, because a monitor sends a change bitset;
+`spmonitor` renders the changed subtree and then the decoded severity.
+
 ## Next
 
 [Serving a .db file](db-files.md).

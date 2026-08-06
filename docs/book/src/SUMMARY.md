@@ -1,6 +1,7 @@
 # Summary
 
 [Introduction](introduction.md)
+[Licence and support](licence.md)
 
 ---
 

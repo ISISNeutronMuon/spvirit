@@ -130,6 +130,38 @@ spput DEMO:SETPOINT 46
 spget DEMO:SETPOINT        # MAJOR HIHI
 ```
 
+```console
+$ splist 127.0.0.1:5075
+DEMO:ENABLE
+DEMO:SETPOINT
+DEMO:SPECTRUM
+DEMO:TEMP
+__pvlist
+
+$ spget DEMO:TEMP
+DEMO:TEMP 2026-08-06 09:14:58.052 22.5
+
+$ spput DEMO:SETPOINT 46
+DEMO:SETPOINT OK
+
+$ spget DEMO:SETPOINT
+DEMO:SETPOINT 2026-08-06 09:14:58.052  46 MAJOR READ HIHI
+
+$ spput DEMO:SETPOINT 25
+DEMO:SETPOINT OK
+
+$ spget DEMO:SETPOINT
+DEMO:SETPOINT 2026-08-06 09:14:58.052  25
+```
+
+Four PVs and no Rust that names any of them — every field, including the
+`HIHI` limit that turned 46 into a MAJOR alarm, came out of the `.db` file.
+The alarm clears on its own when the value drops back inside the limits;
+nothing acknowledged it.
+
+`__pvlist` in the listing is the server's own directory record, not one of
+yours. It is how `splist` works at all.
+
 ## Next
 
 [Tables and images](tables-and-images.md).

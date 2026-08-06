@@ -133,6 +133,73 @@ spinfo SIM:GAIN
 spinfo SIM:STATUS
 ```
 
+Terminal 2 prints:
+
+```console
+$ spget SIM:TEMPERATURE
+SIM:TEMPERATURE 2026-08-06 09:13:06.435 22.5
+
+$ spget SIM:TEMPERATURE.MDEL
+SIM:TEMPERATURE.MDEL 2026-08-06 09:13:06.707 0.5
+
+$ spput SIM:SETPOINT 30
+SIM:SETPOINT OK
+```
+
+`spinfo` prints the type of every field. Only the third line differs
+between the two records — `SIM:GAIN` is a `ushort`, `SIM:STATUS` a `ubyte`
+— and the remaining forty-odd lines are the same NTScalar skeleton in both:
+
+```console
+$ spinfo SIM:GAIN
+SIM:GAIN:
+struct epics:nt/NTScalar:1.0
+value: ushort
+alarm: structure
+  severity: int
+  status: int
+  message: string
+timeStamp: structure
+  secondsPastEpoch: long
+  nanoseconds: int
+  userTag: int
+display: structure
+  limitLow: double
+  limitHigh: double
+  description: string
+  units: string
+  precision: int
+  form: structure
+    index: int
+    choices: string[]
+control: structure
+  limitLow: double
+  limitHigh: double
+  minStep: double
+valueAlarm: structure
+  active: boolean
+  lowAlarmLimit: double
+  lowWarningLimit: double
+  highWarningLimit: double
+  highAlarmLimit: double
+  lowAlarmSeverity: int
+  lowWarningSeverity: int
+  highWarningSeverity: int
+  highAlarmSeverity: int
+  hysteresis: ubyte
+
+$ spinfo SIM:STATUS
+SIM:STATUS:
+struct epics:nt/NTScalar:1.0
+value: ubyte
+...
+```
+
+That is the point of the narrow types: the wire carries two bytes for a
+`ushort` and one for a `ubyte`, but the surrounding structure — alarm,
+timestamp, display, control, valueAlarm — is identical whatever the value
+type is.
+
 ## Next
 
 [Reading and writing](read-write.md).

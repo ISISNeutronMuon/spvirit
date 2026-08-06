@@ -65,11 +65,34 @@ cargo run -p spvirit-server --example simple_server
 cargo run -p spvirit-client --example pvget -- SIM:TEMPERATURE
 ```
 
-Or with the Python pair:
+Terminal 2 should print the whole structure — this is what success looks
+like:
+
+```console
+$ cargo run -p spvirit-client --example pvget -- SIM:TEMPERATURE
+SIM:TEMPERATURE: {value=22.500000, alarm={severity=0, status=0, message=""},
+timeStamp={secondsPastEpoch=1786008647, nanoseconds=984899400, userTag=0},
+display={limitLow=0.000000, limitHigh=0.000000, description="", units="",
+precision=0, form={index=0, choices=["Default", "String", "Binary",
+"Decimal", "Hex", "Exponential", "Engineering"]}}, control={limitLow=0.000000,
+limitHigh=0.000000, minStep=0.000000}, valueAlarm={active=false,
+lowAlarmLimit=0.000000, lowWarningLimit=0.000000, highWarningLimit=0.000000,
+highAlarmLimit=0.000000, lowAlarmSeverity=0, lowWarningSeverity=0,
+highWarningSeverity=0, highAlarmSeverity=0, hysteresis=0}}
+```
+
+That is one long line, wrapped here to fit the page — nothing has been
+elided. Or with the Python pair:
 
 ```bash
 python spvirit-py/examples/demo_first_pv.py     # terminal 1
 python spvirit-py/examples/demo_get.py          # terminal 2
+```
+
+```console
+$ python spvirit-py/examples/demo_get.py
+SIM:TEMPERATURE = 22.5
+severity: 0
 ```
 
 The two halves mix freely: the Rust client reads the Python server, `spget`

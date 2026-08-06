@@ -21,6 +21,15 @@ undocumented_examples = [
   "spvirit-server/examples/store_runtime.rs",
 ]
 
+# --- Front matter --------------------------------------------------------
+
+[chapters."introduction.md"]
+tools = ["spget", "spput"]
+py_examples = ["spvirit-py/examples/demo_first_pv.py"]
+anchors = ["spvirit-py/examples/demo_first_pv.py:serve"]
+
+[chapters."licence.md"]
+
 # ─── Part I: Fundamentals ───────────────────────────────────────────────
 # Mostly concept chapters; the ones with no {{#include}}s get a badge
 # reading "no code on this page".
