@@ -57,6 +57,13 @@ the EPICS CALC expression language. It is a workspace member and is published
 alongside the rest, but nothing in the diagram above depends on it — it stands
 alone, and you add it explicitly if you want it.
 
+> **Incomplete.** `spvirit-calc` is a work in progress. Its conformance
+> corpus (`spvirit-calc/tests/base_corpus.rs`, transcribed from EPICS Base's
+> `epicsCalcTest.cpp`) still has failing cases in the parser's conditional/`:`
+> error classification, so that corpus test is currently commented out. The
+> per-module unit tests pass, but treat the crate as unfinished. See
+> [Known gaps](known-gaps.md).
+
 This book is the tutorial; the docs.rs pages are the exhaustive per-item
 reference. They are generated from the same source tree and versioned with
 each release, so `latest` always matches the newest published version.
