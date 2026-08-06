@@ -50,9 +50,10 @@ wrong. See [Known gaps](known-gaps.md).
 ³ Writable in the sense that the record accepts write access. A wire PUT of
 an enum index is currently dropped — see [Known gaps](known-gaps.md).
 
-⁴ Writable via `store.put_nt()`, not via a client PUT. The wire-PUT arm for
-`NtTable`/`NtNdArray` logs and returns without changing anything
-(`spvirit-server/src/simple_store.rs:608`).
+⁴ Writable via a client PUT as well as `store.put_nt()`. The `NtTable`/
+`NtNdArray` arms of `RecordInstance::apply_put`
+(`spvirit-server/src/apply.rs:609`) apply the wire fields and restamp the
+record.
 
 ## Reading the columns
 

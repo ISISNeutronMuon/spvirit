@@ -74,8 +74,9 @@ Cross-referenced from the per-crate chapters.
 
 **Server**
 - CANCEL_REQUEST unimplemented (some clients send it).
-- PUT to NtTable/NtNdArray/Generic not wired into `apply_put_to_record`
-  (only `put_nt` works) even though `apply.rs` has the functions.
+- PUT to `Generic` not wired into `RecordInstance::apply_put` (only `put_nt`
+  works); `NtTable`/`NtNdArray` PUTs are wired and restamp like any other
+  record.
 - `.db` parser: one-statement-per-line only; cannot load
   longin/longout/mbbi/mbbo/table/ndarray/generic (the repo's only two
   `TODO(follow-up)` markers: `types.rs:45`, `db.rs:546`).

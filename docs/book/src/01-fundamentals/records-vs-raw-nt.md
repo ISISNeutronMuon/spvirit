@@ -18,7 +18,7 @@ monitor fire on every tick".
 | You create them with | `Pv<T>` handles (`Pv::ai(...)` …), builder methods (`.ai()`, `.waveform()` …), `.db` files | `NtScalar`/`NtScalarArray`/… built by hand; hand-built `RecordInstance`; custom `Source` impls |
 | You read/write | plain values: `pv.set(21.5)`, `store.set_value(...)` | whole payloads: `store.put_nt(...)` / `get_nt(...)`, `Notifier` posts |
 | Alarm state | computed for you from HIHI/HIGH/LOW/LOLO limits (`compute_alarms`), or `pv.set_alarm(...)` | you set `alarm` on every payload yourself |
-| Timestamps | stamped automatically on every *server-side* update; **not** on a client PUT | yours to fill in — an explicit `timeStamp` is honoured, a zero one is stamped for you |
+| Timestamps | stamped automatically on every update, client PUT included | yours to fill in — an explicit `timeStamp` is honoured, a zero one is stamped for you |
 | Display/control metadata (EGU, PREC, limits) | record fields, visible QSRV-style (`PV.EGU`, `PV.DESC`, …) | whatever you put in the payload, each update |
 | Monitor deadbands (MDEL/ADEL) | applied by the server | not applied — every `put_nt`/notify posts |
 | Best for | soft IOCs, simulators, anything that should feel like an EPICS record | gateways/bridges, tables, images, PVs whose metadata changes per update |
@@ -42,19 +42,21 @@ that entirely: every post goes out. If you have a 1 kHz raw-NT source and a
 monitor client, you are sending 1000 updates a second, and no amount of
 `MDEL` in a `.db` file will change that.
 
-**Timestamps are automatic at the record level, with one exception** — and
-the raw level is forgiving. Post a payload with a zero `timeStamp` and the
-server stamps it for you; post one with a real `timeStamp` and it is
-honoured. That is deliberate, so a gateway can forward the *originating*
-timestamp rather than the time it happened to relay the value.
+**Timestamps are automatic at both levels, and the rule is the same one.**
+Post a payload — or PUT a record field — with a zero or absent `timeStamp`
+and the server stamps it with the current time; supply a real `timeStamp`
+and it is honoured instead. That is deliberate, so a gateway can forward
+the *originating* acquisition time rather than the time it happened to
+relay the value.
 
-The exception is worth stating on its own: a **client PUT does not restamp
-the record**. Server-side updates do — `set_value`, a `scan` callback, a
-`.link()` recomputation — but a value that arrived over the wire from a
-client keeps whatever timestamp the record already had. EPICS Base would
-restamp on record processing, so this is a divergence, not a design
-choice. [Reading and writing](../03-progressive/read-write.md) shows it
-happening.
+At the record level this restamp happens on every accepted PUT, whether or
+not the value itself changed — `RecordInstance::apply_put`
+(`spvirit-server/src/apply.rs:546`) applies `value`, `alarm`, `display` and
+`control`, then always calls `set_time_stamp`. Server-side updates —
+`set_value`, a `scan` callback, a `.link()` recomputation — restamp the same
+way. EPICS Base does the same: `recGblGetTimeStampSimm()` runs
+unconditionally in `process()`, independent of whether the value moved.
+[Reading and writing](../03-progressive/read-write.md) shows it happening.
 
 **Alarms are only computed at the record level.** `compute_alarms` walks the
 `HIHI`/`HIGH`/`LOW`/`LOLO` thresholds and sets severity. Raw payloads get the
@@ -96,9 +98,9 @@ constructors are `spvirit.NtScalar`, `spvirit.NtScalarArray`,
 `spvirit.NtTable`, `spvirit.NtNdArray`, plus `Alarm`, `TimeStamp`, `Display`
 and `Control` for the substructures.
 
-Note what neither example gets for free: no deadband, no computed alarm, no
-automatic restamp. All three are record-level services, and the payload you
-built is not a record. That is the trade the table above describes.
+Note what neither example gets for free: no deadband, no computed alarm.
+Both are record-level services, and the payload you built is not a record.
+That is the trade the table above describes.
 
 ## Which one am I on?
 

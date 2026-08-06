@@ -9,7 +9,7 @@ use std::time::Duration;
 pub use spvirit_types::*;
 
 /// Current wall-clock time as an [`NtTimeStamp`] (UNIX epoch).
-fn now_nt_timestamp() -> NtTimeStamp {
+pub(crate) fn now_nt_timestamp() -> NtTimeStamp {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
@@ -422,6 +422,34 @@ impl RecordInstance {
                 if nt.data_time_stamp == NtTimeStamp::default() {
                     nt.data_time_stamp = ts;
                 }
+            }
+            RecordData::Generic { .. } => {}
+        }
+    }
+
+    /// Overwrite the record's timestamp, whatever it currently holds.
+    ///
+    /// Mirrors [`RecordInstance::stamp_missing_timestamps`]'s arm structure
+    /// but assigns unconditionally. Used by the PUT path, which restamps on
+    /// every accepted write — EPICS Base advances TIME on every record
+    /// process, value change or not.
+    pub fn set_time_stamp(&mut self, ts: NtTimeStamp) {
+        match &mut self.data {
+            RecordData::Ai { nt, .. }
+            | RecordData::Ao { nt, .. }
+            | RecordData::Bi { nt, .. }
+            | RecordData::Bo { nt, .. }
+            | RecordData::StringIn { nt, .. }
+            | RecordData::StringOut { nt, .. } => nt.time_stamp = Some(ts),
+            RecordData::Waveform { nt, .. }
+            | RecordData::Aai { nt, .. }
+            | RecordData::Aao { nt, .. }
+            | RecordData::SubArray { nt, .. } => nt.time_stamp = ts,
+            RecordData::NtEnum { nt, .. } => nt.time_stamp = ts,
+            RecordData::NtTable { nt, .. } => nt.time_stamp = Some(ts),
+            RecordData::NtNdArray { nt, .. } => {
+                nt.time_stamp = Some(ts.clone());
+                nt.data_time_stamp = ts;
             }
             RecordData::Generic { .. } => {}
         }
@@ -1007,5 +1035,70 @@ fn parse_bool_like(input: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ai_record(val: f64) -> RecordInstance {
+        RecordInstance {
+            name: "T".to_string(),
+            record_type: RecordType::Ai,
+            common: DbCommonState::default(),
+            data: RecordData::Ai {
+                nt: NtScalar::from_value(ScalarValue::F64(val)),
+                inp: None,
+                siml: None,
+                siol: None,
+                simm: false,
+            },
+            raw_fields: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn set_time_stamp_overwrites_an_existing_stamp() {
+        let mut rec = ai_record(1.0);
+        rec.set_time_stamp(NtTimeStamp {
+            seconds_past_epoch: 100,
+            nanoseconds: 0,
+            user_tag: 0,
+        });
+        let replacement = NtTimeStamp {
+            seconds_past_epoch: 200,
+            nanoseconds: 7,
+            user_tag: 3,
+        };
+        rec.set_time_stamp(replacement.clone());
+
+        let RecordData::Ai { nt, .. } = &rec.data else {
+            panic!("expected Ai");
+        };
+        assert_eq!(nt.time_stamp, Some(replacement));
+    }
+
+    #[test]
+    fn set_time_stamp_on_generic_record_is_a_no_op() {
+        let mut rec = RecordInstance {
+            name: "G".to_string(),
+            record_type: RecordType::Generic,
+            common: DbCommonState::default(),
+            data: RecordData::Generic {
+                struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                fields: vec![],
+                inp: None,
+                out: None,
+                omsl: OutputMode::Supervisory,
+            },
+            raw_fields: std::collections::HashMap::new(),
+        };
+        // Must not panic and must leave the record untouched.
+        rec.set_time_stamp(now_nt_timestamp());
+        let RecordData::Generic { fields, .. } = &rec.data else {
+            panic!("expected Generic");
+        };
+        assert!(fields.is_empty());
     }
 }

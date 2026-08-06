@@ -78,14 +78,14 @@ exit status. `spput` returns non-zero on a rejected write.
 **It is an enum.** A wire PUT of an `NtEnum` index currently reports success
 and changes nothing. [Known gaps](known-gaps.md).
 
-**It is an `NtTable` or `NtNdArray`.** The wire-PUT arm for those logs and
-returns (`spvirit-server/src/simple_store.rs:608`). Write them server-side
-with `store.put_nt()`.
+**It is a `Generic` record.** The `Generic` arm of `RecordInstance::apply_put`
+(`spvirit-server/src/apply.rs:639`) is a no-op. Write it server-side with
+`store.put_nt()`.
 
 ## A monitor looks frozen
 
 The value is moving but no updates arrive. Almost always the deadband:
-`should_post_update` (`spvirit-server/src/simple_store.rs:535`) suppresses
+`should_post_update` (`spvirit-server/src/simple_store.rs:545`) suppresses
 the *post*, not the store, when the record is a numeric scalar, `MDEL` is
 greater than zero, the severity has not changed, and the delta is under
 `MDEL`.
@@ -96,15 +96,6 @@ is the deadband. Set `MDEL` to 0 to post everything.
 Two things that are *not* the cause: alarm transitions always post regardless
 of the deadband, and `ADEL` is parsed and exposed but not wired into any
 posting logic.
-
-## The timestamp never advances
-
-A client PUT does not restamp the record. Server-side updates do — a `scan`
-callback, a `.link()` recomputation, `set_value` — but a value that arrived
-over the wire keeps whatever timestamp the record already had
-(`apply_put_to_record`, `spvirit-server/src/simple_store.rs:558`). EPICS Base
-would restamp on record processing, so this is a divergence. It is on
-[Known gaps](known-gaps.md).
 
 ## Python: `on_put` never fires
 

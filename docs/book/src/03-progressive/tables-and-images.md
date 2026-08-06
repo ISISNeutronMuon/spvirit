@@ -84,9 +84,13 @@ interest.
 
 ## What to notice
 
-**Neither type is writable.** The store's PUT branch for `NtTable` and
-`NtNdArray` does nothing (`spvirit-server/src/simple_store.rs:608`). These
-are server-to-client payloads. Drive them with `store.put_nt(...)`.
+**Both types accept a wire PUT.** `RecordInstance::apply_put`
+(`spvirit-server/src/apply.rs:609`) dispatches `NtTable` and `NtNdArray` PUTs
+to `apply_table_put`/`apply_ndarray_put`, so a client write updates the
+record and restamps it like any other. The examples above still use
+`store.put_nt(...)` because that is the natural way to drive a
+server-to-client payload from Rust or Python code, not because a client PUT
+is refused.
 
 **No deadband, no alarm computation, no scanning.** All of that lives in
 the record layer, which these types are not part of. Every `put_nt` posts
