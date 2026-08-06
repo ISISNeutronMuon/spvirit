@@ -130,4 +130,4 @@ Stop it with `Ctrl-C`.
 
 ## Next
 
-[Reacting to writes](reacting-to-writes.md).
+[Discovery and introspection](discovery.md).
