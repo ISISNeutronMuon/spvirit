@@ -15,10 +15,6 @@ use std::pin::Pin;
 use spvirit_codec::spvd_decode::{DecodedValue, FieldDesc, FieldType, StructureDesc, TypeCode};
 use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
-use crate::apply::{
-    apply_alarm_update, apply_control_update, apply_display_update, apply_scalar_array_put,
-    apply_value_update,
-};
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::{PvInfo, Source};
 use crate::types::{RecordData, RecordInstance};
@@ -442,24 +438,35 @@ impl Source for SimplePvStore {
                 }
 
                 let prev_severity = entry.record.to_ntscalar().alarm_severity;
-                let changed = apply_put_to_record(&mut entry.record, &value, self.compute_alarms);
-                if !changed {
-                    return Ok(vec![]);
-                }
+                let outcome = entry.record.apply_put(&value, self.compute_alarms);
 
-                if should_post_update(entry, prev_severity) {
+                // A client-supplied timeStamp is new information even when the
+                // value is identical, so it posts. A server-generated stamp on
+                // an unchanged value updates the record silently — GETs and the
+                // next real post carry it. should_post_update is only consulted
+                // on a value change, so the MDEL reference point is untouched
+                // by timestamp-only updates.
+                let post = if outcome.value_changed {
+                    should_post_update(entry, prev_severity)
+                } else {
+                    outcome.client_stamped
+                };
+
+                if post {
                     let payload = entry.record.to_ntpayload();
                     entry
                         .subscribers
                         .retain(|tx| tx.try_send(payload.clone()).is_ok());
-                    Some((name.clone(), payload))
+                    (Some((name.clone(), payload)), outcome)
                 } else {
-                    // Within the MDEL monitor deadband — value applied, no post.
-                    None
+                    (None, outcome)
                 }
             }; // pvs lock dropped
+            let (result, outcome) = result;
 
-            // Fire on_put callback (non-blocking).
+            // EPICS runs the forward link on every record process, so on_put
+            // fires for every accepted PUT — including one that did not change
+            // the value.
             if let Some(cb) = self.on_put.get(&name) {
                 let cb = cb.clone();
                 let n = name.clone();
@@ -467,8 +474,11 @@ impl Source for SimplePvStore {
                 tokio::spawn(async move { cb(&n, &v) });
             }
 
-            // Propagate linked PV updates.
-            self.evaluate_links(&name).await;
+            // Links are change-driven here, not post-driven: a PUT suppressed
+            // by the MDEL deadband still propagates, matching set_value.
+            if outcome.value_changed {
+                self.evaluate_links(&name).await;
+            }
 
             Ok(result.into_iter().collect())
         })
@@ -552,92 +562,6 @@ fn should_post_update(entry: &mut PvEntry, prev_severity: i32) -> bool {
     }
     entry.last_posted = Some(new_f);
     true
-}
-
-/// Apply a decoded PUT value to a RecordInstance, returning whether it changed.
-fn apply_put_to_record(
-    record: &mut RecordInstance,
-    value: &DecodedValue,
-    compute_alarms: bool,
-) -> bool {
-    let fields = match value {
-        DecodedValue::Structure(f) => f,
-        other => {
-            // Bare scalar — wrap as value field.
-            return apply_put_to_record(
-                record,
-                &DecodedValue::Structure(vec![("value".to_string(), other.clone())]),
-                compute_alarms,
-            );
-        }
-    };
-
-    let mut changed = false;
-
-    match &mut record.data {
-        RecordData::Ai { nt, .. }
-        | RecordData::Ao { nt, .. }
-        | RecordData::Bi { nt, .. }
-        | RecordData::Bo { nt, .. }
-        | RecordData::StringIn { nt, .. }
-        | RecordData::StringOut { nt, .. } => {
-            for (name, val) in fields {
-                match name.as_str() {
-                    "value" => {
-                        changed |= apply_value_update(nt, val, compute_alarms);
-                    }
-                    "alarm" => {
-                        changed |= apply_alarm_update(nt, val);
-                    }
-                    "display" => {
-                        changed |= apply_display_update(nt, val);
-                    }
-                    "control" => {
-                        changed |= apply_control_update(nt, val);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        RecordData::Waveform { nt, nord, .. }
-        | RecordData::Aai { nt, nord, .. }
-        | RecordData::Aao { nt, nord, .. }
-        | RecordData::SubArray { nt, nord, .. } => {
-            changed = apply_scalar_array_put(nt, nord, value);
-        }
-        RecordData::NtTable { .. } | RecordData::NtNdArray { .. } => {
-            // Table/NdArray PUT not supported via high-level API yet.
-            debug!("PUT to NtTable/NtNdArray not yet supported in SimplePvStore");
-        }
-        RecordData::NtEnum { nt, .. } => {
-            // Accept index updates for NtEnum PVs.
-            for (name, val) in fields {
-                if name == "value" {
-                    let idx = match val {
-                        DecodedValue::Int32(v) => Some(*v),
-                        DecodedValue::Int64(v) => Some(*v as i32),
-                        DecodedValue::Int16(v) => Some(*v as i32),
-                        DecodedValue::Int8(v) => Some(*v as i32),
-                        DecodedValue::Float64(v) => Some(*v as i32),
-                        _ => None,
-                    };
-                    if let Some(idx) = idx {
-                        if idx < 0 || (idx as usize) >= nt.choices.len() {
-                            // out-of-range index — reject, keep value
-                        } else if nt.index != idx {
-                            nt.index = idx;
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-        RecordData::Generic { .. } => {
-            debug!("PUT to Generic not yet supported in SimplePvStore");
-        }
-    }
-
-    changed
 }
 
 // ── NtPayload → StructureDesc ────────────────────────────────────────────
@@ -1492,6 +1416,125 @@ record(ao, "DB:AO") {
         assert!(store.get_value("T:GONE").await.is_none(), "record is gone");
         assert!(!store.remove("T:GONE").await, "second remove returns false");
         assert!(store.claim("T:GONE").await.is_none(), "claim no longer matches");
+    }
+
+    #[tokio::test]
+    async fn put_advances_the_timestamp() {
+        let mut records = HashMap::new();
+        records.insert("TEST:AO".into(), make_ao("TEST:AO", 1.0));
+        let store = SimplePvStore::new(records, HashMap::new(), vec![], false);
+
+        let first = match store.get_nt("TEST:AO").await.unwrap() {
+            NtPayload::Scalar(nt) => nt.time_stamp.unwrap(),
+            other => panic!("expected scalar, got {other:?}"),
+        };
+
+        store
+            .put("TEST:AO", &DecodedValue::Float64(2.0))
+            .await
+            .unwrap();
+
+        let second = match store.get_nt("TEST:AO").await.unwrap() {
+            NtPayload::Scalar(nt) => nt.time_stamp.unwrap(),
+            other => panic!("expected scalar, got {other:?}"),
+        };
+        assert!(
+            (second.seconds_past_epoch, second.nanoseconds)
+                > (first.seconds_past_epoch, first.nanoseconds),
+            "timestamp did not advance: {first:?} -> {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_of_identical_value_restamps_without_posting() {
+        let mut records = HashMap::new();
+        records.insert("TEST:AO".into(), make_ao("TEST:AO", 1.0));
+        let store = SimplePvStore::new(records, HashMap::new(), vec![], false);
+        let mut rx = Source::subscribe(&store, "TEST:AO").await.unwrap();
+
+        let before = match store.get_nt("TEST:AO").await.unwrap() {
+            NtPayload::Scalar(nt) => nt.time_stamp.unwrap(),
+            other => panic!("expected scalar, got {other:?}"),
+        };
+
+        let posted = store
+            .put("TEST:AO", &DecodedValue::Float64(1.0))
+            .await
+            .unwrap();
+
+        assert!(posted.is_empty(), "no-op PUT must not report a change");
+        assert!(rx.try_recv().is_err(), "no-op PUT must not post to monitors");
+
+        let after = match store.get_nt("TEST:AO").await.unwrap() {
+            NtPayload::Scalar(nt) => nt.time_stamp.unwrap(),
+            other => panic!("expected scalar, got {other:?}"),
+        };
+        assert!(
+            (after.seconds_past_epoch, after.nanoseconds)
+                > (before.seconds_past_epoch, before.nanoseconds),
+            "record was not restamped: {before:?} -> {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_supplied_timestamp_posts_even_when_value_is_unchanged() {
+        let mut records = HashMap::new();
+        records.insert("TEST:AO".into(), make_ao("TEST:AO", 1.0));
+        let store = SimplePvStore::new(records, HashMap::new(), vec![], false);
+        let mut rx = Source::subscribe(&store, "TEST:AO").await.unwrap();
+
+        let body = DecodedValue::Structure(vec![
+            ("value".to_string(), DecodedValue::Float64(1.0)),
+            (
+                "timeStamp".to_string(),
+                DecodedValue::Structure(vec![
+                    (
+                        "secondsPastEpoch".to_string(),
+                        DecodedValue::Int64(9_000),
+                    ),
+                    ("nanoseconds".to_string(), DecodedValue::Int32(0)),
+                    ("userTag".to_string(), DecodedValue::Int32(0)),
+                ]),
+            ),
+        ]);
+        let posted = store.put("TEST:AO", &body).await.unwrap();
+
+        assert_eq!(posted.len(), 1, "client-stamped PUT must post");
+        assert!(rx.try_recv().is_ok(), "subscriber must receive the update");
+        match store.get_nt("TEST:AO").await.unwrap() {
+            NtPayload::Scalar(nt) => {
+                assert_eq!(nt.time_stamp.unwrap().seconds_past_epoch, 9_000)
+            }
+            other => panic!("expected scalar, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_put_fires_for_a_value_unchanged_put() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+
+        let mut records = HashMap::new();
+        records.insert("TEST:AO".into(), make_ao("TEST:AO", 1.0));
+        let mut on_put: HashMap<String, OnPutCallback> = HashMap::new();
+        on_put.insert(
+            "TEST:AO".into(),
+            Arc::new(move |_name, _val| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let store = SimplePvStore::new(records, on_put, vec![], false);
+
+        store
+            .put("TEST:AO", &DecodedValue::Float64(1.0))
+            .await
+            .unwrap();
+
+        // on_put is spawned; give the task a chance to run.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

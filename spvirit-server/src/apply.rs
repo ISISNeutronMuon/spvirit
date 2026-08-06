@@ -625,11 +625,13 @@ impl RecordInstance {
                         DecodedValue::Float64(v) => Some(*v as i32),
                         _ => None,
                     };
-                    if let Some(idx) = idx
-                        && nt.index != idx
-                    {
-                        nt.index = idx;
-                        changed = true;
+                    if let Some(idx) = idx {
+                        if idx < 0 || (idx as usize) >= nt.choices.len() {
+                            // out-of-range index — reject, keep value
+                        } else if nt.index != idx {
+                            nt.index = idx;
+                            changed = true;
+                        }
                     }
                 }
                 changed
