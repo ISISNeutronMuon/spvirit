@@ -2283,11 +2283,15 @@ async fn apply_put_and_process(
     let mut force_post: HashSet<String> = HashSet::new();
     let outcome = record.apply_put(value, state.compute_alarms);
     if outcome.value_changed {
+        // A value change is always judged by the deadband (should_post_update
+        // must run so the MDEL reference point stays current); it is never
+        // force-posted just because the PUT also carried a client stamp.
         changed_names.insert(pv_name.to_string());
-    }
-    if outcome.client_stamped {
+    } else if outcome.client_stamped {
         // A client-supplied acquisition time is new information even when the
-        // value is identical: post it past the MDEL gate.
+        // value is identical: post it past the MDEL gate. should_post_update
+        // is skipped here, matching SimplePvStore::put — an unchanged value
+        // must not touch the MDEL reference point.
         changed_names.insert(pv_name.to_string());
         force_post.insert(pv_name.to_string());
     }
@@ -2311,8 +2315,11 @@ async fn notify_changed_records(state: &Arc<ServerState>, changed: Vec<(String, 
 }
 
 /// As [`notify_changed_records`], but PVs named in `force` post even when the
-/// MDEL deadband would suppress them — used for client-stamped PUTs, where the
-/// value may be unchanged but the timestamp is new information.
+/// MDEL deadband would suppress them — used only for client-stamped PUTs
+/// whose value did *not* change, where the timestamp alone is new
+/// information. A PUT that changed the value is never in `force`: it must
+/// always be judged by `should_post_update` so the MDEL reference point
+/// stays current, matching `SimplePvStore::put`.
 async fn notify_changed_records_forced(
     state: &Arc<ServerState>,
     changed: Vec<(String, NtPayload)>,
@@ -3234,6 +3241,97 @@ mod tests {
 
         let target = search_reply_target(&addr, 60292, peer);
         assert_eq!(target, "130.246.90.69:60292".parse().unwrap());
+    }
+
+    fn test_state(record: RecordInstance) -> Arc<ServerState> {
+        let mut store = HashMap::new();
+        store.insert(record.name.clone(), record);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        Arc::new(ServerState::new(
+            store,
+            false,
+            event_tx,
+            PvListMode::Off,
+            1024,
+            None,
+            [0u8; 12],
+            5075,
+            None,
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        ))
+    }
+
+    fn mdel_ai_record(name: &str, val: f64, mdel: &str) -> RecordInstance {
+        let nt = NtScalar::from_value(spvirit_tools::spvirit_server::types::ScalarValue::F64(val));
+        let mut raw_fields = HashMap::new();
+        raw_fields.insert("MDEL".to_string(), mdel.to_string());
+        RecordInstance {
+            name: name.to_string(),
+            record_type: spvirit_tools::spvirit_server::types::RecordType::Ai,
+            common: spvirit_tools::spvirit_server::types::DbCommonState::default(),
+            data: RecordData::Ai {
+                nt,
+                inp: None,
+                siml: None,
+                siol: None,
+                simm: true, // Ai is only writable() in simulation mode.
+            },
+            raw_fields,
+        }
+    }
+
+    fn ts_field(seconds: i64, nanos: i32) -> DecodedValue {
+        DecodedValue::Structure(vec![
+            (
+                "secondsPastEpoch".to_string(),
+                DecodedValue::Int64(seconds),
+            ),
+            ("nanoseconds".to_string(), DecodedValue::Int32(nanos)),
+            ("userTag".to_string(), DecodedValue::Int32(0)),
+        ])
+    }
+
+    // Regression test for the Task 6 review finding: a client-stamped PUT
+    // that *also* changes the value must be judged by should_post_update
+    // (never force-posted), and posting must refresh the MDEL reference
+    // point in `last_posted` — matching SimplePvStore::put exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_stamped_value_change_consults_deadband_and_updates_last_posted() {
+        let state = test_state(mdel_ai_record("test_pv", 1.0, "0.5"));
+
+        // Sanity: ServerState::new seeded the MDEL reference from the
+        // starting value.
+        {
+            let last_posted = state.last_posted.lock().await;
+            assert_eq!(last_posted.get("test_pv"), Some(&(1.0, 0)));
+        }
+
+        // A PUT that changes the value (delta 1.0 >= MDEL 0.5, so it clears
+        // the deadband) and also carries a non-default client timestamp.
+        let body = DecodedValue::Structure(vec![
+            ("value".to_string(), DecodedValue::Float64(2.0)),
+            ("timeStamp".to_string(), ts_field(5_000, 0)),
+        ]);
+        let (changed, force) = apply_put_and_process(&state, "test_pv", &body)
+            .await
+            .expect("put accepted");
+
+        // The value change must not be force-posted: it goes through the
+        // ordinary deadband check like any other value change.
+        assert!(
+            force.is_empty(),
+            "a value-changing PUT must never be in the force set, even when client-stamped"
+        );
+
+        notify_changed_records_forced(&state, changed, &force).await;
+
+        // Posting a value change must refresh the MDEL reference point.
+        let last_posted = state.last_posted.lock().await;
+        assert_eq!(
+            last_posted.get("test_pv"),
+            Some(&(2.0, 0)),
+            "should_post_update must run on a value change so last_posted stays current"
+        );
     }
 }
 
