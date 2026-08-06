@@ -642,7 +642,8 @@ impl RecordInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DbCommonState, RecordData, RecordInstance, RecordType};
+    use crate::types::{DbCommonState, OutputMode, RecordData, RecordInstance, RecordType};
+    use spvirit_types::{NdCodec, NdDimension, NtEnum, NtNdArray, NtScalarArray, ScalarArrayValue};
     use std::collections::HashMap;
 
     const OLD: NtTimeStamp = NtTimeStamp {
@@ -767,5 +768,152 @@ mod tests {
 
         assert!(!outcome.value_changed);
         assert!(stamp_of(&rec).seconds_past_epoch > OLD.seconds_past_epoch);
+    }
+
+    fn waveform_record(vals: Vec<f64>) -> RecordInstance {
+        let mut nt = NtScalarArray::from_value(ScalarArrayValue::F64(vals.clone()));
+        nt.time_stamp = OLD;
+        RecordInstance {
+            name: "W".to_string(),
+            record_type: RecordType::Waveform,
+            common: DbCommonState::default(),
+            data: RecordData::Waveform {
+                nt,
+                nord: vals.len(),
+                nelm: 16,
+                inp: None,
+                ftvl: "DOUBLE".to_string(),
+            },
+            raw_fields: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn array_put_restamps() {
+        let mut rec = waveform_record(vec![1.0, 2.0]);
+        let body = DecodedValue::Structure(vec![(
+            "value".to_string(),
+            DecodedValue::Array(vec![
+                DecodedValue::Float64(3.0),
+                DecodedValue::Float64(4.0),
+            ]),
+        )]);
+        let outcome = rec.apply_put(&body, false);
+
+        assert!(outcome.value_changed);
+        let RecordData::Waveform { nt, .. } = &rec.data else {
+            panic!("expected Waveform");
+        };
+        assert!(nt.time_stamp.seconds_past_epoch > OLD.seconds_past_epoch);
+    }
+
+    #[test]
+    fn array_put_with_unchanged_value_still_restamps() {
+        let mut rec = waveform_record(vec![1.0, 2.0]);
+        let body = DecodedValue::Structure(vec![(
+            "value".to_string(),
+            DecodedValue::Array(vec![
+                DecodedValue::Float64(1.0),
+                DecodedValue::Float64(2.0),
+            ]),
+        )]);
+        let outcome = rec.apply_put(&body, false);
+
+        assert!(!outcome.value_changed);
+        let RecordData::Waveform { nt, .. } = &rec.data else {
+            panic!("expected Waveform");
+        };
+        assert!(nt.time_stamp.seconds_past_epoch > OLD.seconds_past_epoch);
+    }
+
+    #[test]
+    fn enum_put_restamps() {
+        let mut nt = NtEnum::new(0, vec!["A".to_string(), "B".to_string()]);
+        nt.time_stamp = OLD;
+        let mut rec = RecordInstance {
+            name: "E".to_string(),
+            record_type: RecordType::Mbbo,
+            common: DbCommonState::default(),
+            data: RecordData::NtEnum {
+                nt,
+                inp: None,
+                out: None,
+                omsl: OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        };
+        let outcome = rec.apply_put(&DecodedValue::Int32(1), false);
+
+        assert!(outcome.value_changed);
+        let RecordData::NtEnum { nt, .. } = &rec.data else {
+            panic!("expected NtEnum");
+        };
+        assert!(nt.time_stamp.seconds_past_epoch > OLD.seconds_past_epoch);
+    }
+
+    fn ndarray_record() -> RecordInstance {
+        let nt = NtNdArray {
+            value: ScalarArrayValue::U8(vec![1, 2, 3, 4]),
+            codec: NdCodec {
+                name: "none".to_string(),
+                parameters: HashMap::new(),
+            },
+            compressed_size: 4,
+            uncompressed_size: 4,
+            dimension: vec![NdDimension {
+                size: 4,
+                offset: 0,
+                full_size: 4,
+                binning: 1,
+                reverse: false,
+            }],
+            unique_id: 1,
+            data_time_stamp: OLD,
+            attribute: vec![],
+            descriptor: Some("ndarray".to_string()),
+            alarm: None,
+            time_stamp: Some(OLD),
+            display: None,
+        };
+        RecordInstance {
+            name: "N".to_string(),
+            record_type: RecordType::NtNdArray,
+            common: DbCommonState::default(),
+            data: RecordData::NtNdArray {
+                nt,
+                inp: None,
+                out: None,
+                omsl: OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn ndarray_put_restamps_both_time_stamp_and_data_time_stamp() {
+        let mut rec = ndarray_record();
+        let body = DecodedValue::Structure(vec![(
+            "value".to_string(),
+            DecodedValue::Array(vec![
+                DecodedValue::UInt8(5),
+                DecodedValue::UInt8(6),
+                DecodedValue::UInt8(7),
+                DecodedValue::UInt8(8),
+            ]),
+        )]);
+        let outcome = rec.apply_put(&body, false);
+
+        assert!(outcome.value_changed);
+        let RecordData::NtNdArray { nt, .. } = &rec.data else {
+            panic!("expected NtNdArray");
+        };
+        assert!(
+            nt.time_stamp
+                .as_ref()
+                .expect("stamped")
+                .seconds_past_epoch
+                > OLD.seconds_past_epoch
+        );
+        assert!(nt.data_time_stamp.seconds_past_epoch > OLD.seconds_past_epoch);
     }
 }
