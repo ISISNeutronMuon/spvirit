@@ -1,7 +1,7 @@
 # A complete IOC
 
 <!-- verify:begin -->
-> ✅ **Verified** · [`complete_ioc.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/complete_ioc.rs) · check [`docs_verify`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-tools/tests/docs_verify.rs) · [![docs-verify](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml/badge.svg)](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml)
+> ✅ **Verified** · [`complete_ioc.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/complete_ioc.rs) · [`demo_complete_ioc.py`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/examples/demo_complete_ioc.py) · check [`docs_verify`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-tools/tests/docs_verify.rs) · [![docs-verify](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml/badge.svg)](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml)
 >
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
@@ -43,11 +43,44 @@ iterator, so the four `Pv<f64>` handles go in the first call and the
 (`spvirit-server/src/pva_server.rs:724`, `:741`). Chain `.pvs()` as many
 times as you have distinct handle types.
 
+## Python
+
+The same five records, with three differences worth naming:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_complete_ioc.py:build}}
+```
+
+`Server(pvs=[...])` takes **one flat list** — the two-call split above is a
+Rust type-system constraint, not a protocol one, so the array handle goes
+in beside the scalars.
+
+`spvirit.calc(name, inputs, callback)` accepts no metadata keywords, so
+`VAC:ERROR` cannot carry `units="mbar"` or a description the way the Rust
+version does. If a computed PV needs metadata, write it through the raw-NT
+layer with `store.put_nt(...)` after the server is up
+([Records vs raw NT](../01-fundamentals/records-vs-raw-nt.md)).
+
+Array PVs reject the scalar keywords (`units`, `prec`, `desc`, `adel`,
+`mdel`, and both limit pairs) with `TypeError`, and `on_put`/`scan` raise
+`TypeError` on them too (`spvirit-py/src/pv.rs:307`, `:365`). `VAC:RGA` is
+therefore driven from a plain loop rather than a scan callback:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_complete_ioc.py:drive}}
+```
+
+Note the rejection path. Raising from `on_put` sends the exception's text
+to the client, matching the Rust `Err(String)`; returning `False` also
+rejects but the client sees a fixed `rejected by on_put`
+(`spvirit-py/src/pv.rs:559`).
+
 ## Run it
 
 ```bash
 # Terminal 1
 cargo run -p spvirit-server --example complete_ioc
+# or: python spvirit-py/examples/demo_complete_ioc.py
 ```
 
 Discover the server, then ask it for its PV list:

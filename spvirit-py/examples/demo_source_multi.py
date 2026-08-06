@@ -88,13 +88,17 @@ def _f(v):
 
 
 def main():
+    # ANCHOR: register
+    # Lower order is asked first; the built-in record store sits at 0.
+    # Fallback claims every name, so it goes last.
     server = (
         spvirit.ServerBuilder()
-        .ai("BLT:X", 3.14)
+        .ai("BLT:X", 3.14)                        # built-in store, order 0
         .add_source("fast", 10, FastCache())
         .add_source("fallback", 100, Fallback())
         .build()
     )
+    # ANCHOR_END: register
     server.start_background()
 
     print("Multi-source server on port 5075.")

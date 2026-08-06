@@ -16,20 +16,27 @@ undocumented_examples = [
   "spvirit-server/examples/custom_record.rs",
   "spvirit-server/examples/get_snapshot.rs",
   "spvirit-server/examples/mailbox.rs",
-  "spvirit-server/examples/nt_put_get.rs",
   "spvirit-server/examples/passthrough_source.rs",
   "spvirit-server/examples/snake.rs",
   "spvirit-server/examples/store_runtime.rs",
 ]
 
 # ─── Part I: Fundamentals ───────────────────────────────────────────────
-# Concept chapters. No {{#include}}s, so their badges read
-# "no code on this page".
+# Mostly concept chapters; the ones with no {{#include}}s get a badge
+# reading "no code on this page".
 
 [chapters."01-fundamentals/what-is-spvirit.md"]
 [chapters."01-fundamentals/epics-in-10-minutes.md"]
 [chapters."01-fundamentals/normative-types.md"]
 [chapters."01-fundamentals/records-vs-raw-nt.md"]
+rust_examples = ["spvirit-server/examples/nt_put_get.rs"]
+py_examples = ["spvirit-py/examples/demo_nt_access.py"]
+anchors = [
+  "spvirit-server/examples/nt_put_get.rs:builder",
+  "spvirit-server/examples/nt_put_get.rs:putget",
+  "spvirit-py/examples/demo_nt_access.py:builder",
+  "spvirit-py/examples/demo_nt_access.py:getnt",
+]
 
 # --- Part II: Getting started -------------------------------------------
 
@@ -148,6 +155,7 @@ py_examples = ["spvirit-py/examples/demo_alarms.py"]
 anchors = [
   "spvirit-server/examples/alarms.rs:limits",
   "spvirit-server/examples/alarms.rs:manual",
+  "spvirit-py/examples/demo_alarms.py:limits",
   "spvirit-py/examples/demo_alarms.py:manual",
 ]
 
@@ -157,7 +165,12 @@ rust_examples = [
   "spvirit-server/examples/db_file.rs",
   "spvirit-server/examples/example.db",
 ]
-anchors = ["spvirit-server/examples/db_file.rs:load"]
+py_examples = ["spvirit-py/examples/demo_db_file.py"]
+anchors = [
+  "spvirit-server/examples/db_file.rs:load",
+  "spvirit-py/examples/demo_db_file.py:load",
+  "spvirit-py/examples/demo_db_file.py:handle",
+]
 
 [chapters."03-progressive/tables-and-images.md"]
 tools = ["spget", "sptable"]
@@ -167,6 +180,8 @@ anchors = [
   "spvirit-server/examples/exotic_nt.rs:table",
   "spvirit-server/examples/exotic_nt.rs:ndarray",
   "spvirit-py/examples/demo_table.py:table",
+  "spvirit-py/examples/demo_table.py:ndarray",
+  "spvirit-py/examples/demo_table.py:drive",
 ]
 
 [chapters."03-progressive/sources.md"]
@@ -177,19 +192,32 @@ rust_examples = [
   "spvirit-server/examples/json_source.rs",
   "spvirit-server/examples/rpc_source.rs",
 ]
+py_examples = [
+  "spvirit-py/examples/demo_source_multi.py",
+  "spvirit-py/examples/demo_source_wildcard.py",
+  "spvirit-py/examples/demo_source_sensor.py",
+  "spvirit-py/examples/demo_source_rpc.py",
+]
 anchors = [
   "spvirit-server/examples/multi_source.rs:register",
   "spvirit-server/examples/wildcard_source.rs:claim",
   "spvirit-server/examples/json_source.rs:impl",
   "spvirit-server/examples/rpc_source.rs:rpc",
+  "spvirit-py/examples/demo_source_multi.py:register",
+  "spvirit-py/examples/demo_source_wildcard.py:claim",
+  "spvirit-py/examples/demo_source_sensor.py:notify",
+  "spvirit-py/examples/demo_source_rpc.py:rpc",
 ]
 
 [chapters."03-progressive/complete-ioc.md"]
 tools = ["spget", "spput", "splist", "spmonitor"]
 rust_examples = ["spvirit-server/examples/complete_ioc.rs"]
+py_examples = ["spvirit-py/examples/demo_complete_ioc.py"]
 anchors = [
   "spvirit-server/examples/complete_ioc.rs:build",
   "spvirit-server/examples/complete_ioc.rs:drive",
+  "spvirit-py/examples/demo_complete_ioc.py:build",
+  "spvirit-py/examples/demo_complete_ioc.py:drive",
 ]
 
 # --- Part IV: Command-line tools ----------------------------------------

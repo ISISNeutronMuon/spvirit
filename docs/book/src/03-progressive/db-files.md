@@ -1,7 +1,7 @@
 # Serving a `.db` file
 
 <!-- verify:begin -->
-> ✅ **Verified** · [`db_file.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/db_file.rs) · [`example.db`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/example.db) · check [`docs_verify`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-tools/tests/docs_verify.rs) · [![docs-verify](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml/badge.svg)](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml)
+> ✅ **Verified** · [`db_file.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/db_file.rs) · [`example.db`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/example.db) · [`demo_db_file.py`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/examples/demo_db_file.py) · check [`docs_verify`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-tools/tests/docs_verify.rs) · [![docs-verify](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml/badge.svg)](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml)
 >
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
@@ -33,6 +33,30 @@ fewer behaviours than EPICS Base would give you.
 
 `.db_string(content)` takes the same syntax from a string, which is
 convenient in tests.
+
+## Python
+
+`db_file=` and `db_string=` are keyword arguments on `Server`, and mix
+freely with `pvs=[...]` handles in the same server:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_db_file.py:load}}
+```
+
+A `.db` record arrives without a handle. `Server.pv(name)` mints one,
+typed from the record's wire type:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_db_file.py:handle}}
+```
+
+**That handle is already bound**, which is the catch worth knowing before
+you plan around it: `on_put`, `scan` and `calc` are only honoured on an
+*unbound* handle, so attaching one to a `.db` record does nothing (the core
+logs a warning and carries on). A record that needs a write validator or a
+scan callback has to be declared in code with `spvirit.ao(...)` rather than
+loaded from the file. The same is true in Rust — `PvaServer::pv()` attaches,
+it does not re-declare. See [Reacting to writes](reacting-to-writes.md).
 
 ## From the command line
 
@@ -97,6 +121,7 @@ rather than assuming every PV made it.
 ```bash
 # Terminal 1
 cargo run -p spvirit-server --example db_file
+# or: python spvirit-py/examples/demo_db_file.py
 
 # Terminal 2
 splist

@@ -1,7 +1,7 @@
 # Records vs raw NT
 
 <!-- verify:begin -->
-> ✅ **Verified** · no code on this page · [![docs-verify](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml/badge.svg)](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml)
+> ✅ **Verified** · [`nt_put_get.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/nt_put_get.rs) · [`demo_nt_access.py`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/examples/demo_nt_access.py) · check [`docs_verify`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-tools/tests/docs_verify.rs) · [![docs-verify](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml/badge.svg)](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml)
 >
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
@@ -61,6 +61,45 @@ happening.
 severity you put in them, which for a hand-built `NtScalar::from_value` is
 `NO_ALARM` — a silently un-alarming PV.
 
+## Building a payload by hand
+
+This is what the raw level actually looks like. In Rust, `NtScalar` starts
+from a `ScalarValue` and the `with_*` builders each consume and return the
+payload, so they chain; fields without a builder are plain `pub` fields you
+assign:
+
+```rust
+{{#include ../../../../spvirit-server/examples/nt_put_get.rs:builder}}
+```
+
+Then the payload goes to the store as a whole, and comes back as a whole:
+
+```rust
+{{#include ../../../../spvirit-server/examples/nt_put_get.rs:putget}}
+```
+
+Python has no builder chain — the same fields are keyword arguments on the
+`NtScalar` constructor:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_nt_access.py:builder}}
+```
+
+and the read side:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_nt_access.py:getnt}}
+```
+
+`NtScalarArray`, `NtTable` and `NtNdArray` follow the same shape. The Python
+constructors are `spvirit.NtScalar`, `spvirit.NtScalarArray`,
+`spvirit.NtTable`, `spvirit.NtNdArray`, plus `Alarm`, `TimeStamp`, `Display`
+and `Control` for the substructures.
+
+Note what neither example gets for free: no deadband, no computed alarm, no
+automatic restamp. All three are record-level services, and the payload you
+built is not a record. That is the trade the table above describes.
+
 ## Which one am I on?
 
 If you called `.ai()`, `.ao()`, `Pv::ai()`, or loaded a `.db`, you are on the
@@ -70,4 +109,7 @@ still on the record level — that is the record API, and it applies deadbands
 and stamps time.
 
 Both are covered in Part III: records throughout, and the raw level in
-[Custom data sources](../03-progressive/sources.md).
+[Tables and images](../03-progressive/tables-and-images.md) (payload types
+the record layer does not model) and [Custom data
+sources](../03-progressive/sources.md) (serving PVs without a record store
+at all).

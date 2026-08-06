@@ -58,6 +58,10 @@ class SensorBackend:
 
     # Background update loop -------------------------------------------
 
+    # ANCHOR: notify
+    # A Python source's `subscribe` is ignored: monitor events come from the
+    # notifier the server hands to `on_start`. Nothing polls `get` on your
+    # behalf, so a source that never notifies looks frozen to a subscriber.
     def _loop(self):
         t = 0.0
         while not self._stop.is_set():
@@ -74,6 +78,7 @@ class SensorBackend:
                     self._notifier.notify(name, spvirit.NtScalar(v))
             t += 0.2
             time.sleep(0.5)
+    # ANCHOR_END: notify
 
 
 def main():

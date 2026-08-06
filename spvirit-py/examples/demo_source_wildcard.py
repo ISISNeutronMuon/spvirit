@@ -21,6 +21,7 @@ import spvirit
 PREFIX = "SCRATCH:"
 
 
+# ANCHOR: claim
 class WildcardSource:
     """Accept any PV under PREFIX and keep a per-name float value."""
 
@@ -59,9 +60,11 @@ class WildcardSource:
         return spvirit.NtScalar(new_val)
 
     def names(self):
-        # Report only the names we've seen so far.
+        # Report only the names we've seen so far. A dynamic namespace
+        # cannot enumerate what does not exist yet; the PVs still serve.
         with self._lock:
             return list(self._values.keys())
+# ANCHOR_END: claim
 
 
 def _coerce_float(v) -> float:

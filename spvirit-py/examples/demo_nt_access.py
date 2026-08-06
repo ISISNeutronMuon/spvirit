@@ -48,8 +48,19 @@ print("=" * 60)
 
 # ─── NtScalar: full metadata for an analog input ─────────────────────────────
 
-print("\n── NtScalar (SIM:TEMPERATURE) ──")
+print("\n── NtScalar (NT:TEMPERATURE) ──")
+# ANCHOR: getnt
+# get_nt returns the whole payload — get_value returns only the number.
+# It works on IOC-style records too, so you can start with handles and
+# reach through to the raw layer for the one PV that needs it.
 nt = store.get_nt("NT:TEMPERATURE")
+if nt is not None:
+    print(f"  value  {nt.value} {nt.units}  severity={nt.alarm_severity}")
+    print(f"  display {nt.display_low}..{nt.display_high} prec={nt.display_precision}")
+    print(f"  control {nt.control_low}..{nt.control_high}")
+# A name nothing serves gives None rather than raising.
+assert store.get_nt("DOES:NOT:EXIST") is None
+# ANCHOR_END: getnt
 if nt is not None:
     print(f"  type          : {type(nt).__name__}")
     print(f"  value         : {nt.value}")
@@ -132,6 +143,9 @@ print(f"  get_nt('DOES:NOT:EXIST') → {result}")
 # ─── Constructing NT objects from Python and writing with put_nt() ────────────
 
 print("\n── Creating NtScalar from Python ──")
+# ANCHOR: builder
+# Python has no builder chain — every field is a keyword argument on the
+# constructor, and anything you leave out keeps its default.
 nt_scalar = spvirit.NtScalar(
     value=42.0,
     units="degC",
@@ -142,7 +156,23 @@ nt_scalar = spvirit.NtScalar(
     control_low=5.0,
     control_high=95.0,
 )
+
+# Nothing computes alarms for a payload you built yourself: an NtScalar is
+# NO_ALARM unless you pass alarm_severity/alarm_status/alarm_message.
+warm = spvirit.NtScalar(
+    value=96.0,
+    units="degC",
+    alarm_severity=1,  # 0=NONE 1=MINOR 2=MAJOR 3=INVALID
+    alarm_status=4,
+    alarm_message="HIGH",
+)
+
+# Write the whole payload, metadata included. put_nt coerces to the record's
+# existing wire type and never retypes it.
+store.put_nt("NT:SETPOINT", nt_scalar)
+# ANCHOR_END: builder
 print(f"  Created: {nt_scalar}")
+print(f"  warm    : {warm} severity={warm.alarm_severity}")
 print(f"  value           : {nt_scalar.value}")
 print(f"  units           : {nt_scalar.units!r}")
 print(f"  display_low     : {nt_scalar.display_low}")
@@ -152,11 +182,7 @@ print(f"  display_prec    : {nt_scalar.display_precision}")
 print(f"  control_low     : {nt_scalar.control_low}")
 print(f"  control_high    : {nt_scalar.control_high}")
 
-# Write it to the server
-ok = store.put_nt("NT:SETPOINT", nt_scalar)
-print(f"  put_nt('NT:SETPOINT', ...) → {ok}")
-
-# Read back and verify
+# Read back and verify the write above
 nt = store.get_nt("NT:SETPOINT")
 print(f"  Readback value  : {nt.value}")
 print(f"  Readback units  : {nt.units!r}")

@@ -36,6 +36,8 @@ class AdderRpcSource:
     def put(self, name, value):
         raise RuntimeError("RPC:add does not accept PUT; use RPC instead")
 
+    # ANCHOR: rpc
+    # `rpc` is optional: a source that does not define it simply has no RPC.
     def rpc(self, name: str, args):
         if name != self.CHANNEL:
             raise RuntimeError(f"unknown RPC channel: {name}")
@@ -43,6 +45,7 @@ class AdderRpcSource:
         a = _as_float(args.get("a", 0.0))
         b = _as_float(args.get("b", 0.0))
         return spvirit.NtScalar(a + b)
+    # ANCHOR_END: rpc
 
     def names(self):
         return [self.CHANNEL]

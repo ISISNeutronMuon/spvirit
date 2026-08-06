@@ -1,7 +1,7 @@
 # Custom data sources
 
 <!-- verify:begin -->
-> ✅ **Verified** · [`multi_source.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/multi_source.rs) · [`wildcard_source.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/wildcard_source.rs) · [`json_source.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/json_source.rs) · [`rpc_source.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/rpc_source.rs) · check [`docs_verify`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-tools/tests/docs_verify.rs) · [![docs-verify](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml/badge.svg)](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml)
+> ✅ **Verified** · [`multi_source.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/multi_source.rs) · [`wildcard_source.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/wildcard_source.rs) · [`json_source.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/json_source.rs) · [`rpc_source.rs`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-server/examples/rpc_source.rs) · [`demo_source_multi.py`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/examples/demo_source_multi.py) · [`demo_source_wildcard.py`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/examples/demo_source_wildcard.py) · [`demo_source_sensor.py`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/examples/demo_source_sensor.py) · [`demo_source_rpc.py`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/examples/demo_source_rpc.py) · check [`docs_verify`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-tools/tests/docs_verify.rs) · [![docs-verify](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml/badge.svg)](https://github.com/ISISNeutronMuon/spvirit/actions/workflows/ci.yml)
 >
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
@@ -34,6 +34,25 @@ See `spvirit-server/src/pvstore.rs:55`.)
 `claim` is the interesting one. It runs on every channel search, and
 returning `Some(PvInfo)` commits you to serving that name.
 
+In Python there is no trait to implement — a source is any object with the
+matching methods, checked by duck typing:
+
+```python
+class MySource:
+    def claim(self, name): ...        # -> PvInfo | None
+    def get(self, name): ...          # -> NtScalar/NtScalarArray/... | None
+    def put(self, name, value): ...   # -> payload, or raise to reject
+    def rpc(self, name, args): ...    # optional
+    def names(self): ...              # -> list[str]
+    def on_start(self, notifier): ... # optional: stash the notifier
+```
+
+Two differences from Rust worth knowing up front. `on_start` has no Rust
+counterpart — it is how a Python source gets the `Notifier` it needs to push
+monitor updates. And `subscribe` is *not* part of the Python protocol: define
+it and it is ignored (`spvirit-py/src/source.rs:535`). Monitors are driven by
+`notifier.notify(name, payload)` instead.
+
 ## Priority and the registry
 
 Sources are registered with an integer **order**. Lower is checked first,
@@ -41,6 +60,10 @@ and the built-in record store sits at **0**:
 
 ```rust
 {{#include ../../../../spvirit-server/examples/multi_source.rs:register}}
+```
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_source_multi.py:register}}
 ```
 
 So `-10` shadows the built-in store, and `10` is a fallback for names it
@@ -53,6 +76,13 @@ starting with `XYZ:` and creates each PV on first touch:
 
 ```rust
 {{#include ../../../../spvirit-server/examples/wildcard_source.rs:claim}}
+```
+
+The Python equivalent, claiming `SCRATCH:` instead — same three methods,
+plus the notifier that publishes each PUT to subscribers:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_source_wildcard.py:claim}}
 ```
 
 ```console
@@ -86,6 +116,18 @@ $ spget JSON:SETPOINT_A
 JSON:SETPOINT_A 123.4
 ```
 
+## Pushing monitor updates
+
+A source with a value that changes on its own — a polled instrument, a
+subscription to some other system — needs to *push*. In Rust that is
+`subscribe`, returning a channel the server drains. In Python `subscribe` is
+ignored; you keep the `Notifier` from `on_start` and call it from whatever
+thread produces the data:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_source_sensor.py:notify}}
+```
+
 ## RPC
 
 `rpc` is the one trait method with a default implementation — it returns
@@ -93,6 +135,13 @@ JSON:SETPOINT_A 123.4
 
 ```rust
 {{#include ../../../../spvirit-server/examples/rpc_source.rs:rpc}}
+```
+
+In Python it is likewise optional — a source without an `rpc` method simply
+has no RPC channel:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_source_rpc.py:rpc}}
 ```
 
 **spvirit ships no general-purpose RPC client.** Neither `spvirit-client`
@@ -114,6 +163,11 @@ print(ctx.rpc('RPC:add', {'a': 3.0, 'b': 4.0}))   # 7.0
 | `aggregate_source.rs` | derived PVs computed from the built-in store's values |
 | `custom_pvstore.rs` | replacing the store wholesale rather than layering on it |
 | `mailbox.rs` | minimal writable scratch PVs |
+
+The Python family is `demo_source_*.py` — `sensor`, `async`, `multi`,
+`passthrough`, `aggregate`, `rpc`, `wildcard`. `demo_source_async.py` is the
+one with no Rust counterpart here: it shows a source whose `get` is an
+`async def`, which the adapter awaits on the server's runtime.
 
 ## What to notice
 
@@ -142,6 +196,11 @@ cargo run -p spvirit-server --example multi_source
 cargo run -p spvirit-server --example wildcard_source
 cargo run -p spvirit-server --example json_source
 cargo run -p spvirit-server --example rpc_source
+
+python spvirit-py/examples/demo_source_multi.py
+python spvirit-py/examples/demo_source_wildcard.py
+python spvirit-py/examples/demo_source_sensor.py
+python spvirit-py/examples/demo_source_rpc.py
 ```
 
 ## Next

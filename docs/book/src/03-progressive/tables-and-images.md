@@ -51,18 +51,36 @@ An image is flat data plus a dimension list. The dimensions carry offset,
 binning and reversal so a client can reconstruct a region of interest
 without a second PV.
 
+### Rust
+
 ```rust
 {{#include ../../../../spvirit-server/examples/exotic_nt.rs:ndarray}}
 ```
 
+### Python
+
 The Python builder is the compact form of the same thing:
 
 ```python
-builder.nt_ndarray("SIM:IMG", [0] * 16, [(4, 4), (4, 4)], type="ubyte")
+{{#include ../../../../spvirit-py/examples/demo_table.py:ndarray}}
 ```
 
-Each tuple is `(size, full_size)` — the served extent and the extent of the
-underlying frame.
+## Driving both
+
+Neither type accepts a client PUT, so the server updates them with
+`store.put_nt(...)` — the raw-NT level from
+[Records vs raw NT](../01-fundamentals/records-vs-raw-nt.md):
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_table.py:drive}}
+```
+
+Watch the dimension argument, which is the one place the two APIs disagree:
+the *builder* takes `(size, full_size)` tuples, while the `NtNdArray`
+*constructor* takes a flat list of sizes and sets `full_size` equal to each
+`size`. Offset, binning and reversal are not reachable from the Python
+constructor at all; build the payload in Rust if you need a region of
+interest.
 
 ## What to notice
 

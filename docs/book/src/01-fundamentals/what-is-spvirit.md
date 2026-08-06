@@ -13,13 +13,6 @@ installed to build or run.
 
 */ˈspɪrɪt/ of the Machine*
 
-## Why Rust?
-
-Honestly: the author wanted to learn Rust, and this seemed like a fun project
-with a moderately useful outcome. The practical benefits followed — no EPICS
-Base build dependency, one static binary per tool, and memory safety in code
-that parses untrusted network packets.
-
 ## The six crates
 
 The project is a Cargo workspace, strictly layered. Each crate depends only on

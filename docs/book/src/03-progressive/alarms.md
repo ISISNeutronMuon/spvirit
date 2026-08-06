@@ -81,6 +81,13 @@ published but never compared against anything.
 
 ## Python
 
+Same two halves. `alarm_limits=(lolo, low, high, hihi)` is a keyword
+argument rather than a builder call:
+
+```python
+{{#include ../../../../spvirit-py/examples/demo_alarms.py:limits}}
+```
+
 ```python
 {{#include ../../../../spvirit-py/examples/demo_alarms.py:manual}}
 ```
