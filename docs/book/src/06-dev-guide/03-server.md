@@ -177,7 +177,7 @@ pv.rs:1154).
   both; **`Pv::alarm_limits()` (pv.rs:329) sets only the wire fields**, so
   handle-API alarm limits do not drive server-side severity computation. Known
   inconsistency — fix or document before it bites a user.
-- **MDEL** (monitor deadband): `should_post_update` (simple_store.rs:535)
+- **MDEL** (monitor deadband): `should_post_update` (simple_store.rs:545)
   suppresses the *post* (not the store) when the record is a numeric scalar,
   MDEL > 0, severity unchanged, and the delta is under MDEL. **ADEL is parsed
   and exposed via field access but not wired into any posting logic**

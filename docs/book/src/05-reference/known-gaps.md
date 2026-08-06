@@ -103,7 +103,7 @@ hardware poke — doubles up on exactly the writes you were trying to refuse.
 
 ## 5. `ADEL` is parsed and exposed but not applied
 
-`MDEL` gates monitor posts (`spvirit-server/src/simple_store.rs:535`).
+`MDEL` gates monitor posts (`spvirit-server/src/simple_store.rs:545`).
 `ADEL` — the archive deadband — is read out of the `.db` file and readable
 as a field, and no posting logic consults it. A `.db` that relies on `ADEL`
 behaves as though it were absent.

@@ -85,7 +85,7 @@ and changes nothing. [Known gaps](known-gaps.md).
 ## A monitor looks frozen
 
 The value is moving but no updates arrive. Almost always the deadband:
-`should_post_update` (`spvirit-server/src/simple_store.rs:535`) suppresses
+`should_post_update` (`spvirit-server/src/simple_store.rs:545`) suppresses
 the *post*, not the store, when the record is a numeric scalar, `MDEL` is
 greater than zero, the severity has not changed, and the delta is under
 `MDEL`.

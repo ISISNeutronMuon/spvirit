@@ -609,7 +609,7 @@ impl RecordInstance {
             RecordData::NtTable { nt, .. } => apply_table_put(nt, value),
             RecordData::NtNdArray { nt, .. } => apply_ndarray_put(nt, value),
             RecordData::NtEnum { nt, .. } => {
-                // Accept index updates for NtEnum PVs. Known gap #2: a wire
+                // Accept index updates for NtEnum PVs. Known gap #1: a wire
                 // PUT delivers `value` as a sub-structure, which no arm here
                 // matches — deliberately left alone, see known-gaps.md.
                 let mut changed = false;

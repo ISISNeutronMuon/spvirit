@@ -28,7 +28,7 @@ the value itself is inside the deadband.
 
 **Alarm transitions always post.** The MDEL deadband gates value changes
 only — a severity change reaches every subscriber regardless of how small
-the value moved (`spvirit-server/src/simple_store.rs:535`).
+the value moved (`spvirit-server/src/simple_store.rs:545`).
 
 ## Two ways to get a severity
 

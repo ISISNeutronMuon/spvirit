@@ -45,7 +45,7 @@ The capstone IOC scans at 2 Hz and posts at about 1 Hz for exactly this
 reason. See [Monitors](../03-progressive/monitors.md).
 
 **Alarm transitions always post,** regardless of the deadband
-(`spvirit-server/src/simple_store.rs:535`). A severity change is never
+(`spvirit-server/src/simple_store.rs:545`). A severity change is never
 suppressed.
 
 **The first update is the current value.** A subscription delivers one
