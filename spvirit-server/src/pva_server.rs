@@ -68,6 +68,7 @@ pub struct PvaServerBuilder {
     pvlist_allow_pattern: Option<Regex>,
     start_hooks: Vec<crate::events::StartHook>,
     event_handlers: Vec<(String, crate::events::EventHandler)>,
+    event_sinks: Vec<Arc<dyn crate::events::EventSink>>,
 }
 
 impl PvaServerBuilder {
@@ -90,6 +91,7 @@ impl PvaServerBuilder {
             pvlist_allow_pattern: None,
             start_hooks: Vec::new(),
             event_handlers: Vec::new(),
+            event_sinks: Vec::new(),
         }
     }
 
@@ -477,6 +479,19 @@ impl PvaServerBuilder {
         self
     }
 
+    /// Register an [`EventSink`](crate::events::EventSink) — an inline
+    /// consumer awaited by `post_event` before any handler is queued.
+    ///
+    /// Sinks were previously reachable only through
+    /// [`PvaServer::events`](PvaServer::events) on an already-built server,
+    /// which leaves no seam for callers that only ever hold a builder (or a
+    /// [`ServeBuilder`]/[`RunningServer`]). Registration order across
+    /// builder-registered and post-build sinks is call order.
+    pub fn event_sink(mut self, sink: Arc<dyn crate::events::EventSink>) -> Self {
+        self.event_sinks.push(sink);
+        self
+    }
+
     /// Link an output PV to one or more input PVs.
     ///
     /// Whenever any input PV changes (via `set_value`, protocol PUT, or
@@ -607,6 +622,9 @@ impl PvaServerBuilder {
         let events = Arc::new(crate::events::Events::new());
         for (name, handler) in self.event_handlers {
             events.add_handler(name, handler);
+        }
+        for sink in self.event_sinks {
+            events.add_sink(sink);
         }
 
         PvaServer {
@@ -971,6 +989,12 @@ impl ServeBuilder {
             + 'static,
     {
         self.inner = self.inner.on_event(event, handler);
+        self
+    }
+
+    /// Register an inline event sink. See [`PvaServerBuilder::event_sink`].
+    pub fn event_sink(mut self, sink: Arc<dyn crate::events::EventSink>) -> Self {
+        self.inner = self.inner.event_sink(sink);
         self
     }
 
@@ -1350,6 +1374,31 @@ mod tests {
         server.run_start_hooks().await.expect("hooks must succeed");
 
         assert_eq!(log.lock().unwrap().as_slice(), &["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn a_builder_registered_sink_receives_posted_events() {
+        use std::sync::Mutex;
+        struct RecordingSink(Mutex<Vec<String>>);
+        impl crate::events::EventSink for RecordingSink {
+            fn on_event(
+                &self,
+                event: &str,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                let event = event.to_string();
+                Box::pin(async move { self.0.lock().unwrap().push(event) })
+            }
+        }
+
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .event_sink(sink.clone())
+            .build();
+
+        server.post_event("SHUTTER").await;
+
+        assert_eq!(sink.0.lock().unwrap().as_slice(), &["SHUTTER".to_string()]);
     }
 
     #[tokio::test]
