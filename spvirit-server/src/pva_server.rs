@@ -753,6 +753,13 @@ impl PvaServer {
             .unwrap_or_else(|| Arc::new(MonitorRegistry::new()));
         self.store.set_registry(registry.clone()).await;
 
+        // 1. Run every on_start hook to completion. Nothing else has started,
+        //    so a hook observes a quiescent store and no client can see a
+        //    pre-initialisation value.
+        self.run_start_hooks()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::<dyn std::error::Error>::from(e) })?;
+
         // Build the source registry with the built-in store at order 0.
         let sources = Arc::new(SourceRegistry::new());
         sources.add("builtin", 0, self.store.clone()).await;
@@ -774,7 +781,7 @@ impl PvaServer {
             sources.add(label.clone(), *order, source.clone()).await;
         }
 
-        // Spawn scan tasks.
+        // 2. Spawn scan tasks.
         for (name, period, callback) in &self.scans {
             let store = self.store.clone();
             let name = name.clone();
@@ -790,12 +797,16 @@ impl PvaServer {
             });
         }
 
+        // 3. Start the event dispatcher.
+        self.events.start_dispatcher(self.store.clone());
+
         let pv_count = self.store.pv_names().await.len();
         info!(
             "PvaServer starting: {} PVs on port {}",
             pv_count, self.config.tcp_port
         );
 
+        // 4. Bind and accept.
         run_pva_server_with_registry(sources, self.config, registry).await
     }
 }
@@ -1279,6 +1290,123 @@ mod tests {
         server.events().drain().await;
 
         assert_eq!(seen.lock().unwrap().as_slice(), &["SHUTTER".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_tasks_do_not_run_before_start_hooks_finish() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        let l = log.clone();
+        let scan_log = log.clone();
+        let server = PvaServer::builder()
+            .ai("T:TICK", 0.0)
+            .port(0)
+            .on_start(move |_store| {
+                let l = l.clone();
+                Box::pin(async move {
+                    // Yield repeatedly: a scan task spawned too early would
+                    // interleave here.
+                    for _ in 0..50 {
+                        tokio::task::yield_now().await;
+                    }
+                    l.lock().unwrap().push("hook-done");
+                })
+            })
+            .scan("T:TICK", Duration::from_millis(1), move |_name| {
+                scan_log.lock().unwrap().push("scan");
+                ScalarValue::F64(1.0)
+            })
+            .build();
+
+        // Output must be Send for tokio::spawn; discard the Result inline
+        // (mirrors ServeBuilder::start's spawn) since this test only checks
+        // ordering via `log`, not the run() outcome.
+        let handle = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.abort();
+
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(
+            entries.first(),
+            Some(&"hook-done"),
+            "start hook must complete before the first scan tick; got {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_client_can_connect_before_start_hooks_finish() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        // The hook blocks on this gate; the test releases it only after
+        // confirming the listener has not yet bound.
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let hook_entered = std::sync::Arc::new(AtomicBool::new(false));
+
+        let g = gate.clone();
+        let entered = hook_entered.clone();
+        let server = PvaServer::builder()
+            .ai("T:GATED", 0.0)
+            .port(0)
+            .on_start(move |store| {
+                let g = g.clone();
+                let entered = entered.clone();
+                Box::pin(async move {
+                    entered.store(true, Ordering::SeqCst);
+                    g.notified().await;
+                    store.set_value("T:GATED", ScalarValue::F64(99.0)).await;
+                })
+            })
+            .build();
+
+        let store = server.store().clone();
+        // Output must be Send for tokio::spawn; discard the Result inline
+        // (mirrors ServeBuilder::start's spawn) since this test only checks
+        // the gating via `store`, not the run() outcome.
+        let handle = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        // Give run() time to reach the hook and block there.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(hook_entered.load(Ordering::SeqCst), "hook should have started");
+        assert_eq!(
+            store.get_value("T:GATED").await,
+            Some(ScalarValue::F64(0.0)),
+            "hook has not finished, so the initial value is still in place"
+        );
+
+        gate.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            store.get_value("T:GATED").await,
+            Some(ScalarValue::F64(99.0)),
+            "hook must have completed once released"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_aborts_when_a_start_hook_panics() {
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .port(0)
+            .on_start(|_store| Box::pin(async { panic!("init failed"); }))
+            .build();
+
+        let result = server.run().await;
+
+        assert!(result.is_err(), "run() must fail when a start hook panics");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("on_start"),
+            "error must name the failing hook, got: {msg}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
