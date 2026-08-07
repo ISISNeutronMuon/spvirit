@@ -16,7 +16,7 @@
 //!
 //! let server = PvaServer::serve([AnyPv::from(temp.clone()), AnyPv::from(sp)])
 //!     .start()
-//!     .await;
+//!     .await?;
 //! temp.set(23.1).await?;
 //! ```
 //!
@@ -33,7 +33,7 @@
 //!     .collect();
 //! let pvs: Vec<AnyPv> = channels.iter().cloned().map(AnyPv::from).collect();
 //!
-//! let server = PvaServer::serve(pvs).start().await;
+//! let server = PvaServer::serve(pvs).start().await?;
 //! channels[0].set(21.3).await?;
 //! ```
 

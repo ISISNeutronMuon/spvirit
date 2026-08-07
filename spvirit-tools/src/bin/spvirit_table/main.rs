@@ -137,6 +137,7 @@ impl ServerHandle {
                 .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
                 .start()
                 .await
+                .expect("server start hooks must succeed")
         });
         let animators: Animators = Arc::new(Mutex::new(HashMap::new()));
         let rate: RateHz = Arc::new(AtomicU64::new(rate_hz.to_bits()));

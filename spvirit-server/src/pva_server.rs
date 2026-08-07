@@ -1042,16 +1042,29 @@ impl ServeBuilder {
         self.build().await.run().await
     }
 
-    /// Build and spawn; returns a handle for typed access and shutdown.
-    pub async fn start(self) -> RunningServer {
+    /// Build, run the `on_start` hooks to completion, then spawn the server;
+    /// returns a handle for typed access and shutdown.
+    ///
+    /// Returns `Err` if a hook aborts startup, mirroring Python's
+    /// `start_background`. This phase is awaited here rather than inside the
+    /// spawned task for two reasons: a hook that aborts must surface to the
+    /// caller instead of only reaching a `tracing::error!` they may have no
+    /// subscriber for, and hooks must have finished before `start()` returns
+    /// so `RunningServer::pv(...)` cannot read pre-hook values.
+    ///
+    /// A failure *after* the hook phase (a bind error, say) still cannot be
+    /// returned here — the server is serving by then — and is logged from
+    /// the spawned task as before.
+    pub async fn start(self) -> Result<RunningServer, String> {
         let server = self.build().await;
         let store = server.store().clone();
+        server.run_start_hooks().await?;
         let handle = tokio::spawn(async move {
-            if let Err(e) = server.run().await {
+            if let Err(e) = server.serve_after_start_hooks().await {
                 tracing::error!("PvaServer exited with error: {e}");
             }
         });
-        RunningServer { store, handle }
+        Ok(RunningServer { store, handle })
     }
 }
 
@@ -1376,6 +1389,67 @@ mod tests {
         assert_eq!(log.lock().unwrap().as_slice(), &["first", "second"]);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_builder_start_surfaces_a_start_hook_abort() {
+        // Previously start() spawned run() and discarded its Result, so a
+        // hook that aborted startup produced a healthy-looking RunningServer,
+        // a tracing::error! the caller may never see, and a server that never
+        // bound. Python's start_background already refuses to do that.
+        const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let started = tokio::time::timeout(
+            RUN_TIMEOUT,
+            PvaServer::serve(Vec::<crate::pv::AnyPv>::new())
+                .port(0)
+                .udp_port(0)
+                .on_start(|_store| Box::pin(async { panic!("init failed: no DB") }))
+                .start(),
+        )
+        .await
+        .expect("ServeBuilder::start() did not return within RUN_TIMEOUT");
+
+        let err = started.err().expect("an aborting hook must fail start()");
+        assert!(
+            err.contains("init failed: no DB"),
+            "start() must surface the hook's cause, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_builder_start_returns_only_after_hooks_have_run() {
+        // RunningServer::pv(...) must never be able to read a pre-hook value.
+        const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let server = tokio::time::timeout(
+            RUN_TIMEOUT,
+            PvaServer::serve(Vec::<crate::pv::AnyPv>::new())
+                .port(0)
+                .udp_port(0)
+                .on_start(|store| {
+                    Box::pin(async move {
+                        store.insert(
+                            "T:HOOKED".to_string(),
+                            make_scalar_record(
+                                "T:HOOKED",
+                                RecordType::Ai,
+                                ScalarValue::F64(7.0),
+                            ),
+                        )
+                        .await;
+                    })
+                })
+                .start(),
+        )
+        .await
+        .expect("ServeBuilder::start() did not return within RUN_TIMEOUT")
+        .expect("hooks must succeed");
+
+        assert_eq!(
+            server.store().get_value("T:HOOKED").await,
+            Some(ScalarValue::F64(7.0)),
+            "start() must not return before on_start hooks have finished"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn a_builder_registered_sink_receives_posted_events() {
         use std::sync::Mutex;
@@ -1686,7 +1760,8 @@ mod tests {
             .port(0)
             .udp_port(0)
             .start()
-            .await;
+            .await
+            .expect("server start hooks must succeed");
 
         // add a writable u32 scalar
         let h = server.add_scalar("RT:U32", ScalarValue::U32(7), true).await;
@@ -1725,7 +1800,8 @@ mod tests {
             .port(0)
             .udp_port(0)
             .start()
-            .await;
+            .await
+            .expect("server start hooks must succeed");
 
         // writable enum -> mbbo, choices + index preserved
         server

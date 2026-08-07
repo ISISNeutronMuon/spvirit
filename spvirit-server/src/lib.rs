@@ -15,7 +15,7 @@
 //!
 //! let server = PvaServer::serve([AnyPv::from(temp.clone()), AnyPv::from(sp)])
 //!     .start()
-//!     .await;
+//!     .await?;
 //! temp.set(23.1).await?;
 //!
 //! // Classic builder (still supported):
