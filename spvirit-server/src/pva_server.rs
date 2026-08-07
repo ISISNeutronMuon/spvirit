@@ -1399,7 +1399,18 @@ mod tests {
             .on_start(|_store| Box::pin(async { panic!("init failed"); }))
             .build();
 
-        let result = server.run().await;
+        // Bounded, like `Events::drain()` (events.rs:176): if a future
+        // regression ever swallows the hook's error again, `run()` falls
+        // through to `run_pva_server_with_registry` and serves forever —
+        // this must surface as a named panic, not a hanging `cargo test`.
+        const RUN_TIMEOUT: Duration = Duration::from_secs(5);
+        let result = tokio::time::timeout(RUN_TIMEOUT, server.run())
+            .await
+            .expect(
+                "run() did not return within 5s — the panicking on_start hook's \
+                 error was likely swallowed, so run() fell through to bind the \
+                 listener and is now serving forever instead of aborting startup",
+            );
 
         assert!(result.is_err(), "run() must fail when a start hook panics");
         let msg = result.unwrap_err().to_string();
