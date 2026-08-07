@@ -517,7 +517,25 @@ mod tests {
         events.add_sink(sink.clone());
 
         // Would deadlock if post() held the sinks read lock across the call.
-        events.post("OUTER");
+        // Run it on its own thread with a bounded wait, the same discipline
+        // `drain()` applies to the dispatcher: a regression that reintroduces
+        // a lock held across the call-out must show up as a clear, named
+        // panic — not an indefinitely hanging `cargo test`.
+        const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let ev = events.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            ev.post("OUTER");
+            let _ = done_tx.send(());
+        });
+        if done_rx.recv_timeout(CALL_TIMEOUT).is_err() {
+            panic!(
+                "sink call-out deadlocked — `post()` is holding a lock across the call-out"
+            );
+        }
+        // The thread finished; join it so a panic inside it (e.g. from the
+        // sink call-out itself) surfaces here instead of being swallowed.
+        handle.join().expect("post(\"OUTER\") thread panicked");
 
         assert_eq!(sink.fired.load(Ordering::SeqCst), 1);
         assert_eq!(
