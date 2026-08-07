@@ -621,6 +621,20 @@ impl PvaServerBuilder {
     }
 }
 
+/// Best-effort rendering of a `catch_unwind` payload.
+///
+/// `panic!("...")` payloads are `String` (formatted) or `&'static str`
+/// (literal); anything else came from `panic_any` and has no text.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "panic payload was not a string".to_string()
+    }
+}
+
 // ─── PvaServer ───────────────────────────────────────────────────────────
 
 /// High-level PVAccess server.
@@ -689,7 +703,9 @@ impl PvaServer {
 
     /// Run every `on_start` hook to completion, in registration order.
     ///
-    /// Returns `Err` naming the hook if one panics.
+    /// Returns `Err` naming the hook and carrying the panic message if one
+    /// panics — including any label the hook panicked with (Python source
+    /// hooks panic with `on_start hook for source '<label>' raised: ...`).
     ///
     /// Also installs the monitor registry onto the store before any hook
     /// runs (idempotently — `SimplePvStore::set_registry` is safe to call
@@ -704,8 +720,18 @@ impl PvaServer {
             let fut = hook(self.store.clone());
             let result =
                 futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
-            if result.is_err() {
-                return Err(format!("on_start hook #{i} panicked; aborting startup"));
+            if let Err(payload) = result {
+                // Fold the panic payload into the message. Without this the
+                // real cause ("ValueError: DB connection refused", or the
+                // source label a Python source hook panics with) reached the
+                // user only via the default panic hook on stderr, and the
+                // returned error named the hook by an index that does not
+                // correspond to anything the user wrote — builder hooks and
+                // source hooks share one list.
+                return Err(format!(
+                    "on_start hook #{i} panicked; aborting startup: {}",
+                    panic_message(payload.as_ref())
+                ));
             }
         }
         Ok(())
@@ -1324,6 +1350,36 @@ mod tests {
         server.run_start_hooks().await.expect("hooks must succeed");
 
         assert_eq!(log.lock().unwrap().as_slice(), &["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_on_start_hook_reports_its_cause() {
+        // The panic payload is the only place the real cause lives — for a
+        // Python hook it is "on_start hook raised: ValueError: ...", and for
+        // a Python *source* hook it also carries the source label. Losing it
+        // left the user with an index into a list they never wrote.
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .on_start(|_store| {
+                Box::pin(async {
+                    panic!("on_start hook for source 'db' raised: DB connection refused")
+                })
+            })
+            .build();
+
+        let err = server
+            .run_start_hooks()
+            .await
+            .expect_err("a panicking hook must abort startup");
+
+        assert!(
+            err.contains("DB connection refused"),
+            "error must carry the panic's cause, got: {err}"
+        );
+        assert!(
+            err.contains("source 'db'"),
+            "error must preserve the hook label the panic carried, got: {err}"
+        );
     }
 
     #[tokio::test]
