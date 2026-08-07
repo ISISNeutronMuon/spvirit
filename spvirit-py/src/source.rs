@@ -30,7 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyCFunction, PyDict, PyList, PyTuple};
 use tokio::sync::mpsc;
 
 use spvirit_codec::spvd_decode::{DecodedValue, FieldDesc, FieldType, StructureDesc};
@@ -315,25 +315,45 @@ fn asyncio_loop(py: Python<'_>) -> PyResult<PyObject> {
         return Ok(l.clone_ref(py));
     }
     let asyncio = py.import("asyncio")?;
-    // Deliberately `asyncio.SelectorEventLoop()`, not `asyncio.new_event_loop()`.
-    // On Windows the default policy hands back a `ProactorEventLoop`, whose
-    // constructor unconditionally calls `signal.set_wakeup_fd()` — which
-    // raises `ValueError: set_wakeup_fd only works in main thread of the
-    // main interpreter` unless the *first* caller happens to be on the
-    // process's main OS thread. This loop is lazily created on first use,
-    // and the first use can easily be a Tokio worker thread (e.g. the
-    // event dispatcher invoking an async `@builder.on_event` handler) —
-    // nowhere near the main thread. `SelectorEventLoop` has no such
-    // main-thread requirement and needs no subprocess support here (we
-    // only ever run plain Python callbacks on it), so it works from any
-    // thread on every platform.
-    let loop_obj: PyObject = asyncio.getattr("SelectorEventLoop")?.call0()?.unbind();
+    // Policy-default loop construction (NOT `SelectorEventLoop()` — see the
+    // module-load-time `threading` import in `lib.rs`'s `#[pymodule]` fn
+    // for the real fix and full explanation of the Windows bug this used to
+    // work around by accident). Using the policy default keeps
+    // subprocess/pipe support on Windows `ProactorEventLoop` and respects a
+    // user-installed policy (uvloop, etc.) instead of silently overriding
+    // it.
+    let loop_obj: PyObject = asyncio.getattr("new_event_loop")?.call0()?.unbind();
     let loop_for_thread = loop_obj.clone_ref(py);
+    // Readiness handshake: don't publish the loop via LOOP.set() until we
+    // know it is actually inside run_forever() and able to accept
+    // run_coroutine_threadsafe submissions. Without this, a submission
+    // racing loop startup can silently vanish (the coroutine object is
+    // created but never scheduled) rather than raising -- exactly the
+    // "coroutine was never awaited" symptom this bridge must not produce.
+    let ready = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let ready_for_thread = ready.clone();
     std::thread::Builder::new()
         .name("spvirit-asyncio".into())
         .spawn(move || {
             Python::with_gil(|py| {
                 let l = loop_for_thread.bind(py);
+                // Flip the readiness flag from inside the loop itself via
+                // call_soon_threadsafe, so "ready" means "run_forever has
+                // started pumping callbacks", not just "the OS thread
+                // started".
+                let ready_cb = {
+                    let ready_for_cb = ready_for_thread.clone();
+                    PyCFunction::new_closure(py, None, None, move |_args, _kwargs| {
+                        let (lock, cvar) = &*ready_for_cb;
+                        *lock.lock().unwrap() = true;
+                        cvar.notify_all();
+                        Ok::<(), PyErr>(())
+                    })
+                };
+                match ready_cb.and_then(|cb| l.call_method1("call_soon_threadsafe", (cb,))) {
+                    Ok(_) => {}
+                    Err(e) => tracing::error!("failed to arm asyncio loop readiness signal: {e}"),
+                }
                 // run_forever releases the GIL while blocking in the selector.
                 if let Err(e) = l.call_method0("run_forever") {
                     tracing::error!("asyncio loop exited: {}", e);
@@ -341,10 +361,19 @@ fn asyncio_loop(py: Python<'_>) -> PyResult<PyObject> {
             });
         })
         .expect("spawn asyncio thread");
-    // Give the loop a moment to actually start running so that
-    // run_coroutine_threadsafe submissions are picked up.
-    // (asyncio.run_coroutine_threadsafe is safe even before run_forever,
-    // but we want the first submission to not race with loop startup.)
+    // Block (releasing the GIL) until the loop confirms it is running, or
+    // give up after a bounded wait rather than risk a silent race forever.
+    py.allow_threads(|| {
+        let (lock, cvar) = &*ready;
+        let guard = lock.lock().unwrap();
+        let (guard, timeout_result) = cvar
+            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |ready| !*ready)
+            .unwrap();
+        if timeout_result.timed_out() {
+            panic!("asyncio bridge loop did not signal readiness within 5s; it may have failed to start");
+        }
+        drop(guard);
+    });
     let out = loop_obj.clone_ref(py);
     let _ = LOOP.set(loop_obj);
     Ok(out)

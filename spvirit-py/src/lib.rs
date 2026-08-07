@@ -22,6 +22,33 @@ fn spvirit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Install the async bridge onto our shared Tokio runtime.
     runtime::init_async_runtime();
 
+    // Eagerly import `threading` on the thread that is importing this
+    // extension module. `import spvirit` always happens on the embedding
+    // process's real main thread (it's a plain Python-level import), so
+    // this guarantees `threading._main_thread` gets bound to the correct
+    // OS thread's identity at module-load time.
+    //
+    // Why this matters: `threading.py` sets its module-level `_main_thread`
+    // singleton to whichever thread is executing when `threading` is FIRST
+    // imported into the process -- not necessarily the process's actual
+    // main OS thread. Our async bridge (`source::asyncio_loop`) lazily
+    // constructs an asyncio event loop the first time an `async def`
+    // source/hook/event-handler callback runs, which can easily be on a
+    // Tokio worker thread rather than this one. If THAT import is what
+    // first pulls in `threading` (transitively, via `import asyncio`), the
+    // worker thread gets mistaken for "the main thread" from then on. On
+    // Windows this is directly observable: `asyncio.new_event_loop()`
+    // builds a `ProactorEventLoop`, whose constructor calls
+    // `signal.set_wakeup_fd()` iff `threading.current_thread() is
+    // threading.main_thread()` -- and with `_main_thread` mis-bound to a
+    // worker thread, that comparison spuriously succeeds on the worker
+    // thread and raises `ValueError: set_wakeup_fd only works in main
+    // thread of the main interpreter`, while succeeding (wrongly) on the
+    // real main thread. Importing `threading` here, unconditionally and
+    // before any background thread can touch Python, pins `_main_thread`
+    // to the correct identity for the lifetime of the process.
+    m.py().import("threading")?;
+
     // Error types
     errors::register(m)?;
 
