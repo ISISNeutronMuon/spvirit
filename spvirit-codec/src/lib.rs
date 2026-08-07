@@ -9,6 +9,7 @@
 pub mod encode_common;
 pub mod epics_decode;
 pub mod error;
+pub mod segment;
 pub mod spvd_decode;
 pub mod spvd_encode;
 pub mod spvirit_encode;
@@ -21,6 +22,9 @@ pub use epics_decode::{
 
 // --- Re-exports: decode errors ---
 pub use error::{DecodeError, DecodeResult};
+
+// --- Re-exports: segmentation ---
+pub use segment::{DEFAULT_MAX_MESSAGE_BYTES, SegmentOutcome, SegmentReassembler};
 
 // --- Re-exports: PVA wire-format encode helpers ---
 pub use spvirit_encode::{
