@@ -614,7 +614,7 @@ impl PvaServerBuilder {
             extra_sources: self.extra_sources,
             config,
             scans: self.scans,
-            monitor_registry: None,
+            monitor_registry: Arc::new(std::sync::OnceLock::new()),
             events,
             start_hooks: self.start_hooks,
         }
@@ -646,9 +646,16 @@ pub struct PvaServer {
     extra_sources: Vec<(String, i32, Arc<dyn Source>)>,
     config: PvaServerConfig,
     scans: Vec<(String, Duration, ScanCallback)>,
-    /// Optional pre-supplied monitor registry so external code (e.g. Python
-    /// bindings) can notify monitors from outside `run()`.
-    monitor_registry: Option<Arc<MonitorRegistry>>,
+    /// The monitor registry, lazily created on first access (by whichever
+    /// runs first among `set_monitor_registry`, `monitor_registry`,
+    /// `run_start_hooks`, or `serve_after_start_hooks`) and shared from
+    /// then on via the `OnceLock`. This guarantees `run_start_hooks` (which
+    /// installs it on the store before any hook runs) and
+    /// `serve_after_start_hooks` (which passes it to the source registry
+    /// and the running protocol) always agree on the exact same instance,
+    /// even when they're invoked as two separate calls (as Python's
+    /// `start_background` does) rather than back-to-back inside `run()`.
+    monitor_registry: Arc<std::sync::OnceLock<Arc<MonitorRegistry>>>,
     events: Arc<crate::events::Events>,
     start_hooks: Vec<crate::events::StartHook>,
 }
@@ -680,7 +687,16 @@ impl PvaServer {
     /// Run every `on_start` hook to completion, in registration order.
     ///
     /// Returns `Err` naming the hook if one panics.
+    ///
+    /// Also installs the monitor registry onto the store before any hook
+    /// runs (idempotently — `SimplePvStore::set_registry` is safe to call
+    /// more than once), so a hook that writes to the store notifies
+    /// subscribed monitors, and a hook that reads the registry off the
+    /// store never sees `None`. This must happen here rather than only in
+    /// `serve_after_start_hooks`, since `run_start_hooks` can be — and, via
+    /// Python's `start_background`, is — called on its own ahead of it.
     pub async fn run_start_hooks(&self) -> Result<(), String> {
+        self.store.set_registry(self.resolved_monitor_registry()).await;
         for (i, hook) in self.start_hooks.iter().enumerate() {
             let fut = hook(self.store.clone());
             let result =
@@ -727,18 +743,31 @@ impl PvaServer {
     /// This lets external code (for example Python `Source` adapters)
     /// hold onto the registry and publish monitor updates to subscribed
     /// PVAccess clients from outside `run()`.
+    ///
+    /// Must be called before the registry has been resolved by any other
+    /// path (`monitor_registry()`, `run_start_hooks()`, or
+    /// `serve_after_start_hooks()`) — in normal usage this is always right
+    /// after `build()`, before any of those run. If the registry was
+    /// already resolved, this is a no-op: the earlier instance wins.
     pub fn set_monitor_registry(&mut self, registry: Arc<MonitorRegistry>) {
-        self.monitor_registry = Some(registry);
+        let _ = self.monitor_registry.set(registry);
     }
 
     /// Get a shared handle to the [`MonitorRegistry`] that will be used
     /// when [`Self::run`] starts.  Creates (and stores) a new registry
     /// on first call so external code can register before run.
     pub fn monitor_registry(&mut self) -> Arc<MonitorRegistry> {
-        if self.monitor_registry.is_none() {
-            self.monitor_registry = Some(Arc::new(MonitorRegistry::new()));
-        }
-        self.monitor_registry.as_ref().unwrap().clone()
+        self.resolved_monitor_registry()
+    }
+
+    /// Get-or-create the single [`MonitorRegistry`] instance this server
+    /// will use for its whole lifetime. Shared by `monitor_registry()`,
+    /// `run_start_hooks()`, and `serve_after_start_hooks()` so they always
+    /// agree on the exact same `Arc`, regardless of call order.
+    fn resolved_monitor_registry(&self) -> Arc<MonitorRegistry> {
+        self.monitor_registry
+            .get_or_init(|| Arc::new(MonitorRegistry::new()))
+            .clone()
     }
 
     /// Start the PVA server (UDP search + TCP handler + beacon + scan tasks).
@@ -771,12 +800,11 @@ impl PvaServer {
     /// them; callers that need the hooks-first guarantee should use `run()`
     /// or call `run_start_hooks()` first themselves.
     pub async fn serve_after_start_hooks(self) -> Result<(), Box<dyn std::error::Error>> {
-        // Create the monitor registry early so scan tasks can notify
-        // PVAccess monitor clients when values change.
-        let registry = self
-            .monitor_registry
-            .clone()
-            .unwrap_or_else(|| Arc::new(MonitorRegistry::new()));
+        // Resolve (or reuse, if run_start_hooks or monitor_registry() already
+        // did) the single monitor registry instance so scan tasks and the
+        // running protocol notify PVAccess monitor clients through the same
+        // registry the store was already given.
+        let registry = self.resolved_monitor_registry();
         self.store.set_registry(registry.clone()).await;
 
         // Build the source registry with the built-in store at order 0.
@@ -1312,6 +1340,57 @@ mod tests {
             server.store().get_value("T:SP").await,
             Some(ScalarValue::F64(22.5))
         );
+    }
+
+    #[tokio::test]
+    async fn on_start_hook_write_reaches_a_subscribed_monitor() {
+        // Regression test for a real ordering bug: splitting run() into
+        // run_start_hooks() + serve_after_start_hooks() briefly moved
+        // `self.store.set_registry(...)` to run *after* the hook phase,
+        // so a hook writing the store during startup would not notify any
+        // subscriber, and a hook reading the registry off the store would
+        // see `None`. Fixed by resolving/installing the registry inside
+        // run_start_hooks() itself (see `resolved_monitor_registry`).
+        use crate::state::MonitorSub;
+
+        let mut server = PvaServer::builder()
+            .ao("T:SP", 0.0)
+            .on_start(|store| {
+                Box::pin(async move {
+                    store.set_value("T:SP", ScalarValue::F64(42.0)).await;
+                })
+            })
+            .build();
+
+        // Pre-create the registry and fake a subscriber directly, the way a
+        // real PVA client connection would register one via
+        // `update_monitor_subscription` -- but without needing a live
+        // socket for this test.
+        let registry = server.monitor_registry();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        registry.conns.lock().await.insert(1, tx);
+        registry.monitors.lock().await.insert(
+            "T:SP".to_string(),
+            vec![MonitorSub {
+                conn_id: 1,
+                ioid: 0,
+                version: 2,
+                is_be: true,
+                running: true,
+                pipeline_enabled: false,
+                nfree: 0,
+                filtered_desc: None,
+                last_snapshot: None,
+            }],
+        );
+
+        server.run_start_hooks().await.expect("hooks must succeed");
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("monitor update did not arrive within 5s -- on_start hook's write did not reach the registry")
+            .expect("monitor channel closed unexpectedly");
+        assert!(!msg.is_empty(), "monitor update message must not be empty");
     }
 
     #[tokio::test]
