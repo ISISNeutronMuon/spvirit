@@ -122,3 +122,10 @@ Cross-referenced from the per-crate chapters.
 4. ~~Finish the Python value-types work (Effort B)~~ — done; see above.
 5. Quality infrastructure: packet-capture regression corpus, benchmarks,
    lint gate in CI, `.pyi` stubs.
+6. Segmentation *emission* in the encoder. Reassembly is being added to
+   `spvirit-codec` (see the codec-gaps work), but nothing in the workspace
+   splits an oversized outgoing message into segments — the server sends one
+   large frame regardless of size. Needed before spvirit can serve large
+   NTNDArray images to clients that expect segmented delivery, and it would
+   also let the reassembler be tested end-to-end against our own server
+   instead of only against synthetic buffers.
