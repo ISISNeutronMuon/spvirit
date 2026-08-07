@@ -105,13 +105,18 @@ should be sugar over the NT level, not a parallel implementation.
    *encode* time, which breaks monitor deltas and Archiver Appliance
    ingestion. All mutation paths stamp update time; keep it that way.
 2. **The introspection registry is per-connection state** — decoders must be
-   reused across a connection's packets (0xFE type refs).
+   reused across a connection's packets (0xFE type refs). The same lifetime
+   rule applies to `SegmentReassembler`: one per connection, because it holds
+   the message currently being reassembled.
 3. **First-claim-wins source priority** — `claim` must be cheap and
    idempotent because `get`/`put`/`subscribe` re-claim.
 4. **on_put (post-apply, can't reject) vs PUT validator (pre-apply, can
    reject)** are different mechanisms; the Python `on_put` maps to the
    validator.
-5. **Monitor bitset ordering is heuristic** (three decode variants + scoring)
-   because implementations disagree; be careful "simplifying" it.
+5. **Monitor bitset ordering is spec-exact by default** — changed bitset,
+   data, overrun bitset — and every workspace call site uses it. The old
+   try-every-layout scoring heuristic still exists behind
+   `DecodeMode::Lenient` for mid-stream captures of implementations that
+   disagree; it has no in-workspace caller, so do not delete it as dead code.
 6. **Bool coercion trap**: `decoded_to_scalar_value` checks truthiness before
    numeric types; typed paths override `from_decoded` to avoid it.

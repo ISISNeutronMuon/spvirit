@@ -134,6 +134,19 @@ The server answers PVA command `CANCEL_REQUEST` with
 Clients that cancel a request rather than destroying the channel will see the
 error; the common clients do not.
 
+## 9. Large values are sent as one frame, never segmented
+
+spvirit reassembles segmented messages it receives — `SegmentReassembler` in
+`spvirit-codec/src/segment.rs:34`, driven by the client transport and the
+server handler — but it never emits them. `encode_header`
+(`spvirit-codec/src/spvirit_encode.rs:66`) never sets the segmentation bits,
+and no encode path splits a payload, so a 4 MB NTNDArray goes out as a single
+PVA frame with a four-byte payload length where EPICS Base would split it.
+Clients that accept large unsegmented frames — pvxs, p4p, PVAJava — read it
+fine; a client that enforces a maximum frame size will not. Tracked as
+roadmap item 6 in
+[Current State and Roadmap](../06-dev-guide/08-current-state.md).
+
 ## What is *not* on this list
 
 Behaviour that is deliberate and merely surprising lives in the chapters, not

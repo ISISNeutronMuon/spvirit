@@ -9,7 +9,7 @@ spvirit-types  (NtPayload, NtScalar, ScalarValue, PvValue, …)   ← zero depen
       │
       ▼
 spvirit-codec  (PVA wire codec + PVD codec + connection state tracker)
-      │             re-exports spvirit_types at crate root (lib.rs:36)
+      │             re-exports spvirit_types at crate root (lib.rs:51)
       ▼
 spvirit-client / spvirit-server / spvirit-tools / spvirit-py
 ```
@@ -52,10 +52,13 @@ store-entry time precisely because of this.
 
 | File | ~Lines | Contents |
 |---|---|---|
-| `lib.rs` | 36 | Module decls + curated re-exports (also re-exports `spvirit_types`) |
+| `lib.rs` | 51 | Module decls + curated re-exports (also re-exports `spvirit_types`) |
 | `encode_common.rs` | 28 | `encode_size` (PVA varint) + `encode_string` |
-| `epics_decode.rs` | 2108 | **PVA wire-format decode**: header, control flags, ~20 command payload structs, `PvaPacket::decode_payload` dispatch, `PvaOpPayload` |
-| `spvd_decode.rs` | 1507 | **pvData (PVD) introspection + value decode**: `TypeCode`, `FieldDesc`, `StructureDesc`, `DecodedValue`, `PvdDecoder` (incl. introspection registry, bitset decode) |
+| `error.rs` | 108 | `DecodeError` (the eleven typed decode failures) + `DecodeResult` |
+| `segment.rs` | 315 | `SegmentReassembler` / `SegmentOutcome`: sans-io reassembly of segmented PVA messages |
+| `monitor.rs` | 621 | **Monitor deltas**: `MonitorUpdate`, `MonitorLayout`, the three bitset-layout body decoders, the lenient scoring heuristic |
+| `epics_decode.rs` | 2046 | **PVA wire-format decode**: header, control flags, ~20 command payload structs, `PvaPacket::decode_payload` dispatch, `PvaOpPayload`, `DecodeMode` |
+| `spvd_decode.rs` | 1842 | **pvData (PVD) introspection + value decode**: `TypeCode`, `FieldDesc`, `StructureDesc`, `DecodedValue`, `DecodeLimits`, `PvdDecoder` (incl. introspection registry, bitset decode) |
 | `spvd_encode.rs` | 2571 | **pvData encode / NT serialization**: struct-desc encoding, per-NT-type encoders, bitset/delta/monitor encoding, PvRequest encode/decode, projection/filtering |
 | `spvirit_encode.rs` | 1372 | **PVA wire-format encode**: `encode_header`, all request/response builders (search, create-channel, op init/data/status, monitor, beacon) |
 | `spvirit_state.rs` | 1358 | **Connection state tracker**: CID↔SID↔PV-name mapping, operation states, search cache, snapshots/stats (used by the sniffing/diagnostic tools) |
@@ -64,7 +67,7 @@ store-entry time precisely because of this.
 
 **Framing.** Every PVA message is an 8-byte header (`magic 0xCA` / version /
 flags / command / payload_length) + payload. Decode entry point:
-`PvaPacket::new` → `decode_payload` (epics_decode.rs:205), which dispatches on
+`PvaPacket::new` → `decode_payload` (epics_decode.rs:206), which dispatches on
 the command byte (0=Beacon, 1=ConnValidation, 3=Search, 4=SearchResp,
 7=CreateChannel, 8=DestroyChannel, 9=ConnValidated, 10–14/16/20=Op,
 15=DestroyRequest, 17=GetField, 18=Message, 21=CancelRequest, 22=OriginTag …).
@@ -84,7 +87,7 @@ change one, check the others.
 
 **Introspection / type descriptors.** PVD structures are described by
 `FieldDesc`/`StructureDesc` trees. Parse path: `PvdDecoder::parse_field_desc`
-(spvd_decode.rs:352) → `parse_type_desc` → `parse_structure_desc`. Tag bytes:
+(spvd_decode.rs:402) → `parse_type_desc` → `parse_structure_desc`. Tag bytes:
 `0x80` structure, `0x81` union, `0x82` variant (+`0x08` for array forms),
 scalar/array mode bits `& 0x18`, base type `& 0xE7`. Encode side:
 `spvd_encode::encode_structure_desc` (spvd_encode.rs:33) plus per-NT descriptor
@@ -93,38 +96,70 @@ builders (`nt_scalar_desc`:274, `nt_scalar_array_desc`:708, `nt_table_desc`:764,
 
 **The introspection registry is stateful.** `0xFD` = "full type with id"
 (parse + cache under a u16 key), `0xFE` = "only id" (look up cached type).
-The registry lives inside a `RefCell` in `PvdDecoder` (spvd_decode.rs:296) —
+The registry lives inside a `RefCell` in `PvdDecoder` (spvd_decode.rs:327) —
 **a single `PvdDecoder` instance must be reused across a connection's packets**
 or `0xFE` references won't resolve. This is easy to get wrong.
 
 **Bitsets (monitor deltas).** Bit 0 = whole structure; field bits start at
-bit 1; nested structs consume a contiguous bit block (`count_structure_fields`
-flattens the count). Decode has **three** variants for the overrun-bitset
-ordering (`decode_structure_with_bitset`, `_and_overrun`, `_then_overrun`,
-spvd_decode.rs:853–911) because real implementations disagree on the wire
-ordering; `PvaOpPayload::decode_with_field_desc` (epics_decode.rs:1468) tries
-all three for MONITOR packets and scores the results
-(`choose_best_decoded_multi` / `score_decoded`). **This is a heuristic, not
-spec-exact — a likely source of future bugs.** Encode side:
-`encode_nt_payload_delta` (spvd_encode.rs:1916), `compute_changed_bits`:1812,
+bit 1; nested structs consume a contiguous bit block (`count_structure_fields`,
+spvd_decode.rs:1204, flattens the count). Decoding is **spec-exact by
+default** — changed bitset, data, overrun bitset — via
+`PvdDecoder::decode_monitor_update` (monitor.rs:116), which returns a
+`MonitorUpdate` (monitor.rs:19): the decoded value, both raw bitsets, the
+bytes consumed, and the bit-indexed field paths captured at decode time
+(`changed_paths`:65, `overrun_paths`:71, `overrun_fields`:58 — the last takes
+the descriptor explicitly). `PvaOpPayload::decode_with_field_desc`
+(epics_decode.rs:1473) selects the policy with a `DecodeMode`
+(epics_decode.rs:1512); every call site in the workspace passes
+`DecodeMode::Strict`. `DecodeMode::Lenient` retains the old
+try-every-layout scoring heuristic — `decode_monitor_update_lenient`
+(monitor.rs:140) reports the winning `MonitorLayout` (monitor.rs:38) — for
+mid-stream captures and peers that disagree on the ordering. It is public API
+for out-of-tree consumers; nothing in the workspace selects it. The
+single-bitset decoders `decode_structure_with_bitset` (spvd_decode.rs:1005)
+and `pub(crate) decode_structure_with_bitset_body` (:1035) are what
+`monitor.rs` builds on. Encode side: `encode_nt_payload_delta`
+(spvd_encode.rs:1916), `compute_changed_bits`:1812,
 `encode_structure_bitset`:464.
+
+The path order in `flatten_field_paths` (monitor.rs:99) must stay in step with
+`count_structure_fields`, which numbers the bits: depth-first, self then
+nested. If the two diverge, overrun bits map to the wrong field names.
 
 **Op payloads.** `PvaOpPayload::new` (epics_decode.rs:1371) handles client vs
 server field-offset differences, the conditional status prefix, PV-name
 extraction, and parses introspection on INIT responses. `decoded_value` is
 filled later once a `field_desc` is known.
 
-**Value decode** (`PvdDecoder::decode_value`, spvd_decode.rs:706) is recursive
-over `FieldType`. Safety caps: scalar arrays 4 M elements, string arrays 4096,
-struct arrays 256, unions 128 — oversized arrays are truncated (string/struct
-truncation can desync the decode stream).
+**Value decode** (`PvdDecoder::decode_value`, spvd_decode.rs:820) is recursive
+over `FieldType`. Every array count is checked before anything is allocated
+(`check_array_count`, spvd_decode.rs:797): a count above its `DecodeLimits`
+ceiling is `DecodeError::ArrayTooLarge`, and a count that cannot fit in the
+bytes that remain is `DecodeError::CountExceedsBuffer`. The limit is checked
+first, so a corrupt length that violates both is reported as `ArrayTooLarge`.
+**Nothing is silently truncated.** `DecodeLimits` (spvd_decode.rs:21) defaults
+to 4 000 000 elements for scalar arrays and 65 536 each for string, structure,
+union and variant arrays; override per decoder with `PvdDecoder::with_limits`
+(spvd_decode.rs:336) and read them back with `limits()`.
 
-**Segmentation is parsed but not reassembled.** The flags byte carries
-first/middle/last segment bits and they are decoded (epics_decode.rs:83–101),
-but `PvaPacket` only decodes a single complete buffer — reassembly is the
-caller's job. `spvirit-server/src/handler.rs` and `decode.rs` implement their
-own reassembly; the codec itself does not. This is an architectural gap if
-you ever handle large segmented values in a new consumer.
+**Segmentation is reassembled by the codec.** The flags byte carries
+first/middle/last segment bits, decoded into `PvaControlFlags`
+(epics_decode.rs:75). `SegmentReassembler` (segment.rs:34) turns a run of them
+back into one message: `push` (segment.rs:65) takes an 8-byte header plus its
+payload and answers `SegmentOutcome::Pending`, `::Complete` — the first
+segment's header with the segment bits cleared and `payload_length` rewritten
+to the concatenated total — or `::Control`, since control frames are legal
+between the segments of one message and leave the in-progress state alone. It
+is sans-io and holds one message at a time, so it needs **one instance per
+connection** — the same lifetime rule as `PvdDecoder`. The ceiling is
+`DEFAULT_MAX_MESSAGE_BYTES` (segment.rs:7, 256 MiB), overridable with
+`with_max_bytes` (segment.rs:46). `spvirit-client`'s `read_packet`
+(transport.rs:63) and the server handler (handler.rs:834) both drive one.
+
+**Emission is still not implemented.** Nothing in the workspace splits an
+oversized outgoing message into segments; the server sends one large frame
+regardless of size. Roadmap item 6 in
+[Current State and Roadmap](08-current-state.md).
 
 ### Connection state tracker (`spvirit_state.rs`)
 
@@ -150,8 +185,6 @@ mapping in these crates**; each consumer interprets `DecodedValue` itself
 ### Known issues & sharp edges
 
 - `PvaHeader::new` panics on < 8 bytes; use `try_new` for untrusted input.
-- `parse_introspection_with_len` has a dead if/else (spvd_decode.rs:583–591)
-  — both branches insert the same value; harmless but confusing.
 - `StructureArray` null elements decode to an empty-struct placeholder, not a
   true null — lossy.
 - `decoded_to_scalar_value`-style truthy-first conversions live in consumers;
@@ -167,7 +200,8 @@ mapping in these crates**; each consumer interprets `DecodedValue` itself
 ### Tests
 
 All inline `#[cfg(test)]` modules at the bottom of each file: spvd_encode 18,
-spvirit_encode 20, spvirit_state 15, epics_decode 9, spvd_decode 7, types 2.
+spvirit_encode 20, spvirit_state 15, spvd_decode 18, epics_decode 10,
+monitor 10, segment 10, error 3, types 2.
 Round-trip oriented (encode → decode → assert equality). The state-tracker
 tests (spvirit_state.rs:1023–1350) double as documentation of the intended
 state-machine semantics. Run with `cargo test -p spvirit-codec -p spvirit-types`.
