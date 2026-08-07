@@ -745,6 +745,32 @@ impl PvaServer {
     ///
     /// This blocks until the server is shut down or an error occurs.
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+        // 1. Run every on_start hook to completion. Nothing else has started,
+        //    so a hook observes a quiescent store and no client can see a
+        //    pre-initialisation value.
+        self.run_start_hooks()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::<dyn std::error::Error>::from(e) })?;
+
+        self.serve_after_start_hooks().await
+    }
+
+    /// Continue startup on the assumption that `run_start_hooks()` has
+    /// already completed successfully.
+    ///
+    /// Builds the source registry, spawns scan tasks, starts the event
+    /// dispatcher, and binds/accepts connections — i.e. everything `run()`
+    /// does except the hook phase. Exists so a caller that needs to surface
+    /// an `on_start` failure synchronously (e.g. Python's
+    /// `start_background`, which must raise before returning rather than
+    /// only logging from a background thread) can run the hooks itself,
+    /// check the result, and only then hand the server off to a background
+    /// task — without running the hooks a second time.
+    ///
+    /// Calling this without having run the start hooks first silently skips
+    /// them; callers that need the hooks-first guarantee should use `run()`
+    /// or call `run_start_hooks()` first themselves.
+    pub async fn serve_after_start_hooks(self) -> Result<(), Box<dyn std::error::Error>> {
         // Create the monitor registry early so scan tasks can notify
         // PVAccess monitor clients when values change.
         let registry = self
@@ -752,13 +778,6 @@ impl PvaServer {
             .clone()
             .unwrap_or_else(|| Arc::new(MonitorRegistry::new()));
         self.store.set_registry(registry.clone()).await;
-
-        // 1. Run every on_start hook to completion. Nothing else has started,
-        //    so a hook observes a quiescent store and no client can see a
-        //    pre-initialisation value.
-        self.run_start_hooks()
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::<dyn std::error::Error>::from(e) })?;
 
         // Build the source registry with the built-in store at order 0.
         let sources = Arc::new(SourceRegistry::new());
