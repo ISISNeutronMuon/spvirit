@@ -643,7 +643,7 @@ class SensorSource:
     def rpc(self, name, args):             # optional: NTURI RPC support
         return spvirit.NtScalar(float(args["x"]) * 2)
 
-    def on_start(self, notifier):          # optional: called at registration
+    def on_start(self, notifier):          # optional: called at server start, not at construction
         self.notifier = notifier           # keep it to push updates later
 
 server = spvirit.Server(sources=[("sensors", 10, SensorSource())])
