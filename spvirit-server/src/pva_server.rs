@@ -15,7 +15,9 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,6 +66,8 @@ pub struct PvaServerBuilder {
     pvlist_mode: PvListMode,
     pvlist_max: usize,
     pvlist_allow_pattern: Option<Regex>,
+    start_hooks: Vec<crate::events::StartHook>,
+    event_handlers: Vec<(String, crate::events::EventHandler)>,
 }
 
 impl PvaServerBuilder {
@@ -84,6 +88,8 @@ impl PvaServerBuilder {
             pvlist_mode: PvListMode::List,
             pvlist_max: 1024,
             pvlist_allow_pattern: None,
+            start_hooks: Vec::new(),
+            event_handlers: Vec::new(),
         }
     }
 
@@ -430,6 +436,47 @@ impl PvaServerBuilder {
         self
     }
 
+    /// Register a hook to run once at startup, before the server serves.
+    ///
+    /// Hooks run in registration order, each to completion, before scan tasks
+    /// spawn and before the listener accepts. A hook that panics aborts
+    /// startup.
+    ///
+    /// ```rust,ignore
+    /// .on_start(|store| Box::pin(async move {
+    ///     store.set_value("SETPOINT", ScalarValue::F64(22.5)).await;
+    /// }))
+    /// ```
+    pub fn on_start<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(Arc<SimplePvStore>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.start_hooks.push(Arc::new(hook));
+        self
+    }
+
+    /// Register a handler for a named event.
+    ///
+    /// Handlers are deferred: `post_event` queues them and returns. They run
+    /// one at a time, in registration order, on the dispatcher.
+    ///
+    /// ```rust,ignore
+    /// .on_event("SHUTTER", |store, event| Box::pin(async move { /* ... */ }))
+    /// ```
+    pub fn on_event<F>(mut self, event: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(Arc<SimplePvStore>, String) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.event_handlers.push((event.into(), Arc::new(handler)));
+        self
+    }
+
     /// Link an output PV to one or more input PVs.
     ///
     /// Whenever any input PV changes (via `set_value`, protocol PUT, or
@@ -557,12 +604,19 @@ impl PvaServerBuilder {
         config.pvlist_max = self.pvlist_max;
         config.pvlist_allow_pattern = self.pvlist_allow_pattern;
 
+        let events = Arc::new(crate::events::Events::new());
+        for (name, handler) in self.event_handlers {
+            events.add_handler(name, handler);
+        }
+
         PvaServer {
             store,
             extra_sources: self.extra_sources,
             config,
             scans: self.scans,
             monitor_registry: None,
+            events,
+            start_hooks: self.start_hooks,
         }
     }
 }
@@ -595,6 +649,8 @@ pub struct PvaServer {
     /// Optional pre-supplied monitor registry so external code (e.g. Python
     /// bindings) can notify monitors from outside `run()`.
     monitor_registry: Option<Arc<MonitorRegistry>>,
+    events: Arc<crate::events::Events>,
+    start_hooks: Vec<crate::events::StartHook>,
 }
 
 impl PvaServer {
@@ -606,6 +662,34 @@ impl PvaServer {
     /// Get a reference to the underlying store for runtime get/put.
     pub fn store(&self) -> &Arc<SimplePvStore> {
         &self.store
+    }
+
+    /// The server's event registry — register sinks or post events.
+    pub fn events(&self) -> &Arc<crate::events::Events> {
+        &self.events
+    }
+
+    /// Post a named event.
+    ///
+    /// Synchronous sinks run inline; handlers are queued. When this returns,
+    /// records have processed and handlers are queued — not necessarily run.
+    pub fn post_event(&self, event: &str) {
+        self.events.post(event);
+    }
+
+    /// Run every `on_start` hook to completion, in registration order.
+    ///
+    /// Returns `Err` naming the hook if one panics.
+    pub async fn run_start_hooks(&self) -> Result<(), String> {
+        for (i, hook) in self.start_hooks.iter().enumerate() {
+            let fut = hook(self.store.clone());
+            let result =
+                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
+            if result.is_err() {
+                return Err(format!("on_start hook #{i} panicked; aborting startup"));
+            }
+        }
+        Ok(())
     }
 
     /// Mint a typed handle to any record in this server's store — the
@@ -1132,6 +1216,70 @@ pub(crate) fn make_table_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn on_start_hooks_are_stored_and_runnable_in_order() {
+        use std::sync::Mutex;
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        let l1 = log.clone();
+        let l2 = log.clone();
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .on_start(move |_store| {
+                let l = l1.clone();
+                Box::pin(async move { l.lock().unwrap().push("first"); })
+            })
+            .on_start(move |_store| {
+                let l = l2.clone();
+                Box::pin(async move { l.lock().unwrap().push("second"); })
+            })
+            .build();
+
+        server.run_start_hooks().await.expect("hooks must succeed");
+
+        assert_eq!(log.lock().unwrap().as_slice(), &["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn on_start_hook_can_write_the_store() {
+        let server = PvaServer::builder()
+            .ao("T:SP", 0.0)
+            .on_start(|store| {
+                Box::pin(async move {
+                    store.set_value("T:SP", ScalarValue::F64(22.5)).await;
+                })
+            })
+            .build();
+
+        server.run_start_hooks().await.expect("hooks must succeed");
+
+        assert_eq!(
+            server.store().get_value("T:SP").await,
+            Some(ScalarValue::F64(22.5))
+        );
+    }
+
+    #[tokio::test]
+    async fn post_event_reaches_a_builder_registered_handler() {
+        use std::sync::Mutex;
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .on_event("SHUTTER", move |_store, event| {
+                let s = s.clone();
+                Box::pin(async move { s.lock().unwrap().push(event); })
+            })
+            .build();
+
+        server.events().start_dispatcher(server.store().clone());
+        server.post_event("SHUTTER");
+        server.events().drain().await;
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &["SHUTTER".to_string()]);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn running_server_add_scalar_and_array() {

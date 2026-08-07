@@ -36,6 +36,10 @@ pub type EventHandler = Arc<
         + Sync,
 >;
 
+/// A startup hook. Runs once, to completion, before the server serves.
+pub type StartHook =
+    Arc<dyn Fn(Arc<SimplePvStore>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// One queued unit of work: a handler plus the event that triggered it.
 struct Dispatch {
     handler: EventHandler,
