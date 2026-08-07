@@ -25,6 +25,12 @@ pub struct MonitorUpdate {
     pub overrun: Vec<u8>,
     /// Bytes consumed from the body.
     pub consumed: usize,
+    /// Bit-indexed field paths for this update's introspection: index 0 is
+    /// `"<whole structure>"`, index *n* is the field addressed by bit *n*.
+    ///
+    /// Captured at decode time so a callback can name the set bits without
+    /// also being handed the [`StructureDesc`].
+    pub paths: Vec<String>,
 }
 
 /// Which wire layout a lenient decode matched.
@@ -46,21 +52,46 @@ impl MonitorUpdate {
 
     /// Dotted paths of the fields whose overrun bits are set.
     ///
-    /// Bit 0 yields the literal `"<whole structure>"`.
+    /// Bit 0 yields the literal `"<whole structure>"`. Takes the descriptor
+    /// explicitly; [`MonitorUpdate::overrun_paths`] uses the paths the decoder
+    /// already captured.
     pub fn overrun_fields(&self, desc: &StructureDesc) -> Vec<String> {
-        let mut paths = vec!["<whole structure>".to_string()];
-        flatten_field_paths(desc, "", &mut paths);
-
-        paths
-            .into_iter()
-            .enumerate()
-            .filter(|(bit, _)| {
-                let byte = bit / 8;
-                byte < self.overrun.len() && (self.overrun[byte] & (1 << (bit % 8))) != 0
-            })
-            .map(|(_, path)| path)
-            .collect()
+        select_paths(&bit_paths(desc), &self.overrun)
     }
+
+    /// Dotted paths of the fields marked changed in this update.
+    ///
+    /// Bit 0 yields the literal `"<whole structure>"`.
+    pub fn changed_paths(&self) -> Vec<String> {
+        select_paths(&self.paths, &self.changed)
+    }
+
+    /// Dotted paths of the fields whose overrun bits are set — the server
+    /// dropped at least one earlier update for each of them.
+    pub fn overrun_paths(&self) -> Vec<String> {
+        select_paths(&self.paths, &self.overrun)
+    }
+}
+
+/// Bit-indexed paths for a descriptor: bit 0 is the whole structure, field
+/// bits follow in `flatten_field_paths` order.
+pub(crate) fn bit_paths(desc: &StructureDesc) -> Vec<String> {
+    let mut paths = vec!["<whole structure>".to_string()];
+    flatten_field_paths(desc, "", &mut paths);
+    paths
+}
+
+/// The subset of `paths` whose bit is set in `bits`.
+fn select_paths(paths: &[String], bits: &[u8]) -> Vec<String> {
+    paths
+        .iter()
+        .enumerate()
+        .filter(|(bit, _)| {
+            let byte = bit / 8;
+            byte < bits.len() && (bits[byte] & (1 << (bit % 8))) != 0
+        })
+        .map(|(_, path)| path.clone())
+        .collect()
 }
 
 /// Depth-first, self-then-nested. Must stay in step with
@@ -97,6 +128,7 @@ impl PvdDecoder {
             changed,
             overrun,
             consumed: next,
+            paths: bit_paths(desc),
         })
     }
 
@@ -165,6 +197,7 @@ impl PvdDecoder {
             changed,
             overrun,
             consumed: offset,
+            paths: bit_paths(desc),
         })
     }
 
@@ -183,6 +216,7 @@ impl PvdDecoder {
             changed,
             overrun: Vec::new(),
             consumed: offset,
+            paths: bit_paths(desc),
         })
     }
 
@@ -431,8 +465,26 @@ mod tests {
             changed: Vec::new(),
             overrun,
             consumed: 0,
+            paths: bit_paths(&root),
         };
         assert_eq!(update.overrun_fields(&root), vec!["mid.leaf.deep"]);
+        assert_eq!(update.overrun_paths(), vec!["mid.leaf.deep"]);
+    }
+
+    /// The shape the client monitor callback relies on: a decoded update can
+    /// name its own changed and overrun bits without the caller holding the
+    /// descriptor.
+    #[test]
+    fn monitor_update_reports_overrun_paths() {
+        let decoder = PvdDecoder::new(false);
+        let desc = nt_scalar_desc();
+        // changed = bit 1 ("value"), overrun = bit 3 ("alarm.severity").
+        let body = spec_order_body(0b0000_0010, 42, 0b0000_1000);
+        let update = decoder.decode_monitor_update(&body, &desc).unwrap();
+
+        assert_eq!(update.changed_paths(), vec!["value"]);
+        assert_eq!(update.overrun_paths(), vec!["alarm.severity"]);
+        assert!(update.has_overrun());
     }
 
     #[test]

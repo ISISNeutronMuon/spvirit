@@ -1,4 +1,4 @@
-use spvirit_client::{MonitorOptions, PvaClient};
+use spvirit_client::{MonitorOptions, MonitorUpdate, PvaClient};
 use std::ops::ControlFlow;
 
 /// Minimal `pvmonitor` example.
@@ -40,8 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pv = pv.unwrap_or_else(|| "MY:PV:NAME".into());
     // ANCHOR: core
     let client = PvaClient::builder().build();
-    let cb = |value: &spvirit_codec::spvd_decode::DecodedValue| {
-        println!("{value}");
+    let cb = |update: &MonitorUpdate| {
+        println!("{}", update.value);
         ControlFlow::Continue(())
     };
     let refs: Vec<&str> = fields.iter().map(String::as_str).collect();

@@ -362,9 +362,9 @@ impl PyClient {
             async move {
                 let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
                 client
-                    .pvmonitor_fields(&pv_name, &refs, |decoded| {
+                    .pvmonitor_fields(&pv_name, &refs, |update| {
                         let keep_going = Python::with_gil(|py| {
-                            let py_val = decoded_to_py(py, decoded);
+                            let py_val = decoded_to_py(py, &update.value);
                             match callback.call1(py, (py_val,)) {
                                 Ok(ret) => {
                                     // If callback returns False, stop
@@ -450,9 +450,9 @@ impl PyClient {
         let handle = RUNTIME.spawn(async move {
             let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
             let result = client
-                .pvmonitor_fields(&task_pv, &refs, |decoded| {
+                .pvmonitor_fields(&task_pv, &refs, |update| {
                     let keep_going = Python::with_gil(|py| {
-                        let py_val = decoded_to_py(py, decoded);
+                        let py_val = decoded_to_py(py, &update.value);
                         match callback.call1(py, (py_val,)) {
                             Ok(ret) => ret.extract::<bool>(py).unwrap_or(true),
                             Err(e) => {

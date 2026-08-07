@@ -21,8 +21,9 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval};
 
+use spvirit_codec::MonitorUpdate;
 use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
-use spvirit_codec::spvd_decode::{DecodedValue, PvdDecoder, StructureDesc};
+use spvirit_codec::spvd_decode::{PvdDecoder, StructureDesc};
 use spvirit_codec::spvd_encode::{encode_pv_request, encode_pv_request_with_options};
 use spvirit_codec::spvirit_encode::{
     encode_control_message, encode_get_field_request, encode_monitor_request, encode_put_request,
@@ -451,14 +452,14 @@ impl PvaClient {
     /// ```rust,ignore
     /// use std::ops::ControlFlow;
     ///
-    /// client.pvmonitor("MY:PV", |value| {
-    ///     println!("{value:?}");
+    /// client.pvmonitor("MY:PV", |update| {
+    ///     println!("{:?}", update.value);
     ///     ControlFlow::Continue(())
     /// }).await?;
     /// ```
     pub async fn pvmonitor<F>(&self, pv_name: &str, callback: F) -> Result<(), PvGetError>
     where
-        F: FnMut(&DecodedValue) -> ControlFlow<()>,
+        F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
     {
         // Default: subscribe to the entire structure. Use
         // [`pvmonitor_fields`](Self::pvmonitor_fields) for filtered subscriptions.
@@ -477,7 +478,7 @@ impl PvaClient {
         callback: F,
     ) -> Result<(), PvGetError>
     where
-        F: FnMut(&DecodedValue) -> ControlFlow<()>,
+        F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
     {
         self.pvmonitor_with_options(pv_name, fields, MonitorOptions::default(), callback)
             .await
@@ -497,7 +498,7 @@ impl PvaClient {
         mut callback: F,
     ) -> Result<(), PvGetError>
     where
-        F: FnMut(&DecodedValue) -> ControlFlow<()>,
+        F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
     {
         let ChannelConn {
             mut stream,
@@ -585,10 +586,10 @@ impl PvaClient {
                         if op.command == 13 && op.ioid == ioid && op.subcmd == 0x00 {
                             let payload = &bytes[8..]; // skip header
                             let pos = 5; // skip ioid(4) + subcmd(1)
-                            if let Ok((decoded, _)) =
-                                decoder.decode_structure_with_bitset(&payload[pos..], &field_desc)
+                            if let Ok(update) =
+                                decoder.decode_monitor_update(&payload[pos..], &field_desc)
                             {
-                                let flow = callback(&decoded);
+                                let flow = callback(&update);
 
                                 if pipeline_queue.is_some() {
                                     consumed_since_ack = consumed_since_ack.saturating_add(1);
@@ -803,7 +804,7 @@ pub async fn pvput(opts: &PvOptions, value: impl Into<Value>) -> Result<(), PvGe
 /// see [`pvmonitor_fields`] for filtered subscriptions.
 pub async fn pvmonitor<F>(opts: &PvOptions, callback: F) -> Result<(), PvGetError>
 where
-    F: FnMut(&DecodedValue) -> ControlFlow<()>,
+    F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
 {
     let client = client_from_opts(opts);
     client.pvmonitor(&opts.pv_name, callback).await
@@ -816,7 +817,7 @@ pub async fn pvmonitor_fields<F>(
     callback: F,
 ) -> Result<(), PvGetError>
 where
-    F: FnMut(&DecodedValue) -> ControlFlow<()>,
+    F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
 {
     let client = client_from_opts(opts);
     client

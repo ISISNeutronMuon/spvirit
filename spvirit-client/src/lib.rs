@@ -60,4 +60,7 @@ pub use transport::{read_frame, read_packet, read_until};
 
 // --- Re-exports: segmentation (so callers need not depend on spvirit-codec) ---
 pub use spvirit_codec::{DecodeError, SegmentOutcome, SegmentReassembler};
+
+// --- Re-exports: monitor updates (callbacks take a &MonitorUpdate) ---
+pub use spvirit_codec::MonitorUpdate;
 pub use types::{PvGetError, PvGetOptions, PvGetResult, PvMonitorEvent, PvOptions};

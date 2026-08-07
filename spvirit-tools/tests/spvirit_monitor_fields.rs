@@ -52,8 +52,8 @@ async fn monitor_unfiltered_returns_full_structure() {
     let received: Arc<StdMutex<Option<DecodedValue>>> = Arc::new(StdMutex::new(None));
     let received_cb = received.clone();
 
-    let monitor = client.pvmonitor(PV, move |value| {
-        *received_cb.lock().unwrap() = Some(value.clone());
+    let monitor = client.pvmonitor(PV, move |update| {
+        *received_cb.lock().unwrap() = Some(update.value.clone());
         ControlFlow::Break(())
     });
 
@@ -86,8 +86,8 @@ async fn monitor_value_only_returns_only_value_field() {
     let received: Arc<StdMutex<Option<DecodedValue>>> = Arc::new(StdMutex::new(None));
     let received_cb = received.clone();
 
-    let monitor = client.pvmonitor_fields(PV, &["value"], move |value| {
-        *received_cb.lock().unwrap() = Some(value.clone());
+    let monitor = client.pvmonitor_fields(PV, &["value"], move |update| {
+        *received_cb.lock().unwrap() = Some(update.value.clone());
         ControlFlow::Break(())
     });
 
@@ -113,8 +113,8 @@ async fn monitor_nested_path_returns_only_alarm_severity() {
     let received: Arc<StdMutex<Option<DecodedValue>>> = Arc::new(StdMutex::new(None));
     let received_cb = received.clone();
 
-    let monitor = client.pvmonitor_fields(PV, &["alarm.severity"], move |value| {
-        *received_cb.lock().unwrap() = Some(value.clone());
+    let monitor = client.pvmonitor_fields(PV, &["alarm.severity"], move |update| {
+        *received_cb.lock().unwrap() = Some(update.value.clone());
         ControlFlow::Break(())
     });
 

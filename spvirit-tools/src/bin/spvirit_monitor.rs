@@ -35,8 +35,17 @@ async fn pvmonitor_high_level(
         render_opts.format = OutputFormat::Json;
     }
 
-    let cb = |value: &spvirit_codec::spvd_decode::DecodedValue| {
-        println!("{}", format_output(&pv_name, value, &render_opts));
+    let cb = |update: &spvirit_client::MonitorUpdate| {
+        println!("{}", format_output(&pv_name, &update.value, &render_opts));
+        // Overruns go to stderr: stdout is compared byte-for-byte by
+        // docs_verify and the interop tests.
+        if update.has_overrun() {
+            eprintln!(
+                "{}: overrun on {}",
+                pv_name,
+                update.overrun_paths().join(", ")
+            );
+        }
         ControlFlow::Continue(())
     };
     let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
