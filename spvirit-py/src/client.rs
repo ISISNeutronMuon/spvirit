@@ -14,6 +14,7 @@ use spvirit_client::search::{build_auto_broadcast_targets, discover_servers};
 
 use crate::convert::{decoded_to_py, py_to_json};
 use crate::errors::to_py_err;
+use crate::monitor_update::PyMonitorUpdate;
 use crate::runtime::RUNTIME;
 
 // ─── GetResult ───────────────────────────────────────────────────────────────
@@ -338,7 +339,11 @@ impl PyClient {
         .map_err(to_py_err)
     }
 
-    /// Subscribe to a PV and call `callback(value_dict)` for each update.
+    /// Subscribe to a PV and call `callback(update)` for each update.
+    ///
+    /// `update` is a `MonitorUpdate`: `.value` is the decoded value dict,
+    /// `.changed` / `.overrun` are dotted field paths and `.has_overrun`
+    /// reports whether the server dropped intermediate updates.
     ///
     /// Blocks (GIL released between updates) until the callback returns
     /// `False` or raises — a raised exception stops the monitor and
@@ -364,7 +369,7 @@ impl PyClient {
                 client
                     .pvmonitor_fields(&pv_name, &refs, |update| {
                         let keep_going = Python::with_gil(|py| {
-                            let py_val = decoded_to_py(py, &update.value);
+                            let py_val = PyMonitorUpdate::from_update(py, update);
                             match callback.call1(py, (py_val,)) {
                                 Ok(ret) => {
                                     // If callback returns False, stop
@@ -424,7 +429,8 @@ impl PyClient {
 
     /// Subscribe to a PV without blocking; returns a `Subscription` handle.
     ///
-    /// `callback(value)` runs on a background runtime thread for each update,
+    /// `callback(update)` receives a `MonitorUpdate` (see `monitor`) and runs
+    /// on a background runtime thread for each update,
     /// sequentially per subscription. Returning `False` from the callback
     /// unsubscribes, matching `monitor`; raising also unsubscribes and stores
     /// the message in `subscription.error`. Call `subscription.close()` to
@@ -452,7 +458,7 @@ impl PyClient {
             let result = client
                 .pvmonitor_fields(&task_pv, &refs, |update| {
                     let keep_going = Python::with_gil(|py| {
-                        let py_val = decoded_to_py(py, &update.value);
+                        let py_val = PyMonitorUpdate::from_update(py, update);
                         match callback.call1(py, (py_val,)) {
                             Ok(ret) => ret.extract::<bool>(py).unwrap_or(true),
                             Err(e) => {

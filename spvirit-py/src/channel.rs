@@ -234,7 +234,7 @@ async fn run_introspect(
 }
 
 /// Monitor loop running against the persistent channel.  Invokes
-/// `callback(decoded_value_py)` inside the GIL; stops when the callback
+/// `callback(MonitorUpdate)` inside the GIL; stops when the callback
 /// returns a falsy value or raises.
 async fn run_monitor(
     state: Arc<Mutex<ChannelState>>,
@@ -285,11 +285,13 @@ async fn run_monitor(
                     if op.command == 13 && op.ioid == ioid && op.subcmd == 0x00 {
                         let payload = &bytes[8..];
                         let pos = 5;
-                        if let Ok((decoded, _)) =
-                            decoder.decode_structure_with_bitset(&payload[pos..], &field_desc)
+                        if let Ok(update) =
+                            decoder.decode_monitor_update(&payload[pos..], &field_desc)
                         {
                             let keep_going = Python::with_gil(|py| {
-                                let v = decoded_to_py(py, &decoded);
+                                let v = crate::monitor_update::PyMonitorUpdate::from_update(
+                                    py, &update,
+                                );
                                 match callback.call1(py, (v,)) {
                                     Ok(ret) => ret.extract::<bool>(py).unwrap_or(true),
                                     Err(e) => {
@@ -470,8 +472,12 @@ impl PyChannel {
     }
 
     /// Subscribe and block (GIL released between updates) until
-    /// `callback(value)` returns False or raises — a raised exception stops
+    /// `callback(update)` returns False or raises — a raised exception stops
     /// the monitor and propagates to the caller.
+    ///
+    /// The callback receives a `MonitorUpdate`; use `update.value` for the
+    /// decoded value, and `.changed` / `.overrun` / `.has_overrun` for the
+    /// bitsets.
     ///
     /// `fields` restricts the subscription to the given dotted paths.
     #[pyo3(signature = (callback, fields=None))]
@@ -629,6 +635,7 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new(py, "lowlevel")?;
     m.add_class::<PyChannel>()?;
     m.add_class::<crate::packet::PyPacket>()?;
+    m.add_class::<crate::monitor_update::PyMonitorUpdate>()?;
     crate::discovery::register(&m)?;
     parent.add_submodule(&m)?;
     py.import("sys")?

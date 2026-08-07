@@ -751,8 +751,8 @@ client.get("SIM:TEMP", fields="value")          # single field: plain str is fin
 client.put("SIM:SP", 21.0)                      # blocking put (fields default: ["value"])
 client.put("SIM:MODE", 2, fields=["value.index"])
 
-def on_update(value):
-    print(value)
+def on_update(update):                          # a MonitorUpdate, not a bare value
+    print(update.value)
     if done:
         return False                            # returning False stops the monitor
 client.monitor("SIM:TEMP", on_update)           # blocks until stopped;
@@ -763,11 +763,35 @@ client.info("SIM:TEMP")                         # {"struct_id": ..., "fields": [
 client.pvlist("192.168.1.10:5075")              # PV names from a specific server
 ```
 
+Every monitor callback — `Client.monitor`, `Client.subscribe` and
+`Channel.monitor` — receives a `spvirit.lowlevel.MonitorUpdate`:
+
+| Attribute | Meaning |
+|---|---|
+| `.value` | the decoded value, the dict these callbacks used to receive directly |
+| `.changed` | dotted paths of the fields this update carries, e.g. `["value", "timeStamp.secondsPastEpoch"]` |
+| `.overrun` | dotted paths of fields the server dropped at least one earlier update for |
+| `.has_overrun` | `True` when `.overrun` is non-empty |
+
+`"<whole structure>"` appears in `.changed` / `.overrun` when bit 0 is set —
+the server is reporting the entire structure rather than named fields.
+
+```python
+def on_update(update):
+    print(update.value["value"])
+    if update.has_overrun:
+        print("dropped updates for:", update.overrun)
+```
+
+> **Breaking change (0.1.20).** Monitor callbacks used to receive the decoded
+> value itself. Add `.value` to restore the previous behaviour:
+> `lambda v: print(v)` becomes `lambda u: print(u.value)`.
+
 Non-blocking monitors — `subscribe` returns immediately with a
 `Subscription` handle while updates are delivered on a background thread:
 
 ```python
-sub = client.subscribe("SIM:TEMP", lambda v: print(v))
+sub = client.subscribe("SIM:TEMP", lambda u: print(u.value))
 # ... program continues; run as many concurrent subscriptions as you like ...
 sub.pv_name       # "SIM:TEMP"
 sub.is_active     # True while updates are flowing
@@ -842,8 +866,10 @@ with Channel.connect("SIM:TEMP", "127.0.0.1:5075", timeout=5.0) as ch:
     r1 = ch.get()                   # reuses the connection — fast repeated gets
     r2 = ch.get(fields=["value"])
     ch.put(22.0)                    # fields: None -> ["value"], or str, or list
-    ch.monitor(lambda v: print(v))  # blocks; callback returns False to stop,
-                                    # a raised exception stops it and propagates
+    ch.monitor(lambda u: print(u.value))
+                                    # blocks; the callback gets a MonitorUpdate
+                                    # and returns False to stop, a raised
+                                    # exception stops it and propagates
     ch.close()                      # or rely on the context manager;
                                     # later operations raise ProtocolError
 # async variants: connect_async, get_async, put_async, introspect_async,
@@ -865,6 +891,14 @@ pkt.decode()                               # same as codec.decode_packet(pkt.byt
 pkt = ch.read_until(lambda p: p.command_name == "MONITOR", timeout=5.0,
                     max_frames=100)        # RuntimeError if max_frames exhausted
 ```
+
+> **Breaking change (0.1.20).** `read_packet` / `read_packet_async` /
+> `read_until` now reassemble segmented messages before returning. A segmented
+> message arrives as one `Packet` whose `is_segmented` is `0` and whose
+> `payload_length` covers the concatenated payload — the individual segments
+> are never surfaced. Code that stitched segments together by hand must stop
+> doing so; it would now concatenate whole messages. Control frames (echo,
+> flow control) still pass through one frame at a time and are unaffected.
 
 Operations on one channel serialize internally, so concurrent `get_async`
 calls on the same channel are safe but sequential on the wire. Monitors send

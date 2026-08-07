@@ -10,6 +10,7 @@ pub mod channel;
 pub mod client;
 pub mod codec;
 pub mod discovery;
+pub mod monitor_update;
 pub mod nt;
 pub mod packet;
 pub mod pv;

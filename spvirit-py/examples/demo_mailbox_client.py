@@ -26,7 +26,10 @@ def main() -> None:
 
     print("monitoring for 5 seconds (put to the PV from another terminal) ...")
     updates = []
-    sub = client.subscribe(PV, lambda v: (updates.append(v), print(f"  update: {v['value']}")))
+    sub = client.subscribe(
+        PV,
+        lambda u: (updates.append(u), print(f"  update: {u.value['value']}")),
+    )
     time.sleep(5.0)
     sub.close()
     print(f"received {len(updates)} update(s)")
