@@ -35,6 +35,20 @@ jobs:
       - name: Run tests
         run: cargo test --all
 
+      - name: Install libpython3-dev (for embedded-interpreter tests)
+        run: sudo apt-get update && sudo apt-get install -y libpython3-dev
+
+      # spvirit-py's default build links no libpython (pyo3's
+      # "extension-module", correct for the cdylib maturin ships) and so
+      # cannot embed a real interpreter. A couple of unit tests need one
+      # (see spvirit-py/Cargo.toml's `test-embed` feature note and
+      # spvirit-py/src/source.rs's `asyncio_loop_race_tests` module), so
+      # they're gated out of the default `cargo test --all` above and run
+      # here instead, against a standalone `rlib` test binary that does
+      # link libpython.
+      - name: Run spvirit-py embedded-interpreter tests
+        run: cargo test -p spvirit-py --no-default-features --features test-embed
+
       # The docs suite runs above as part of `cargo test --all`; naming it
       # separately makes a documentation drift failure obvious in the log.
       - name: Verify documentation

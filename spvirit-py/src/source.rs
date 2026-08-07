@@ -780,7 +780,7 @@ pub(crate) fn _ensure_used(py: Python<'_>, p: NtPayload) -> PyObject {
     nt_payload_to_py(py, p)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-embed"))]
 mod asyncio_loop_race_tests {
     //! Requires a real embedded interpreter, which "extension-module"
     //! deliberately does not provide (see the `[features]` note in
