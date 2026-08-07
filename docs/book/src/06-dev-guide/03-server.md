@@ -22,6 +22,7 @@ All paths under `spvirit-server/src/`.
 | `monitor.rs` | 311 | `MonitorRegistry`: per-PV subscriber lists, delta/full frame building, pipeline credit accounting |
 | `convert.rs` | 276 | `DecodedValue` → `ScalarValue`/`ScalarArrayValue` conversions |
 | `pvstore.rs` | 259 | The **`Source` trait** + `PvInfo` + `SourceRegistry` |
+| `events.rs` | 562 | `Events`: server-wide `on_start` hooks, named `on_event` handlers, the `EventSink` trait, and the single-task dispatcher behind `post_event` |
 | `server.rs` | 183 | Orchestration: `run_pva_server_with_registry` binds TCP/UDP/beacon and joins the tasks |
 | `decode.rs` | 128 | PUT-body decoding with fallback strategies + segmented-message reassembly |
 | `beacon.rs` | 67 | Periodic UDP beacon sender |
@@ -165,6 +166,63 @@ pv.rs:1154).
 | `on_put` (classic builder) | **after** apply, detached `tokio::spawn` | no (fire-and-forget) | `SimplePvStore.on_put` |
 | `scan` | interval task calling `store.set_value` | n/a | spawned in `PvaServer::run` |
 | `calc`/`link` | `evaluate_links` after any input changes | n/a | `LinkDef` list |
+| `on_start` | once, awaited in registration order, before scans/dispatcher/listener | yes — a panic aborts `run()`/`run_start_hooks()`, naming the hook | `PvaServerBuilder::on_start` / `ServeBuilder::on_start` |
+| `on_event` | queued by `post_event`, run one at a time on the dispatcher task | no — `catch_unwind` logs and counts, dispatcher continues | `PvaServerBuilder::on_event` / `ServeBuilder::on_event` |
+
+## Lifecycle hooks and named events (`events.rs`)
+
+`Events` (events.rs:54) is one `Arc` shared by the builder and the built
+`PvaServer`: `sinks: RwLock<Vec<Arc<dyn EventSink>>>`, `handlers:
+RwLock<HashMap<String, Vec<EventHandler>>>`, an `mpsc::channel` of capacity
+`DISPATCH_QUEUE_CAPACITY` (1024), and `AtomicU64` counters for drops
+(`dropped_count`) and handler panics (`failed_count`).
+
+- **`EventSink`** (events.rs:23) is a synchronous trait — `fn on_event(&self,
+  event: &str)` — called inline on the `post_event` caller's thread, in
+  registration order, before any handler is queued. This is the seam a
+  future EPICS-`EVNT`-scan-list consumer implements; nothing in this repo
+  registers a sink today.
+- **`EventHandler`** (events.rs:33) is the deferred, async counterpart:
+  `Arc<dyn Fn(Arc<SimplePvStore>, String) -> Pin<Box<dyn Future<Output = ()> +
+  Send>> + Send + Sync>`. `Events::post` (events.rs:134) runs the sinks
+  inline, then increments `inflight` for the whole batch *before* enqueueing
+  any of it (so a concurrent `drain()` can never observe `inflight == 0`
+  mid-batch), and `try_send`s each handler — a full queue drops and counts
+  rather than blocking the poster.
+- **`start_dispatcher`** (events.rs:108) spawns the single task that drains
+  the channel and awaits each handler wrapped in
+  `futures::FutureExt::catch_unwind(AssertUnwindSafe(fut))`: a panicking
+  handler is logged, counted in `failed_count`, and the loop continues —
+  handlers never abort the dispatcher. Handlers therefore run strictly one
+  at a time, in the order they were enqueued across *all* events, so a slow
+  handler for one event delays every other event's handlers behind it.
+- **`drain()`** (events.rs:175) is test-only: it polls `inflight` down to
+  zero with a 10 s timeout that panics by name rather than hanging CI if the
+  dispatcher-invariant (`catch_unwind` always present, `inflight` always
+  decremented) is ever broken by a regression.
+
+**Startup hooks** (`StartHook`, events.rs:40) are not part of `Events` —
+they are a plain `Vec` on `PvaServer` (`start_hooks`, pva_server.rs:660),
+run by `run_start_hooks()` (pva_server.rs:698) to completion, in order,
+*before* `serve_after_start_hooks()` builds the source registry, spawns
+scan tasks, starts the event dispatcher, and binds (pva_server.rs:776–858:
+`run()` is exactly `run_start_hooks().await?` then
+`serve_after_start_hooks().await`). A panicking hook returns
+`Err(format!("on_start hook #{i} panicked; ..."))` and `run()` never reaches
+`serve_after_start_hooks` — no scan task, dispatcher, or listener starts.
+`run_start_hooks` also installs the `MonitorRegistry` onto the store before
+the first hook runs (pva_server.rs:699), so a hook that writes the store
+reaches any monitor subscribed later, and a hook that reads the registry
+never sees `None`.
+
+**Python sources fold into the same list.** `spvirit-py/src/server.rs`
+registers a source's `on_start(notifier)` as one more `PvaServerBuilder::on_start`
+closure, at the point `add_source`/`.add_source()` is called — so a source's
+hook and a `@builder.on_start` hook interleave in true registration order,
+not "sources first" or "hooks first". This changed behaviour from an
+earlier revision where a Python source's `on_start` fired eagerly inside
+`build()`; see the Python-facing note in [Custom data
+sources](../03-progressive/sources.md).
 
 ## Alarms and deadbands
 

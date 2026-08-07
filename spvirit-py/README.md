@@ -48,6 +48,7 @@ protocol internals, and the CLI tools (`spget`, `spput`, `spmonitor`,
 - [The classic builder API](#the-classic-builder-api)
 - [Runtime store access](#runtime-store-access)
 - [Dynamic sources](#dynamic-sources)
+- [Lifecycle hooks and events](#lifecycle-hooks-and-events)
 - [Normative Type classes](#normative-type-classes)
 - [Client API](#client-api)
 - [Low-level API: spvirit.lowlevel](#low-level-api-spviritlowlevel)
@@ -671,6 +672,85 @@ Key points:
 - `async def` source methods run on a dedicated background asyncio event loop
   (thread name `spvirit-asyncio`) — do not call `asyncio.run` yourself inside
   source methods.
+
+---
+
+## Lifecycle hooks and events
+
+### `@builder.on_start`
+
+Registered on the **builder**, before `build()` — there is no `server.on_start`.
+A hook runs once, at server start: after the store is built, before scan
+tasks spawn, and before the server accepts connections. No client can
+observe a pre-initialisation value.
+
+```python
+b = spvirit.ServerBuilder().ao("SETPOINT", 0.0).port(0).udp_port(0)
+
+@b.on_start
+def initialise(store):
+    store.set_value("SETPOINT", 22.5)
+
+server = b.build()
+server.start_background()
+```
+
+Hooks may be `def` or `async def` (an `async def` is awaited on the
+`spvirit-asyncio` loop) and run in registration order. A [dynamic
+source's](#dynamic-sources) `on_start(notifier)` shares that same ordered
+list — builder hooks and source hooks interleave in true registration
+order, whichever `add_source`/`@builder.on_start` call came first. A
+source's `order` value governs which source claims a PV name; it has no
+effect on this startup sequence.
+
+A hook that raises (or panics) **aborts startup** — the server does not
+serve, and the error names the hook. This is deliberate: startup is a
+barrier under your control, so failing loudly and early is safe. A handler
+firing at 3am from a live event is a different story — see below.
+
+> **Migration note.** Before this feature, a Python source's `on_start` fired
+> during `build()`. It now fires at server start (`start()` /
+> `start_background()` / `run()`), alongside `@builder.on_start` hooks. Code
+> that relied on a source's `on_start` running at `build()` time will now see
+> it run later.
+
+### `@builder.on_event` and `post_event`
+
+A named trigger that fans out across the whole server. Handlers are also
+registered on the builder, not the running server.
+
+```python
+b = spvirit.ServerBuilder().ao("SHUTTER:COUNT", 0.0).port(0).udp_port(0)
+
+@b.on_event("SHUTTER")
+async def on_shutter(store, event):
+    store.set_value("SHUTTER:COUNT", store.get_value("SHUTTER:COUNT") + 1)
+
+server = b.build()
+server.start_background()
+server.post_event("SHUTTER")
+```
+
+Handlers receive `(store, event)`; the second argument lets one function
+serve several events. They are **deferred**: `post_event` queues them and
+returns. The only guarantee is that when `post_event` returns, any IOC
+records on that event have processed and the handlers are queued — never
+read "queued" as "run". Handlers run one at a time, in registration order,
+**across all events** on a single dispatcher — a slow handler for one event
+delays every other event's handlers behind it.
+
+A handler that raises is logged and skipped; the next handler still runs
+(unlike a raising `on_start`, which aborts startup — see above). The queue
+is bounded (1024 entries); under sustained overload, invocations are
+dropped with a counter rather than growing without limit. Posting an event
+with no registered handlers is a no-op, not an error.
+
+`server.drain_events()` blocks until the queue is empty. It exists so tests
+can wait for handlers deterministically; production code should not need
+it, since it does not know when a handler will next need to fire.
+
+`post_event` takes a name only. Data travels through PVs, where it is
+observable and visible to both stores.
 
 ---
 
