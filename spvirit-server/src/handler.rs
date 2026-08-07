@@ -12,7 +12,7 @@ use regex::Regex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use spvirit_codec::epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::{PvdDecoder, StructureDesc, extract_subfield_desc};
@@ -32,9 +32,11 @@ use spvirit_codec::spvirit_encode::{
     ip_from_bytes, ip_to_bytes,
 };
 
+use spvirit_codec::{SegmentOutcome, SegmentReassembler};
+
 use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue, ScalarValue};
 
-use crate::decode::{assemble_segmented_message, decode_put_body};
+use crate::decode::decode_put_body;
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::SourceRegistry;
 use crate::state::{ConnState, MonitorState, MonitorSub};
@@ -827,6 +829,9 @@ pub async fn handle_connection(
     state.registry.send_msg(conn_id, server_validation).await;
 
     let mut last_activity = Instant::now();
+    // One reassembler for the whole connection: the segments of a message may
+    // be separated by control frames, which are handled in between.
+    let mut reassembler = SegmentReassembler::new();
 
     loop {
         let mut header = [0u8; 8];
@@ -871,79 +876,23 @@ pub async fn handle_connection(
             }
         }
         last_activity = Instant::now();
-        let mut full = header.to_vec();
-        full.extend_from_slice(&payload);
 
-        // Segmented message reassembly
-        if header_pkt.header.flags.is_segmented != 0 && !header_pkt.header.flags.is_control {
-            debug!(
-                "Conn {}: segmented message cmd={} seg=0x{:02x}",
-                conn_id, header_pkt.header.command, header_pkt.header.flags.is_segmented
-            );
-            let mut payloads = vec![payload];
-            let mut seg_flags = header_pkt.header.flags;
-            while !seg_flags.is_last_segment {
-                let mut seg_header = [0u8; 8];
-                let elapsed = last_activity.elapsed();
-                if elapsed >= conn_timeout {
-                    info!("Conn {} idle timeout", conn_id);
-                    break;
-                }
-                let remaining = conn_timeout - elapsed;
-                let read_header =
-                    tokio::time::timeout(remaining, reader.read_exact(&mut seg_header)).await;
-                match read_header {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        info!("Conn {} idle timeout", conn_id);
-                        break;
-                    }
-                }
-
-                let seg_header_pkt = PvaPacket::new(&seg_header);
-                let seg_payload_len = if seg_header_pkt.header.flags.is_control {
-                    0usize
-                } else {
-                    seg_header_pkt.header.payload_length as usize
-                };
-                let mut seg_payload = vec![0u8; seg_payload_len];
-                if seg_payload_len > 0 {
-                    let elapsed = last_activity.elapsed();
-                    if elapsed >= conn_timeout {
-                        info!("Conn {} idle timeout", conn_id);
-                        break;
-                    }
-                    let remaining = conn_timeout - elapsed;
-                    let read_payload =
-                        tokio::time::timeout(remaining, reader.read_exact(&mut seg_payload)).await;
-                    match read_payload {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(_)) => break,
-                        Err(_) => {
-                            info!("Conn {} idle timeout", conn_id);
-                            break;
-                        }
-                    }
-                }
-                last_activity = Instant::now();
-
-                if seg_header_pkt.header.flags.is_control {
-                    handle_control_message(&state, conn_id, &seg_header_pkt.header).await;
-                    continue;
-                }
-                if seg_header_pkt.header.flags.is_segmented == 0 {
-                    debug!(
-                        "Conn {}: segmented message interrupted by non-segmented cmd={}",
-                        conn_id, seg_header_pkt.header.command
-                    );
-                    break;
-                }
-                payloads.push(seg_payload);
-                seg_flags = seg_header_pkt.header.flags;
+        // Segment reassembly is delegated to the shared codec state machine.
+        // Control frames come back verbatim and are answered here; they never
+        // reach command dispatch below.
+        let full = match reassembler.push(header, payload) {
+            Ok(SegmentOutcome::Complete(msg)) => msg,
+            Ok(SegmentOutcome::Pending) => continue,
+            Ok(SegmentOutcome::Control(msg)) => {
+                let ctrl = PvaPacket::new(&msg);
+                handle_control_message(&state, conn_id, &ctrl.header).await;
+                continue;
             }
-            full = assemble_segmented_message(header, payloads);
-        }
+            Err(e) => {
+                warn!("Conn {}: segmentation error: {}", conn_id, e);
+                break;
+            }
+        };
 
         let mut pkt = PvaPacket::new(&full);
         let Some(cmd) = pkt.decode_payload() else {

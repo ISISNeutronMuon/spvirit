@@ -108,23 +108,3 @@ pub fn shift_bitset_left(bitset: &[u8], shift: usize) -> Vec<u8> {
     }
     out
 }
-
-/// Reassemble a segmented PVA message from the first header and accumulated
-/// payload fragments.
-pub fn assemble_segmented_message(first_header: [u8; 8], payloads: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut header = first_header;
-    let is_be = (header[2] & 0x80) != 0;
-    header[2] &= !0x30;
-    let total_len: usize = payloads.iter().map(|p| p.len()).sum();
-    let len_bytes = if is_be {
-        (total_len as u32).to_be_bytes()
-    } else {
-        (total_len as u32).to_le_bytes()
-    };
-    header[4..8].copy_from_slice(&len_bytes);
-    let mut out = header.to_vec();
-    for payload in payloads {
-        out.extend_from_slice(&payload);
-    }
-    out
-}
