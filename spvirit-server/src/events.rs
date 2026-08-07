@@ -425,4 +425,116 @@ mod tests {
         let events = Events::new();
         events.post("NOBODY:LISTENING");
     }
+
+    #[tokio::test]
+    async fn a_handler_may_post_another_event() {
+        let store = test_store();
+        let events = Arc::new(Events::new());
+        let log = Arc::new(Mutex::new(Vec::new()));
+
+        let l = log.clone();
+        let ev = events.clone();
+        events.add_handler("FIRST", Arc::new(move |_s, _e| {
+            let l = l.clone();
+            let ev = ev.clone();
+            Box::pin(async move {
+                l.lock().unwrap().push("first:enter".to_string());
+                ev.post("SECOND");
+                l.lock().unwrap().push("first:exit".to_string());
+            })
+        }));
+
+        let l = log.clone();
+        events.add_handler("SECOND", Arc::new(move |_s, _e| {
+            let l = l.clone();
+            Box::pin(async move { l.lock().unwrap().push("second".to_string()); })
+        }));
+
+        events.start_dispatcher(store);
+        events.post("FIRST");
+        events.drain().await;
+
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[
+                "first:enter".to_string(),
+                "first:exit".to_string(),
+                "second".to_string(),
+            ],
+            "nested handler must queue behind the posting handler, not run inside it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sink_may_post_another_event_without_deadlocking() {
+        // A sink registered from inside another sink's call-out. Its
+        // presence is the second half of the test: it proves the
+        // registration made during the call-out actually took effect, not
+        // just that the call-out itself returned.
+        struct LateSink {
+            fired: Arc<AtomicUsize>,
+        }
+        impl EventSink for LateSink {
+            fn on_event(&self, _event: &str) {
+                self.fired.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct Reposter {
+            events: Mutex<Option<std::sync::Weak<Events>>>,
+            fired: AtomicUsize,
+            late_fired: Arc<AtomicUsize>,
+        }
+        impl EventSink for Reposter {
+            fn on_event(&self, event: &str) {
+                if event == "OUTER" {
+                    self.fired.fetch_add(1, Ordering::SeqCst);
+                    if let Some(ev) = self.events.lock().unwrap().as_ref().and_then(|w| w.upgrade())
+                    {
+                        ev.post("INNER");
+                        // add_sink() takes the sinks lock for write. If
+                        // post() ever held the sinks read lock across this
+                        // call-out instead of cloning it first, this write
+                        // request would deadlock the calling thread against
+                        // itself deterministically — a read guard can never
+                        // be upgraded to a write guard, on any platform,
+                        // regardless of writer contention from other threads.
+                        ev.add_sink(Arc::new(LateSink {
+                            fired: self.late_fired.clone(),
+                        }));
+                    }
+                }
+            }
+        }
+
+        let events = Arc::new(Events::new());
+        let late_fired = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::new(Reposter {
+            events: Mutex::new(Some(Arc::downgrade(&events))),
+            fired: AtomicUsize::new(0),
+            late_fired: late_fired.clone(),
+        });
+        events.add_sink(sink.clone());
+
+        // Would deadlock if post() held the sinks read lock across the call.
+        events.post("OUTER");
+
+        assert_eq!(sink.fired.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            late_fired.load(Ordering::SeqCst),
+            0,
+            "late sink registered but not yet posted to"
+        );
+
+        // Probe with a fresh event name: the sink added from inside the
+        // "OUTER" call-out must now be live. (Re-posting "OUTER" itself
+        // would also re-trigger the nested "INNER" post and double-count
+        // through LateSink, so a distinct probe event keeps this precise.)
+        events.post("PROBE");
+        assert_eq!(
+            late_fired.load(Ordering::SeqCst),
+            1,
+            "sink registered from inside a call-out must take effect"
+        );
+    }
 }
