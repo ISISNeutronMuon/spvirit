@@ -134,25 +134,6 @@ The server answers PVA command `CANCEL_REQUEST` with
 Clients that cancel a request rather than destroying the channel will see the
 error; the common clients do not.
 
-## 9. `spvirit-calc` is incomplete
-
-**What happens.** The `spvirit-calc` crate implements the EPICS CALC
-expression language, but it does not yet pass its own conformance corpus.
-
-**Why.** The corpus (`spvirit-calc/tests/base_corpus.rs`), transcribed
-case-for-case from EPICS Base's `epicsCalcTest.cpp`, still has 2 of 686 cases
-failing. Both are error-classification mismatches in the parser's handling of
-conditional/`:` syntax: `"1?"` is reported as `MissingOperand` where Base
-expects a conditional error, and `":1"` is reported as a conditional error
-where Base expects a syntax error.
-
-**Consequence.** The `base_corpus` conformance test is currently commented out
-so the workspace test suite is green. The per-module unit tests in
-`spvirit-calc/src/` all pass, but the crate should be treated as unfinished
-until the corpus is re-enabled and passes.
-
-**Where it is documented.** [Crate map](crate-map.md).
-
 ## What is *not* on this list
 
 Behaviour that is deliberate and merely surprising lives in the chapters, not

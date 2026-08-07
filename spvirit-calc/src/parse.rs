@@ -293,6 +293,24 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                 expect_operand = false;
             }
             Token::Op("?") => {
+                // Operand-position guard, as for `:=` above. Base's
+                // `get_element` looks operand-position tokens up in
+                // `operands[]` (`refs/postfix.c:197-199`; `:200-204` is the
+                // other branch, the `operators[]` one), and neither `?`
+                // nor `:` appears there — they are `operators[]` rows only
+                // (`:173`, `:161`). So a `?` where an operand is wanted is
+                // not recognised at all: `get_element` returns FALSE, the
+                // loop exits with input left over, and `:475-478`'s
+                // `*psrc != '\0'` check reports `CALC_ERR_SYNTAX` — NOT
+                // `CALC_ERR_CONDITIONAL`, which `cond_count` never sees
+                // because the `?` was never consumed. This crate's lexer is
+                // context-free and has one shared symbol table, so the
+                // rejection is made explicitly here; `MissingOperand` is
+                // this crate's category for Base's "operator where an
+                // operand was expected" flavour of `SYNTAX`.
+                if expect_operand {
+                    return Err(CalcError::MissingOperand);
+                }
                 // `?`/`:` carry priority 0 in `postfix.c` (`:161,173`) —
                 // loosest of everything else in the table — so pop every
                 // pending operator down to the nearest `(` or enclosing
@@ -399,6 +417,15 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
                 expect_operand = true;
             }
             Token::Op(":") => {
+                // Operand-position guard — see the `?` arm above for the
+                // full derivation. `":1"` is `CALC_ERR_SYNTAX` in Base
+                // (`epicsCalcTest.cpp:1014`), not `CALC_ERR_CONDITIONAL`,
+                // because the leading `:` is looked up in `operands[]`,
+                // is absent, and so is never consumed as a conditional at
+                // all.
+                if expect_operand {
+                    return Err(CalcError::MissingOperand);
+                }
                 // A pending `Op::Store` is deliberately carried across this
                 // `:` rather than emitted into the then-branch.
                 // `refs/postfix.c:402-403`, the `CONDITIONAL` flush, uses a
@@ -501,6 +528,65 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
         }
     }
 
+    // ORDER IS LOAD-BEARING: the stack unwind runs BEFORE the
+    // `operand_needed` check below, because Base does the same. Its end
+    // sequence is (`refs/postfix.c`): unwind with `(` -> `CALC_ERR_PAREN_OPEN`
+    // (`:481-487`), then `cond_count != 0` -> `CALC_ERR_CONDITIONAL`
+    // (`:495-497`), and only then `operand_needed || runtime_depth != 1` ->
+    // `CALC_ERR_INCOMPLETE` (`:499-501`). That is why `"1?"` is
+    // `CALC_ERR_CONDITIONAL` and not `CALC_ERR_INCOMPLETE`
+    // (`epicsCalcTest.cpp:1012`) even though an operand is plainly still
+    // needed: the dangling `?` is diagnosed first. Running the
+    // `expect_operand` check first — as this did before — reports
+    // `MissingOperand` for `"1?"` and loses that distinction.
+    //
+    // Known divergence, not corpus-tested: Base finds the `(` during the
+    // unwind but defers `cond_count` until after it, so `"(A?B"` is
+    // `PAREN_OPEN` there; this crate pops the `CondHead` frame first and
+    // reports `BadConditional`. Both reject, and `"(A?B)"` — which the
+    // corpus does reach via the `)` arm — agrees with Base either way.
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Op(op) => out.push(op),
+            // A completed ternary at the very top level, e.g. `"A?B:C"`
+            // itself: finalize it the same way any other consumer of
+            // `Frame::CondTail` does.
+            Frame::CondTail { if_idx, else_idx } => finalize_cond(&mut out, if_idx, else_idx),
+            Frame::Paren => return Err(CalcError::Unbalanced),
+            Frame::CondHead(_) => return Err(CalcError::BadConditional),
+            // A function name that never got its `(` — `"MIN"`, `"SIN A"`.
+            // (An *unclosed* call like `"MIN(A,B"` does not reach here: its
+            // `Frame::Paren` sits ABOVE the `Frame::Func` and is popped, and
+            // erred on, first. But an enclosing paren does not win that way:
+            // `"( MIN A"` leaves `Func` on top of `Paren`, so this arm fires
+            // and gives `MissingOperand` where Base — which emits the element
+            // and then meets the `(` — gives `PAREN_OPEN` at `:483`. Variant
+            // divergence only; both reject, and no corpus case reaches it.)
+            //
+            // Base emits the pending function element during this unwind
+            // rather than erring — only a literal `(` is `PAREN_OPEN`
+            // (`refs/postfix.c:481-487`) — and then reports
+            // `CALC_ERR_INCOMPLETE` at `:499-501` because `operand_needed` is
+            // still set. That is why bare `"MIN"`/`"MAX"` are `INCOMPLETE`
+            // and not a paren error (`epicsCalcTest.cpp:1004,1008`), so
+            // `MissingOperand` is the matching variant here.
+            //
+            // Divergence, deliberate and pre-existing: because Base *emits*
+            // the element, parenthesis-free application (`"MIN A"`,
+            // `"SIN A"`) COMPILES in Base, as `MIN(A)`/`SIN(A)`. This crate
+            // requires parentheses on every call — consistent with the
+            // adjacency rule enforced on function names at the `Token::Ident`
+            // arm above — so it rejects those. No corpus case exercises
+            // parenthesis-free application. This arm only refines the error
+            // variant (previously `Unbalanced`); the accept/reject verdict
+            // for every input is unchanged *by this arm*. Note that is a
+            // claim about this arm alone — the operand-position guards on the
+            // `?` and `:` arms above DO widen rejection, deliberately; see
+            // `conditional_punctuation_in_operand_position_is_a_syntax_error`.
+            Frame::Func(_) => return Err(CalcError::MissingOperand),
+        }
+    }
+
     // `refs/postfix.c:499`: `if (operand_needed || runtime_depth != 1)` ->
     // `CALC_ERR_INCOMPLETE`. `check_arity` below covers the depth half, but
     // not the `operand_needed` half: a trailing `;` or `:=` leaves the output
@@ -516,23 +602,6 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
     // here as-is rather than matched to Base.
     if expect_operand && !tokens.is_empty() {
         return Err(CalcError::MissingOperand);
-    }
-
-    while let Some(frame) = stack.pop() {
-        match frame {
-            Frame::Op(op) => out.push(op),
-            // A completed ternary at the very top level, e.g. `"A?B:C"`
-            // itself: finalize it the same way any other consumer of
-            // `Frame::CondTail` does.
-            Frame::CondTail { if_idx, else_idx } => finalize_cond(&mut out, if_idx, else_idx),
-            Frame::Paren => return Err(CalcError::Unbalanced),
-            Frame::CondHead(_) => return Err(CalcError::BadConditional),
-            // An unclosed function call, e.g. `"MIN(A,B"`: the `Frame::Paren`
-            // above it on the stack is popped (and erred on) first, so this
-            // arm is unreachable in practice, but the match must stay
-            // exhaustive.
-            Frame::Func(_) => return Err(CalcError::Unbalanced),
-        }
     }
 
     check_arity(&out)?;
@@ -1216,6 +1285,100 @@ mod tests {
     #[test]
     fn rejects_colon_without_question_mark() {
         assert_eq!(compile("A:B"), Err(CalcError::BadConditional));
+    }
+
+    // Task 9. `"1?"` needs an operand AND has a dangling `?`; Base diagnoses
+    // the conditional first (`cond_count` at `refs/postfix.c:495`, before
+    // `operand_needed` at `:499`), so this is `CALC_ERR_CONDITIONAL`
+    // (`epicsCalcTest.cpp:1012`).
+    //
+    // DISCRIMINATOR: this is the ordering test. Moving the end-of-parse
+    // `expect_operand` check back above the stack unwind — where it used to
+    // be — yields `MissingOperand` here and fails. `rejects_dangling_
+    // question_mark` above cannot catch that: `"A?B"` has its then-branch,
+    // so `expect_operand` is already `false` and the two orderings agree.
+    // The trailing-`?` shape is the only one that separates them.
+    #[test]
+    fn dangling_conditional_outranks_a_missing_operand() {
+        assert_eq!(compile("1?"), Err(CalcError::BadConditional));
+        assert_eq!(compile("1?1"), Err(CalcError::BadConditional));
+    }
+
+    // ...but the unwind must not swallow the plain missing-operand cases it
+    // now runs ahead of.
+    //
+    // DISCRIMINATOR: `"(A+"`, and only `"(A+"`. Move the `expect_operand`
+    // check back above the unwind and it reports `MissingOperand` instead of
+    // letting the open paren win (Base: `CALC_ERR_PAREN_OPEN` during the
+    // unwind, `:481-487`).
+    //
+    // `"1*"` is a redundancy guard, not a discriminator: it survives both that
+    // mutant and outright deletion of the `expect_operand` check, because
+    // `check_arity` independently reports `MissingOperand` on the depth
+    // underflow. It is kept because it is the shape Base names at
+    // `epicsCalcTest.cpp:1002` — a `Frame::Op(Mul)` that unwinds without
+    // erring — but do not read it as pinning the ordering.
+    #[test]
+    fn reordered_unwind_preserves_the_other_end_of_parse_errors() {
+        assert_eq!(compile("1*"), Err(CalcError::MissingOperand));
+        assert_eq!(compile("(A+"), Err(CalcError::Unbalanced));
+    }
+
+    // Task 9. `?` and `:` live only in Base's `operators[]` table, never in
+    // `operands[]`, so in operand position `get_element` fails to recognise
+    // them at all: the parse loop exits with input left over and
+    // `refs/postfix.c:475-478` reports `CALC_ERR_SYNTAX` — the "operator
+    // where an operand was expected" category, which this crate spells
+    // `MissingOperand`. Notably NOT `CALC_ERR_CONDITIONAL`: the token was
+    // never consumed, so `cond_count` never moved (`epicsCalcTest.cpp:1014`).
+    //
+    // DISCRIMINATOR: without the operand-position guards on the `?`/`:` arms,
+    // `":1"` falls through to the "no `CondHead` to close" path and reports
+    // `BadConditional`.
+    #[test]
+    fn conditional_punctuation_in_operand_position_is_a_syntax_error() {
+        assert_eq!(compile(":1"), Err(CalcError::MissingOperand));
+        assert_eq!(compile("?1"), Err(CalcError::MissingOperand));
+        // Also in the operand position that opens a sub-expression or a
+        // right-hand side, not just at the very start.
+        assert_eq!(compile("(:1)"), Err(CalcError::MissingOperand));
+        assert_eq!(compile("A+?B"), Err(CalcError::MissingOperand));
+
+        // `"1;?2:3"` is the shape where the `?` guard changes the VERDICT and
+        // not merely the variant: without it this crate COMPILES this and
+        // evaluates it to 2.0. Base rejects it — after a `;` the terminator
+        // arm sets `operand_needed = TRUE` (`refs/postfix.c:457`), so
+        // `get_element(TRUE)` cannot see the `?` at all and `:476` fires on
+        // the leftover input. The guards are therefore a conformance fix, not
+        // a cosmetic reclassification, and this assertion is the only place
+        // that pins that. (The `&&` shapes are NOT flips — `"A&&?1:2"` and
+        // `"A&&:1"` are rejected either way, only the variant moves.)
+        assert_eq!(compile("1;?2:3"), Err(CalcError::MissingOperand));
+        // Discriminates the `:` guard specifically: with it removed this is
+        // `BadConditional`, because the `:` reaches the "no `CondHead` to
+        // close" path. Variant-only, unlike the case above.
+        assert_eq!(compile("A&&:1"), Err(CalcError::MissingOperand));
+    }
+
+    // Task 9. A function name whose `(` never arrives. Base emits the pending
+    // element during the unwind and then trips `operand_needed`, giving
+    // `CALC_ERR_INCOMPLETE` (`epicsCalcTest.cpp:1004,1008`) rather than a
+    // paren error — so `MissingOperand`, not `Unbalanced`.
+    #[test]
+    fn bare_function_name_without_a_call_is_incomplete() {
+        assert_eq!(compile("MIN"), Err(CalcError::MissingOperand));
+        assert_eq!(compile("MAX"), Err(CalcError::MissingOperand));
+        assert_eq!(compile("SIN"), Err(CalcError::MissingOperand));
+        // Parenthesis-free application. Base ACCEPTS these as `MIN(A)` /
+        // `SIN(A)`; this crate requires parentheses on every call and rejects
+        // them. Documented divergence, pinned here so it stays deliberate —
+        // see the `Frame::Func` arm of the end-of-parse unwind. No corpus
+        // case exercises it.
+        assert_eq!(compile("MIN A"), Err(CalcError::MissingOperand));
+        assert_eq!(compile("SIN A"), Err(CalcError::MissingOperand));
+        // An unclosed call still reports the paren mismatch: the
+        // `Frame::Paren` sits above the `Frame::Func` and is popped first.
+        assert_eq!(compile("MIN(A,B"), Err(CalcError::Unbalanced));
     }
 
     // Minor 3: a `)` closing over a pending `?` with no matching `:` is a

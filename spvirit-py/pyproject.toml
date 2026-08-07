@@ -29,7 +29,7 @@ dynamic = ["version"]
 # The pin is exact and must equal the workspace version in the root Cargo.toml.
 # This file's own version is dynamic, so nothing bumps this line automatically;
 # `spvirit-tools/tests/version_pin.rs` fails the build when it drifts.
-dependencies = ["spvirit-tools == 0.1.19"]
+dependencies = ["spvirit-tools == 0.1.20"]
 
 [project.urls]
 Repository = "https://github.com/ISISNeutronMuon/spvirit"

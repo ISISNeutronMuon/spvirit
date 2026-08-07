@@ -1,8 +1,3 @@
-// The `base_corpus` test below is commented out while spvirit-calc is
-// incomplete (see the note above that test), which leaves its helper
-// constants and functions unused. Silence the resulting dead-code warnings.
-#![allow(dead_code)]
-
 //! Conformance corpus transcribed from EPICS Base 7.0's own unit test,
 //! `modules/libcom/test/epicsCalcTest.cpp`, on disk at
 //! `.superpowers/sdd/2026-08-04-calc-expression-engine/refs/epicsCalcTest.cpp`.
@@ -29,7 +24,8 @@
 //!   on IEEE-754 `f64` arithmetic and comparison, including every NaN case, so
 //!   the translation is mechanical. Where the C text uses one of the test's
 //!   own macros (`ABS`, `LN`, `LOG`, `NINT`, `MAX`, `MIN`, `ATAN2`, `AND`,
-//!   `OR`, `XOR`, `D2R`, `R2D`, `:196-297`), the helper below reproduces that
+//!   `OR`, `XOR`, `D2R`, `R2D`, `:193-297` - the `#define`s run to `:209` and
+//!   the `MAX`/`MIN` overload sets to `:297`), the helper below reproduces that
 //!   macro, not the CALC opcode - the point of `testExpr` is that the two
 //!   independently agree.
 //! - `testUInt32Calc(expr, expected)` (`:86-119`) post-converts the `f64`
@@ -47,12 +43,35 @@
 //! # Known divergences from Base, ruled on before this task and not fixed here
 //!
 //! - Base's literal parsing delegates to `epicsParseDouble`/`epicsParseUInt32`
-//!   (`refs/postfix.c:263,285`), so strtod spellings such as `nan(0)` and
+//!   (`refs/postfix.c:263,283`), so strtod spellings such as `nan(0)` and
 //!   `0x1p3` are accepted by Base and rejected by this crate. **Not
 //!   corpus-tested** - no case below exercises them.
 //! - `compile("")` returns `Ok(empty)` here where Base gives
 //!   `CALC_ERR_NULL_ARG`. Pre-existing from Tasks 1-2; not corpus-tested
 //!   either (Base's test never passes an empty expression).
+
+// Every expected value below is written as a Rust expression that MIRRORS the
+// CALC expression text it is checking, so that the two can be read side by
+// side and the transcription audited against `epicsCalcTest.cpp` line by line.
+// That is the whole method of this file, and it puts it structurally at odds
+// with three lints:
+//
+// - `eq_op`: Base's corpus deliberately tests self-comparisons (`"A-A"`,
+//   `"A=A"`, `"1/1"`) to pin NaN/identity behaviour, so the mirrored
+//   expectation is genuinely `1.0 - 1.0`, `4.0 == 4.0`, and so on. Folding
+//   them to constants would silently drop the correspondence.
+// - `identity_op`: `"3 | 1 & 2"` exists to pin `&` binding tighter than `|`;
+//   the mirror must keep the parenthesisation (`3 | (1 & 2)`) even though the
+//   result happens to reduce to `3`. Reducing it would erase the very
+//   precedence claim the case makes.
+// - `approx_constant`: `PI` here is Base's own 14-digit test macro
+//   (`epicsCalcTest.cpp:194`), not `std::f64::consts::PI`. Substituting the
+//   std constant would mean this file no longer compares against the oracle.
+//   See the doc comment on `PI` below.
+//
+// Scoped to this test target only; `spvirit-calc/src/` is clippy-clean
+// without any allows.
+#![allow(clippy::eq_op, clippy::identity_op, clippy::approx_constant)]
 
 use spvirit_calc::{CalcError, compile};
 
@@ -1110,18 +1129,28 @@ fn slice_args(c: &mut Corpus) {
 ///
 /// | Base code | `CalcError` | note |
 /// |---|---|---|
-/// | `CALC_ERR_INCOMPLETE` (`postfix.c:495`, operand still needed at end) | `MissingOperand` | one-to-one |
-/// | `CALC_ERR_CONDITIONAL` (`:504`, unbalanced `?`/`:`) | `BadConditional` | one-to-one |
-/// | `CALC_ERR_PAREN_NOT_OPEN` (`:410`, `)` with no `(`) | `Unbalanced` | one-to-one |
-/// | `CALC_ERR_BAD_SEPERATOR` (`:392`, `,` outside a call) | `Unbalanced` | **many-to-one**: joins `PAREN_NOT_OPEN` in `Unbalanced`, since this crate reports both "a `,` with no enclosing call" and "a `)` with no `(`" as one unbalanced-grouping error |
-/// | `CALC_ERR_SYNTAX` (`:242`, an operand where none was wanted, or an unknown name) | `MissingOperand`, `ExtraOperand`, or `UnknownIdent` | **one-to-many**, see below |
-/// | `CALC_ERR_TOOMANY` (`:499`, depth > 1 at end) | `ExtraOperand` | one-to-one; not reached by any corpus case |
+/// | `CALC_ERR_INCOMPLETE` (`postfix.c:500`, `operand_needed \|\| runtime_depth != 1` at end; also `:394`, a zero-argument call) | `MissingOperand` **or** `ExtraOperand` | **one-to-many**: the `operand_needed` half is `MissingOperand`, the `runtime_depth != 1` half is `ExtraOperand` |
+/// | `CALC_ERR_CONDITIONAL` (`:496` at end of parse; also `:419`, `:449`) | `BadConditional` | one-to-one |
+/// | `CALC_ERR_PAREN_NOT_OPEN` (`:370`, `:376`, `)` with no `(`) | `Unbalanced` | one-to-one |
+/// | `CALC_ERR_BAD_SEPERATOR` (`:348`, `:354`, `,` outside a call) | `Unbalanced` | **many-to-one**: joins `PAREN_NOT_OPEN` in `Unbalanced`, since this crate reports both "a `,` with no enclosing call" and "a `)` with no `(`" as one unbalanced-grouping error |
+/// | `CALC_ERR_SYNTAX` (`:476`, input left over after the parse loop) | `MissingOperand`, `ExtraOperand`, or `UnknownIdent` | **one-to-many**, see below |
+/// | `CALC_ERR_TOOMANY` (`:453`, depth > 1 at a `;`) | `ExtraOperand` | one-to-one; not reached by any corpus case |
 ///
-/// `CALC_ERR_SYNTAX` is Base's catch-all and is the only entry that fans out.
-/// Base reaches it from three distinct situations that this crate keeps
-/// separate, and the split is *finer*, not different - every expression below
-/// is rejected by both, and the crate's variant names the more specific
-/// reason:
+/// Two of these are easy to get backwards, so both are spelled out:
+///
+/// - **`TOOMANY` is not the end-of-parse "too many operands" code.** `:453`
+///   sits inside `case EXPR_TERMINATOR`, so it fires only at a `;` that leaves
+///   more than one value on the stack. At end of parse Base has no `TOOMANY`
+///   path at all - `:499` is `operand_needed || runtime_depth != 1`, i.e.
+///   `INCOMPLETE` covers *both* directions. So this crate's `ExtraOperand` at
+///   end of parse corresponds to Base's `INCOMPLETE`, not to `TOOMANY`.
+/// - `INCOMPLETE` therefore fans out as well; `SYNTAX` is not the only row
+///   that does.
+///
+/// `CALC_ERR_SYNTAX` is Base's catch-all. Base reaches it from three distinct
+/// situations that this crate keeps separate, and the split is *finer*, not
+/// different - every expression below is rejected by both, and the crate's
+/// variant names the more specific reason:
 ///
 /// - an operand appearing where an operator was expected (`0x0.1`) -> this
 ///   crate finishes the parse with two values on the stack: `ExtraOperand`;
@@ -1232,11 +1261,6 @@ fn slice_uint32(c: &mut Corpus) {
 // The test entry point
 // ---------------------------------------------------------------------------
 
-// NOTE: `spvirit-calc` is incomplete. The base corpus currently has 2 of 686
-// cases failing (conditional/`:` error classification: `"1?"` and `":1"`), so
-// this test is commented out until the parser's error handling is finished.
-// See docs/book/src/05-reference/known-gaps.md.
-/*
 #[test]
 fn base_corpus() {
     let mut c = Corpus::default();
@@ -1249,13 +1273,17 @@ fn base_corpus() {
     slice_bad_exprs(&mut c);
     slice_uint32(&mut c);
 
-    if !c.skips.is_empty() {
-        eprintln!(
-            "{} case(s) skipped (crate bugs, see task-9-report.md):\n{}",
-            c.skips.len(),
-            c.skips.join("\n")
-        );
-    }
+    // A skip FAILS the run. `eprintln!` would not be enough: cargo swallows a
+    // passing test's stderr, so a skipped case would be invisible in CI, which
+    // is exactly what the task addendum forbids. Currently zero cases skip; if
+    // one ever has to, the failure text is the record of it and the case must
+    // be argued in the task report before the assertion is relaxed.
+    assert!(
+        c.skips.is_empty(),
+        "{} case(s) skipped - a skip is never silent:\n{}",
+        c.skips.len(),
+        c.skips.join("\n")
+    );
     assert!(
         c.failures.is_empty(),
         "{} of {} case(s) failed:\n{}",
@@ -1264,7 +1292,6 @@ fn base_corpus() {
         c.failures.join("\n")
     );
 }
-*/
 
 /// `epicsCalcTest.cpp:365-372`: 100 evaluations of `rndm`, each required to
 /// land in `[0, 1]`.
