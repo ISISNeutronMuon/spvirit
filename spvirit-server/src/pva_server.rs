@@ -1058,19 +1058,35 @@ impl ServeBuilder {
     pub async fn start(self) -> Result<RunningServer, String> {
         let server = self.build().await;
         let store = server.store().clone();
+        let events = server.events().clone();
         server.run_start_hooks().await?;
+        // Start the dispatcher here rather than leaving it to
+        // `serve_after_start_hooks` in the spawned task: otherwise
+        // `RunningServer::post_event` immediately after `start()` races the
+        // spawn, and `events().drain()` would report a dispatcher that has
+        // not started yet. `start_dispatcher` is idempotent.
+        events.start_dispatcher(store.clone());
         let handle = tokio::spawn(async move {
             if let Err(e) = server.serve_after_start_hooks().await {
                 tracing::error!("PvaServer exited with error: {e}");
             }
         });
-        Ok(RunningServer { store, handle })
+        Ok(RunningServer {
+            store,
+            events,
+            handle,
+        })
     }
 }
 
 /// A started server: mint typed handles, then `abort()` to stop.
 pub struct RunningServer {
     store: Arc<SimplePvStore>,
+    /// Kept independently of the `PvaServer`, which `start()` moves into the
+    /// spawned task — otherwise `ServeBuilder::on_event` could register
+    /// handlers that nothing could ever fire. Python's `PyServer` keeps the
+    /// same handle for the same reason.
+    events: Arc<crate::events::Events>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -1151,6 +1167,17 @@ impl RunningServer {
 
     pub fn store(&self) -> &Arc<SimplePvStore> {
         &self.store
+    }
+
+    /// The running server's event registry — register sinks or handlers, or
+    /// read the drop/failure counters.
+    pub fn events(&self) -> &Arc<crate::events::Events> {
+        &self.events
+    }
+
+    /// Post a named event. See [`PvaServer::post_event`].
+    pub async fn post_event(&self, event: &str) {
+        self.events.post(event).await;
     }
 
     pub fn abort(&self) {
@@ -1446,6 +1473,48 @@ mod tests {
             server.store().get_value("T:HOOKED").await,
             Some(ScalarValue::F64(7.0)),
             "start() must not return before on_start hooks have finished"
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_server_can_post_to_a_serve_builder_handler() {
+        // ServeBuilder::on_event registered handlers that nothing could ever
+        // fire: start() moved the PvaServer into the spawned task and
+        // RunningServer had no events()/post_event().
+        const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let server = tokio::time::timeout(
+            RUN_TIMEOUT,
+            PvaServer::serve(Vec::<crate::pv::AnyPv>::new())
+                .port(0)
+                .udp_port(0)
+                .on_event("SHUTTER", |store, _event| {
+                    Box::pin(async move {
+                        store
+                            .insert(
+                                "T:FIRED".to_string(),
+                                make_scalar_record(
+                                    "T:FIRED",
+                                    RecordType::Ai,
+                                    ScalarValue::F64(1.0),
+                                ),
+                            )
+                            .await;
+                    })
+                })
+                .start(),
+        )
+        .await
+        .expect("ServeBuilder::start() did not return within RUN_TIMEOUT")
+        .expect("hooks must succeed");
+
+        server.post_event("SHUTTER").await;
+        server.events().drain().await;
+
+        assert_eq!(
+            server.store().get_value("T:FIRED").await,
+            Some(ScalarValue::F64(1.0)),
+            "a ServeBuilder-registered handler must be reachable from the handle"
         );
         server.abort();
     }

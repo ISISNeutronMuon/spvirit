@@ -131,8 +131,11 @@ impl Events {
 
     /// Start the single dispatcher task. Call once, at server start.
     pub fn start_dispatcher(&self, store: Arc<SimplePvStore>) {
+        // Idempotent: `ServeBuilder::start` starts the dispatcher before it
+        // returns (so a handle-API caller can post immediately), and the
+        // spawned `serve_after_start_hooks` then calls this again.
         let Some(mut rx) = self.rx.write().unwrap().take() else {
-            warn!("Events::start_dispatcher called twice; ignoring");
+            tracing::debug!("Events::start_dispatcher called again; already running");
             return;
         };
         let inflight = self.inflight.clone();
