@@ -505,6 +505,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_panicking_sink_does_not_truncate_the_fan_out() {
+        struct BoomSink;
+        impl EventSink for BoomSink {
+            fn on_event(&self, _event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                Box::pin(async { panic!("sink blew up") })
+            }
+        }
+
+        let store = test_store();
+        let events = Events::new();
+        let before = Arc::new(RecordingSink { seen: Mutex::new(Vec::new()) });
+        let after = Arc::new(RecordingSink { seen: Mutex::new(Vec::new()) });
+        events.add_sink(before.clone());
+        events.add_sink(Arc::new(BoomSink));
+        events.add_sink(after.clone());
+
+        let handler_ran = Arc::new(AtomicUsize::new(0));
+        let h = handler_ran.clone();
+        events.add_handler(
+            "BOOM",
+            Arc::new(move |_s, _e| {
+                let h = h.clone();
+                Box::pin(async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        events.start_dispatcher(store);
+
+        // Must not unwind out of post().
+        events.post("BOOM").await;
+        events.drain().await;
+
+        assert_eq!(before.seen.lock().unwrap().as_slice(), &["BOOM".to_string()]);
+        assert_eq!(
+            after.seen.lock().unwrap().as_slice(),
+            &["BOOM".to_string()],
+            "a sink after the panicking one must still see the event"
+        );
+        assert_eq!(
+            handler_ran.load(Ordering::SeqCst),
+            1,
+            "a panicking sink must not stop handlers from being queued"
+        );
+        assert_eq!(events.failed_count(), 1);
+    }
+
+    #[tokio::test]
     async fn a_handler_may_post_another_event() {
         let store = test_store();
         let events = Arc::new(Events::new());
