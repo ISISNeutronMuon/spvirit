@@ -56,5 +56,8 @@ pub use pvlist::PvListSource;
 pub use client::{ChannelConn, build_client_validation, establish_channel, pvget, pvget_fields};
 pub use format::{OutputFormat, RenderOptions, format_output};
 pub use search::{SearchTarget, build_auto_broadcast_targets, resolve_pv_server, search_pv};
-pub use transport::read_packet;
+pub use transport::{read_frame, read_packet, read_until};
+
+// --- Re-exports: segmentation (so callers need not depend on spvirit-codec) ---
+pub use spvirit_codec::{DecodeError, SegmentOutcome, SegmentReassembler};
 pub use types::{PvGetError, PvGetOptions, PvGetResult, PvMonitorEvent, PvOptions};

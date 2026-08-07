@@ -118,6 +118,7 @@ pub fn to_py_err(e: PvGetError) -> PyErr {
         PvGetError::Search(ctx) => SearchError::new_err(ctx.to_string()),
         PvGetError::Protocol(ctx) => ProtocolError::new_err(ctx),
         PvGetError::Decode(ctx) => DecodeError::new_err(ctx),
+        PvGetError::Codec(e) => DecodeError::new_err(e.to_string()),
     }
 }
 

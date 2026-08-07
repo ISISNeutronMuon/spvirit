@@ -144,7 +144,7 @@ async fn run_get(
     let get_init = encode_get_request(sid, ioid, QOS_INIT, &pv_request, version, is_be);
     conn.stream.write_all(&get_init).await?;
 
-    let init_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let init_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 10 && op.ioid == ioid && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -153,7 +153,7 @@ async fn run_get(
     let get_data = encode_get_request(sid, ioid, 0x00, &[], version, is_be);
     conn.stream.write_all(&get_data).await?;
 
-    let data_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let data_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 10 && op.ioid == ioid && op.subcmd == 0x00)
     })
     .await?;
@@ -192,7 +192,7 @@ async fn run_put(
     let init = encode_put_request(sid, ioid, QOS_INIT, &pv_request, PVA_VERSION, is_be);
     conn.stream.write_all(&init).await?;
 
-    let init_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let init_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.ioid == ioid && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -203,7 +203,7 @@ async fn run_put(
     let req = encode_put_request(sid, ioid, 0x00, &payload, PVA_VERSION, is_be);
     conn.stream.write_all(&req).await?;
 
-    let resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.ioid == ioid && op.subcmd == 0x00)
     })
     .await?;
@@ -226,7 +226,7 @@ async fn run_introspect(
     let pv_request = vec![0xfd, 0x02, 0x00, 0x80, 0x00, 0x00];
     let init = encode_get_request(sid, ioid, QOS_INIT, &pv_request, version, is_be);
     conn.stream.write_all(&init).await?;
-    let init_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let init_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 10 && op.ioid == ioid && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -254,7 +254,7 @@ async fn run_monitor(
     let init = encode_monitor_request(sid, ioid, QOS_INIT, &pv_request, PVA_VERSION, is_be);
     conn.stream.write_all(&init).await?;
 
-    let init_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let init_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 13 && op.ioid == ioid && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -274,7 +274,7 @@ async fn run_monitor(
                 echo_token = echo_token.wrapping_add(1);
                 let _ = conn.stream.write_all(&msg).await;
             }
-            res = read_packet(&mut conn.stream, timeout) => {
+            res = read_packet(&mut conn.stream, timeout, &mut conn.reassembler) => {
                 let bytes = match res {
                     Ok(b) => b,
                     Err(PvGetError::Timeout(_)) => continue,
@@ -544,7 +544,7 @@ impl PyChannel {
             let mut guard = state.lock().await;
             let t = override_timeout.unwrap_or(guard.timeout);
             let conn = guard.conn_mut()?;
-            read_packet(&mut conn.stream, t).await
+            read_packet(&mut conn.stream, t, &mut conn.reassembler).await
         })
         .map_err(to_py_err)?;
         Ok(crate::packet::PyPacket::from_bytes(bytes))
@@ -564,7 +564,9 @@ impl PyChannel {
                 let mut guard = state.lock().await;
                 let t = override_timeout.unwrap_or(guard.timeout);
                 let conn = guard.conn_mut().map_err(to_py_err)?;
-                read_packet(&mut conn.stream, t).await.map_err(to_py_err)?
+                read_packet(&mut conn.stream, t, &mut conn.reassembler)
+                    .await
+                    .map_err(to_py_err)?
             };
             Python::with_gil(|py| Py::new(py, crate::packet::PyPacket::from_bytes(bytes)))
         })
@@ -597,7 +599,7 @@ impl PyChannel {
                     let mut guard = state.lock().await;
                     let t = override_timeout.unwrap_or(guard.timeout);
                     let conn = guard.conn_mut()?;
-                    read_packet(&mut conn.stream, t).await
+                    read_packet(&mut conn.stream, t, &mut conn.reassembler).await
                 })
                 .map_err(to_py_err)?
             };

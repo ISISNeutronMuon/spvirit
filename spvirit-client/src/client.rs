@@ -6,6 +6,7 @@ use crate::auth::{resolved_authnz_host, resolved_authnz_user};
 use crate::search::resolve_pv_server;
 use crate::transport::{read_packet, read_until};
 use crate::types::{PvGetError, PvGetOptions, PvGetResult};
+use spvirit_codec::SegmentReassembler;
 use spvirit_codec::epics_decode::{
     DecodeMode, PvaPacket, PvaPacketCommand,
     decode_op_response_status as codec_decode_op_response_status,
@@ -52,6 +53,13 @@ pub struct ChannelConn {
     pub version: u8,
     pub is_be: bool,
     pub server_addr: std::net::SocketAddr,
+    /// Segment reassembly state for this connection.
+    ///
+    /// It lives on the connection rather than on each read call because a
+    /// message's segments may be separated by control frames — and by the
+    /// boundary between [`establish_channel`] and whatever the caller does
+    /// next on the same socket.
+    pub reassembler: SegmentReassembler,
 }
 
 pub async fn establish_channel(
@@ -62,11 +70,15 @@ pub async fn establish_channel(
         .await
         .map_err(|_| PvGetError::Timeout("connect"))??;
 
+    // One reassembler for the lifetime of this connection; it is handed to
+    // the caller in `ChannelConn` so pending segments survive the handshake.
+    let mut reassembler = SegmentReassembler::new();
+
     let mut version = 2u8;
     let mut is_be = false;
 
     for _ in 0..2 {
-        if let Ok(bytes) = read_packet(&mut stream, opts.timeout).await {
+        if let Ok(bytes) = read_packet(&mut stream, opts.timeout, &mut reassembler).await {
             let mut pkt = PvaPacket::new(&bytes);
             if let Some(cmd) = pkt.decode_payload() {
                 match cmd {
@@ -88,7 +100,7 @@ pub async fn establish_channel(
     let validation = build_client_validation(opts, version, is_be);
     stream.write_all(&validation).await?;
 
-    let _ = read_until(&mut stream, opts.timeout, |cmd| {
+    let _ = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::ConnectionValidated(_))
     })
     .await?;
@@ -97,7 +109,7 @@ pub async fn establish_channel(
     let create = encode_create_channel_request(cid, &opts.pv_name, version, is_be);
     stream.write_all(&create).await?;
 
-    let create_resp = read_until(&mut stream, opts.timeout, |cmd| {
+    let create_resp = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::CreateChannel(_))
     })
     .await?;
@@ -133,6 +145,7 @@ pub async fn establish_channel(
         version,
         is_be,
         server_addr: target,
+        reassembler,
     })
 }
 
@@ -154,6 +167,7 @@ pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetR
         sid,
         version,
         is_be,
+        mut reassembler,
         ..
     } = conn;
 
@@ -170,6 +184,7 @@ pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetR
     let init_resp = read_until(
         &mut stream,
         opts.timeout,
+        &mut reassembler,
         |cmd| matches!(cmd, PvaPacketCommand::Op(op) if (op.subcmd & 0x08) != 0),
     )
     .await?;
@@ -195,6 +210,7 @@ pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetR
     let data_resp = read_until(
         &mut stream,
         opts.timeout,
+        &mut reassembler,
         |cmd| matches!(cmd, PvaPacketCommand::Op(op) if op.subcmd == 0x00),
     )
     .await?;

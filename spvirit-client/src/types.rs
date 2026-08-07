@@ -65,6 +65,8 @@ pub enum PvGetError {
     Search(&'static str),
     Protocol(String),
     Decode(String),
+    /// A typed failure from `spvirit-codec`.
+    Codec(spvirit_codec::DecodeError),
 }
 
 impl std::fmt::Display for PvGetError {
@@ -75,6 +77,7 @@ impl std::fmt::Display for PvGetError {
             PvGetError::Search(ctx) => write!(f, "search error: {}", ctx),
             PvGetError::Protocol(ctx) => write!(f, "protocol error: {}", ctx),
             PvGetError::Decode(ctx) => write!(f, "decode error: {}", ctx),
+            PvGetError::Codec(e) => write!(f, "codec error: {}", e),
         }
     }
 }
@@ -84,5 +87,11 @@ impl std::error::Error for PvGetError {}
 impl From<std::io::Error> for PvGetError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<spvirit_codec::DecodeError> for PvGetError {
+    fn from(value: spvirit_codec::DecodeError) -> Self {
+        Self::Codec(value)
     }
 }

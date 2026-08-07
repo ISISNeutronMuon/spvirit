@@ -66,6 +66,7 @@ async fn pvmonitor_raw(
         sid,
         version,
         is_be,
+        mut reassembler,
         ..
     } = conn;
 
@@ -93,7 +94,7 @@ async fn pvmonitor_raw(
     let mon_init = encode_monitor_request(sid, ioid, init_subcmd, &pv_request, version, is_be);
     stream.write_all(&mon_init).await?;
 
-    let init_resp = read_until(&mut stream, opts.timeout, |cmd| {
+    let init_resp = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 13 && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -128,7 +129,7 @@ async fn pvmonitor_raw(
                 echo_token = echo_token.wrapping_add(1);
                 let _ = stream.write_all(&msg).await;
             }
-            res = read_packet(&mut stream, opts.timeout) => {
+            res = read_packet(&mut stream, opts.timeout, &mut reassembler) => {
                 let bytes = match res {
                     Ok(b) => b,
                     Err(PvGetError::Timeout(_)) => continue,

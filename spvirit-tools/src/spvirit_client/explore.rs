@@ -86,12 +86,15 @@ where
         .await
         .map_err(|_| PvGetError::Timeout("connect"))??;
 
+    // One reassembler for this connection, shared by every read below.
+    let mut reassembler = spvirit_client::SegmentReassembler::new();
+
     let mut version = 2u8;
     let mut is_be = false;
 
     // Read initial server messages: SET_BYTE_ORDER and server validation.
     for _ in 0..2 {
-        if let Ok(bytes) = read_packet(&mut stream, opts.timeout).await {
+        if let Ok(bytes) = read_packet(&mut stream, opts.timeout, &mut reassembler).await {
             let mut pkt = spvirit_codec::epics_decode::PvaPacket::new(&bytes);
             if let Some(cmd) = pkt.decode_payload() {
                 match cmd {
@@ -112,7 +115,7 @@ where
 
     let validation = build_client_validation(opts, version, is_be);
     stream.write_all(&validation).await?;
-    let _ = read_until(&mut stream, opts.timeout, |cmd| {
+    let _ = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::ConnectionValidated(_))
     })
     .await?;
@@ -120,7 +123,7 @@ where
     let cid = 1u32;
     let create = encode_create_channel_request(cid, pv_name, version, is_be);
     stream.write_all(&create).await?;
-    let create_cmd = read_until(&mut stream, opts.timeout, |cmd| {
+    let create_cmd = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::CreateChannel(_))
     })
     .await?;
@@ -153,10 +156,17 @@ where
     let ioid = 1u32;
     let mon_init = encode_monitor_request(sid, ioid, 0x08, &PV_REQUEST_EMPTY, version, is_be);
     stream.write_all(&mon_init).await?;
-    let init_resp = read_until(&mut stream, opts.timeout, |cmd| match cmd {
-        PvaPacketCommand::Op(op) => op.command == 13 && op.ioid == ioid && (op.subcmd & 0x08) != 0,
-        _ => false,
-    })
+    let init_resp = read_until(
+        &mut stream,
+        opts.timeout,
+        &mut reassembler,
+        |cmd| match cmd {
+            PvaPacketCommand::Op(op) => {
+                op.command == 13 && op.ioid == ioid && (op.subcmd & 0x08) != 0
+            }
+            _ => false,
+        },
+    )
     .await?;
     let mut pkt = spvirit_codec::epics_decode::PvaPacket::new(&init_resp);
     let init_cmd = pkt.decode_payload().ok_or(PvGetError::Protocol(
@@ -202,7 +212,7 @@ where
                 echo_token = echo_token.wrapping_add(1);
                 let _ = stream.write_all(&msg).await;
             }
-            res = read_packet(&mut stream, opts.timeout) => {
+            res = read_packet(&mut stream, opts.timeout, &mut reassembler) => {
                 let bytes = match res {
                     Ok(b) => b,
                     Err(PvGetError::Timeout(_)) => continue,
