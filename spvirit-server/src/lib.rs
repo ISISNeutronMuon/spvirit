@@ -33,6 +33,7 @@ pub mod beacon;
 pub mod convert;
 pub mod db;
 pub mod decode;
+pub mod events;
 pub mod group;
 pub mod handler;
 pub mod monitor;
