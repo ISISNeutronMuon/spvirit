@@ -787,6 +787,35 @@ impl PvdDecoder {
         Ok((value, size))
     }
 
+    /// Reject an array count that exceeds its configured limit, or that could
+    /// not possibly fit in the bytes that remain.
+    ///
+    /// `min_elem` is the smallest number of wire bytes one element can
+    /// occupy: the fixed width for scalars, 1 for strings, structures and
+    /// unions. The limit is checked first, so a count that violates both
+    /// yields `ArrayTooLarge`.
+    fn check_array_count(
+        &self,
+        count: usize,
+        min_elem: usize,
+        available: usize,
+        kind: &'static str,
+        limit: usize,
+    ) -> DecodeResult<()> {
+        if count > limit {
+            return Err(DecodeError::ArrayTooLarge { kind, count, limit });
+        }
+        let min_bytes = count.saturating_mul(min_elem);
+        if min_bytes > available {
+            return Err(DecodeError::CountExceedsBuffer {
+                count,
+                min_bytes,
+                available,
+            });
+        }
+        Ok(())
+    }
+
     /// Decode value according to field type
     pub fn decode_value(
         &self,
@@ -802,35 +831,37 @@ impl PvdDecoder {
             FieldType::ScalarArray(tc) => {
                 let (count, size_consumed) = self.decode_size(data)?;
                 let mut offset = size_consumed;
-                let limit = count.min(4_000_000);
-                let mut values = Vec::with_capacity(limit);
                 let elem_size = tc.size().unwrap_or(1);
-                for _ in 0..limit {
-                    if let Ok((val, consumed)) = self.decode_scalar(&data[offset..], *tc) {
-                        values.push(val);
-                        offset += consumed;
-                    } else {
-                        break;
-                    }
+                self.check_array_count(
+                    count,
+                    elem_size,
+                    data.len() - offset,
+                    "scalar array",
+                    self.limits.max_scalar_array,
+                )?;
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (val, consumed) = self.decode_scalar(&data[offset..], *tc)?;
+                    values.push(val);
+                    offset += consumed;
                 }
-                // Skip past any remaining elements we didn't store, so the
-                // stream stays aligned for the next field.
-                let remaining = count.saturating_sub(limit);
-                offset += remaining * elem_size;
                 Ok((DecodedValue::Array(values), offset))
             }
             FieldType::StringArray => {
                 let (count, size_consumed) = self.decode_size(data)?;
                 let mut offset = size_consumed;
-                let max_items = count.min(4096);
-                let mut values = Vec::with_capacity(max_items);
-                for _ in 0..max_items {
-                    if let Ok((s, consumed)) = self.decode_string(&data[offset..]) {
-                        values.push(DecodedValue::String(s));
-                        offset += consumed;
-                    } else {
-                        break;
-                    }
+                self.check_array_count(
+                    count,
+                    1,
+                    data.len() - offset,
+                    "string array",
+                    self.limits.max_string_array,
+                )?;
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (s, consumed) = self.decode_string(&data[offset..])?;
+                    values.push(DecodedValue::String(s));
+                    offset += consumed;
                 }
                 Ok((DecodedValue::Array(values), offset))
             }
@@ -838,8 +869,15 @@ impl PvdDecoder {
             FieldType::StructureArray(desc) => {
                 let (count, size_consumed) = self.decode_size(data)?;
                 let mut offset = size_consumed;
-                let mut values = Vec::with_capacity(count.min(256));
-                for _ in 0..count.min(256) {
+                self.check_array_count(
+                    count,
+                    1,
+                    data.len() - offset,
+                    "structure array",
+                    self.limits.max_struct_array,
+                )?;
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
                     // Read per-element null indicator (0 = null, non-zero = present)
                     if offset >= data.len() {
                         return Err(DecodeError::Truncated {
@@ -876,8 +914,15 @@ impl PvdDecoder {
             FieldType::UnionArray(fields) => {
                 let (count, size_consumed) = self.decode_size(data)?;
                 let mut offset = size_consumed;
-                let mut values = Vec::with_capacity(count.min(128));
-                for _ in 0..count.min(128) {
+                self.check_array_count(
+                    count,
+                    1,
+                    data.len() - offset,
+                    "union array",
+                    self.limits.max_union_array,
+                )?;
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
                     let (selector, consumed) = self.decode_size(&data[offset..])?;
                     offset += consumed;
                     let field =
@@ -912,8 +957,15 @@ impl PvdDecoder {
             FieldType::VariantArray => {
                 let (count, size_consumed) = self.decode_size(data)?;
                 let mut offset = size_consumed;
-                let mut values = Vec::with_capacity(count.min(128));
-                for _ in 0..count.min(128) {
+                self.check_array_count(
+                    count,
+                    1,
+                    data.len() - offset,
+                    "variant array",
+                    self.limits.max_variant_array,
+                )?;
+                let mut values = Vec::with_capacity(count);
+                for _ in 0..count {
                     let (v, consumed) = self.decode_value(&data[offset..], &FieldType::Variant)?;
                     values.push(v);
                     offset += consumed;
@@ -1683,5 +1735,185 @@ mod tests {
             panic!("expected decoded array");
         };
         assert_eq!(items.len(), item_count);
+    }
+
+    /// Encode a PVA size prefix for `n` using the 4-byte form.
+    fn size_prefix(n: u32) -> Vec<u8> {
+        let mut v = vec![254u8];
+        v.extend_from_slice(&n.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn oversized_string_array_errors_instead_of_truncating() {
+        let limits = DecodeLimits {
+            max_string_array: 4,
+            ..DecodeLimits::default()
+        };
+        let decoder = PvdDecoder::with_limits(false, limits);
+        let mut data = size_prefix(9);
+        for _ in 0..9 {
+            data.push(1); // one-byte string, length 1
+            data.push(b'x');
+        }
+        assert_eq!(
+            decoder
+                .decode_value(&data, &FieldType::StringArray)
+                .unwrap_err(),
+            DecodeError::ArrayTooLarge {
+                kind: "string array",
+                count: 9,
+                limit: 4
+            }
+        );
+    }
+
+    #[test]
+    fn count_larger_than_the_buffer_is_rejected_before_allocating() {
+        let decoder = PvdDecoder::new(false);
+        // Claims 4 billion int32s in a 5-byte buffer.
+        let data = size_prefix(4_000_000_000);
+        let err = decoder
+            .decode_value(&data, &FieldType::ScalarArray(TypeCode::Int32))
+            .unwrap_err();
+        // The limit is checked first, so this is ArrayTooLarge, not
+        // CountExceedsBuffer. See the Global Constraints.
+        assert_eq!(
+            err,
+            DecodeError::ArrayTooLarge {
+                kind: "scalar array",
+                count: 4_000_000_000,
+                limit: 4_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn count_within_the_limit_but_beyond_the_buffer_is_rejected() {
+        let decoder = PvdDecoder::new(false);
+        // 1000 int32s = 4000 bytes claimed, 8 supplied.
+        let mut data = size_prefix(1000);
+        data.extend_from_slice(&[0u8; 8]);
+        assert_eq!(
+            decoder
+                .decode_value(&data, &FieldType::ScalarArray(TypeCode::Int32))
+                .unwrap_err(),
+            DecodeError::CountExceedsBuffer {
+                count: 1000,
+                min_bytes: 4000,
+                available: 8
+            }
+        );
+    }
+
+    #[test]
+    fn oversized_struct_array_errors() {
+        let limits = DecodeLimits {
+            max_struct_array: 2,
+            ..DecodeLimits::default()
+        };
+        let decoder = PvdDecoder::with_limits(false, limits);
+        let mut inner = StructureDesc::new();
+        inner.fields.push(FieldDesc {
+            name: "a".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int8),
+        });
+        let mut data = size_prefix(5);
+        for _ in 0..5 {
+            data.push(1); // present
+            data.push(0); // the int8
+        }
+        assert_eq!(
+            decoder
+                .decode_value(&data, &FieldType::StructureArray(inner))
+                .unwrap_err(),
+            DecodeError::ArrayTooLarge {
+                kind: "structure array",
+                count: 5,
+                limit: 2
+            }
+        );
+    }
+
+    /// The regression this whole task exists for. Before the change, an
+    /// over-cap string array returned a short Vec *and* left the offset
+    /// short, so the following int32 decoded from the wrong bytes and the
+    /// caller got a plausible, wrong answer.
+    #[test]
+    fn truncated_array_no_longer_desyncs_the_following_field() {
+        let limits = DecodeLimits {
+            max_string_array: 2,
+            ..DecodeLimits::default()
+        };
+        let decoder = PvdDecoder::with_limits(false, limits);
+
+        let mut desc = StructureDesc::new();
+        desc.fields.push(FieldDesc {
+            name: "names".to_string(),
+            field_type: FieldType::StringArray,
+        });
+        desc.fields.push(FieldDesc {
+            name: "count".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+
+        let mut data = size_prefix(4);
+        for _ in 0..4 {
+            data.push(1);
+            data.push(b'x');
+        }
+        data.extend_from_slice(&7i32.to_le_bytes());
+
+        // decode_structure stops at the first field it cannot decode and
+        // returns what it has, so "count" must be absent rather than wrong.
+        let (value, _) = decoder.decode_structure(&data, &desc).unwrap();
+        let DecodedValue::Structure(fields) = value else {
+            panic!("expected a structure");
+        };
+        assert!(
+            fields.iter().all(|(name, _)| name != "count"),
+            "a desynced 'count' must not be reported: got {fields:?}"
+        );
+
+        // And with a limit that admits the array, the following field decodes
+        // correctly — proving the payload above really does carry a readable
+        // `count` that only the desync could have mangled.
+        let loose = PvdDecoder::new(false);
+        let (value, consumed) = loose.decode_structure(&data, &desc).unwrap();
+        let DecodedValue::Structure(fields) = value else {
+            panic!("expected a structure");
+        };
+        assert_eq!(consumed, data.len());
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[1].0, "count");
+        assert!(
+            matches!(fields[1].1, DecodedValue::Int32(7)),
+            "expected count == 7, got {:?}",
+            fields[1].1
+        );
+    }
+
+    #[test]
+    fn raising_the_limit_lets_the_same_payload_decode() {
+        let mut data = size_prefix(5);
+        for _ in 0..5 {
+            data.push(1);
+            data.push(b'x');
+        }
+        let strict = PvdDecoder::with_limits(
+            false,
+            DecodeLimits {
+                max_string_array: 2,
+                ..DecodeLimits::default()
+            },
+        );
+        assert!(strict.decode_value(&data, &FieldType::StringArray).is_err());
+
+        let loose = PvdDecoder::new(false);
+        let (value, _) = loose.decode_value(&data, &FieldType::StringArray).unwrap();
+        let DecodedValue::Array(items) = value else {
+            panic!("expected an array");
+        };
+        assert_eq!(items.len(), 5);
     }
 }
