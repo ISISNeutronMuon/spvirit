@@ -505,6 +505,38 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "the dispatcher was never started")]
+    async fn drain_without_a_dispatcher_fails_immediately_and_says_why() {
+        // `build() -> post_event() -> drain_events()` with no start in
+        // between: the old code spun the full 10 s DRAIN_TIMEOUT and then
+        // blamed the dispatcher for being stuck.
+        let events = Events::new();
+        events.add_handler(
+            "GO",
+            Arc::new(|_s, _e| Box::pin(async {})),
+        );
+        events.post("GO").await;
+        let t0 = std::time::Instant::now();
+        let hit = std::panic::AssertUnwindSafe(events.drain());
+        let result = futures::FutureExt::catch_unwind(hit).await;
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "drain() must fail fast when the dispatcher never started, took {:?}",
+            t0.elapsed()
+        );
+        std::panic::resume_unwind(result.expect_err("drain() must panic"));
+    }
+
+    #[tokio::test]
+    async fn drain_with_nothing_queued_is_fine_without_a_dispatcher() {
+        // No handler invocations in flight means nothing to wait for; the
+        // dispatcher check must not turn that into a failure.
+        let events = Events::new();
+        events.post("NOBODY").await;
+        events.drain().await;
+    }
+
+    #[tokio::test]
     async fn a_panicking_sink_does_not_truncate_the_fan_out() {
         struct BoomSink;
         impl EventSink for BoomSink {
