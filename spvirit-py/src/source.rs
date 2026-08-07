@@ -279,24 +279,25 @@ impl PySourceAdapter {
         Self { obj: Arc::new(obj) }
     }
 
-    /// If the user's Python object has an `on_start(notifier)` method, call it.
-    pub fn invoke_on_start(&self, notifier: PyNotifier) {
+    /// If the user's Python object has an `on_start(notifier)` method, call
+    /// it. Returns `Err` if the method raises (or doesn't exist as a
+    /// callable) — the caller decides what a raise means in its context:
+    /// aborting startup (deferred hooks on the shared start_hooks list) or
+    /// propagating as a normal Python exception (the immediate
+    /// `Server.add_source` window). This must NOT swallow-and-log: a
+    /// swallowed exception here would let startup silently proceed after a
+    /// source's on_start failed, which is exactly the bug this method
+    /// used to have.
+    pub fn invoke_on_start(&self, notifier: PyNotifier) -> PyResult<()> {
         let obj = self.obj.clone();
         Python::with_gil(|py| {
             let b = obj.bind(py);
             if let Ok(method) = b.getattr("on_start") {
-                let py_notifier = match notifier.into_pyobject(py) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::error!("Notifier.into_pyobject: {e}");
-                        return;
-                    }
-                };
-                if let Err(e) = method.call1((py_notifier,)) {
-                    tracing::error!("source.on_start error: {e}");
-                }
+                let py_notifier = notifier.into_pyobject(py)?;
+                method.call1((py_notifier,))?;
             }
-        });
+            Ok(())
+        })
     }
 }
 
@@ -314,7 +315,19 @@ fn asyncio_loop(py: Python<'_>) -> PyResult<PyObject> {
         return Ok(l.clone_ref(py));
     }
     let asyncio = py.import("asyncio")?;
-    let loop_obj: PyObject = asyncio.getattr("new_event_loop")?.call0()?.unbind();
+    // Deliberately `asyncio.SelectorEventLoop()`, not `asyncio.new_event_loop()`.
+    // On Windows the default policy hands back a `ProactorEventLoop`, whose
+    // constructor unconditionally calls `signal.set_wakeup_fd()` — which
+    // raises `ValueError: set_wakeup_fd only works in main thread of the
+    // main interpreter` unless the *first* caller happens to be on the
+    // process's main OS thread. This loop is lazily created on first use,
+    // and the first use can easily be a Tokio worker thread (e.g. the
+    // event dispatcher invoking an async `@builder.on_event` handler) —
+    // nowhere near the main thread. `SelectorEventLoop` has no such
+    // main-thread requirement and needs no subprocess support here (we
+    // only ever run plain Python callbacks on it), so it works from any
+    // thread on every platform.
+    let loop_obj: PyObject = asyncio.getattr("SelectorEventLoop")?.call0()?.unbind();
     let loop_for_thread = loop_obj.clone_ref(py);
     std::thread::Builder::new()
         .name("spvirit-asyncio".into())
@@ -339,7 +352,7 @@ fn asyncio_loop(py: Python<'_>) -> PyResult<PyObject> {
 
 /// Call a Python method that may be sync or async; if the return value is a
 /// coroutine, submit it to the shared asyncio loop and block on the result.
-async fn call_py_await(
+pub(crate) async fn call_py_await(
     obj: Arc<PyObject>,
     method: &'static str,
     build_args: impl for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyTuple>> + Send,

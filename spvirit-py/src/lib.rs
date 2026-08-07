@@ -36,6 +36,7 @@ fn spvirit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<server::PyServerBuilder>()?;
     m.add_class::<server::PyServer>()?;
     m.add_class::<server::PyStore>()?;
+    m.add_class::<server::PyEventDecorator>()?;
 
     // Dynamic-source classes
     source::register(m)?;

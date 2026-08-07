@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
 
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::SimplePvStore;
@@ -338,6 +339,82 @@ impl PyServerBuilder {
         Ok(slf)
     }
 
+    /// Register a startup hook: `@builder.on_start`.
+    ///
+    /// The callback is invoked as `callback(store)` once at server start,
+    /// before scan tasks spawn and before the listener accepts. May be `def`
+    /// or `async def`. It shares one ordered list with sources' `on_start`
+    /// hooks (registered via `add_source`) — all fire in true registration
+    /// order, builder hooks and source hooks interleaved. Raising aborts
+    /// startup, naming the hook. Returns the callback unchanged so it works
+    /// as a decorator.
+    fn on_start(mut slf: PyRefMut<'_, Self>, callback: PyObject) -> PyResult<PyObject> {
+        let cb = Arc::new(callback.clone_ref(slf.py()));
+        let b = take_builder(&mut slf)?;
+        slf.builder = Some(b.on_start(move |store| {
+            let cb = cb.clone();
+            Box::pin(async move {
+                let py_store = PyStore { inner: store };
+                let result = crate::source::call_py_await(cb, "__call__", move |py| {
+                    PyTuple::new(py, &[py_store.into_pyobject(py)?.into_any()])
+                })
+                .await;
+                if let Err(e) = result {
+                    // Propagate as a panic so run_start_hooks aborts startup,
+                    // naming the hook (see run_start_hooks' error message).
+                    panic!("on_start hook raised: {e}");
+                }
+            })
+        }));
+        Ok(callback)
+    }
+
+    /// Register an event handler: `@builder.on_event("NAME")`.
+    ///
+    /// The callback is invoked as `callback(store, event)` on the dispatcher
+    /// after `post_event`. May be `def` or `async def`. Raising is logged and
+    /// does not stop the dispatcher. Returns a decorator.
+    fn on_event(slf: PyRefMut<'_, Self>, event: String) -> PyResult<PyObject> {
+        let py = slf.py();
+        let builder_obj: PyObject = slf.into_pyobject(py)?.into_any().unbind();
+        let decorator = PyEventDecorator {
+            builder: builder_obj,
+            event,
+        };
+        Ok(decorator.into_pyobject(py)?.into_any().unbind())
+    }
+
+    /// Internal: attach an already-resolved handler. Called by the decorator
+    /// returned from `on_event`.
+    fn _add_event_handler(
+        mut slf: PyRefMut<'_, Self>,
+        event: String,
+        callback: PyObject,
+    ) -> PyResult<()> {
+        let cb = Arc::new(callback);
+        let b = take_builder(&mut slf)?;
+        slf.builder = Some(b.on_event(event, move |store, ev| {
+            let cb = cb.clone();
+            Box::pin(async move {
+                let py_store = PyStore { inner: store };
+                let result = crate::source::call_py_await(cb, "__call__", move |py| {
+                    PyTuple::new(
+                        py,
+                        &[
+                            py_store.into_pyobject(py)?.into_any(),
+                            ev.into_pyobject(py)?.into_any(),
+                        ],
+                    )
+                })
+                .await;
+                if let Err(e) = result {
+                    tracing::error!("event handler raised: {e}");
+                }
+            })
+        }));
+        Ok(())
+    }
+
     fn scan(
         mut slf: PyRefMut<'_, Self>,
         name: String,
@@ -452,7 +529,15 @@ impl PyServerBuilder {
             let label = label_for_hook.clone();
             Box::pin(async move {
                 if let Some(notifier) = cell.get() {
-                    adapter.invoke_on_start(notifier.clone());
+                    if let Err(e) = adapter.invoke_on_start(notifier.clone()) {
+                        // Propagate as a panic so run_start_hooks aborts
+                        // startup, naming the hook — the same rule that
+                        // holds for a raising @builder.on_start. A raising
+                        // source on_start is not a lesser citizen: letting
+                        // startup silently proceed after it failed was the
+                        // exact bug this hook exists to fix.
+                        panic!("on_start hook for source '{label}' raised: {e}");
+                    }
                 } else {
                     // Should be unreachable: `build()` always fills the cell
                     // before any hook can fire. If it ever happens, the
@@ -484,12 +569,35 @@ impl PyServerBuilder {
         // in add_source. They fire at server start (via run_start_hooks),
         // not here.
         let _ = self.notifier_cell.set(notifier.clone());
+        let events = server.events().clone();
         Ok(PyServer {
             server: Some(server),
             store: Some(store),
             notifier: Some(notifier),
             post_build_sources: sources,
+            events,
         })
+    }
+}
+
+/// Returned by `builder.on_event("NAME")` — calling it with a function
+/// registers that function and returns it unchanged, so it works as
+/// `@builder.on_event("NAME")`.
+#[pyclass]
+pub struct PyEventDecorator {
+    builder: PyObject,
+    event: String,
+}
+
+#[pymethods]
+impl PyEventDecorator {
+    fn __call__(&self, py: Python<'_>, callback: PyObject) -> PyResult<PyObject> {
+        self.builder.call_method1(
+            py,
+            "_add_event_handler",
+            (self.event.clone(), callback.clone_ref(py)),
+        )?;
+        Ok(callback)
     }
 }
 
@@ -508,6 +616,10 @@ pub struct PyServer {
     /// so they outlive `run()`.
     #[allow(dead_code)]
     post_build_sources: Vec<(String, i32, Arc<PySourceAdapter>)>,
+    /// Kept independently of `server` (which `run()`/`start_background()`
+    /// consume) so `post_event`/`drain_events` keep working once the
+    /// server is running.
+    events: Arc<spvirit_server::events::Events>,
 }
 
 #[pymethods]
@@ -587,7 +699,9 @@ impl PyServer {
                 let label = label_for_hook.clone();
                 Box::pin(async move {
                     if let Some(notifier) = cell.get() {
-                        adapter.invoke_on_start(notifier.clone());
+                        if let Err(e) = adapter.invoke_on_start(notifier.clone()) {
+                            panic!("on_start hook for source '{label}' raised: {e}");
+                        }
                     } else {
                         // Should be unreachable: filled right after
                         // `sb.build()` below, before any hook can fire.
@@ -604,11 +718,13 @@ impl PyServer {
         let registry = server.monitor_registry();
         let notifier = PyNotifier::new(registry);
         let _ = notifier_cell.set(notifier.clone());
+        let events = server.events().clone();
         Ok(PyServer {
             server: Some(server),
             store: Some(store),
             notifier: Some(notifier),
             post_build_sources: python_sources,
+            events,
         })
     }
 
@@ -619,8 +735,8 @@ impl PyServer {
     }
 
     /// Start serving on a background thread (returns immediately).
-    fn start(&mut self) -> PyResult<()> {
-        self.start_background().map(|_| ())
+    fn start(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.start_background(py).map(|_| ())
     }
 
     fn __repr__(&self) -> &'static str {
@@ -726,6 +842,13 @@ impl PyServer {
     /// private with no API to push onto it after `build()`. Prefer
     /// `ServerBuilder.add_source(...)` (before `build()`) when hook
     /// ordering relative to other `on_start` hooks matters.
+    ///
+    /// If the source's `on_start` raises here, there is no startup in
+    /// flight to abort — this call happens synchronously in the gap between
+    /// `build()` and `run()`/`start_background()`. The exception simply
+    /// propagates as a normal Python exception out of this `add_source()`
+    /// call; the source is not added to the registry and its `on_start` is
+    /// not retried.
     fn add_source(&mut self, label: String, order: i32, source: PyObject) -> PyResult<()> {
         let server = self
             .server
@@ -733,7 +856,7 @@ impl PyServer {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("server already consumed"))?;
         let adapter = Arc::new(PySourceAdapter::new(source));
         if let Some(notifier) = self.notifier.clone() {
-            adapter.invoke_on_start(notifier);
+            adapter.invoke_on_start(notifier)?;
         }
         let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter.clone();
         server.add_source(label.clone(), order, as_dyn);
@@ -755,7 +878,12 @@ impl PyServer {
     }
 
     /// Start the server in a background thread and return the store handle.
-    fn start_background(&mut self) -> PyResult<PyStore> {
+    ///
+    /// Runs every `on_start` hook synchronously before returning, so a
+    /// raising hook surfaces here as a `RuntimeError` naming the hook,
+    /// rather than only being logged from the background thread after this
+    /// call has already returned successfully.
+    fn start_background(&mut self, py: Python<'_>) -> PyResult<PyStore> {
         let server = self
             .server
             .take()
@@ -766,13 +894,38 @@ impl PyServer {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("server already consumed"))?
             .clone();
 
+        block_on_py(py, server.run_start_hooks())
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+
         std::thread::spawn(move || {
-            if let Err(e) = RUNTIME.block_on(server.run()) {
+            if let Err(e) = RUNTIME.block_on(server.serve_after_start_hooks()) {
                 tracing::error!("background server error: {e}");
             }
         });
 
         Ok(PyStore { inner: store })
+    }
+
+    /// Post a named event.
+    ///
+    /// Synchronous sinks (if any) run inline. Handlers registered via
+    /// `@builder.on_event(...)` are queued on the dispatcher. When this
+    /// returns, records have processed and handlers are queued — not
+    /// necessarily run. Never assume a handler has finished by the time
+    /// `post_event` returns; use `drain_events()` in tests if you need that.
+    fn post_event(&self, name: String) -> PyResult<()> {
+        self.events.post(&name);
+        Ok(())
+    }
+
+    /// Block until every queued event handler has finished running.
+    ///
+    /// Test-only: production code should not need to know when handlers
+    /// have finished, only that `post_event` has queued them.
+    fn drain_events(&self, py: Python<'_>) -> PyResult<()> {
+        let events = self.events.clone();
+        block_on_py(py, async move { events.drain().await });
+        Ok(())
     }
 }
 
