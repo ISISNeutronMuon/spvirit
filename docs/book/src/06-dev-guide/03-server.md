@@ -10,19 +10,19 @@ All paths under `spvirit-server/src/`.
 
 | File | ~Lines | Purpose |
 |---|---|---|
-| `handler.rs` | 1867 | **The core.** TCP connection processor (`handle_connection`), UDP search responder (`run_udp_search`), TCP accept loop, `ServerState`, wildcard matching, GUID generation |
-| `simple_store.rs` | 1493 | `SimplePvStore`: in-memory `Source` backed by `RecordInstance`s — value/NT writes, subscribers, MDEL gate, link evaluation, PUT application, NTScalar descriptor builders |
-| `pv.rs` | 1471 | Typed handle layer: `Pv<T>`, `PvArray`, `AnyPv`, `PvScalar` trait, pending/bound state machine, builder methods, `attach` |
-| `pva_server.rs` | 1247 | `PvaServer` + `PvaServerBuilder` (classic API), `ServeBuilder`/`RunningServer` (handle API), shared record-construction helpers `make_scalar_record`/`make_output_record`/`make_array_record` |
+| `pva_server.rs` | 2131 | `PvaServer` + `PvaServerBuilder` (classic API), `ServeBuilder`/`RunningServer` (handle API), shared record-construction helpers `make_scalar_record`/`make_output_record`/`make_array_record` |
+| `handler.rs` | 1818 | **The core.** TCP connection processor (`handle_connection`), UDP search responder (`run_udp_search`), TCP accept loop, `ServerState`, wildcard matching, GUID generation |
+| `simple_store.rs` | 1560 | `SimplePvStore`: in-memory `Source` backed by `RecordInstance`s — value/NT writes, subscribers, MDEL gate, link evaluation, PUT application, NTScalar descriptor builders |
+| `pv.rs` | 1498 | Typed handle layer: `Pv<T>`, `PvArray`, `AnyPv`, `PvScalar` trait, pending/bound state machine, builder methods, `attach` |
 | `group.rs` | 1161 | QSRV-style group PVs: `info(Q:group)` JSON parsing → `GroupPvDef`, and `GroupSource` composing members into `NtPayload::Generic` |
 | `types.rs` | 1011 | Record model: `RecordType`, `ScanMode`, `LinkExpr`, `DbCommonState`, `RecordData`, `RecordInstance` + value-mutation methods |
+| `events.rs` | 736 | `Events`: server-wide `on_start` hooks, named `on_event` handlers, the `EventSink` trait, and the single-task dispatcher behind `post_event` |
 | `db.rs` | 717 | EPICS `.db` file parser (regex, line-oriented) |
 | `apply.rs` | 511 | Pure functions applying a decoded PUT to NT payloads (`apply_value_update`, `apply_table_put`, `apply_ndarray_put`, …) |
 | `record_fields.rs` | 467 | QSRV-style field access: serves `<pv>.<FIELD>` and `<pv>.<FIELD>$` as read-only channels; dbCommon defaults table |
 | `monitor.rs` | 311 | `MonitorRegistry`: per-PV subscriber lists, delta/full frame building, pipeline credit accounting |
 | `convert.rs` | 276 | `DecodedValue` → `ScalarValue`/`ScalarArrayValue` conversions |
 | `pvstore.rs` | 259 | The **`Source` trait** + `PvInfo` + `SourceRegistry` |
-| `events.rs` | 736 | `Events`: server-wide `on_start` hooks, named `on_event` handlers, the `EventSink` trait, and the single-task dispatcher behind `post_event` |
 | `server.rs` | 183 | Orchestration: `run_pva_server_with_registry` binds TCP/UDP/beacon and joins the tasks |
 | `decode.rs` | 128 | PUT-body decoding with fallback strategies + segmented-message reassembly |
 | `beacon.rs` | 67 | Periodic UDP beacon sender |
@@ -236,6 +236,18 @@ starts the dispatcher (idempotent) before spawning, so
 `RunningServer::post_event` does not race the spawn; `RunningServer` keeps
 its own `Arc<Events>` (`events()`, `post_event()`) because `start()` moves
 the `PvaServer` into the spawned task.
+
+**The two APIs order the dispatcher differently.** `run()` is hooks →
+sources → scan tasks → dispatcher → bind. `start()` and Python's
+`start_background()` are hooks → dispatcher → spawn(sources → scan tasks →
+bind), because the dispatcher must be running before the call returns or a
+`post_event()` on the next line would race the spawned task. The consequence
+is that on the handle API an `on_event` handler can run before
+`.source()`-registered sources exist and before any scan task is spawned.
+Handlers receive only `Arc<SimplePvStore>`, and nothing has bound on either
+path, so this is not observable by a client — but a handler must not assume
+a source is registered. What both orders share is the part that matters: no
+hook runs late, and nothing binds before every hook has returned.
 `run_start_hooks` also installs the `MonitorRegistry` onto the store before
 the first hook runs (pva_server.rs:736), so a hook that writes the store
 reaches any monitor subscribed later, and a hook that reads the registry
