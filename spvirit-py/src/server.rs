@@ -437,6 +437,7 @@ impl PyServerBuilder {
         let b = take_builder(&mut slf)?;
         // Cast to Arc<dyn Source> via Arc<PySourceAdapter>.
         let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter.clone();
+        let label_for_hook = label.clone();
         let b = b.source(label, order, as_dyn);
 
         // Register the source's on_start on the shared hook list, so it
@@ -448,9 +449,18 @@ impl PyServerBuilder {
         slf.builder = Some(b.on_start(move |_store| {
             let adapter = adapter.clone();
             let cell = cell.clone();
+            let label = label_for_hook.clone();
             Box::pin(async move {
                 if let Some(notifier) = cell.get() {
                     adapter.invoke_on_start(notifier.clone());
+                } else {
+                    // Should be unreachable: `build()` always fills the cell
+                    // before any hook can fire. If it ever happens, the
+                    // source's on_start silently never runs, so log loudly.
+                    tracing::error!(
+                        "on_start hook for source '{label}' fired before the notifier \
+                         cell was filled; on_start was NOT invoked"
+                    );
                 }
             })
         }));
@@ -565,6 +575,7 @@ impl PyServer {
             let adapter = Arc::new(PySourceAdapter::new(obj));
             python_sources.push((label.clone(), order, adapter.clone()));
             let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter.clone();
+            let label_for_hook = label.clone();
             sb = sb.source(label, order, as_dyn);
 
             // Same deferred hook as PyServerBuilder::add_source: fires at
@@ -573,9 +584,17 @@ impl PyServer {
             sb = sb.on_start(move |_store| {
                 let adapter = adapter.clone();
                 let cell = cell.clone();
+                let label = label_for_hook.clone();
                 Box::pin(async move {
                     if let Some(notifier) = cell.get() {
                         adapter.invoke_on_start(notifier.clone());
+                    } else {
+                        // Should be unreachable: filled right after
+                        // `sb.build()` below, before any hook can fire.
+                        tracing::error!(
+                            "on_start hook for source '{label}' fired before the notifier \
+                             cell was filled; on_start was NOT invoked"
+                        );
                     }
                 })
             });
@@ -687,23 +706,37 @@ impl PyServer {
     }
 
     /// Register an additional Python source after build.  The source's
-    /// `on_start(notifier)` (if defined) is invoked immediately: there is no
-    /// startup left to join once the server has been built (or is already
-    /// running), so this is the one path where the hook fires synchronously
+    /// `on_start(notifier)` (if defined) is invoked immediately, synchronously,
     /// rather than through the shared startup list.
+    ///
+    /// Only valid in the window between `build()` and `run()`/
+    /// `start_background()`: `PvaServer::run()` builds its `SourceRegistry`
+    /// internally and never hands it back, so once the server is running
+    /// there is no live registry left for a late source to join. Calling
+    /// this after the server has started raises `RuntimeError` — silently
+    /// accepting the source and firing its `on_start` while leaving its PVs
+    /// permanently unroutable would be a worse failure mode than an error.
+    ///
+    /// Note: a source added in this pre-`run()` window has its `on_start`
+    /// fired **immediately**, synchronously, here — not queued onto the
+    /// shared `on_start` hook list. That means it can run *before* hooks
+    /// registered earlier via `@builder.on_start`/`ServeBuilder::on_start`,
+    /// which violates "registration order, one list" for this narrow
+    /// window. This is architecturally forced: `PvaServer::start_hooks` is
+    /// private with no API to push onto it after `build()`. Prefer
+    /// `ServerBuilder.add_source(...)` (before `build()`) when hook
+    /// ordering relative to other `on_start` hooks matters.
     fn add_source(&mut self, label: String, order: i32, source: PyObject) -> PyResult<()> {
+        let server = self
+            .server
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("server already consumed"))?;
         let adapter = Arc::new(PySourceAdapter::new(source));
         if let Some(notifier) = self.notifier.clone() {
             adapter.invoke_on_start(notifier);
         }
         let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter.clone();
-        // If the server has already started (`run`/`start_background` took
-        // it), there is no live registry left to join — the source's PVs
-        // simply won't be routable. Still fire on_start above; that part
-        // has no prerequisite on the server field.
-        if let Some(server) = self.server.as_mut() {
-            server.add_source(label.clone(), order, as_dyn);
-        }
+        server.add_source(label.clone(), order, as_dyn);
         self.post_build_sources.push((label, order, adapter));
         Ok(())
     }

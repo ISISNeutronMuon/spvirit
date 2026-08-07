@@ -53,6 +53,7 @@ def test_source_on_start_does_not_fire_at_build():
         spvirit.ServerBuilder()
         .ai("LCE:A", 1.0)
         .port(0)
+        .udp_port(0)
         .add_source("rec", -5, src)
         .build()
     )
@@ -66,6 +67,7 @@ def test_source_on_start_fires_at_server_start():
         spvirit.ServerBuilder()
         .ai("LCE:B", 1.0)
         .port(0)
+        .udp_port(0)
         .add_source("rec", -5, src)
         .build()
     )
@@ -74,12 +76,23 @@ def test_source_on_start_fires_at_server_start():
     assert log == ["source-on-start"], f"on_start must fire at start, got {log}"
 
 
-def test_add_source_after_start_still_fires_immediately():
+def test_add_source_after_start_is_rejected():
     log = []
-    server = spvirit.ServerBuilder().ai("LCE:C", 1.0).port(0).build()
+    server = (
+        spvirit.ServerBuilder()
+        .ai("LCE:C", 1.0)
+        .port(0)
+        .udp_port(0)
+        .build()
+    )
     server.start_background()
-    server.add_source("late", -5, RecordingSource(log))
-    assert log == ["source-on-start"], f"late source must fire now, got {log}"
+    try:
+        server.add_source("late", -5, RecordingSource(log))
+    except RuntimeError as e:
+        assert "already consumed" in str(e), f"wrong error: {e}"
+    else:
+        raise AssertionError("add_source after start must raise")
+    assert log == [], f"a rejected source must not fire on_start, got {log}"
 
 
 if __name__ == "__main__":
