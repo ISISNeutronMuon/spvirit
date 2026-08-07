@@ -30,6 +30,9 @@ pub struct PyServerBuilder {
     builder: Option<spvirit_server::PvaServerBuilder>,
     /// Python sources to wire up on build (label, order, adapter).
     python_sources: Vec<(String, i32, Arc<PySourceAdapter>)>,
+    /// Filled during `build()`; read by deferred source `on_start` hooks when
+    /// they fire at server start.
+    notifier_cell: Arc<std::sync::OnceLock<PyNotifier>>,
 }
 
 /// Take the inner builder, raising `RuntimeError` if `build()` already ran.
@@ -50,6 +53,7 @@ impl PyServerBuilder {
         Self {
             builder: Some(PvaServer::builder()),
             python_sources: Vec::new(),
+            notifier_cell: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -432,8 +436,24 @@ impl PyServerBuilder {
             .push((label.clone(), order, adapter.clone()));
         let b = take_builder(&mut slf)?;
         // Cast to Arc<dyn Source> via Arc<PySourceAdapter>.
-        let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter;
-        slf.builder = Some(b.source(label, order, as_dyn));
+        let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter.clone();
+        let b = b.source(label, order, as_dyn);
+
+        // Register the source's on_start on the shared hook list, so it
+        // interleaves with builder-registered on_start hooks in true
+        // registration order (the spec's "one list" rule). The notifier
+        // does not exist yet at add_source time; the hook reads it lazily
+        // from the cell that `build()` fills.
+        let cell = slf.notifier_cell.clone();
+        slf.builder = Some(b.on_start(move |_store| {
+            let adapter = adapter.clone();
+            let cell = cell.clone();
+            Box::pin(async move {
+                if let Some(notifier) = cell.get() {
+                    adapter.invoke_on_start(notifier.clone());
+                }
+            })
+        }));
         Ok(slf)
     }
 
@@ -450,10 +470,10 @@ impl PyServerBuilder {
         let registry = server.monitor_registry();
         let notifier = PyNotifier::new(registry);
         let sources = std::mem::take(&mut self.python_sources);
-        // Invoke `on_start(notifier)` on every Python source that defines it.
-        for (_, _, adapter) in &sources {
-            adapter.invoke_on_start(notifier.clone());
-        }
+        // Hand the notifier to the deferred source on_start hooks registered
+        // in add_source. They fire at server start (via run_start_hooks),
+        // not here.
+        let _ = self.notifier_cell.set(notifier.clone());
         Ok(PyServer {
             server: Some(server),
             store: Some(store),
@@ -538,20 +558,33 @@ impl PyServer {
         if let Some(secs) = beacon_period {
             sb = sb.beacon_period(secs.round().max(1.0) as u64);
         }
+        let notifier_cell: Arc<std::sync::OnceLock<PyNotifier>> =
+            Arc::new(std::sync::OnceLock::new());
         let mut python_sources: Vec<(String, i32, Arc<PySourceAdapter>)> = Vec::new();
         for (label, order, obj) in sources.unwrap_or_default() {
             let adapter = Arc::new(PySourceAdapter::new(obj));
             python_sources.push((label.clone(), order, adapter.clone()));
-            let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter;
+            let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter.clone();
             sb = sb.source(label, order, as_dyn);
+
+            // Same deferred hook as PyServerBuilder::add_source: fires at
+            // server start, not here, and interleaves on the shared list.
+            let cell = notifier_cell.clone();
+            sb = sb.on_start(move |_store| {
+                let adapter = adapter.clone();
+                let cell = cell.clone();
+                Box::pin(async move {
+                    if let Some(notifier) = cell.get() {
+                        adapter.invoke_on_start(notifier.clone());
+                    }
+                })
+            });
         }
         let mut server = py.allow_threads(|| RUNTIME.block_on(sb.build()));
         let store = server.store().clone();
         let registry = server.monitor_registry();
         let notifier = PyNotifier::new(registry);
-        for (_, _, adapter) in &python_sources {
-            adapter.invoke_on_start(notifier.clone());
-        }
+        let _ = notifier_cell.set(notifier.clone());
         Ok(PyServer {
             server: Some(server),
             store: Some(store),
@@ -654,18 +687,23 @@ impl PyServer {
     }
 
     /// Register an additional Python source after build.  The source's
-    /// `on_start(notifier)` (if defined) is invoked immediately.
+    /// `on_start(notifier)` (if defined) is invoked immediately: there is no
+    /// startup left to join once the server has been built (or is already
+    /// running), so this is the one path where the hook fires synchronously
+    /// rather than through the shared startup list.
     fn add_source(&mut self, label: String, order: i32, source: PyObject) -> PyResult<()> {
-        let server = self
-            .server
-            .as_mut()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("server already consumed"))?;
         let adapter = Arc::new(PySourceAdapter::new(source));
         if let Some(notifier) = self.notifier.clone() {
             adapter.invoke_on_start(notifier);
         }
         let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter.clone();
-        server.add_source(label.clone(), order, as_dyn);
+        // If the server has already started (`run`/`start_background` took
+        // it), there is no live registry left to join — the source's PVs
+        // simply won't be routable. Still fire on_start above; that part
+        // has no prerequisite on the server field.
+        if let Some(server) = self.server.as_mut() {
+            server.add_source(label.clone(), order, as_dyn);
+        }
         self.post_build_sources.push((label, order, adapter));
         Ok(())
     }
