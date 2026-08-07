@@ -716,7 +716,7 @@ impl PvaGetFieldPayload {
             };
             let introspection = if !pvd_raw.is_empty() {
                 let decoder = PvdDecoder::new(is_be);
-                decoder.parse_introspection(&pvd_raw)
+                decoder.parse_introspection(&pvd_raw).ok()
             } else {
                 None
             };
@@ -1443,7 +1443,7 @@ impl PvaOpPayload {
         // Try to parse introspection from INIT response (subcmd & 0x08 and is_server)
         let introspection = if is_server && (subcmd & 0x08) != 0 && !pvd_raw.is_empty() {
             let decoder = PvdDecoder::new(is_be);
-            decoder.parse_introspection(&pvd_raw)
+            decoder.parse_introspection(&pvd_raw).ok()
         } else {
             None
         };
@@ -1481,15 +1481,19 @@ impl PvaOpPayload {
                     decoder.decode_structure_with_bitset_then_overrun(&self.body, field_desc);
                 let cand_legacy = decoder.decode_structure_with_bitset(&self.body, field_desc);
                 self.decoded_value =
-                    choose_best_decoded_multi([cand_overrun_pre, cand_overrun_post, cand_legacy]);
-            } else if let Some((value, _)) =
+                    choose_best_decoded_multi([
+                        cand_overrun_pre.ok(),
+                        cand_overrun_post.ok(),
+                        cand_legacy.ok(),
+                    ]);
+            } else if let Ok((value, _)) =
                 decoder.decode_structure_with_bitset(&self.body, field_desc)
             {
                 self.decoded_value = Some(value);
             }
         } else {
             // Full structure decode
-            if let Some((value, _)) = decoder.decode_structure(&self.body, field_desc) {
+            if let Ok((value, _)) = decoder.decode_structure(&self.body, field_desc) {
                 self.decoded_value = Some(value);
             }
         }

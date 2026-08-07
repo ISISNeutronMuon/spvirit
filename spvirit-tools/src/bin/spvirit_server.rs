@@ -3007,13 +3007,13 @@ fn decode_put_body(
     is_be: bool,
 ) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
-    if let Some((value, _)) = decoder.decode_structure_with_bitset(body, desc) {
+    if let Ok((value, _)) = decoder.decode_structure_with_bitset(body, desc) {
         if !decoded_is_empty(&value) {
             return Some(value);
         }
     }
     if !body.is_empty() && body[0] == 0xFF {
-        if let Some((value, _)) = decoder.decode_structure_with_bitset(&body[1..], desc) {
+        if let Ok((value, _)) = decoder.decode_structure_with_bitset(&body[1..], desc) {
             if !decoded_is_empty(&value) {
                 return Some(value);
             }
@@ -3038,7 +3038,7 @@ fn decode_put_body_shifted_bitset(
     is_be: bool,
 ) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
-    let (size, consumed) = decoder.decode_size(body)?;
+    let (size, consumed) = decoder.decode_size(body).ok()?;
     if size == 0 || body.len() < consumed + size {
         return None;
     }
@@ -3051,6 +3051,7 @@ fn decode_put_body_shifted_bitset(
     shifted_body.extend_from_slice(data);
     decoder
         .decode_structure_with_bitset(&shifted_body, desc)
+        .ok()
         .map(|(value, _)| value)
         .filter(|value| !decoded_is_empty(value))
 }
@@ -3061,7 +3062,7 @@ fn decode_put_body_value_only(
     is_be: bool,
 ) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
-    if let Some((size, consumed)) = decoder.decode_size(body) {
+    if let Ok((size, consumed)) = decoder.decode_size(body) {
         if consumed + size <= body.len() {
             let data = &body[consumed + size..];
             if let Some(value) = decode_value_only_from_data(data, desc, &decoder) {
@@ -3080,6 +3081,7 @@ fn decode_value_only_from_data(
     let value_field = desc.fields.iter().find(|f| f.name == "value")?;
     decoder
         .decode_value(data, &value_field.field_type)
+        .ok()
         .map(|(value, _)| DecodedValue::Structure(vec![("value".to_string(), value)]))
 }
 

@@ -1647,9 +1647,11 @@ pub async fn handle_connection(
                                 let args = if !payload.body.is_empty() {
                                     decoder
                                         .parse_introspection_with_len(&payload.body)
+                                        .ok()
                                         .and_then(|(desc, consumed)| {
                                             decoder
                                                 .decode_structure(&payload.body[consumed..], &desc)
+                                                .ok()
                                                 .map(|(val, _)| val)
                                         })
                                 } else {

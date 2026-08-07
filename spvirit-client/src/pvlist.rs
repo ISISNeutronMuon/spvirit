@@ -368,14 +368,14 @@ async fn list_pvs_via_server_rpc_channel(
     let decoder = PvdDecoder::new(is_be);
     let (desc, consumed) = decoder
         .parse_introspection_with_len(&op.body)
-        .ok_or_else(|| PvGetError::Decode("RPC missing introspection".to_string()))?;
+        .map_err(|_| PvGetError::Decode("RPC missing introspection".to_string()))?;
     let value_raw = op
         .body
         .get(consumed..)
         .ok_or_else(|| PvGetError::Decode("RPC malformed payload".to_string()))?;
     let (decoded, _) = decoder
         .decode_structure(value_raw, &desc)
-        .ok_or_else(|| PvGetError::Decode("RPC decode failed".to_string()))?;
+        .map_err(|_| PvGetError::Decode("RPC decode failed".to_string()))?;
 
     let mut strings = Vec::new();
     collect_strings_from_decoded(&decoded, &mut strings);

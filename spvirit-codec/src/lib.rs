@@ -35,7 +35,9 @@ pub use spvirit_encode::{
 pub use spvirit_state::{ConnectionKey, PvaStateConfig, PvaStateStats, PvaStateTracker};
 
 // --- Re-exports: pvData structure decode ---
-pub use spvd_decode::{DecodedValue, FieldDesc, FieldType, PvdDecoder, StructureDesc, TypeCode};
+pub use spvd_decode::{
+    DecodeLimits, DecodedValue, FieldDesc, FieldType, PvdDecoder, StructureDesc, TypeCode,
+};
 
 // --- Re-exports: pvData structure encode ---
 pub use spvd_encode::{encode_decoded_value, encode_pv_request, encode_structure_desc};

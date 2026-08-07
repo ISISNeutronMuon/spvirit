@@ -582,7 +582,7 @@ impl PvaClient {
                         if op.command == 13 && op.ioid == ioid && op.subcmd == 0x00 {
                             let payload = &bytes[8..]; // skip header
                             let pos = 5; // skip ioid(4) + subcmd(1)
-                            if let Some((decoded, _)) =
+                            if let Ok((decoded, _)) =
                                 decoder.decode_structure_with_bitset(&payload[pos..], &field_desc)
                             {
                                 let flow = callback(&decoded);

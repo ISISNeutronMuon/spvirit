@@ -284,7 +284,7 @@ async fn run_monitor(
                     if op.command == 13 && op.ioid == ioid && op.subcmd == 0x00 {
                         let payload = &bytes[8..];
                         let pos = 5;
-                        if let Some((decoded, _)) =
+                        if let Ok((decoded, _)) =
                             decoder.decode_structure_with_bitset(&payload[pos..], &field_desc)
                         {
                             let keep_going = Python::with_gil(|py| {

@@ -6,9 +6,37 @@
 use std::fmt;
 use tracing::debug;
 
+use crate::error::{DecodeError, DecodeResult};
+
 /// Re-export the free-standing `decode_string` from `epics_decode` for
 /// discoverability alongside the other decode helpers in this module.
 pub use crate::epics_decode::decode_string;
+
+/// Ceilings on decoded array lengths, per array kind.
+///
+/// These are a backstop against corrupt or hostile element counts. Exceeding
+/// one is [`DecodeError::ArrayTooLarge`] — the decoder never returns a
+/// silently shortened array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    pub max_scalar_array: usize,
+    pub max_string_array: usize,
+    pub max_struct_array: usize,
+    pub max_union_array: usize,
+    pub max_variant_array: usize,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_scalar_array: 4_000_000,
+            max_string_array: 65_536,
+            max_struct_array: 65_536,
+            max_union_array: 65_536,
+            max_variant_array: 65_536,
+        }
+    }
+}
 
 /// PVD type codes from the specification
 #[repr(u8)]
@@ -293,6 +321,7 @@ impl fmt::Display for DecodedValue {
 /// PVD Decoder state
 pub struct PvdDecoder {
     is_be: bool,
+    limits: DecodeLimits,
     /// IntrospectionRegistry: maps int16 keys to previously seen FieldTypes.
     /// Populated when parsing `0xFD` (full-with-id) entries, looked up on `0xFE` (only-id).
     registry: std::cell::RefCell<std::collections::HashMap<u16, FieldType>>,
@@ -300,58 +329,82 @@ pub struct PvdDecoder {
 
 impl PvdDecoder {
     pub fn new(is_be: bool) -> Self {
+        Self::with_limits(is_be, DecodeLimits::default())
+    }
+
+    /// Build a decoder with non-default array-length ceilings.
+    pub fn with_limits(is_be: bool, limits: DecodeLimits) -> Self {
         Self {
             is_be,
+            limits,
             registry: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
+    /// The array-length ceilings this decoder was built with.
+    pub fn limits(&self) -> &DecodeLimits {
+        &self.limits
+    }
+
     /// Decode a size value (PVA variable-length encoding)
-    pub fn decode_size(&self, data: &[u8]) -> Option<(usize, usize)> {
+    pub fn decode_size(&self, data: &[u8]) -> DecodeResult<(usize, usize)> {
         if data.is_empty() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: 1,
+                available: 0,
+            });
         }
         let first = data[0];
         if first == 0xFF {
             // Special: -1 (null)
-            return Some((0, 1)); // Treat as 0 for simplicity
+            return Ok((0, 1)); // Treat as 0 for simplicity
         }
         if first < 254 {
-            return Some((first as usize, 1));
+            return Ok((first as usize, 1));
         }
         if first == 254 {
             // 4-byte size follows
             if data.len() < 5 {
-                return None;
+                return Err(DecodeError::Truncated {
+                    needed: 5,
+                    available: data.len(),
+                });
             }
             let size = if self.is_be {
                 u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize
             } else {
                 u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize
             };
-            return Some((size, 5));
+            return Ok((size, 5));
         }
         // first == 255 is null marker, handled above.
-        None
+        Err(DecodeError::Malformed("invalid size prefix 255"))
     }
 
     /// Decode a string
-    pub fn decode_string(&self, data: &[u8]) -> Option<(String, usize)> {
+    pub fn decode_string(&self, data: &[u8]) -> DecodeResult<(String, usize)> {
         let (size, size_bytes) = self.decode_size(data)?;
         if size == 0 {
-            return Some((String::new(), size_bytes));
+            return Ok((String::new(), size_bytes));
         }
         if data.len() < size_bytes + size {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: size_bytes + size,
+                available: data.len(),
+            });
         }
-        let s = std::str::from_utf8(&data[size_bytes..size_bytes + size]).ok()?;
-        Some((s.to_string(), size_bytes + size))
+        let s = std::str::from_utf8(&data[size_bytes..size_bytes + size])
+            .map_err(|_| DecodeError::Malformed("string is not valid UTF-8"))?;
+        Ok((s.to_string(), size_bytes + size))
     }
 
     /// Parse field description from introspection data
-    pub fn parse_field_desc(&self, data: &[u8]) -> Option<(FieldDesc, usize)> {
+    pub fn parse_field_desc(&self, data: &[u8]) -> DecodeResult<(FieldDesc, usize)> {
         if data.is_empty() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: 1,
+                available: 0,
+            });
         }
 
         let mut offset = 0;
@@ -361,20 +414,26 @@ impl PvdDecoder {
         offset += consumed;
 
         if offset >= data.len() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: offset + 1,
+                available: data.len(),
+            });
         }
 
         // Parse type descriptor
         let (field_type, type_consumed) = self.parse_type_desc(&data[offset..])?;
         offset += type_consumed;
 
-        Some((FieldDesc { name, field_type }, offset))
+        Ok((FieldDesc { name, field_type }, offset))
     }
 
     /// Parse type descriptor
-    fn parse_type_desc(&self, data: &[u8]) -> Option<(FieldType, usize)> {
+    fn parse_type_desc(&self, data: &[u8]) -> DecodeResult<(FieldType, usize)> {
         if data.is_empty() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: 1,
+                available: 0,
+            });
         }
 
         let type_byte = data[0];
@@ -382,32 +441,36 @@ impl PvdDecoder {
 
         // Check for NULL type
         if type_byte == 0xFF {
-            return Some((FieldType::Variant, 1));
+            return Ok((FieldType::Variant, 1));
         }
 
         // Full-with-id from IntrospectionRegistry:
         // 0xFD + int16 key + type descriptor payload.
         if type_byte == 0xFD {
             if data.len() < 3 {
-                return None;
+                return Err(DecodeError::Truncated {
+                    needed: 3,
+                    available: data.len(),
+                });
             }
             let key = if self.is_be {
                 u16::from_be_bytes([data[1], data[2]])
             } else {
                 u16::from_le_bytes([data[1], data[2]])
             };
-            if let Some((field_type, consumed)) = self.parse_type_desc(&data[3..]) {
-                self.registry.borrow_mut().insert(key, field_type.clone());
-                return Some((field_type, 3 + consumed));
-            }
-            return None;
+            let (field_type, consumed) = self.parse_type_desc(&data[3..])?;
+            self.registry.borrow_mut().insert(key, field_type.clone());
+            return Ok((field_type, 3 + consumed));
         }
 
         // Only-id from IntrospectionRegistry:
         // 0xFE + int16 key — reference to a previously seen type.
         if type_byte == 0xFE {
             if data.len() < 3 {
-                return None;
+                return Err(DecodeError::Truncated {
+                    needed: 3,
+                    available: data.len(),
+                });
             }
             let key = if self.is_be {
                 u16::from_be_bytes([data[1], data[2]])
@@ -415,13 +478,13 @@ impl PvdDecoder {
                 u16::from_le_bytes([data[1], data[2]])
             };
             if let Some(ft) = self.registry.borrow().get(&key) {
-                return Some((ft.clone(), 3));
+                return Ok((ft.clone(), 3));
             }
             debug!(
                 "Type descriptor ONLY_ID (0xFE) key={} not found in registry",
                 key
             );
-            return None;
+            return Err(DecodeError::UnresolvedTypeId(key));
         }
 
         // Check for structure (0x80) or structure array (0x88)
@@ -429,17 +492,23 @@ impl PvdDecoder {
             let is_array = (type_byte & 0x08) != 0;
             if is_array {
                 // Skip the inner structure element tag (0x80)
-                if offset >= data.len() || data[offset] != 0x80 {
-                    return None;
+                if offset >= data.len() {
+                    return Err(DecodeError::Truncated {
+                        needed: offset + 1,
+                        available: data.len(),
+                    });
+                }
+                if data[offset] != 0x80 {
+                    return Err(DecodeError::UnknownTypeTag(data[offset]));
                 }
                 offset += 1;
             }
             let (struct_desc, consumed) = self.parse_structure_desc(&data[offset..])?;
             offset += consumed;
             if is_array {
-                return Some((FieldType::StructureArray(struct_desc), offset));
+                return Ok((FieldType::StructureArray(struct_desc), offset));
             } else {
-                return Some((FieldType::Structure(struct_desc), offset));
+                return Ok((FieldType::Structure(struct_desc), offset));
             }
         }
 
@@ -448,8 +517,14 @@ impl PvdDecoder {
             let is_array = (type_byte & 0x08) != 0;
             if is_array {
                 // Skip the inner union element tag (0x81)
-                if offset >= data.len() || data[offset] != 0x81 {
-                    return None;
+                if offset >= data.len() {
+                    return Err(DecodeError::Truncated {
+                        needed: offset + 1,
+                        available: data.len(),
+                    });
+                }
+                if data[offset] != 0x81 {
+                    return Err(DecodeError::UnknownTypeTag(data[offset]));
                 }
                 offset += 1;
             }
@@ -457,25 +532,25 @@ impl PvdDecoder {
             let (struct_desc, consumed) = self.parse_structure_desc(&data[offset..])?;
             offset += consumed;
             if is_array {
-                return Some((FieldType::UnionArray(struct_desc.fields), offset));
+                return Ok((FieldType::UnionArray(struct_desc.fields), offset));
             } else {
-                return Some((FieldType::Union(struct_desc.fields), offset));
+                return Ok((FieldType::Union(struct_desc.fields), offset));
             }
         }
 
         // Check for variant/any (0x82) or variant array (0x8A)
         if type_byte == 0x82 {
-            return Some((FieldType::Variant, 1));
+            return Ok((FieldType::Variant, 1));
         }
         if type_byte == 0x8A {
-            return Some((FieldType::VariantArray, 1));
+            return Ok((FieldType::VariantArray, 1));
         }
 
         // Check for bounded string (0x83, legacy 0x86 accepted for compatibility)
         if type_byte == 0x83 || type_byte == 0x86 {
             let (bound, consumed) = self.decode_size(&data[offset..])?;
             offset += consumed;
-            return Some((FieldType::BoundedString(bound as u32), offset));
+            return Ok((FieldType::BoundedString(bound as u32), offset));
         }
 
         // Scalar / scalar-array with mode bits:
@@ -492,27 +567,27 @@ impl PvdDecoder {
         // String type
         if base_type == 0x60 {
             if is_array {
-                return Some((FieldType::StringArray, offset));
+                return Ok((FieldType::StringArray, offset));
             } else {
-                return Some((FieldType::String, offset));
+                return Ok((FieldType::String, offset));
             }
         }
 
         // Numeric types
         if let Some(tc) = TypeCode::from_byte(base_type) {
             if is_array {
-                return Some((FieldType::ScalarArray(tc), offset));
+                return Ok((FieldType::ScalarArray(tc), offset));
             } else {
-                return Some((FieldType::Scalar(tc), offset));
+                return Ok((FieldType::Scalar(tc), offset));
             }
         }
 
         debug!("Unknown type byte: 0x{:02x}", type_byte);
-        None
+        Err(DecodeError::UnknownTypeTag(type_byte))
     }
 
     /// Parse structure description
-    fn parse_structure_desc(&self, data: &[u8]) -> Option<(StructureDesc, usize)> {
+    fn parse_structure_desc(&self, data: &[u8]) -> DecodeResult<(StructureDesc, usize)> {
         let mut offset = 0;
 
         // Parse optional struct ID
@@ -535,7 +610,7 @@ impl PvdDecoder {
             if offset >= data.len() {
                 break;
             }
-            if let Some((field, consumed)) = self.parse_field_desc(&data[offset..]) {
+            if let Ok((field, consumed)) = self.parse_field_desc(&data[offset..]) {
                 offset += consumed;
                 fields.push(field);
             } else {
@@ -543,19 +618,22 @@ impl PvdDecoder {
             }
         }
 
-        Some((StructureDesc { struct_id, fields }, offset))
+        Ok((StructureDesc { struct_id, fields }, offset))
     }
 
     /// Parse the full type introspection from INIT response
-    pub fn parse_introspection(&self, data: &[u8]) -> Option<StructureDesc> {
+    pub fn parse_introspection(&self, data: &[u8]) -> DecodeResult<StructureDesc> {
         self.parse_introspection_with_len(data)
             .map(|(desc, _)| desc)
     }
 
     /// Parse full type introspection and return consumed bytes.
-    pub fn parse_introspection_with_len(&self, data: &[u8]) -> Option<(StructureDesc, usize)> {
+    pub fn parse_introspection_with_len(&self, data: &[u8]) -> DecodeResult<(StructureDesc, usize)> {
         if data.is_empty() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: 1,
+                available: 0,
+            });
         }
 
         // The introspection starts with a type byte
@@ -564,41 +642,39 @@ impl PvdDecoder {
         // Should be a structure (0x80)
         if type_byte == 0x80 {
             let (desc, consumed) = self.parse_structure_desc(&data[1..])?;
-            return Some((desc, 1 + consumed));
+            return Ok((desc, 1 + consumed));
         }
 
         // Full-with-id from IntrospectionRegistry:
         // 0xFD + int16 key + field type descriptor payload.
         if type_byte == 0xFD {
             if data.len() < 3 {
-                return None;
+                return Err(DecodeError::Truncated {
+                    needed: 3,
+                    available: data.len(),
+                });
             }
             let key = if self.is_be {
                 u16::from_be_bytes([data[1], data[2]])
             } else {
                 u16::from_le_bytes([data[1], data[2]])
             };
-            if let Some((desc, consumed)) = self.parse_introspection_with_len(&data[3..]) {
-                // Register this structure type for later 0xFE references
-                if !desc.fields.is_empty() {
-                    self.registry
-                        .borrow_mut()
-                        .insert(key, FieldType::Structure(desc.clone()));
-                } else {
-                    self.registry
-                        .borrow_mut()
-                        .insert(key, FieldType::Structure(desc.clone()));
-                }
-                return Some((desc, 3 + consumed));
-            }
-            return None;
+            let (desc, consumed) = self.parse_introspection_with_len(&data[3..])?;
+            // Register this structure type for later 0xFE references
+            self.registry
+                .borrow_mut()
+                .insert(key, FieldType::Structure(desc.clone()));
+            return Ok((desc, 3 + consumed));
         }
 
         // Only-id from IntrospectionRegistry:
         // 0xFE + int16 key — reference to a previously seen type.
         if type_byte == 0xFE {
             if data.len() < 3 {
-                return None;
+                return Err(DecodeError::Truncated {
+                    needed: 3,
+                    available: data.len(),
+                });
             }
             let key = if self.is_be {
                 u16::from_be_bytes([data[1], data[2]])
@@ -607,25 +683,30 @@ impl PvdDecoder {
             };
             if let Some(ft) = self.registry.borrow().get(&key) {
                 if let FieldType::Structure(desc) = ft {
-                    return Some((desc.clone(), 3));
+                    return Ok((desc.clone(), 3));
                 }
             }
             debug!(
                 "Introspection ONLY_ID (0xFE) key={} not found in registry",
                 key
             );
-            return None;
+            return Err(DecodeError::UnresolvedTypeId(key));
         }
 
         debug!("Unexpected introspection type byte: 0x{:02x}", type_byte);
-        None
+        Err(DecodeError::UnknownTypeTag(type_byte))
     }
 
     /// Decode a scalar value
-    fn decode_scalar(&self, data: &[u8], tc: TypeCode) -> Option<(DecodedValue, usize)> {
-        let size = tc.size()?;
+    fn decode_scalar(&self, data: &[u8], tc: TypeCode) -> DecodeResult<(DecodedValue, usize)> {
+        let size = tc
+            .size()
+            .ok_or(DecodeError::Malformed("type code has no fixed scalar size"))?;
         if data.len() < size {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: size,
+                available: data.len(),
+            });
         }
 
         let value = match tc {
@@ -696,10 +777,14 @@ impl PvdDecoder {
                 };
                 DecodedValue::Float64(v)
             }
-            _ => return None,
+            _ => {
+                return Err(DecodeError::Malformed(
+                    "type code is not a decodable scalar",
+                ))
+            }
         };
 
-        Some((value, size))
+        Ok((value, size))
     }
 
     /// Decode value according to field type
@@ -707,12 +792,12 @@ impl PvdDecoder {
         &self,
         data: &[u8],
         field_type: &FieldType,
-    ) -> Option<(DecodedValue, usize)> {
+    ) -> DecodeResult<(DecodedValue, usize)> {
         match field_type {
             FieldType::Scalar(tc) => self.decode_scalar(data, *tc),
             FieldType::String | FieldType::BoundedString(_) => {
                 let (s, consumed) = self.decode_string(data)?;
-                Some((DecodedValue::String(s), consumed))
+                Ok((DecodedValue::String(s), consumed))
             }
             FieldType::ScalarArray(tc) => {
                 let (count, size_consumed) = self.decode_size(data)?;
@@ -721,7 +806,7 @@ impl PvdDecoder {
                 let mut values = Vec::with_capacity(limit);
                 let elem_size = tc.size().unwrap_or(1);
                 for _ in 0..limit {
-                    if let Some((val, consumed)) = self.decode_scalar(&data[offset..], *tc) {
+                    if let Ok((val, consumed)) = self.decode_scalar(&data[offset..], *tc) {
                         values.push(val);
                         offset += consumed;
                     } else {
@@ -732,7 +817,7 @@ impl PvdDecoder {
                 // stream stays aligned for the next field.
                 let remaining = count.saturating_sub(limit);
                 offset += remaining * elem_size;
-                Some((DecodedValue::Array(values), offset))
+                Ok((DecodedValue::Array(values), offset))
             }
             FieldType::StringArray => {
                 let (count, size_consumed) = self.decode_size(data)?;
@@ -740,14 +825,14 @@ impl PvdDecoder {
                 let max_items = count.min(4096);
                 let mut values = Vec::with_capacity(max_items);
                 for _ in 0..max_items {
-                    if let Some((s, consumed)) = self.decode_string(&data[offset..]) {
+                    if let Ok((s, consumed)) = self.decode_string(&data[offset..]) {
                         values.push(DecodedValue::String(s));
                         offset += consumed;
                     } else {
                         break;
                     }
                 }
-                Some((DecodedValue::Array(values), offset))
+                Ok((DecodedValue::Array(values), offset))
             }
             FieldType::Structure(desc) => self.decode_structure(data, desc),
             FieldType::StructureArray(desc) => {
@@ -757,7 +842,10 @@ impl PvdDecoder {
                 for _ in 0..count.min(256) {
                     // Read per-element null indicator (0 = null, non-zero = present)
                     if offset >= data.len() {
-                        return None;
+                        return Err(DecodeError::Truncated {
+                            needed: offset + 1,
+                            available: data.len(),
+                        });
                     }
                     let null_indicator = data[offset];
                     offset += 1;
@@ -770,14 +858,17 @@ impl PvdDecoder {
                     values.push(item);
                     offset += consumed;
                 }
-                Some((DecodedValue::Array(values), offset))
+                Ok((DecodedValue::Array(values), offset))
             }
             FieldType::Union(fields) => {
                 let (selector, consumed) = self.decode_size(data)?;
-                let field = fields.get(selector)?;
+                let field = fields.get(selector).ok_or(DecodeError::UnknownUnionSelector {
+                    selector,
+                    len: fields.len(),
+                })?;
                 let (value, val_consumed) =
                     self.decode_value(&data[consumed..], &field.field_type)?;
-                Some((
+                Ok((
                     DecodedValue::Structure(vec![(field.name.clone(), value)]),
                     consumed + val_consumed,
                 ))
@@ -789,25 +880,34 @@ impl PvdDecoder {
                 for _ in 0..count.min(128) {
                     let (selector, consumed) = self.decode_size(&data[offset..])?;
                     offset += consumed;
-                    let field = fields.get(selector)?;
+                    let field =
+                        fields
+                            .get(selector)
+                            .ok_or(DecodeError::UnknownUnionSelector {
+                                selector,
+                                len: fields.len(),
+                            })?;
                     let (value, val_consumed) =
                         self.decode_value(&data[offset..], &field.field_type)?;
                     offset += val_consumed;
                     values.push(DecodedValue::Structure(vec![(field.name.clone(), value)]));
                 }
-                Some((DecodedValue::Array(values), offset))
+                Ok((DecodedValue::Array(values), offset))
             }
             FieldType::Variant => {
                 if data.is_empty() {
-                    return None;
+                    return Err(DecodeError::Truncated {
+                        needed: 1,
+                        available: 0,
+                    });
                 }
                 if data[0] == 0xFF {
-                    return Some((DecodedValue::Null, 1));
+                    return Ok((DecodedValue::Null, 1));
                 }
                 let (variant_type, type_consumed) = self.parse_type_desc(data)?;
                 let (variant_value, value_consumed) =
                     self.decode_value(&data[type_consumed..], &variant_type)?;
-                Some((variant_value, type_consumed + value_consumed))
+                Ok((variant_value, type_consumed + value_consumed))
             }
             FieldType::VariantArray => {
                 let (count, size_consumed) = self.decode_size(data)?;
@@ -818,7 +918,7 @@ impl PvdDecoder {
                     values.push(v);
                     offset += consumed;
                 }
-                Some((DecodedValue::Array(values), offset))
+                Ok((DecodedValue::Array(values), offset))
             }
         }
     }
@@ -828,7 +928,7 @@ impl PvdDecoder {
         &self,
         data: &[u8],
         desc: &StructureDesc,
-    ) -> Option<(DecodedValue, usize)> {
+    ) -> DecodeResult<(DecodedValue, usize)> {
         let mut offset = 0;
         let mut fields: Vec<(String, DecodedValue)> = Vec::new();
 
@@ -836,7 +936,7 @@ impl PvdDecoder {
             if offset >= data.len() {
                 break;
             }
-            if let Some((value, consumed)) = self.decode_value(&data[offset..], &field.field_type) {
+            if let Ok((value, consumed)) = self.decode_value(&data[offset..], &field.field_type) {
                 fields.push((field.name.clone(), value));
                 offset += consumed;
             } else {
@@ -845,7 +945,7 @@ impl PvdDecoder {
             }
         }
 
-        Some((DecodedValue::Structure(fields), offset))
+        Ok((DecodedValue::Structure(fields), offset))
     }
 
     /// Decode a structure with a bitset indicating which fields are present
@@ -854,9 +954,12 @@ impl PvdDecoder {
         &self,
         data: &[u8],
         desc: &StructureDesc,
-    ) -> Option<(DecodedValue, usize)> {
+    ) -> DecodeResult<(DecodedValue, usize)> {
         if data.is_empty() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: 1,
+                available: 0,
+            });
         }
 
         let mut offset = 0;
@@ -866,7 +969,7 @@ impl PvdDecoder {
         offset += size_consumed;
 
         if bitset_size == 0 || offset + bitset_size > data.len() {
-            return Some((DecodedValue::Structure(vec![]), offset));
+            return Ok((DecodedValue::Structure(vec![]), offset));
         }
 
         let bitset = &data[offset..offset + bitset_size];
@@ -874,7 +977,7 @@ impl PvdDecoder {
 
         let (value, consumed) =
             self.decode_structure_with_bitset_body(&data[offset..], desc, bitset)?;
-        Some((value, offset + consumed))
+        Ok((value, offset + consumed))
     }
 
     /// Decode a structure with changed and overrun bitsets (MONITOR updates)
@@ -882,15 +985,21 @@ impl PvdDecoder {
         &self,
         data: &[u8],
         desc: &StructureDesc,
-    ) -> Option<(DecodedValue, usize)> {
+    ) -> DecodeResult<(DecodedValue, usize)> {
         if data.is_empty() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: 1,
+                available: 0,
+            });
         }
         let mut offset = 0usize;
         let (changed_size, consumed1) = self.decode_size(&data[offset..])?;
         offset += consumed1;
         if offset + changed_size > data.len() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: offset + changed_size,
+                available: data.len(),
+            });
         }
         let changed = &data[offset..offset + changed_size];
         offset += changed_size;
@@ -898,13 +1007,16 @@ impl PvdDecoder {
         let (overrun_size, consumed2) = self.decode_size(&data[offset..])?;
         offset += consumed2;
         if offset + overrun_size > data.len() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: offset + overrun_size,
+                available: data.len(),
+            });
         }
         offset += overrun_size;
 
         let (value, consumed) =
             self.decode_structure_with_bitset_body(&data[offset..], desc, changed)?;
-        Some((value, offset + consumed))
+        Ok((value, offset + consumed))
     }
 
     /// Decode a structure with changed bitset, data, then overrun bitset (spec order)
@@ -912,15 +1024,21 @@ impl PvdDecoder {
         &self,
         data: &[u8],
         desc: &StructureDesc,
-    ) -> Option<(DecodedValue, usize)> {
+    ) -> DecodeResult<(DecodedValue, usize)> {
         if data.is_empty() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: 1,
+                available: 0,
+            });
         }
         let mut offset = 0usize;
         let (changed_size, consumed1) = self.decode_size(&data[offset..])?;
         offset += consumed1;
         if offset + changed_size > data.len() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: offset + changed_size,
+                available: data.len(),
+            });
         }
         let changed = &data[offset..offset + changed_size];
         offset += changed_size;
@@ -932,19 +1050,22 @@ impl PvdDecoder {
         let (overrun_size, consumed2) = self.decode_size(&data[offset..])?;
         offset += consumed2;
         if offset + overrun_size > data.len() {
-            return None;
+            return Err(DecodeError::Truncated {
+                needed: offset + overrun_size,
+                available: data.len(),
+            });
         }
         offset += overrun_size;
 
-        Some((value, offset))
+        Ok((value, offset))
     }
 
-    fn decode_structure_with_bitset_body(
+    pub(crate) fn decode_structure_with_bitset_body(
         &self,
         data: &[u8],
         desc: &StructureDesc,
         bitset: &[u8],
-    ) -> Option<(DecodedValue, usize)> {
+    ) -> DecodeResult<(DecodedValue, usize)> {
         // Bit 0 is for the whole structure, field bits start at bit 1
         debug!(
             "Bitset: {:02x?} (size={}), total_fields={}",
@@ -969,8 +1090,8 @@ impl PvdDecoder {
             }
         }
         if !has_field_bits && !bitset.is_empty() && (bitset[0] & 0x01) != 0 {
-            if let Some((value, consumed)) = self.decode_structure(data, desc) {
-                return Some((value, consumed));
+            if let Ok((value, consumed)) = self.decode_structure(data, desc) {
+                return Ok((value, consumed));
             }
         }
 
@@ -1030,7 +1151,7 @@ impl PvdDecoder {
                     if field_present && !any_child_bits_set {
                         *bit_offset += child_field_count;
                         if *offset < data.len() {
-                            if let Some((value, consumed)) =
+                            if let Ok((value, consumed)) =
                                 decoder.decode_structure(&data[*offset..], nested_desc)
                             {
                                 debug!(
@@ -1077,7 +1198,7 @@ impl PvdDecoder {
                         );
                         return false;
                     }
-                    if let Some((value, consumed)) =
+                    if let Ok((value, consumed)) =
                         decoder.decode_value(&data[*offset..], &field.field_type)
                     {
                         fields.push((field.name.clone(), value));
@@ -1100,7 +1221,7 @@ impl PvdDecoder {
             &mut bit_offset,
             &mut fields,
         );
-        Some((DecodedValue::Structure(fields), offset))
+        Ok((DecodedValue::Structure(fields), offset))
     }
 }
 
@@ -1352,14 +1473,73 @@ mod tests {
         let decoder = PvdDecoder::new(false);
 
         // Small size (single byte)
-        assert_eq!(decoder.decode_size(&[5]), Some((5, 1)));
-        assert_eq!(decoder.decode_size(&[253]), Some((253, 1)));
+        assert_eq!(decoder.decode_size(&[5]), Ok((5, 1)));
+        assert_eq!(decoder.decode_size(&[253]), Ok((253, 1)));
 
         // Medium/large size (5 bytes, 254 prefix + uint32)
         assert_eq!(
             decoder.decode_size(&[254, 0x00, 0x01, 0x00, 0x00]),
-            Some((256, 5))
+            Ok((256, 5))
         );
+    }
+
+    #[test]
+    fn decode_size_reports_truncation_rather_than_none() {
+        let decoder = PvdDecoder::new(false);
+        // 254 announces a 4-byte length that is not present.
+        let err = decoder.decode_size(&[254, 0x01]).unwrap_err();
+        assert_eq!(
+            err,
+            DecodeError::Truncated {
+                needed: 5,
+                available: 2
+            }
+        );
+    }
+
+    #[test]
+    fn decode_size_on_empty_buffer_is_truncated() {
+        let decoder = PvdDecoder::new(false);
+        assert_eq!(
+            decoder.decode_size(&[]).unwrap_err(),
+            DecodeError::Truncated {
+                needed: 1,
+                available: 0
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_type_tag_is_named() {
+        let decoder = PvdDecoder::new(false);
+        // Empty field name (0x00), then 0x40 — not a valid type descriptor
+        // byte. (0x7F, as the plan suggested, is consumed as a 127-byte field
+        // name and reports Truncated before reaching the type tag.)
+        assert_eq!(
+            decoder.parse_field_desc(&[0x00, 0x40]).unwrap_err(),
+            DecodeError::UnknownTypeTag(0x40)
+        );
+    }
+
+    #[test]
+    fn limits_are_configurable_and_readable() {
+        let limits = DecodeLimits {
+            max_string_array: 7,
+            ..DecodeLimits::default()
+        };
+        let decoder = PvdDecoder::with_limits(false, limits);
+        assert_eq!(decoder.limits().max_string_array, 7);
+        assert_eq!(decoder.limits().max_scalar_array, 4_000_000);
+    }
+
+    #[test]
+    fn default_limits_match_the_documented_values() {
+        let d = DecodeLimits::default();
+        assert_eq!(d.max_scalar_array, 4_000_000);
+        assert_eq!(d.max_string_array, 65_536);
+        assert_eq!(d.max_struct_array, 65_536);
+        assert_eq!(d.max_union_array, 65_536);
+        assert_eq!(d.max_variant_array, 65_536);
     }
 
     #[test]
@@ -1390,11 +1570,11 @@ mod tests {
         let decoder = PvdDecoder::new(false);
 
         // Empty string
-        assert_eq!(decoder.decode_string(&[0]), Some((String::new(), 1)));
+        assert_eq!(decoder.decode_string(&[0]), Ok((String::new(), 1)));
 
         // "hello"
         let data = [5, b'h', b'e', b'l', b'l', b'o'];
-        assert_eq!(decoder.decode_string(&data), Some(("hello".to_string(), 6)));
+        assert_eq!(decoder.decode_string(&data), Ok(("hello".to_string(), 6)));
     }
 
     #[test]

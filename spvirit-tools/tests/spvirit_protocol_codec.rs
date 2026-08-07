@@ -138,7 +138,7 @@ fn malformed_magic_mark_header_invalid() {
 fn malformed_unknown_pvd_type_decodes_to_none() {
     let decoder = PvdDecoder::new(false);
     let field_desc = [1u8, b'v', 0x06];
-    assert!(decoder.parse_field_desc(&field_desc).is_none());
+    assert!(decoder.parse_field_desc(&field_desc).is_err());
 }
 
 #[test]
