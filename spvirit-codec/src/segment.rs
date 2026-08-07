@@ -196,6 +196,8 @@ mod tests {
             other => panic!("expected Complete, got {other:?}"),
         };
         assert_eq!(&out[8..], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(out[0], 0xCA, "magic byte preserved");
+        assert_eq!(out[1], 2, "version byte preserved");
         assert_eq!(out[2] & 0x30, 0, "segment bits must be cleared");
         assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 6);
         assert_eq!(out[3], 13, "command byte preserved");
