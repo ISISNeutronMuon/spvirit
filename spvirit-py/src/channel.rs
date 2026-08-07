@@ -20,7 +20,7 @@ use spvirit_client::client::{
 use spvirit_client::pva_client::decode_init_introspection;
 use spvirit_client::transport::{read_packet, read_until};
 use spvirit_client::types::{PvGetError, PvGetOptions};
-use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_codec::epics_decode::{DecodeMode, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::PvdDecoder;
 use spvirit_codec::spvd_encode::encode_pv_request;
 use spvirit_codec::spvirit_encode::encode_control_message;
@@ -163,7 +163,8 @@ async fn run_get(
         .ok_or_else(|| PvGetError::Protocol("get data decode failed".to_string()))?;
     match cmd {
         PvaPacketCommand::Op(mut op) => {
-            op.decode_with_field_desc(&desc, is_be);
+            // A decode failure leaves decoded_value None, reported below.
+            let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
             let value = op
                 .decoded_value
                 .ok_or_else(|| PvGetError::Decode("no decoded value".to_string()))?;

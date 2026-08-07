@@ -1032,86 +1032,6 @@ impl PvdDecoder {
         Ok((value, offset + consumed))
     }
 
-    /// Decode a structure with changed and overrun bitsets (MONITOR updates)
-    pub fn decode_structure_with_bitset_and_overrun(
-        &self,
-        data: &[u8],
-        desc: &StructureDesc,
-    ) -> DecodeResult<(DecodedValue, usize)> {
-        if data.is_empty() {
-            return Err(DecodeError::Truncated {
-                needed: 1,
-                available: 0,
-            });
-        }
-        let mut offset = 0usize;
-        let (changed_size, consumed1) = self.decode_size(&data[offset..])?;
-        offset += consumed1;
-        if offset + changed_size > data.len() {
-            return Err(DecodeError::Truncated {
-                needed: offset + changed_size,
-                available: data.len(),
-            });
-        }
-        let changed = &data[offset..offset + changed_size];
-        offset += changed_size;
-
-        let (overrun_size, consumed2) = self.decode_size(&data[offset..])?;
-        offset += consumed2;
-        if offset + overrun_size > data.len() {
-            return Err(DecodeError::Truncated {
-                needed: offset + overrun_size,
-                available: data.len(),
-            });
-        }
-        offset += overrun_size;
-
-        let (value, consumed) =
-            self.decode_structure_with_bitset_body(&data[offset..], desc, changed)?;
-        Ok((value, offset + consumed))
-    }
-
-    /// Decode a structure with changed bitset, data, then overrun bitset (spec order)
-    pub fn decode_structure_with_bitset_then_overrun(
-        &self,
-        data: &[u8],
-        desc: &StructureDesc,
-    ) -> DecodeResult<(DecodedValue, usize)> {
-        if data.is_empty() {
-            return Err(DecodeError::Truncated {
-                needed: 1,
-                available: 0,
-            });
-        }
-        let mut offset = 0usize;
-        let (changed_size, consumed1) = self.decode_size(&data[offset..])?;
-        offset += consumed1;
-        if offset + changed_size > data.len() {
-            return Err(DecodeError::Truncated {
-                needed: offset + changed_size,
-                available: data.len(),
-            });
-        }
-        let changed = &data[offset..offset + changed_size];
-        offset += changed_size;
-
-        let (value, consumed) =
-            self.decode_structure_with_bitset_body(&data[offset..], desc, changed)?;
-        offset += consumed;
-
-        let (overrun_size, consumed2) = self.decode_size(&data[offset..])?;
-        offset += consumed2;
-        if offset + overrun_size > data.len() {
-            return Err(DecodeError::Truncated {
-                needed: offset + overrun_size,
-                available: data.len(),
-            });
-        }
-        offset += overrun_size;
-
-        Ok((value, offset))
-    }
-
     pub(crate) fn decode_structure_with_bitset_body(
         &self,
         data: &[u8],
@@ -1277,8 +1197,11 @@ impl PvdDecoder {
     }
 }
 
-/// Count total fields in a structure (including nested)
-fn count_structure_fields(desc: &StructureDesc) -> usize {
+/// Count total fields in a structure (including nested).
+///
+/// Self-then-nested, depth-first. This is the order the MONITOR bitset bits
+/// are numbered in, so `monitor::flatten_field_paths` must walk it identically.
+pub(crate) fn count_structure_fields(desc: &StructureDesc) -> usize {
     let mut count = 0;
     for field in &desc.fields {
         count += 1;

@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_codec::epics_decode::{DecodeMode, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::{
     DecodedValue, FieldDesc, FieldType, PvdDecoder, StructureDesc, extract_nt_scalar_value,
 };
@@ -493,7 +493,8 @@ pub async fn list_pvs_via_server_get(
             for field in &desc.fields {
                 names.push(field.name.clone());
             }
-            op.decode_with_field_desc(desc, is_be);
+            // A decode failure leaves decoded_value None, handled below.
+            let _ = op.decode_with_field_desc(desc, is_be, DecodeMode::Strict);
             if let Some(decoded) = &op.decoded_value {
                 collect_strings_from_decoded(decoded, &mut names);
             }

@@ -7,7 +7,8 @@ use crate::search::resolve_pv_server;
 use crate::transport::{read_packet, read_until};
 use crate::types::{PvGetError, PvGetOptions, PvGetResult};
 use spvirit_codec::epics_decode::{
-    PvaPacket, PvaPacketCommand, decode_op_response_status as codec_decode_op_response_status,
+    DecodeMode, PvaPacket, PvaPacketCommand,
+    decode_op_response_status as codec_decode_op_response_status,
 };
 use spvirit_codec::spvd_encode::encode_pv_request;
 use spvirit_codec::spvirit_encode::encode_client_connection_validation;
@@ -204,7 +205,8 @@ pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetR
 
     match cmd {
         PvaPacketCommand::Op(mut op) => {
-            op.decode_with_field_desc(&desc, is_be);
+            // A decode failure leaves decoded_value None, handled below.
+            let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
             if let Some(value) = op.decoded_value {
                 return Ok(PvGetResult {
                     pv_name: opts.pv_name.clone(),

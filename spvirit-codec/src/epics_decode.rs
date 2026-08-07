@@ -7,6 +7,7 @@ use hex;
 use std::fmt;
 use tracing::debug;
 
+use crate::error::DecodeResult;
 use crate::spvd_decode::{DecodedValue, PvdDecoder, StructureDesc, format_compact_value};
 use crate::spvirit_encode::format_pva_address;
 
@@ -1464,10 +1465,19 @@ impl PvaOpPayload {
         result
     }
 
-    /// Decode the body using provided field description
-    pub fn decode_with_field_desc(&mut self, field_desc: &StructureDesc, is_be: bool) {
+    /// Decode the body using provided field description.
+    ///
+    /// See [`DecodeMode`] for the MONITOR bitset-layout policy. Live
+    /// connections, where the introspection is known, want
+    /// [`DecodeMode::Strict`].
+    pub fn decode_with_field_desc(
+        &mut self,
+        field_desc: &StructureDesc,
+        is_be: bool,
+        mode: DecodeMode,
+    ) -> DecodeResult<()> {
         if self.body.is_empty() {
-            return;
+            return Ok(());
         }
 
         let decoder = PvdDecoder::new(is_be);
@@ -1475,126 +1485,41 @@ impl PvaOpPayload {
         // For data updates (subcmd == 0x00 or subcmd & 0x40), use bitset decoding
         if self.subcmd == 0x00 || (self.subcmd & 0x40) != 0 {
             if self.command == 13 {
-                let cand_overrun_pre =
-                    decoder.decode_structure_with_bitset_and_overrun(&self.body, field_desc);
-                let cand_overrun_post =
-                    decoder.decode_structure_with_bitset_then_overrun(&self.body, field_desc);
-                let cand_legacy = decoder.decode_structure_with_bitset(&self.body, field_desc);
-                self.decoded_value =
-                    choose_best_decoded_multi([
-                        cand_overrun_pre.ok(),
-                        cand_overrun_post.ok(),
-                        cand_legacy.ok(),
-                    ]);
-            } else if let Ok((value, _)) =
-                decoder.decode_structure_with_bitset(&self.body, field_desc)
-            {
+                let update = match mode {
+                    DecodeMode::Strict => decoder.decode_monitor_update(&self.body, field_desc)?,
+                    DecodeMode::Lenient => {
+                        decoder
+                            .decode_monitor_update_lenient(&self.body, field_desc)?
+                            .0
+                    }
+                };
+                self.decoded_value = Some(update.value);
+            } else {
+                let (value, _) = decoder.decode_structure_with_bitset(&self.body, field_desc)?;
                 self.decoded_value = Some(value);
             }
         } else {
             // Full structure decode
-            if let Ok((value, _)) = decoder.decode_structure(&self.body, field_desc) {
-                self.decoded_value = Some(value);
-            }
+            let (value, _) = decoder.decode_structure(&self.body, field_desc)?;
+            self.decoded_value = Some(value);
         }
+        Ok(())
     }
 }
 
-fn choose_best_decoded_multi(cands: [Option<(DecodedValue, usize)>; 3]) -> Option<DecodedValue> {
-    let mut best_value: Option<DecodedValue> = None;
-    let mut best_score = i32::MIN;
-    let mut best_consumed = 0usize;
-    let mut best_idx = 0usize;
-
-    for (idx, cand) in cands.into_iter().enumerate() {
-        let Some((value, consumed)) = cand else {
-            continue;
-        };
-        let score = score_decoded(&value);
-        let better = score > best_score
-            || (score == best_score && consumed > best_consumed)
-            || (score == best_score && consumed == best_consumed && idx > best_idx);
-        if better {
-            best_score = score;
-            best_consumed = consumed;
-            best_idx = idx;
-            best_value = Some(value);
-        }
-    }
-
-    best_value
-}
-
-fn score_decoded(value: &DecodedValue) -> i32 {
-    let DecodedValue::Structure(fields) = value else {
-        return -1;
-    };
-
-    let mut score = fields.len() as i32;
-
-    let mut has_value = false;
-    let mut has_alarm = false;
-    let mut has_ts = false;
-
-    for (name, val) in fields {
-        match name.as_str() {
-            "value" => {
-                has_value = true;
-                score += 4;
-                match val {
-                    DecodedValue::Array(items) => {
-                        if items.is_empty() {
-                            score -= 2;
-                        } else {
-                            score += 6 + (items.len().min(8) as i32);
-                        }
-                    }
-                    DecodedValue::Structure(_) => score += 1,
-                    _ => score += 2,
-                }
-            }
-            "alarm" => {
-                has_alarm = true;
-                score += 2;
-            }
-            "timeStamp" => {
-                has_ts = true;
-                score += 2;
-                if let DecodedValue::Structure(ts_fields) = val {
-                    if let Some(secs) = ts_fields.iter().find_map(|(n, v)| {
-                        if n == "secondsPastEpoch" {
-                            if let DecodedValue::Int64(s) = v {
-                                return Some(*s);
-                            }
-                        }
-                        None
-                    }) {
-                        if (0..=4_000_000_000i64).contains(&secs) {
-                            score += 2;
-                        } else if secs.abs() > 10_000_000_000i64 {
-                            score -= 2;
-                        }
-                    }
-                }
-            }
-            "display" | "control" => {
-                score += 1;
-            }
-            _ => {}
-        }
-    }
-
-    if !has_value {
-        score -= 2;
-    }
-    if !has_alarm {
-        score -= 1;
-    }
-    if !has_ts {
-        score -= 1;
-    }
-
-    score
+/// How strictly to interpret a MONITOR body's bitset layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeMode {
+    /// Specification order only: changed bitset, data, overrun bitset. Use
+    /// this on live connections, where the introspection is known.
+    Strict,
+    /// Try every known layout and pick the most plausible. For mid-stream
+    /// packet captures where the peer's layout is unknown.
+    ///
+    /// Nothing in this workspace uses it; it is public API for out-of-tree
+    /// consumers talking to implementations that disagree about where the
+    /// overrun bitset goes.
+    Lenient,
 }
 
 #[derive(Debug, Clone)]
@@ -1971,50 +1896,13 @@ mod tests {
         out
     }
 
+    /// Strict mode decodes the specification layout: changed bitset, data,
+    /// overrun bitset.
     #[test]
-    fn test_monitor_decode_overrun_and_legacy() {
+    fn test_monitor_decode_spec_order_strict() {
         let nt = NtScalar::from_value(ScalarValue::F64(3.5));
         let desc = nt_scalar_desc(&nt.value);
         let (changed_bitset, values) = encode_nt_scalar_bitset_parts(&nt, false);
-
-        let mut body_overrun = Vec::new();
-        body_overrun.extend_from_slice(&changed_bitset);
-        body_overrun.extend_from_slice(&encode_size_pvd(0, false));
-        body_overrun.extend_from_slice(&values);
-
-        let pkt = build_monitor_packet(1, 0x00, &body_overrun);
-        let mut pva = PvaPacket::new(&pkt);
-        let mut cmd = pva.decode_payload().expect("decoded");
-        if let PvaPacketCommand::Op(ref mut op) = cmd {
-            op.decode_with_field_desc(&desc, false);
-            let decoded = op.decoded_value.as_ref().expect("decoded");
-            let value = extract_nt_scalar_value(decoded).expect("value");
-            match value {
-                DecodedValue::Float64(v) => assert!((*v - 3.5).abs() < 1e-6),
-                other => panic!("unexpected value {:?}", other),
-            }
-        } else {
-            panic!("unexpected cmd");
-        }
-
-        let mut body_legacy = Vec::new();
-        body_legacy.extend_from_slice(&changed_bitset);
-        body_legacy.extend_from_slice(&values);
-
-        let pkt = build_monitor_packet(1, 0x00, &body_legacy);
-        let mut pva = PvaPacket::new(&pkt);
-        let mut cmd = pva.decode_payload().expect("decoded");
-        if let PvaPacketCommand::Op(ref mut op) = cmd {
-            op.decode_with_field_desc(&desc, false);
-            let decoded = op.decoded_value.as_ref().expect("decoded");
-            let value = extract_nt_scalar_value(decoded).expect("value");
-            match value {
-                DecodedValue::Float64(v) => assert!((*v - 3.5).abs() < 1e-6),
-                other => panic!("unexpected value {:?}", other),
-            }
-        } else {
-            panic!("unexpected cmd");
-        }
 
         let mut body_spec = Vec::new();
         body_spec.extend_from_slice(&changed_bitset);
@@ -2025,7 +1913,8 @@ mod tests {
         let mut pva = PvaPacket::new(&pkt);
         let mut cmd = pva.decode_payload().expect("decoded");
         if let PvaPacketCommand::Op(ref mut op) = cmd {
-            op.decode_with_field_desc(&desc, false);
+            op.decode_with_field_desc(&desc, false, DecodeMode::Strict)
+                .expect("spec-order body decodes");
             let decoded = op.decoded_value.as_ref().expect("decoded");
             let value = extract_nt_scalar_value(decoded).expect("value");
             match value {
@@ -2034,6 +1923,50 @@ mod tests {
             }
         } else {
             panic!("unexpected cmd");
+        }
+    }
+
+    /// The two non-specification layouts this codec used to guess at are now
+    /// only reachable through the lenient decoder. Ported from the old
+    /// `test_monitor_decode_overrun_and_legacy`, which relied on
+    /// `decode_with_field_desc` scoring all three variants.
+    #[test]
+    fn test_monitor_decode_non_spec_layouts_via_lenient() {
+        use crate::monitor::MonitorLayout;
+        use crate::spvd_decode::PvdDecoder;
+
+        let nt = NtScalar::from_value(ScalarValue::F64(3.5));
+        let desc = nt_scalar_desc(&nt.value);
+        let (changed_bitset, values) = encode_nt_scalar_bitset_parts(&nt, false);
+        let decoder = PvdDecoder::new(false);
+
+        // changed bitset, overrun bitset, data.
+        let mut body_overrun = Vec::new();
+        body_overrun.extend_from_slice(&changed_bitset);
+        body_overrun.extend_from_slice(&encode_size_pvd(0, false));
+        body_overrun.extend_from_slice(&values);
+
+        let (update, layout) = decoder
+            .decode_monitor_update_lenient(&body_overrun, &desc)
+            .expect("overrun-before-data body decodes");
+        assert_eq!(layout, MonitorLayout::OverrunBeforeData);
+        match extract_nt_scalar_value(&update.value).expect("value") {
+            DecodedValue::Float64(v) => assert!((*v - 3.5).abs() < 1e-6),
+            other => panic!("unexpected value {:?}", other),
+        }
+
+        // changed bitset, data, no overrun bitset.
+        let mut body_legacy = Vec::new();
+        body_legacy.extend_from_slice(&changed_bitset);
+        body_legacy.extend_from_slice(&values);
+
+        let (update, layout) = decoder
+            .decode_monitor_update_lenient(&body_legacy, &desc)
+            .expect("changed-only body decodes");
+        assert_eq!(layout, MonitorLayout::ChangedOnly);
+        match extract_nt_scalar_value(&update.value).expect("value") {
+            DecodedValue::Float64(v) => assert!((*v - 3.5).abs() < 1e-6),
+            other => panic!("unexpected value {:?}", other),
         }
     }
 
@@ -2055,7 +1988,8 @@ mod tests {
         let mut pva = PvaPacket::new(&pkt);
         let mut cmd = pva.decode_payload().expect("decoded");
         if let PvaPacketCommand::Op(ref mut op) = cmd {
-            op.decode_with_field_desc(&desc, false);
+            op.decode_with_field_desc(&desc, false, DecodeMode::Strict)
+                .expect("spec-order body decodes");
             let decoded = op.decoded_value.as_ref().expect("decoded");
             let value = extract_nt_scalar_value(decoded).expect("value");
             match value {

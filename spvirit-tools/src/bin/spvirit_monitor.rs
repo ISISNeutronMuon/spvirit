@@ -8,7 +8,7 @@ use tokio::runtime::Runtime;
 use tokio::time::interval;
 
 use spvirit_client::{MonitorOptions, client_from_opts};
-use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_codec::epics_decode::{DecodeMode, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_encode::{encode_pv_request, encode_pv_request_with_options};
 use spvirit_codec::spvirit_encode::encode_control_message;
 use spvirit_tools::spvirit_client::cli::CommonClientArgs;
@@ -144,7 +144,8 @@ async fn pvmonitor_raw(
                         if op.command != 13 || (op.subcmd != 0x00 && op.subcmd != 0x10) {
                             continue;
                         }
-                        op.decode_with_field_desc(&desc, is_be);
+                        // A decode failure leaves decoded_value None; skip the update.
+                        let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
                         if let Some(full) = op.decoded_value {
                             let mut render_opts = RenderOptions::default();
                             if json {

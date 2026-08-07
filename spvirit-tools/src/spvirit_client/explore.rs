@@ -10,7 +10,7 @@ use crate::spvirit_client::client::{
 };
 use crate::spvirit_client::transport::{read_packet, read_until};
 use crate::spvirit_client::types::{PvGetError, PvGetOptions, PvGetResult};
-use spvirit_codec::epics_decode::PvaPacketCommand;
+use spvirit_codec::epics_decode::{DecodeMode, PvaPacketCommand};
 use spvirit_codec::spvirit_encode::encode_control_message;
 
 pub use spvirit_client::pvlist::PvListSource;
@@ -219,7 +219,8 @@ where
                     continue;
                 }
 
-                op.decode_with_field_desc(&desc, is_be);
+                // A decode failure leaves decoded_value None; skip the update.
+                let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
                 if let Some(value) = op.decoded_value {
                     on_update(PvGetResult {
                         pv_name: pv_name.to_string(),
