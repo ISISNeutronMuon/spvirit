@@ -22,7 +22,7 @@ All paths under `spvirit-server/src/`.
 | `monitor.rs` | 311 | `MonitorRegistry`: per-PV subscriber lists, delta/full frame building, pipeline credit accounting |
 | `convert.rs` | 276 | `DecodedValue` → `ScalarValue`/`ScalarArrayValue` conversions |
 | `pvstore.rs` | 259 | The **`Source` trait** + `PvInfo` + `SourceRegistry` |
-| `events.rs` | 562 | `Events`: server-wide `on_start` hooks, named `on_event` handlers, the `EventSink` trait, and the single-task dispatcher behind `post_event` |
+| `events.rs` | 736 | `Events`: server-wide `on_start` hooks, named `on_event` handlers, the `EventSink` trait, and the single-task dispatcher behind `post_event` |
 | `server.rs` | 183 | Orchestration: `run_pva_server_with_registry` binds TCP/UDP/beacon and joins the tasks |
 | `decode.rs` | 128 | PUT-body decoding with fallback strategies + segmented-message reassembly |
 | `beacon.rs` | 67 | Periodic UDP beacon sender |
@@ -168,50 +168,76 @@ pv.rs:1154).
 | `calc`/`link` | `evaluate_links` after any input changes | n/a | `LinkDef` list |
 | `on_start` | once, awaited in registration order, before scans/dispatcher/listener | yes — a panic aborts `run()`/`run_start_hooks()`, naming the hook | `PvaServerBuilder::on_start` / `ServeBuilder::on_start` |
 | `on_event` | queued by `post_event`, run one at a time on the dispatcher task | no — `catch_unwind` logs and counts, dispatcher continues | `PvaServerBuilder::on_event` / `ServeBuilder::on_event` |
+| `EventSink::on_event` | awaited inline by `post_event`, before any handler is queued | no — `catch_unwind` logs and counts, the fan-out continues | `PvaServerBuilder::event_sink` / `ServeBuilder::event_sink` / `Events::add_sink` |
 
 ## Lifecycle hooks and named events (`events.rs`)
 
-`Events` (events.rs:54) is one `Arc` shared by the builder and the built
+`Events` (events.rs:71) is one `Arc` shared by the builder and the built
 `PvaServer`: `sinks: RwLock<Vec<Arc<dyn EventSink>>>`, `handlers:
 RwLock<HashMap<String, Vec<EventHandler>>>`, an `mpsc::channel` of capacity
 `DISPATCH_QUEUE_CAPACITY` (1024), and `AtomicU64` counters for drops
 (`dropped_count`) and handler panics (`failed_count`).
 
-- **`EventSink`** (events.rs:23) is a synchronous trait — `fn on_event(&self,
-  event: &str)` — called inline on the `post_event` caller's thread, in
-  registration order, before any handler is queued. This is the seam a
-  future EPICS-`EVNT`-scan-list consumer implements; nothing in this repo
-  registers a sink today.
-- **`EventHandler`** (events.rs:33) is the deferred, async counterpart:
+- **`EventSink`** (events.rs:40) is an async trait — `fn on_event(&self,
+  event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>` — awaited
+  inline by `Events::post`, in registration order, before any handler is
+  queued. It is a boxed future rather than a plain `fn` for the same reason
+  `EventHandler` is: every store mutation is `async`, and `post` is reachable
+  from inside the dispatcher on a `current_thread` runtime, where
+  `Handle::block_on` panics, `block_in_place` panics, and
+  `futures::executor::block_on` deadlocks on the store's tokio `RwLock` — so
+  a sync signature could not be honoured by any sink that touches a record.
+  The returned future borrows `&self`, not `event`. This is the seam a future
+  EPICS-`EVNT`-scan-list consumer implements; nothing in this repo registers
+  a sink today.
+- **`EventHandler`** (events.rs:50) is the deferred counterpart:
   `Arc<dyn Fn(Arc<SimplePvStore>, String) -> Pin<Box<dyn Future<Output = ()> +
-  Send>> + Send + Sync>`. `Events::post` (events.rs:134) runs the sinks
-  inline, then increments `inflight` for the whole batch *before* enqueueing
-  any of it (so a concurrent `drain()` can never observe `inflight == 0`
-  mid-batch), and `try_send`s each handler — a full queue drops and counts
-  rather than blocking the poster.
-- **`start_dispatcher`** (events.rs:108) spawns the single task that drains
+  Send>> + Send + Sync>`. `Events::post` (events.rs:170) awaits the sinks —
+  each wrapped in `catch_unwind(AssertUnwindSafe(..))`, so a panicking sink
+  is logged, counted in `failed_count`, and neither truncates the fan-out nor
+  stops handlers being queued — then increments `inflight` for the whole
+  batch *before* enqueueing any of it (so a concurrent `drain()` can never
+  observe `inflight == 0` mid-batch), and `try_send`s each handler — a full
+  queue drops and counts rather than blocking the poster.
+- **`start_dispatcher`** (events.rs:133) spawns the single task that drains
   the channel and awaits each handler wrapped in
   `futures::FutureExt::catch_unwind(AssertUnwindSafe(fut))`: a panicking
   handler is logged, counted in `failed_count`, and the loop continues —
   handlers never abort the dispatcher. Handlers therefore run strictly one
   at a time, in the order they were enqueued across *all* events, so a slow
   handler for one event delays every other event's handlers behind it.
-- **`drain()`** (events.rs:175) is test-only: it polls `inflight` down to
+- **`drain()`** (events.rs:232) is test-only: it polls `inflight` down to
   zero with a 10 s timeout that panics by name rather than hanging CI if the
   dispatcher-invariant (`catch_unwind` always present, `inflight` always
-  decremented) is ever broken by a regression.
+  decremented) is ever broken by a regression. It first checks the
+  `dispatcher_started` flag and fails immediately if handler invocations are
+  queued with no dispatcher to run them — `build() -> post_event() ->
+  drain_events()` without a start used to burn the full 10 s and then blame
+  the dispatcher.
 
-**Startup hooks** (`StartHook`, events.rs:40) are not part of `Events` —
-they are a plain `Vec` on `PvaServer` (`start_hooks`, pva_server.rs:660),
-run by `run_start_hooks()` (pva_server.rs:698) to completion, in order,
+**Startup hooks** (`StartHook`, events.rs:57) are not part of `Events` —
+they are a plain `Vec` on `PvaServer` (`start_hooks`, pva_server.rs:692),
+run by `run_start_hooks()` (pva_server.rs:735) to completion, in order,
 *before* `serve_after_start_hooks()` builds the source registry, spawns
-scan tasks, starts the event dispatcher, and binds (pva_server.rs:776–858:
+scan tasks, starts the event dispatcher, and binds (pva_server.rs:823–905:
 `run()` is exactly `run_start_hooks().await?` then
 `serve_after_start_hooks().await`). A panicking hook returns
-`Err(format!("on_start hook #{i} panicked; ..."))` and `run()` never reaches
-`serve_after_start_hooks` — no scan task, dispatcher, or listener starts.
+`Err(format!("on_start hook #{i} panicked; aborting startup: {cause}"))` —
+the `catch_unwind` payload is downcast to `String`/`&str`, so the real cause
+(and any label the hook panicked with, such as a Python source's) survives
+instead of reaching the user only through the default panic hook on stderr
+— and `run()` never reaches `serve_after_start_hooks`: no scan task,
+dispatcher, or listener starts.
+`ServeBuilder::start()` runs the same hook phase to completion *before* it
+returns (`Result<RunningServer, String>`), so an aborting hook fails the
+call rather than handing back a handle to a server that never bound, and
+`RunningServer::pv(...)` can never read a pre-hook value. `start()` then
+starts the dispatcher (idempotent) before spawning, so
+`RunningServer::post_event` does not race the spawn; `RunningServer` keeps
+its own `Arc<Events>` (`events()`, `post_event()`) because `start()` moves
+the `PvaServer` into the spawned task.
 `run_start_hooks` also installs the `MonitorRegistry` onto the store before
-the first hook runs (pva_server.rs:699), so a hook that writes the store
+the first hook runs (pva_server.rs:736), so a hook that writes the store
 reaches any monitor subscribed later, and a hook that reads the registry
 never sees `None`.
 

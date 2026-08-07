@@ -739,6 +739,12 @@ read "queued" as "run". Handlers run one at a time, in registration order,
 **across all events** on a single dispatcher — a slow handler for one event
 delays every other event's handlers behind it.
 
+The record half of that guarantee is real, not aspirational: `post_event`
+blocks the calling Python thread until every registered record consumer has
+finished, releasing the GIL for the duration, so a consumer that itself
+needs the GIL cannot deadlock against the poster. (Nothing registers such a
+consumer yet; the seam exists for the scan-list work.)
+
 A handler that raises is logged and skipped; the next handler still runs
 (unlike a raising `on_start`, which aborts startup — see above). The queue
 is bounded (1024 entries); under sustained overload, invocations are
@@ -747,7 +753,9 @@ with no registered handlers is a no-op, not an error.
 
 `server.drain_events()` blocks until the queue is empty. It exists so tests
 can wait for handlers deterministically; production code should not need
-it, since it does not know when a handler will next need to fire.
+it, since it does not know when a handler will next need to fire. Calling
+it with handlers queued but the server never started fails immediately and
+says so, rather than waiting out the 10 s drain timeout.
 
 `post_event` takes a name only. Data travels through PVs, where it is
 observable and visible to both stores.
