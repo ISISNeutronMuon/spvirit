@@ -874,6 +874,30 @@ impl ServeBuilder {
         self
     }
 
+    /// Register a startup hook. See [`PvaServerBuilder::on_start`].
+    pub fn on_start<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(Arc<SimplePvStore>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.inner = self.inner.on_start(hook);
+        self
+    }
+
+    /// Register an event handler. See [`PvaServerBuilder::on_event`].
+    pub fn on_event<F>(mut self, event: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(Arc<SimplePvStore>, String) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.inner = self.inner.on_event(event, handler);
+        self
+    }
+
     /// Materialise records, links and scans from the handles, build the
     /// server, then bind every handle to the store.
     ///
@@ -1418,6 +1442,34 @@ mod tests {
             msg.contains("on_start"),
             "error must name the failing hook, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_builder_forwards_on_start_and_on_event() {
+        use std::sync::Mutex;
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let l1 = log.clone();
+        let l2 = log.clone();
+
+        let temp = Pv::ai("T:TEMP", 20.0);
+        let server = PvaServer::serve([temp])
+            .on_start(move |_store| {
+                let l = l1.clone();
+                Box::pin(async move { l.lock().unwrap().push("started"); })
+            })
+            .on_event("GO", move |_store, _event| {
+                let l = l2.clone();
+                Box::pin(async move { l.lock().unwrap().push("evented"); })
+            })
+            .build()
+            .await;
+
+        server.run_start_hooks().await.expect("hooks must succeed");
+        server.events().start_dispatcher(server.store().clone());
+        server.post_event("GO");
+        server.events().drain().await;
+
+        assert_eq!(log.lock().unwrap().as_slice(), &["started", "evented"]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
