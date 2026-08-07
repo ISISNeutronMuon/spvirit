@@ -897,6 +897,16 @@ impl PyServer {
         block_on_py(py, server.run_start_hooks())
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
 
+        // Start the event dispatcher here rather than leaving it to
+        // `serve_after_start_hooks` on the background thread: otherwise
+        // `post_event()` / `drain_events()` immediately after this call race
+        // the thread getting that far. `start_dispatcher` is idempotent, and
+        // needs a runtime context because it spawns.
+        {
+            let _guard = RUNTIME.enter();
+            server.events().start_dispatcher(store.clone());
+        }
+
         std::thread::spawn(move || {
             if let Err(e) = RUNTIME.block_on(server.serve_after_start_hooks()) {
                 tracing::error!("background server error: {e}");
