@@ -324,13 +324,22 @@ fn asyncio_loop(py: Python<'_>) -> PyResult<PyObject> {
     // it.
     let loop_obj: PyObject = asyncio.getattr("new_event_loop")?.call0()?.unbind();
     let loop_for_thread = loop_obj.clone_ref(py);
-    // Readiness handshake: don't publish the loop via LOOP.set() until we
-    // know it is actually inside run_forever() and able to accept
+    // Readiness handshake: don't publish the loop via LOOP.get_or_init()
+    // until we know it is actually inside run_forever() and able to accept
     // run_coroutine_threadsafe submissions. Without this, a submission
     // racing loop startup can silently vanish (the coroutine object is
     // created but never scheduled) rather than raising -- exactly the
     // "coroutine was never awaited" symptom this bridge must not produce.
-    let ready = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    //
+    // `Ready` distinguishes "loop is running" from "loop could not even be
+    // armed" so a failure to install the readiness callback (below) is
+    // reported to the waiter instead of leaving it to time out after 5s
+    // against a loop that will never signal.
+    enum Ready {
+        Started,
+        ArmFailed(String),
+    }
+    let ready = Arc::new((std::sync::Mutex::new(None::<Ready>), std::sync::Condvar::new()));
     let ready_for_thread = ready.clone();
     std::thread::Builder::new()
         .name("spvirit-asyncio".into())
@@ -345,38 +354,74 @@ fn asyncio_loop(py: Python<'_>) -> PyResult<PyObject> {
                     let ready_for_cb = ready_for_thread.clone();
                     PyCFunction::new_closure(py, None, None, move |_args, _kwargs| {
                         let (lock, cvar) = &*ready_for_cb;
-                        *lock.lock().unwrap() = true;
+                        *lock.lock().unwrap() = Some(Ready::Started);
                         cvar.notify_all();
                         Ok::<(), PyErr>(())
                     })
                 };
-                match ready_cb.and_then(|cb| l.call_method1("call_soon_threadsafe", (cb,))) {
-                    Ok(_) => {}
-                    Err(e) => tracing::error!("failed to arm asyncio loop readiness signal: {e}"),
-                }
-                // run_forever releases the GIL while blocking in the selector.
-                if let Err(e) = l.call_method0("run_forever") {
-                    tracing::error!("asyncio loop exited: {}", e);
+                let armed = ready_cb.and_then(|cb| l.call_method1("call_soon_threadsafe", (cb,)));
+                match armed {
+                    Ok(_) => {
+                        // run_forever releases the GIL while blocking in the selector.
+                        if let Err(e) = l.call_method0("run_forever") {
+                            tracing::error!("asyncio loop exited: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        // Could not arm the readiness signal at all: do NOT
+                        // fall through into run_forever() (the loop would
+                        // run fine but nothing would ever flip the flag,
+                        // guaranteeing the waiter panics on a 5s timeout
+                        // instead of failing immediately with the real
+                        // cause). Report failure and let this thread exit;
+                        // the loop object is dropped unstarted.
+                        tracing::error!("failed to arm asyncio loop readiness signal: {e}");
+                        let (lock, cvar) = &*ready_for_thread;
+                        *lock.lock().unwrap() = Some(Ready::ArmFailed(e.to_string()));
+                        cvar.notify_all();
+                    }
                 }
             });
         })
         .expect("spawn asyncio thread");
     // Block (releasing the GIL) until the loop confirms it is running, or
     // give up after a bounded wait rather than risk a silent race forever.
-    py.allow_threads(|| {
+    let outcome = py.allow_threads(|| {
         let (lock, cvar) = &*ready;
         let guard = lock.lock().unwrap();
         let (guard, timeout_result) = cvar
-            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |ready| !*ready)
+            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |r| r.is_none())
             .unwrap();
         if timeout_result.timed_out() {
             panic!("asyncio bridge loop did not signal readiness within 5s; it may have failed to start");
         }
-        drop(guard);
+        match guard.as_ref().expect("readiness flag set before notify") {
+            Ready::Started => Ok(()),
+            Ready::ArmFailed(e) => Err(e.clone()),
+        }
     });
-    let out = loop_obj.clone_ref(py);
-    let _ = LOOP.set(loop_obj);
-    Ok(out)
+    if let Err(e) = outcome {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to start asyncio bridge loop: {e}"
+        )));
+    }
+
+    // Winner-take-all: two Tokio workers can race to first-use this bridge
+    // (e.g. concurrent `async def` source/hook/handler calls), each
+    // constructing and starting its own loop+thread before reaching this
+    // point. `OnceLock::get_or_init` makes exactly one of them the
+    // published winner atomically; whichever loop we personally built and
+    // started must NOT be returned unless it *is* that winner, or the
+    // loser's caller would submit coroutines to a loop nobody else is
+    // waiting on. The loser's loop is still running on its own thread at
+    // this point, so explicitly stop it rather than leaking the thread.
+    let winner = LOOP.get_or_init(|| loop_obj.clone_ref(py)).clone_ref(py);
+    if !winner.bind(py).is(loop_obj.bind(py))
+        && let Err(e) = loop_obj.bind(py).call_method0("stop")
+    {
+        tracing::error!("failed to stop orphaned asyncio bridge loop: {e}");
+    }
+    Ok(winner)
 }
 
 /// Call a Python method that may be sync or async; if the return value is a
