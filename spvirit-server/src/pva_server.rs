@@ -678,10 +678,13 @@ impl PvaServer {
 
     /// Post a named event.
     ///
-    /// Synchronous sinks run inline; handlers are queued. When this returns,
-    /// records have processed and handlers are queued — not necessarily run.
-    pub fn post_event(&self, event: &str) {
-        self.events.post(event);
+    /// Async because sinks are awaited inline: when this returns, every sink
+    /// has finished — records on that event have processed — and handlers
+    /// are queued, not necessarily run. Making the caller `.await` is what
+    /// buys the guarantee; a sync wrapper that spawned and returned would
+    /// silently drop it.
+    pub async fn post_event(&self, event: &str) {
+        self.events.post(event).await;
     }
 
     /// Run every `on_start` hook to completion, in registration order.
@@ -1408,7 +1411,7 @@ mod tests {
             .build();
 
         server.events().start_dispatcher(server.store().clone());
-        server.post_event("SHUTTER");
+        server.post_event("SHUTTER").await;
         server.events().drain().await;
 
         assert_eq!(seen.lock().unwrap().as_slice(), &["SHUTTER".to_string()]);
@@ -1564,7 +1567,7 @@ mod tests {
 
         server.run_start_hooks().await.expect("hooks must succeed");
         server.events().start_dispatcher(server.store().clone());
-        server.post_event("GO");
+        server.post_event("GO").await;
         server.events().drain().await;
 
         assert_eq!(log.lock().unwrap().as_slice(), &["started", "evented"]);

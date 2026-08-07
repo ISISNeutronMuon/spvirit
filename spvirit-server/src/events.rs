@@ -14,15 +14,32 @@ use crate::simple_store::SimplePvStore;
 /// Maximum number of queued handler invocations before new ones are dropped.
 pub const DISPATCH_QUEUE_CAPACITY: usize = 1024;
 
-/// A synchronous consumer of named events.
+/// An inline, awaited consumer of named events.
 ///
-/// Implementors are called inline on the `post_event` caller's thread and
-/// must have finished their work when they return — this is what makes the
-/// "records have processed when `post_event` returns" guarantee true.
+/// Implementors are awaited by [`Events::post`], in registration order,
+/// before any deferred handler is queued — when `post` returns, every sink
+/// has finished its work. That is what makes the "records have processed
+/// when `post_event` returns" guarantee true.
 /// Sub-project B implements this on its `Scanner` to drive `EVNT` scan lists.
+///
+/// The method returns a boxed future rather than being a plain `fn`, for the
+/// same reason [`EventHandler`] does: every store mutation a realistic sink
+/// needs (`SimplePvStore::set_value` and friends) is `async`, and a sync
+/// trait would force implementors to block on a future from inside `post` —
+/// which is reachable from the dispatcher task on a `current_thread`
+/// runtime, where `Handle::block_on` panics, `block_in_place` panics, and
+/// `futures::executor::block_on` deadlocks against the store's tokio
+/// `RwLock`. There is no correct way to honour a sync signature.
+///
+/// The returned future borrows `&self`, not `event` — copy the name in if
+/// the future needs it (`let event = event.to_string();`).
+///
+/// A panicking sink is caught, counted in [`Events::failed_count`], and the
+/// remaining sinks still run: one bad sink can neither truncate the fan-out
+/// nor stop handlers from being queued.
 pub trait EventSink: Send + Sync {
-    /// Handle `event`. Called on the poster's thread; keep it short.
-    fn on_event(&self, event: &str);
+    /// Handle `event`. Awaited inline by `post`; keep it short.
+    fn on_event(&self, event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// A deferred event handler.
@@ -48,9 +65,9 @@ struct Dispatch {
 
 /// Server-wide event registry.
 ///
-/// Owns the synchronous sinks and the deferred handlers. Sinks run inline on
-/// the poster's thread; handlers are queued and run one at a time on a single
-/// dispatcher task.
+/// Owns the inline sinks and the deferred handlers. Sinks are awaited by
+/// `post` before it returns; handlers are queued and run one at a time on a
+/// single dispatcher task.
 pub struct Events {
     sinks: RwLock<Vec<Arc<dyn EventSink>>>,
     handlers: RwLock<HashMap<String, Vec<EventHandler>>>,
@@ -58,6 +75,10 @@ pub struct Events {
     rx: RwLock<Option<mpsc::Receiver<Dispatch>>>,
     dropped: AtomicU64,
     failed: Arc<AtomicU64>,
+    /// Set by `start_dispatcher`. `drain()` and `post()` read it so that
+    /// "you forgot to start the server" is diagnosed immediately and by
+    /// name, instead of as a 10 s spin blamed on a stuck dispatcher.
+    dispatcher_started: std::sync::atomic::AtomicBool,
     /// Incremented on every successful enqueue, decremented after the handler
     /// finishes. `drain()` waits for this to reach zero.
     inflight: Arc<AtomicU64>,
@@ -73,11 +94,15 @@ impl Events {
             rx: RwLock::new(Some(rx)),
             dropped: AtomicU64::new(0),
             failed: Arc::new(AtomicU64::new(0)),
+            dispatcher_started: std::sync::atomic::AtomicBool::new(false),
             inflight: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Register a synchronous sink. Sinks are called in registration order.
+    /// Register an inline sink. Sinks are awaited in registration order.
+    ///
+    /// May be called at any time, including from inside another sink's
+    /// call-out; the new sink takes effect from the next `post`.
     pub fn add_sink(&self, sink: Arc<dyn EventSink>) {
         self.sinks.write().unwrap().push(sink);
     }
@@ -99,7 +124,7 @@ impl Events {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Number of handler invocations that panicked.
+    /// Number of sink or handler invocations that panicked.
     pub fn failed_count(&self) -> u64 {
         self.failed.load(Ordering::Relaxed)
     }
@@ -112,6 +137,7 @@ impl Events {
         };
         let inflight = self.inflight.clone();
         let failed = self.failed.clone();
+        self.dispatcher_started.store(true, Ordering::SeqCst);
         tokio::spawn(async move {
             while let Some(Dispatch { handler, event }) = rx.recv().await {
                 let fut = handler(store.clone(), event.clone());
@@ -128,13 +154,32 @@ impl Events {
         });
     }
 
-    /// Post `event`: call sinks inline, then queue handlers and return.
+    /// Post `event`: await every sink, then queue handlers and return.
+    ///
+    /// Sinks run in registration order and are each wrapped in
+    /// `catch_unwind`, exactly as handlers are on the dispatcher: a
+    /// panicking sink is logged, counted in [`Self::failed_count`], and the
+    /// fan-out continues. Without that, one bad sink would unwind out of
+    /// `post` and the remaining sinks *and every handler* would silently
+    /// never see the event.
     ///
     /// An unknown event name is a no-op — events are a dynamic namespace.
-    pub fn post(&self, event: &str) {
+    pub async fn post(&self, event: &str) {
+        // Clone the list rather than holding the read guard across the
+        // call-outs: a sink is allowed to post, and to register further
+        // sinks, from inside its own call-out.
         let sinks = self.sinks.read().unwrap().clone();
         for sink in &sinks {
-            sink.on_event(event);
+            // AssertUnwindSafe: on panic we drop the sink's in-progress
+            // state and continue; the store's invariants are upheld by its
+            // own locks. The call itself is inside the async block so a
+            // panic while *building* the future is caught too.
+            let fut = async { sink.on_event(event).await };
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
+            if result.is_err() {
+                warn!("event sink for '{}' panicked; continuing fan-out", event);
+                self.failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         let handlers = {
@@ -145,6 +190,15 @@ impl Events {
         // a concurrent drain() can never observe inflight == 0 partway
         // through this loop (e.g. because the dispatcher already finished
         // handler 1 while handler 2 has not been enqueued yet).
+        if !handlers.is_empty() && !self.dispatcher_started.load(Ordering::SeqCst) {
+            warn!(
+                "posted '{}' with {} handler(s) registered but the event dispatcher \
+                 has not started — nothing will run them until the server starts \
+                 (run()/start()/start_background())",
+                event,
+                handlers.len()
+            );
+        }
         self.inflight
             .fetch_add(handlers.len() as u64, Ordering::SeqCst);
         for handler in handlers {
@@ -174,6 +228,21 @@ impl Events {
     /// as a clear, named test failure — not an indefinitely hanging CI job.
     pub async fn drain(&self) {
         const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        // `build() -> post_event() -> drain_events()` is the natural test
+        // shape, and forgetting to start the server is the natural mistake.
+        // Diagnose it here in microseconds instead of spinning a core for
+        // ten seconds and then blaming the dispatcher for being stuck.
+        if !self.dispatcher_started.load(Ordering::SeqCst)
+            && self.inflight.load(Ordering::SeqCst) > 0
+        {
+            panic!(
+                "Events::drain() called with {} handler invocation(s) queued but the \
+                 dispatcher was never started — nothing will ever run them. Start the \
+                 server (run() / start() / start_background(), or \
+                 Events::start_dispatcher) before posting events you intend to drain.",
+                self.inflight.load(Ordering::SeqCst)
+            );
+        }
         let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
         while self.inflight.load(Ordering::SeqCst) > 0 {
             if tokio::time::Instant::now() >= deadline {
@@ -226,7 +295,7 @@ mod tests {
         );
         events.start_dispatcher(store);
 
-        events.post("GO");
+        events.post("GO").await;
         // Deferred: must not have run yet at the moment post() returned.
         assert_eq!(ran.load(Ordering::SeqCst), 0, "handler ran inline");
 
@@ -257,7 +326,7 @@ mod tests {
         }
         events.start_dispatcher(store);
 
-        events.post("GO");
+        events.post("GO").await;
         events.drain().await;
 
         // Serialized: every enter is immediately followed by its own exit.
@@ -293,7 +362,7 @@ mod tests {
         }));
         events.start_dispatcher(store);
 
-        events.post("A");
+        events.post("A").await;
         events.drain().await;
 
         assert_eq!(a.load(Ordering::SeqCst), 1);
@@ -313,7 +382,7 @@ mod tests {
         }));
         events.start_dispatcher(store);
 
-        events.post("SHUTTER");
+        events.post("SHUTTER").await;
         events.drain().await;
 
         assert_eq!(seen.lock().unwrap().as_slice(), &["SHUTTER".to_string()]);
@@ -333,7 +402,7 @@ mod tests {
         }));
         events.start_dispatcher(store.clone());
 
-        events.post("BUMP");
+        events.post("BUMP").await;
         events.drain().await;
 
         assert_eq!(
@@ -355,12 +424,14 @@ mod tests {
         }));
         events.start_dispatcher(store);
 
-        // #[tokio::test] defaults to current_thread, and this loop has no
-        // .await point, so the spawned dispatcher is never polled and never
-        // dequeues anything before we assert below — capacity is filled from
-        // the sender side alone, deterministically. Post well past capacity.
+        // #[tokio::test] defaults to current_thread, and with no sinks
+        // registered `post()` completes without ever returning `Pending`, so
+        // awaiting it never yields to the executor: the spawned dispatcher is
+        // never polled and never dequeues anything before we assert below —
+        // capacity is filled from the sender side alone, deterministically.
+        // Post well past capacity.
         for _ in 0..(DISPATCH_QUEUE_CAPACITY + 50) {
-            events.post("FLOOD");
+            events.post("FLOOD").await;
         }
 
         assert!(
@@ -389,7 +460,7 @@ mod tests {
         }));
         events.start_dispatcher(store);
 
-        events.post("BOOM");
+        events.post("BOOM").await;
         events.drain().await;
 
         assert_eq!(
@@ -405,29 +476,32 @@ mod tests {
     }
 
     impl EventSink for RecordingSink {
-        fn on_event(&self, event: &str) {
-            self.seen.lock().unwrap().push(event.to_string());
+        fn on_event(&self, event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            let event = event.to_string();
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(event);
+            })
         }
     }
 
-    #[test]
-    fn post_calls_sinks_in_registration_order() {
+    #[tokio::test]
+    async fn post_calls_sinks_in_registration_order() {
         let a = Arc::new(RecordingSink { seen: Mutex::new(Vec::new()) });
         let b = Arc::new(RecordingSink { seen: Mutex::new(Vec::new()) });
         let events = Events::new();
         events.add_sink(a.clone());
         events.add_sink(b.clone());
 
-        events.post("SHUTTER");
+        events.post("SHUTTER").await;
 
         assert_eq!(a.seen.lock().unwrap().as_slice(), &["SHUTTER".to_string()]);
         assert_eq!(b.seen.lock().unwrap().as_slice(), &["SHUTTER".to_string()]);
     }
 
-    #[test]
-    fn post_with_no_sinks_is_a_noop() {
+    #[tokio::test]
+    async fn post_with_no_sinks_is_a_noop() {
         let events = Events::new();
-        events.post("NOBODY:LISTENING");
+        events.post("NOBODY:LISTENING").await;
     }
 
     #[tokio::test]
@@ -443,7 +517,7 @@ mod tests {
             let ev = ev.clone();
             Box::pin(async move {
                 l.lock().unwrap().push("first:enter".to_string());
-                ev.post("SECOND");
+                ev.post("SECOND").await;
                 l.lock().unwrap().push("first:exit".to_string());
             })
         }));
@@ -455,7 +529,7 @@ mod tests {
         }));
 
         events.start_dispatcher(store);
-        events.post("FIRST");
+        events.post("FIRST").await;
         events.drain().await;
 
         assert_eq!(
@@ -479,8 +553,10 @@ mod tests {
             fired: Arc<AtomicUsize>,
         }
         impl EventSink for LateSink {
-            fn on_event(&self, _event: &str) {
-                self.fired.fetch_add(1, Ordering::SeqCst);
+            fn on_event(&self, _event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                Box::pin(async move {
+                    self.fired.fetch_add(1, Ordering::SeqCst);
+                })
             }
         }
 
@@ -490,12 +566,21 @@ mod tests {
             late_fired: Arc<AtomicUsize>,
         }
         impl EventSink for Reposter {
-            fn on_event(&self, event: &str) {
-                if event == "OUTER" {
+            fn on_event(&self, event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                let event = event.to_string();
+                Box::pin(async move {
+                    if event != "OUTER" {
+                        return;
+                    }
                     self.fired.fetch_add(1, Ordering::SeqCst);
-                    if let Some(ev) = self.events.lock().unwrap().as_ref().and_then(|w| w.upgrade())
-                    {
-                        ev.post("INNER");
+                    // Take and drop the guard before awaiting: a std
+                    // MutexGuard held across an await would not be Send.
+                    let ev = {
+                        let g = self.events.lock().unwrap();
+                        g.as_ref().and_then(|w| w.upgrade())
+                    };
+                    if let Some(ev) = ev {
+                        ev.post("INNER").await;
                         // add_sink() takes the sinks lock for write. If
                         // post() ever held the sinks read lock across this
                         // call-out instead of cloning it first, this write
@@ -507,7 +592,7 @@ mod tests {
                             fired: self.late_fired.clone(),
                         }));
                     }
-                }
+                })
             }
         }
 
@@ -521,15 +606,21 @@ mod tests {
         events.add_sink(sink.clone());
 
         // Would deadlock if post() held the sinks read lock across the call.
-        // Run it on its own thread with a bounded wait, the same discipline
-        // `drain()` applies to the dispatcher: a regression that reintroduces
-        // a lock held across the call-out must show up as a clear, named
-        // panic — not an indefinitely hanging `cargo test`.
+        // Run it on its own thread (with its own runtime, since the lock
+        // deadlock would wedge the *thread*, not just the task, so an
+        // in-runtime `tokio::time::timeout` could never fire) with a bounded
+        // wait — the same discipline `drain()` applies to the dispatcher: a
+        // regression that reintroduces a lock held across the call-out must
+        // show up as a clear, named panic, not an indefinitely hanging
+        // `cargo test`.
         const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let ev = events.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            ev.post("OUTER");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("current_thread runtime for the sink call-out");
+            rt.block_on(ev.post("OUTER"));
             let _ = done_tx.send(());
         });
         if done_rx.recv_timeout(CALL_TIMEOUT).is_err() {
@@ -552,7 +643,7 @@ mod tests {
         // "OUTER" call-out must now be live. (Re-posting "OUTER" itself
         // would also re-trigger the nested "INNER" post and double-count
         // through LateSink, so a distinct probe event keeps this precise.)
-        events.post("PROBE");
+        events.post("PROBE").await;
         assert_eq!(
             late_fired.load(Ordering::SeqCst),
             1,

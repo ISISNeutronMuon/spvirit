@@ -908,13 +908,20 @@ impl PyServer {
 
     /// Post a named event.
     ///
-    /// Synchronous sinks (if any) run inline. Handlers registered via
-    /// `@builder.on_event(...)` are queued on the dispatcher. When this
-    /// returns, records have processed and handlers are queued — not
-    /// necessarily run. Never assume a handler has finished by the time
-    /// `post_event` returns; use `drain_events()` in tests if you need that.
-    fn post_event(&self, name: String) -> PyResult<()> {
-        self.events.post(&name);
+    /// Inline sinks (if any) are awaited to completion before this returns;
+    /// handlers registered via `@builder.on_event(...)` are queued on the
+    /// dispatcher. When this returns, records on that event have processed
+    /// and handlers are queued — not necessarily run. Never assume a handler
+    /// has finished by the time `post_event` returns; use `drain_events()`
+    /// in tests if you need that.
+    ///
+    /// Stays synchronous by blocking the calling Python thread on the shared
+    /// multi-threaded runtime, with the GIL released for the duration
+    /// (`block_on_py`) — so the guarantee is genuinely upheld here, and a
+    /// sink that needs the GIL cannot deadlock against the poster.
+    fn post_event(&self, py: Python<'_>, name: String) -> PyResult<()> {
+        let events = self.events.clone();
+        block_on_py(py, async move { events.post(&name).await });
         Ok(())
     }
 
