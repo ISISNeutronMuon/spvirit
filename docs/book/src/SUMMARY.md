@@ -78,4 +78,5 @@
 - [Testing](06-dev-guide/06-testing.md)
 - [Build, CI, and Release](06-dev-guide/07-build-ci-release.md)
 - [Current State and Roadmap](06-dev-guide/08-current-state.md)
+- [The record-processing engine](06-dev-guide/09-processing-engine.md)
 
