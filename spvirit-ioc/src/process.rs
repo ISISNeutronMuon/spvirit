@@ -97,24 +97,17 @@ fn process_inner(
     //    write outputs, post monitors, then FLNK. Filled in by Tasks 7-10.
     let body = record_body(set, id, ctx);
 
-    // 5. A synchronous record is done. An async one returned from the body
-    //    with PACT still set; sub-project B's completion path clears it.
-    let still_async = set.get(id).common.pact && body.is_ok() && is_async_pending(set, id);
-    if !still_async {
-        set.get_mut(id).common.pact = false;
-    }
+    // 5. PACT itself is the flag; there is nothing left to decide here. As
+    //    in Base, a record's own `process()` clears `prec->pact` as the last
+    //    thing a synchronous pass does — `record_body` now does that
+    //    directly (see its doc comment) once its own work is complete. A
+    //    body that is still two-phase-pending, or that failed before
+    //    reaching that point, simply leaves PACT set; `complete_async` is
+    //    the only other path that clears it.
     if tpro {
         ctx.trace_line(format!("{name}: process complete"));
     }
     body
-}
-
-/// Whether the body left an asynchronous operation outstanding.
-///
-/// A has no async devices, so this is always false. Sub-project B replaces
-/// the body with one that can return `AsyncOutcome::Pending`.
-fn is_async_pending(_set: &LockSetData, _id: RecordId) -> bool {
-    false
 }
 
 /// `recGblSetSevr`: raise the pending alarm state, never lower it.
@@ -329,6 +322,28 @@ pub(crate) fn read_field(set: &LockSetData, id: RecordId, field: Field) -> Value
 /// Input records read INP and store it. Output records take a desired value
 /// from DOL when OMSL says so, then write it through OUT. Both then check
 /// limits or UDF, stamp the time, and commit their alarm state.
+///
+/// This is also where PACT is owned. `process_inner` sets `common.pact`
+/// before calling this function; mirroring Base, where a record type's own
+/// `process()` clears `prec->pact` as the very last synchronous thing it
+/// does, this function clears it once its own work — value, limits, alarms,
+/// monitors — is done, immediately before firing the forward link. Every
+/// return from this function via `?` above (an error from `input_body` or
+/// `output_body`) skips that clear entirely, so an error leaves PACT set.
+///
+/// This is also the declared seam for two-phase (async) device support,
+/// which sub-project A does not implement: the hook point a future
+/// `AsyncSupport` implementation would need is inside `input_body` (INP) or
+/// `output_body` (OUT), above, at the point the value is fetched or
+/// written. An implementation whose `start()` returns
+/// `AsyncOutcome::Pending` must return from that call site without reaching
+/// this function's `common.pact = false` line below — since PACT was
+/// already set by `process_inner` before this function was ever called,
+/// simply not reaching the clear is sufficient to leave the record
+/// two-phase-pending until [`complete_async`] runs. How a record binds to
+/// an `AsyncSupport` implementation (a registry, a per-record slot, or
+/// something else) is left undecided here; see [`AsyncSupport`]'s own doc
+/// comment for why.
 pub(crate) fn record_body(
     set: &mut LockSetData,
     id: RecordId,
@@ -353,6 +368,9 @@ pub(crate) fn record_body(
     }
     let alarm_changed = reset_alarms(set, id, ctx);
     post_monitors(set, id, alarm_changed, ctx);
+    // The direct analogue of `prec->pact = FALSE` at the end of a Base
+    // record's `process()` — see this function's doc comment above.
+    set.get_mut(id).common.pact = false;
     forward_link(set, id, ctx)
 }
 
@@ -536,10 +554,20 @@ pub enum AsyncOutcome {
 
 /// Device support that may take longer than a processing pass.
 ///
-/// Sub-project A ships no implementations — every A record is soft. The
-/// trait and [`complete_async`] exist so B's scan threads have a defined
-/// completion path, and so the PACT semantics it depends on are covered by
-/// tests written against the engine that owns them.
+/// This is sub-project A's *declared contract* for sub-project B, not live
+/// machinery: A ships no implementation of it, and nothing in A's
+/// `record_body` calls `start()` — there is no call site to wire one into
+/// yet. See [`record_body`]'s doc comment for exactly which hook point
+/// (inside `input_body`/`output_body`, immediately before the PACT clear at
+/// the end of `record_body`) a future implementation must use, and what a
+/// `Pending` outcome requires of it. Deciding how a record binds to a
+/// specific `AsyncSupport` implementation — a registry, a per-record slot,
+/// how that lookup stays deterministic across a `.db` — is design work
+/// owned by the source-tier spec and sub-project B, not by this trait: A
+/// declares the gap rather than filling it in unspecified. [`complete_async`]
+/// exists so B's scan threads have a defined completion path today, and so
+/// the PACT semantics it depends on are covered by tests written against
+/// the engine that owns them, rather than retro-fitted later.
 pub trait AsyncSupport: Send + Sync {
     fn start(&self, record: &str, ctx: &mut ProcCtx) -> AsyncOutcome;
 }
@@ -547,7 +575,9 @@ pub trait AsyncSupport: Send + Sync {
 /// Finish a record that returned from its body with PACT still set.
 ///
 /// The second half of processing — value, limits, monitors, forward link —
-/// runs now. A record that is not active is left alone: a duplicate
+/// runs now, via the ordinary [`record_body`], which owns clearing PACT
+/// itself once it reaches the end of a synchronous pass (see its doc
+/// comment). A record that is not active is left alone: a duplicate
 /// completion callback must not process the record twice.
 pub fn complete_async(
     set: &mut LockSetData,
@@ -561,7 +591,6 @@ pub fn complete_async(
     ctx.push_depth(&name)?;
     let result = record_body(set, id, ctx);
     ctx.pop_depth();
-    set.get_mut(id).common.pact = false;
     result
 }
 
