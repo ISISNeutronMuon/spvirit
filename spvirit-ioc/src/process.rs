@@ -406,8 +406,8 @@ pub(crate) fn record_body(
     // Fire the forward link while PACT is still set — this is what makes
     // PACT the brake for FLNK cycles: if the chain re-enters this record,
     // `process()` sees PACT set and returns immediately instead of
-    // recursing. Base does the same in `dbProcess`: `recGblFwdLink` runs
-    // before `prec->pact = FALSE`. The clear below is the direct analogue
+    // recursing. Base does the same at the bottom of each record's own
+    // `process()`: `recGblFwdLink` runs before `prec->pact = FALSE`. The clear below is the direct analogue
     // of that `prec->pact = FALSE`, and it must run unconditionally —
     // whether `forward_link` succeeded or errored — or a failure here would
     // strand PACT set for the rest of the IOC's life.
