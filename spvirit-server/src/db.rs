@@ -571,25 +571,187 @@ fn to_record(record: &DbRecord) -> Option<RecordInstance> {
     })
 }
 
-pub fn load_db(path: &str) -> Result<HashMap<String, RecordInstance>, String> {
-    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    parse_db(&content)
+/// A `.db` parse failure, naming the file and the line that caused it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbParseError {
+    pub path: String,
+    pub line: usize,
+    pub message: String,
 }
 
-pub fn parse_db(content: &str) -> Result<HashMap<String, RecordInstance>, String> {
-    let record_re = Regex::new(r#"^\s*record\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([^"]+)"\s*\)\s*\{"#)
-        .map_err(|e| e.to_string())?;
-    let field_re = Regex::new(r#"^\s*field\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([^"]*)"\s*\)\s*"#)
-        .map_err(|e| e.to_string())?;
+impl std::fmt::Display for DbParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}: {}", self.path, self.line, self.message)
+    }
+}
+
+impl std::error::Error for DbParseError {}
+
+/// Expand `$(NAME)` and `${NAME}` from `macros`.
+///
+/// An undefined macro is an error: silently expanding to the empty string is
+/// how a typo becomes a record named `""` that no client can ever find.
+fn expand_macros(
+    raw: &str,
+    macros: &HashMap<String, String>,
+    path: &str,
+    line: usize,
+) -> Result<String, DbParseError> {
+    let mut out = String::with_capacity(raw.len());
+    let bytes: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '$' && i + 1 < bytes.len() && (bytes[i + 1] == '(' || bytes[i + 1] == '{') {
+            let close = if bytes[i + 1] == '(' { ')' } else { '}' };
+            let start = i + 2;
+            let Some(end) = (start..bytes.len()).find(|&j| bytes[j] == close) else {
+                return Err(DbParseError {
+                    path: path.to_string(),
+                    line,
+                    message: format!("unterminated macro reference starting at column {}", i + 1),
+                });
+            };
+            let name: String = bytes[start..end].iter().collect();
+            let Some(value) = macros.get(&name) else {
+                return Err(DbParseError {
+                    path: path.to_string(),
+                    line,
+                    message: format!("undefined macro '{name}'"),
+                });
+            };
+            out.push_str(value);
+            i = end + 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Join physical lines into logical ones so a quoted value may span newlines.
+///
+/// Returns `(logical_line_text, first_physical_line_number)` pairs.
+fn logical_lines(content: &str, path: &str) -> Result<Vec<(String, usize)>, DbParseError> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut start_line = 0usize;
+    let mut in_quote = false;
+
+    for (idx, physical) in content.lines().enumerate() {
+        let lineno = idx + 1;
+        if !in_quote {
+            start_line = lineno;
+            buf.clear();
+        } else {
+            buf.push('\n');
+        }
+        for ch in physical.chars() {
+            if ch == '"' {
+                in_quote = !in_quote;
+            }
+            buf.push(ch);
+        }
+        if in_quote {
+            continue;
+        }
+        out.push((buf.clone(), start_line));
+    }
+
+    if in_quote {
+        return Err(DbParseError {
+            path: path.to_string(),
+            line: start_line,
+            message: "unterminated quoted value".to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// Parse `content` into untyped records, expanding `include` and macros.
+///
+/// `path` is used only for error messages and for resolving relative
+/// `include` paths; it need not exist on disk.
+pub fn parse_db_records(
+    content: &str,
+    path: &str,
+    macros: &HashMap<String, String>,
+) -> Result<Vec<DbRecord>, DbParseError> {
+    let mut visiting = Vec::new();
+    parse_db_inner(content, path, macros, &mut visiting)
+}
+
+/// Read `path` and parse it. `include` targets resolve relative to the
+/// including file's directory, as EPICS `dbLoadRecords` does.
+pub fn load_db_records(
+    path: &str,
+    macros: &HashMap<String, String>,
+) -> Result<Vec<DbRecord>, DbParseError> {
+    let mut visiting = Vec::new();
+    load_db_inner(path, macros, &mut visiting)
+}
+
+fn load_db_inner(
+    path: &str,
+    macros: &HashMap<String, String>,
+    visiting: &mut Vec<String>,
+) -> Result<Vec<DbRecord>, DbParseError> {
+    let canonical = fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    if visiting.contains(&canonical) {
+        return Err(DbParseError {
+            path: path.to_string(),
+            line: 0,
+            message: format!("include cycle: '{path}' is already being parsed"),
+        });
+    }
+    let content = fs::read_to_string(path).map_err(|e| DbParseError {
+        path: path.to_string(),
+        line: 0,
+        message: e.to_string(),
+    })?;
+    visiting.push(canonical);
+    let result = parse_db_inner(&content, path, macros, visiting);
+    visiting.pop();
+    result
+}
+
+fn parse_db_inner(
+    content: &str,
+    path: &str,
+    macros: &HashMap<String, String>,
+    visiting: &mut Vec<String>,
+) -> Result<Vec<DbRecord>, DbParseError> {
+    let record_re = Regex::new(r#"^record\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([^"]*)"\s*\)\s*\{?$"#)
+        .expect("static record regex");
+    let field_re = Regex::new(r#"^field\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([\s\S]*)"\s*\)$"#)
+        .expect("static field regex");
+    let include_re = Regex::new(r#"^include\s+"?([^"]+)"?$"#).expect("static include regex");
 
     let mut records: Vec<DbRecord> = Vec::new();
     let mut current: Option<DbRecord> = None;
 
-    for line in content.lines() {
-        let line = line.trim();
+    for (raw_line, lineno) in logical_lines(content, path)? {
+        let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+
+        if let Some(caps) = include_re.captures(line) {
+            let target = expand_macros(&caps[1], macros, path, lineno)?;
+            let base = std::path::Path::new(path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let resolved = base.join(&target);
+            let nested = load_db_inner(resolved.to_str().unwrap_or(&target), macros, visiting)?;
+            records.extend(nested);
+            continue;
+        }
+
+        let line = expand_macros(line, macros, path, lineno)?;
+        let line = line.trim();
+
         if let Some(caps) = record_re.captures(line) {
             if let Some(rec) = current.take() {
                 records.push(rec);
@@ -601,6 +763,9 @@ pub fn parse_db(content: &str) -> Result<HashMap<String, RecordInstance>, String
             });
             continue;
         }
+        if line == "{" {
+            continue;
+        }
         if line.starts_with('}') {
             if let Some(rec) = current.take() {
                 records.push(rec);
@@ -608,22 +773,53 @@ pub fn parse_db(content: &str) -> Result<HashMap<String, RecordInstance>, String
             continue;
         }
         if let Some(caps) = field_re.captures(line) {
-            if let Some(rec) = current.as_mut() {
-                rec.fields.insert(caps[1].to_string(), caps[2].to_string());
-            }
+            let Some(rec) = current.as_mut() else {
+                return Err(DbParseError {
+                    path: path.to_string(),
+                    line: lineno,
+                    message: "field() outside any record() block".to_string(),
+                });
+            };
+            rec.fields.insert(caps[1].to_string(), caps[2].to_string());
+            continue;
         }
+
+        return Err(DbParseError {
+            path: path.to_string(),
+            line: lineno,
+            message: format!("unrecognised line: {line}"),
+        });
     }
+
     if let Some(rec) = current.take() {
         records.push(rec);
     }
+    Ok(records)
+}
 
+pub fn load_db(path: &str) -> Result<HashMap<String, RecordInstance>, String> {
+    let raw = load_db_records(path, &HashMap::new()).map_err(|e| e.to_string())?;
+    typed_from_raw(&raw)
+}
+
+pub fn parse_db(content: &str) -> Result<HashMap<String, RecordInstance>, String> {
+    let raw = parse_db_records(content, "<memory>", &HashMap::new()).map_err(|e| e.to_string())?;
+    typed_from_raw(&raw)
+}
+
+/// Build the `SimplePvStore` typed model. A record the typed layer cannot
+/// represent is now an error rather than a silent omission.
+fn typed_from_raw(raw: &[DbRecord]) -> Result<HashMap<String, RecordInstance>, String> {
     let mut map = HashMap::new();
-    for rec in &records {
-        if let Some(parsed) = to_record(rec) {
-            map.insert(parsed.name.clone(), parsed);
-        }
+    for rec in raw {
+        let Some(parsed) = to_record(rec) else {
+            return Err(format!(
+                "record '{}' of type '{}' is not supported",
+                rec.name, rec.record_type
+            ));
+        };
+        map.insert(parsed.name.clone(), parsed);
     }
-
     Ok(map)
 }
 
@@ -713,5 +909,107 @@ mod tests {
         assert_eq!(event.common.scan, ScanMode::Event("MY_EVT".to_string()));
         let io = map.get("PV:IO").unwrap();
         assert_eq!(io.common.scan, ScanMode::IoEvent("ADC0".to_string()));
+    }
+
+    #[test]
+    fn parse_error_names_the_file_and_line() {
+        let input = "record(ai, \"PV:A\") {\n    field(VAL \"1\")\n}\n";
+        let err = parse_db_records(input, "bad.db", &HashMap::new())
+            .expect_err("a malformed field line must abort the load");
+        assert_eq!(err.path, "bad.db");
+        assert_eq!(err.line, 2, "the error must name the offending line");
+        assert!(
+            err.to_string().contains("bad.db:2"),
+            "Display must render path:line, got {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_record_type_is_no_longer_silently_dropped() {
+        let input = "record(nosuchtype, \"PV:X\") {\n    field(VAL, \"1\")\n}\n";
+        // parse_db_records is untyped and keeps it; to_record is what rejects.
+        let raw = parse_db_records(input, "x.db", &HashMap::new()).expect("raw parse succeeds");
+        assert_eq!(raw.len(), 1);
+        let err = parse_db(input).expect_err("the typed load must abort");
+        assert!(
+            err.contains("PV:X"),
+            "the error must name the record, got {err}"
+        );
+    }
+
+    #[test]
+    fn macro_substitution_expands_dollar_braces_and_parens() {
+        let mut macros = HashMap::new();
+        macros.insert("P".to_string(), "SYS:".to_string());
+        macros.insert("N".to_string(), "7".to_string());
+        let input = "record(ai, \"${P}AI$(N)\") {\n    field(VAL, \"$(N)\")\n}\n";
+        let recs = parse_db_records(input, "m.db", &macros).expect("expansion succeeds");
+        assert_eq!(recs[0].name, "SYS:AI7");
+        assert_eq!(recs[0].fields.get("VAL").map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    fn undefined_macro_is_an_error_naming_the_macro() {
+        let input = "record(ai, \"$(NOPE)\") {\n}\n";
+        let err = parse_db_records(input, "m.db", &HashMap::new())
+            .expect_err("an undefined macro must abort the load");
+        assert!(err.message.contains("NOPE"), "got {}", err.message);
+    }
+
+    #[test]
+    fn quoted_field_values_may_continue_across_lines() {
+        let input = "record(ai, \"PV:A\") {\n    field(DESC, \"one\ntwo\")\n}\n";
+        let recs = parse_db_records(input, "c.db", &HashMap::new()).expect("continuation parses");
+        assert_eq!(
+            recs[0].fields.get("DESC").map(String::as_str),
+            Some("one\ntwo")
+        );
+    }
+
+    #[test]
+    fn unterminated_quote_reports_the_opening_line() {
+        let input = "record(ai, \"PV:A\") {\n    field(DESC, \"never closed\n}\n";
+        let err = parse_db_records(input, "c.db", &HashMap::new())
+            .expect_err("an unterminated quote must abort the load");
+        assert_eq!(err.line, 2);
+    }
+
+    #[test]
+    fn include_pulls_in_a_sibling_file() {
+        let dir = std::env::temp_dir().join("spvirit_db_include_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        fs::write(dir.join("inner.db"), "record(ai, \"PV:INNER\") {\n}\n").expect("write inner");
+        let outer = dir.join("outer.db");
+        fs::write(
+            &outer,
+            "include \"inner.db\"\nrecord(ai, \"PV:OUTER\") {\n}\n",
+        )
+        .expect("write outer");
+
+        let recs = load_db_records(outer.to_str().expect("utf8 path"), &HashMap::new())
+            .expect("include resolves relative to the including file");
+        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["PV:INNER", "PV:OUTER"]);
+
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn include_cycle_is_reported_rather_than_hanging() {
+        let dir = std::env::temp_dir().join("spvirit_db_cycle_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        fs::write(dir.join("a.db"), "include \"b.db\"\n").expect("write a");
+        fs::write(dir.join("b.db"), "include \"a.db\"\n").expect("write b");
+
+        let err = load_db_records(
+            dir.join("a.db").to_str().expect("utf8 path"),
+            &HashMap::new(),
+        )
+        .expect_err("an include cycle must be an error, not a hang");
+        assert!(err.message.contains("cycle"), "got {}", err.message);
+
+        fs::remove_dir_all(&dir).expect("clean up");
     }
 }
