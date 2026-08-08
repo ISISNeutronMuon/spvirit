@@ -10,7 +10,7 @@ use crate::alarm::{Condition, Severity};
 use crate::ctx::MAX_DEPTH;
 use crate::ctx::{ProcCtx, ProcError};
 use crate::lockset::{LockSetData, RecordId};
-use crate::model::{Field, Kind, Limits, Link, Record, Target, Value};
+use crate::model::{Field, Kind, Limits, Link, Omsl, Record, Target, Value};
 
 /// Wall-clock nanoseconds since the epoch, for the record's timestamp.
 ///
@@ -168,8 +168,8 @@ fn limit_crossed(value: f64, limits: &Limits, current: Condition) -> Option<(Sev
 /// return; }`) — it is not part of `recGblResetAlarms`, which only commits.
 /// Routed through `set_sevr` so there is exactly one raise-only
 /// implementation. `pub(crate)` because every record kind must call this,
-/// including the ones (bi/bo/longin/longout) that never call
-/// [`check_limits`] — see Task 9's binding note.
+/// including `bi`/`bo`, which have no limit fields at all and so never call
+/// [`check_limits`] — see [`record_body`]'s `else` branch.
 pub(crate) fn check_udf(set: &mut LockSetData, id: RecordId) -> bool {
     let r = set.get_mut(id);
     if r.common.udf {
@@ -269,18 +269,12 @@ pub(crate) fn fetch_link_value(
 ///
 /// This is the write-side counterpart to [`fetch_link_value`]'s read side —
 /// the entry point a future client put (CA/PVA) or an output record's OUT
-/// write calls. Task 8 only wires up the primitive and its own test; no
-/// production caller exists yet, so it is exercised solely by
-/// `writing_dot_proc_forces_a_process_pass` until a later task adds one.
+/// write calls. Task 9's `output_body` is its first production caller.
 ///
 /// Note for Task 10: the `.VAL` branch below sets the field and clears UDF
 /// only — it does not touch `prev_val` or post any monitor. Monitor
 /// bookkeeping (comparing against `prev_val`/`MDEL`/`ADEL` and queuing the
 /// update) is Task 10's territory, not this one's.
-#[allow(
-    dead_code,
-    reason = "no production caller yet; wired up by a later task's client-put or output-record path"
-)]
 pub(crate) fn write_field(
     set: &mut LockSetData,
     id: RecordId,
@@ -329,27 +323,56 @@ pub(crate) fn read_field(set: &LockSetData, id: RecordId, field: Field) -> Value
     }
 }
 
-/// The type-specific processing body. Tasks 9-10 build this out further;
-/// Task 8 adds the input-link read (PP ordering, MS severity); Task 7 adds
-/// alarm-limit checking, which every numeric record needs regardless of kind
-/// (binary records simply have every limit severity at its `NoAlarm`
-/// default, so `check_limits` is a no-op for them).
+/// The type-specific processing body.
+///
+/// Input records read INP and store it. Output records take a desired value
+/// from DOL when OMSL says so, then write it through OUT. Both then check
+/// limits or UDF, stamp the time, and commit their alarm state.
 pub(crate) fn record_body(
     set: &mut LockSetData,
     id: RecordId,
     ctx: &mut ProcCtx,
 ) -> Result<(), ProcError> {
     let kind = set.get(id).kind;
+    if kind.is_output() {
+        output_body(set, id, ctx)?;
+    } else {
+        input_body(set, id, ctx)?;
+    }
+    set.get_mut(id).time_ns = now_ns();
+    if is_analogue(kind) {
+        check_limits(set, id);
+    } else {
+        // bi/bo carry no limit fields at all (EPICS gives them ZSV/OSV/COSV
+        // state alarms instead, out of scope for this plan), so they never
+        // reach `check_limits` — and therefore never reach the `check_udf`
+        // inside it. Every kind must still promote a never-processed record
+        // to INVALID/UDF, so bi/bo call `check_udf` directly here.
+        check_udf(set, id);
+    }
+    reset_alarms(set, id, ctx);
+    Ok(())
+}
+
+/// Only `ai`/`ao`/`longin`/`longout` carry HIHI/HIGH/LOW/LOLO limit fields
+/// and run the limit ladder in [`check_limits`], exactly as their EPICS Base
+/// counterparts do. `bi`/`bo` have no limit fields at all — see
+/// [`record_body`]'s `else` branch for how they still get UDF promotion.
+fn is_analogue(kind: Kind) -> bool {
+    matches!(kind, Kind::Ai | Kind::Ao | Kind::LongIn | Kind::LongOut)
+}
+
+fn input_body(set: &mut LockSetData, id: RecordId, ctx: &mut ProcCtx) -> Result<(), ProcError> {
+    let kind = set.get(id).kind;
     let inp = set.get(id).inp.clone();
-    // Input records take their value from INP; output records are Task 9.
     // A CONSTANT link is a no-op during processing — `dbGetLink` returns
     // immediately for `plink->type == CONSTANT` without touching the
     // destination. Constant links are applied once, at init time, by
     // `recGblInitConstantLink` (PINI-time initialisation is Task 13's); on
     // every later process pass a soft record with a constant (including a
     // never-configured, i.e. default) INP simply keeps whatever value a
-    // direct write last gave it. See the SDIS check above for the same
-    // idiom.
+    // direct write last gave it. See the SDIS check in `process_inner` for
+    // the same idiom.
     // UDF is cleared unconditionally here, not on some success condition —
     // and that is deliberate, not a shortcut. `aiRecord::process` clears UDF
     // on a successful read (`if (status == 0) prec->udf = FALSE;`), and in
@@ -362,7 +385,7 @@ pub(crate) fn record_body(
     // "fix" a bug; there isn't one. See
     // `a_record_reports_invalid_udf_before_the_first_process_pass` /
     // `_and_no_alarm_after_it` below for the transition this produces.
-    if !kind.is_output() && !matches!(inp, Link::Constant(_)) {
+    if !matches!(inp, Link::Constant(_)) {
         let (value, link_sev) = fetch_link_value(set, &inp, kind, ctx)?;
         let r = set.get_mut(id);
         r.val = value;
@@ -373,9 +396,56 @@ pub(crate) fn record_body(
     } else {
         set.get_mut(id).common.udf = false;
     }
-    set.get_mut(id).time_ns = now_ns();
-    check_limits(set, id);
-    reset_alarms(set, id, ctx);
+    Ok(())
+}
+
+fn output_body(set: &mut LockSetData, id: RecordId, ctx: &mut ProcCtx) -> Result<(), ProcError> {
+    let kind = set.get(id).kind;
+
+    // OMSL = closed_loop means the record is driven by DOL rather than by
+    // whatever a client last wrote. As with INP above, a CONSTANT DOL is a
+    // processing-time no-op — it was already applied once, at init time, by
+    // `recGblInitConstantLink` (see `build.rs::init_constant`). Re-reading it
+    // on every pass would clobber a supervisory-then-switched-to-closed-loop
+    // record back to its constant default instead of leaving it to whatever
+    // a real (non-constant) DOL link supplies.
+    if set.get(id).omsl == Omsl::ClosedLoop {
+        let dol = set.get(id).dol.clone();
+        if !matches!(dol, Link::Constant(_)) {
+            let (value, link_sev) = fetch_link_value(set, &dol, kind, ctx)?;
+            let r = set.get_mut(id);
+            r.val = value;
+            if link_sev != Severity::NoAlarm {
+                set_sevr(r, link_sev, Condition::Link);
+            }
+        }
+    }
+    set.get_mut(id).common.udf = false;
+
+    // Write through OUT. A constant OUT is the "no hardware attached" case
+    // every soft record has; there is nothing to write.
+    let out = set.get(id).out.clone();
+    let value = set.get(id).val;
+    match out {
+        Link::Db {
+            target: Target::Id(target_id),
+            field,
+            process_passive,
+            ..
+        } => {
+            write_field(set, target_id, field, value, ctx)?;
+            if process_passive {
+                process(set, target_id, ctx)?;
+            }
+        }
+        Link::Unresolved { .. } | Link::Constant(_) => {}
+        Link::Db {
+            target: Target::Name(name),
+            ..
+        } => {
+            unreachable!("unresolved OUT target '{name}' reached process()")
+        }
+    }
     Ok(())
 }
 
@@ -1100,6 +1170,169 @@ mod tests {
         d.with_set(a.set, |set| {
             write_field(set, a, Field::Proc, Value::Long(1), &mut ctx).expect("write succeeds");
             assert!(set.get(a).time_ns > 0, "writing PROC processes the record");
+        });
+    }
+
+    // --- Task 9: type-specific bodies ---------------------------------------
+
+    // The brief's original fixtures for these two tests gave DOL a bare
+    // numeric literal ("9"), which `build.rs::link` parses as a *constant*
+    // link. A constant DOL is init-seeded into VAL unconditionally at load
+    // (`build.rs::init_constant`, ungated by OMSL — see
+    // `a_specified_numeric_dol_seeds_val_and_clears_udf_for_an_output_record`
+    // in `build.rs`) and is then a no-op on every later process pass
+    // regardless of OMSL (the same CONSTANT-link idiom `input_body` uses for
+    // INP). So under a constant DOL, supervisory and closed_loop are
+    // indistinguishable in this engine, just as they are in EPICS Base:
+    // `aoRecord.c`'s `init_record` seeds VAL from a constant DOL ungated by
+    // OMSL, and `dbGetLink` on a CONSTANT link during `process` writes
+    // nothing either way. That made the original fixture unsound in
+    // principle — the same failure mode Task 8's PP/NPP fixtures had — not
+    // just for this implementation but for any correct one. The fix moves
+    // DOL to a real DB link (`PV:SRC`, a plain `ai` record) so the two tests
+    // actually exercise different code paths: supervisory never reads
+    // `PV:SRC` at all; closed_loop reads it and overwrites VAL. The tests'
+    // names and asserted intent are unchanged.
+
+    #[test]
+    fn an_output_record_in_supervisory_mode_keeps_its_own_value() {
+        let d = db("record(ao, \"PV:O\") {\n    field(VAL, \"3\")\n\
+                    field(DOL, \"PV:SRC\")\n    field(OMSL, \"supervisory\")\n}\n\
+                    record(ai, \"PV:SRC\") {\n    field(VAL, \"9\")\n}\n");
+        let id = d.lookup("PV:O").expect("PV:O exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            assert_eq!(set.get(id).val.as_f64(), 3.0, "supervisory ignores DOL");
+        });
+    }
+
+    #[test]
+    fn an_output_record_in_closed_loop_takes_its_value_from_dol() {
+        let d = db("record(ao, \"PV:O\") {\n    field(VAL, \"3\")\n\
+                    field(DOL, \"PV:SRC\")\n    field(OMSL, \"closed_loop\")\n}\n\
+                    record(ai, \"PV:SRC\") {\n    field(VAL, \"9\")\n}\n");
+        let id = d.lookup("PV:O").expect("PV:O exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            assert_eq!(set.get(id).val.as_f64(), 9.0, "closed_loop follows DOL");
+        });
+    }
+
+    #[test]
+    fn an_output_record_writes_its_value_through_out() {
+        let d = db("record(ao, \"PV:O\") {\n    field(VAL, \"4\")\n\
+                    field(OUT, \"PV:T.VAL\")\n}\n\
+                    record(ai, \"PV:T\") {\n}\n");
+        let o = d.lookup("PV:O").expect("PV:O exists");
+        let t = d.lookup("PV:T").expect("PV:T exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(o.set, |set| {
+            process(set, o, &mut ctx).expect("process succeeds");
+            assert_eq!(set.get(t).val.as_f64(), 4.0, "OUT must write the target");
+        });
+    }
+
+    #[test]
+    fn a_binary_record_stores_zero_or_one() {
+        let d = db("record(bi, \"PV:B\") {\n    field(INP, \"7\")\n}\n");
+        let id = d.lookup("PV:B").expect("PV:B exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            assert_eq!(
+                set.get(id).val,
+                Value::Enum(1),
+                "any non-zero input means 1"
+            );
+        });
+    }
+
+    #[test]
+    fn a_long_record_rounds_a_double_input() {
+        let d = db(
+            "record(longin, \"PV:L\") {\n    field(INP, \"PV:S NPP\")\n}\n\
+                    record(ai, \"PV:S\") {\n    field(VAL, \"2.6\")\n}\n",
+        );
+        let l = d.lookup("PV:L").expect("PV:L exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(l.set, |set| {
+            process(set, l, &mut ctx).expect("process succeeds");
+            assert_eq!(set.get(l).val, Value::Long(3));
+        });
+    }
+
+    #[test]
+    fn a_binary_record_does_not_apply_numeric_limits() {
+        let d = db("record(bi, \"PV:B\") {\n    field(INP, \"1\")\n\
+                    field(HIHI, \"0\")\n    field(HHSV, \"MAJOR\")\n}\n");
+        let id = d.lookup("PV:B").expect("PV:B exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            assert_eq!(
+                set.get(id).common.sevr,
+                Severity::NoAlarm,
+                "binary records have no analogue limits"
+            );
+        });
+    }
+
+    // --- discriminators for the corrected `is_analogue` set -----------------
+    //
+    // Ruling: `is_analogue` is `Ai | Ao | LongIn | LongOut`, matching EPICS
+    // (longinRecord/longoutRecord carry HIHI/HIGH/LOW/LOLO and run the same
+    // checkAlarms ladder as ai/ao; only bi/bo have no limit fields at all).
+    // Neither of these was pinned by the brief's own tests, so a later
+    // narrowing of `is_analogue` back to `{Ai, Ao}` would pass every test
+    // above but silently drop limit checking for longin/longout.
+
+    #[test]
+    fn a_longin_record_crossing_hihi_is_limit_checked() {
+        // INP is a constant (numeric literal), so it seeds VAL = 20 at load
+        // and is a no-op on every later process pass (see
+        // `a_constant_link_is_a_no_op_during_processing`); the limit ladder
+        // is what must catch the crossing, not the input read.
+        let d = db("record(longin, \"PV:L\") {\n    field(INP, \"20\")\n\
+                    field(HIHI, \"10\")\n    field(HHSV, \"MAJOR\")\n}\n");
+        let id = d.lookup("PV:L").expect("PV:L exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            assert_eq!(
+                set.get(id).common.sevr,
+                Severity::Major,
+                "longin must run the same limit ladder as ai/ao"
+            );
+            assert_eq!(set.get(id).common.stat, Condition::HiHi);
+        });
+    }
+
+    #[test]
+    fn a_never_processed_binary_record_is_invalid_udf() {
+        // bi/bo never reach `check_limits` (they have no limit fields), so
+        // `record_body` must call `check_udf` directly for them — otherwise
+        // a never-processed binary record would never be promoted to
+        // INVALID/UDF at all. There is no "peek without processing" API (see
+        // the equivalent ai-kind tests above), so this drives `check_udf`
+        // directly, the same way those do.
+        let d = db("record(bi, \"PV:B\") {\n}\n");
+        let id = d.lookup("PV:B").expect("PV:B exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            assert!(
+                set.get(id).common.udf,
+                "a never-processed record is UDF by default"
+            );
+            check_udf(set, id);
+            reset_alarms(set, id, &mut ctx);
+            assert_eq!(
+                set.get(id).common.sevr,
+                Severity::Invalid,
+                "bi must still get UDF promotion despite having no limit fields"
+            );
+            assert_eq!(set.get(id).common.stat, Condition::Udf);
         });
     }
 }
