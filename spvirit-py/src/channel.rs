@@ -20,7 +20,7 @@ use spvirit_client::client::{
 use spvirit_client::pva_client::decode_init_introspection;
 use spvirit_client::transport::{read_packet, read_until};
 use spvirit_client::types::{PvGetError, PvGetOptions};
-use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_codec::epics_decode::{DecodeMode, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::PvdDecoder;
 use spvirit_codec::spvd_encode::encode_pv_request;
 use spvirit_codec::spvirit_encode::encode_control_message;
@@ -144,7 +144,7 @@ async fn run_get(
     let get_init = encode_get_request(sid, ioid, QOS_INIT, &pv_request, version, is_be);
     conn.stream.write_all(&get_init).await?;
 
-    let init_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let init_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 10 && op.ioid == ioid && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -153,7 +153,7 @@ async fn run_get(
     let get_data = encode_get_request(sid, ioid, 0x00, &[], version, is_be);
     conn.stream.write_all(&get_data).await?;
 
-    let data_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let data_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 10 && op.ioid == ioid && op.subcmd == 0x00)
     })
     .await?;
@@ -163,7 +163,8 @@ async fn run_get(
         .ok_or_else(|| PvGetError::Protocol("get data decode failed".to_string()))?;
     match cmd {
         PvaPacketCommand::Op(mut op) => {
-            op.decode_with_field_desc(&desc, is_be);
+            // A decode failure leaves decoded_value None, reported below.
+            let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
             let value = op
                 .decoded_value
                 .ok_or_else(|| PvGetError::Decode("no decoded value".to_string()))?;
@@ -191,7 +192,7 @@ async fn run_put(
     let init = encode_put_request(sid, ioid, QOS_INIT, &pv_request, PVA_VERSION, is_be);
     conn.stream.write_all(&init).await?;
 
-    let init_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let init_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.ioid == ioid && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -202,7 +203,7 @@ async fn run_put(
     let req = encode_put_request(sid, ioid, 0x00, &payload, PVA_VERSION, is_be);
     conn.stream.write_all(&req).await?;
 
-    let resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.ioid == ioid && op.subcmd == 0x00)
     })
     .await?;
@@ -225,7 +226,7 @@ async fn run_introspect(
     let pv_request = vec![0xfd, 0x02, 0x00, 0x80, 0x00, 0x00];
     let init = encode_get_request(sid, ioid, QOS_INIT, &pv_request, version, is_be);
     conn.stream.write_all(&init).await?;
-    let init_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let init_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 10 && op.ioid == ioid && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -233,7 +234,7 @@ async fn run_introspect(
 }
 
 /// Monitor loop running against the persistent channel.  Invokes
-/// `callback(decoded_value_py)` inside the GIL; stops when the callback
+/// `callback(MonitorUpdate)` inside the GIL; stops when the callback
 /// returns a falsy value or raises.
 async fn run_monitor(
     state: Arc<Mutex<ChannelState>>,
@@ -253,7 +254,7 @@ async fn run_monitor(
     let init = encode_monitor_request(sid, ioid, QOS_INIT, &pv_request, PVA_VERSION, is_be);
     conn.stream.write_all(&init).await?;
 
-    let init_resp = read_until(&mut conn.stream, timeout, |cmd| {
+    let init_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 13 && op.ioid == ioid && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -273,7 +274,7 @@ async fn run_monitor(
                 echo_token = echo_token.wrapping_add(1);
                 let _ = conn.stream.write_all(&msg).await;
             }
-            res = read_packet(&mut conn.stream, timeout) => {
+            res = read_packet(&mut conn.stream, timeout, &mut conn.reassembler) => {
                 let bytes = match res {
                     Ok(b) => b,
                     Err(PvGetError::Timeout(_)) => continue,
@@ -284,11 +285,13 @@ async fn run_monitor(
                     if op.command == 13 && op.ioid == ioid && op.subcmd == 0x00 {
                         let payload = &bytes[8..];
                         let pos = 5;
-                        if let Some((decoded, _)) =
-                            decoder.decode_structure_with_bitset(&payload[pos..], &field_desc)
+                        if let Ok(update) =
+                            decoder.decode_monitor_update(&payload[pos..], &field_desc)
                         {
                             let keep_going = Python::with_gil(|py| {
-                                let v = decoded_to_py(py, &decoded);
+                                let v = crate::monitor_update::PyMonitorUpdate::from_update(
+                                    py, &update,
+                                );
                                 match callback.call1(py, (v,)) {
                                     Ok(ret) => ret.extract::<bool>(py).unwrap_or(true),
                                     Err(e) => {
@@ -469,8 +472,12 @@ impl PyChannel {
     }
 
     /// Subscribe and block (GIL released between updates) until
-    /// `callback(value)` returns False or raises — a raised exception stops
+    /// `callback(update)` returns False or raises — a raised exception stops
     /// the monitor and propagates to the caller.
+    ///
+    /// The callback receives a `MonitorUpdate`; use `update.value` for the
+    /// decoded value, and `.changed` / `.overrun` / `.has_overrun` for the
+    /// bitsets.
     ///
     /// `fields` restricts the subscription to the given dotted paths.
     #[pyo3(signature = (callback, fields=None))]
@@ -543,7 +550,7 @@ impl PyChannel {
             let mut guard = state.lock().await;
             let t = override_timeout.unwrap_or(guard.timeout);
             let conn = guard.conn_mut()?;
-            read_packet(&mut conn.stream, t).await
+            read_packet(&mut conn.stream, t, &mut conn.reassembler).await
         })
         .map_err(to_py_err)?;
         Ok(crate::packet::PyPacket::from_bytes(bytes))
@@ -563,7 +570,9 @@ impl PyChannel {
                 let mut guard = state.lock().await;
                 let t = override_timeout.unwrap_or(guard.timeout);
                 let conn = guard.conn_mut().map_err(to_py_err)?;
-                read_packet(&mut conn.stream, t).await.map_err(to_py_err)?
+                read_packet(&mut conn.stream, t, &mut conn.reassembler)
+                    .await
+                    .map_err(to_py_err)?
             };
             Python::with_gil(|py| Py::new(py, crate::packet::PyPacket::from_bytes(bytes)))
         })
@@ -596,7 +605,7 @@ impl PyChannel {
                     let mut guard = state.lock().await;
                     let t = override_timeout.unwrap_or(guard.timeout);
                     let conn = guard.conn_mut()?;
-                    read_packet(&mut conn.stream, t).await
+                    read_packet(&mut conn.stream, t, &mut conn.reassembler).await
                 })
                 .map_err(to_py_err)?
             };
@@ -626,6 +635,7 @@ pub fn register(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new(py, "lowlevel")?;
     m.add_class::<PyChannel>()?;
     m.add_class::<crate::packet::PyPacket>()?;
+    m.add_class::<crate::monitor_update::PyMonitorUpdate>()?;
     crate::discovery::register(&m)?;
     parent.add_submodule(&m)?;
     py.import("sys")?

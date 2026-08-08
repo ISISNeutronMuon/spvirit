@@ -248,7 +248,7 @@ def test_subscribe():
     assert _wait_for(lambda: len(updates) >= 1), "no initial monitor update"
     assert sub.is_active
     t.set(2.5)
-    assert _wait_for(lambda: any(u.get("value") == 2.5 for u in updates)), \
+    assert _wait_for(lambda: any(u.value.get("value") == 2.5 for u in updates)), \
         "value update not delivered"
 
     sub.close()

@@ -15,7 +15,9 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,6 +66,9 @@ pub struct PvaServerBuilder {
     pvlist_mode: PvListMode,
     pvlist_max: usize,
     pvlist_allow_pattern: Option<Regex>,
+    start_hooks: Vec<crate::events::StartHook>,
+    event_handlers: Vec<(String, crate::events::EventHandler)>,
+    event_sinks: Vec<Arc<dyn crate::events::EventSink>>,
 }
 
 impl PvaServerBuilder {
@@ -84,6 +89,9 @@ impl PvaServerBuilder {
             pvlist_mode: PvListMode::List,
             pvlist_max: 1024,
             pvlist_allow_pattern: None,
+            start_hooks: Vec::new(),
+            event_handlers: Vec::new(),
+            event_sinks: Vec::new(),
         }
     }
 
@@ -430,6 +438,60 @@ impl PvaServerBuilder {
         self
     }
 
+    /// Register a hook to run once at startup, before the server serves.
+    ///
+    /// Hooks run in registration order, each to completion, before scan tasks
+    /// spawn and before the listener accepts. A hook that panics aborts
+    /// startup.
+    ///
+    /// ```rust,ignore
+    /// .on_start(|store| Box::pin(async move {
+    ///     store.set_value("SETPOINT", ScalarValue::F64(22.5)).await;
+    /// }))
+    /// ```
+    pub fn on_start<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(Arc<SimplePvStore>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.start_hooks.push(Arc::new(hook));
+        self
+    }
+
+    /// Register a handler for a named event.
+    ///
+    /// Handlers are deferred: `post_event` queues them and returns. They run
+    /// one at a time, in registration order, on the dispatcher.
+    ///
+    /// ```rust,ignore
+    /// .on_event("SHUTTER", |store, event| Box::pin(async move { /* ... */ }))
+    /// ```
+    pub fn on_event<F>(mut self, event: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(Arc<SimplePvStore>, String) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.event_handlers.push((event.into(), Arc::new(handler)));
+        self
+    }
+
+    /// Register an [`EventSink`](crate::events::EventSink) — an inline
+    /// consumer awaited by `post_event` before any handler is queued.
+    ///
+    /// Sinks were previously reachable only through
+    /// [`PvaServer::events`](PvaServer::events) on an already-built server,
+    /// which leaves no seam for callers that only ever hold a builder (or a
+    /// [`ServeBuilder`]/[`RunningServer`]). Registration order across
+    /// builder-registered and post-build sinks is call order.
+    pub fn event_sink(mut self, sink: Arc<dyn crate::events::EventSink>) -> Self {
+        self.event_sinks.push(sink);
+        self
+    }
+
     /// Link an output PV to one or more input PVs.
     ///
     /// Whenever any input PV changes (via `set_value`, protocol PUT, or
@@ -557,13 +619,37 @@ impl PvaServerBuilder {
         config.pvlist_max = self.pvlist_max;
         config.pvlist_allow_pattern = self.pvlist_allow_pattern;
 
+        let events = Arc::new(crate::events::Events::new());
+        for (name, handler) in self.event_handlers {
+            events.add_handler(name, handler);
+        }
+        for sink in self.event_sinks {
+            events.add_sink(sink);
+        }
+
         PvaServer {
             store,
             extra_sources: self.extra_sources,
             config,
             scans: self.scans,
-            monitor_registry: None,
+            monitor_registry: Arc::new(std::sync::OnceLock::new()),
+            events,
+            start_hooks: self.start_hooks,
         }
+    }
+}
+
+/// Best-effort rendering of a `catch_unwind` payload.
+///
+/// `panic!("...")` payloads are `String` (formatted) or `&'static str`
+/// (literal); anything else came from `panic_any` and has no text.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "panic payload was not a string".to_string()
     }
 }
 
@@ -592,9 +678,18 @@ pub struct PvaServer {
     extra_sources: Vec<(String, i32, Arc<dyn Source>)>,
     config: PvaServerConfig,
     scans: Vec<(String, Duration, ScanCallback)>,
-    /// Optional pre-supplied monitor registry so external code (e.g. Python
-    /// bindings) can notify monitors from outside `run()`.
-    monitor_registry: Option<Arc<MonitorRegistry>>,
+    /// The monitor registry, lazily created on first access (by whichever
+    /// runs first among `set_monitor_registry`, `monitor_registry`,
+    /// `run_start_hooks`, or `serve_after_start_hooks`) and shared from
+    /// then on via the `OnceLock`. This guarantees `run_start_hooks` (which
+    /// installs it on the store before any hook runs) and
+    /// `serve_after_start_hooks` (which passes it to the source registry
+    /// and the running protocol) always agree on the exact same instance,
+    /// even when they're invoked as two separate calls (as Python's
+    /// `start_background` does) rather than back-to-back inside `run()`.
+    monitor_registry: Arc<std::sync::OnceLock<Arc<MonitorRegistry>>>,
+    events: Arc<crate::events::Events>,
+    start_hooks: Vec<crate::events::StartHook>,
 }
 
 impl PvaServer {
@@ -606,6 +701,58 @@ impl PvaServer {
     /// Get a reference to the underlying store for runtime get/put.
     pub fn store(&self) -> &Arc<SimplePvStore> {
         &self.store
+    }
+
+    /// The server's event registry — register sinks or post events.
+    pub fn events(&self) -> &Arc<crate::events::Events> {
+        &self.events
+    }
+
+    /// Post a named event.
+    ///
+    /// Async because sinks are awaited inline: when this returns, every sink
+    /// has finished — records on that event have processed — and handlers
+    /// are queued, not necessarily run. Making the caller `.await` is what
+    /// buys the guarantee; a sync wrapper that spawned and returned would
+    /// silently drop it.
+    pub async fn post_event(&self, event: &str) {
+        self.events.post(event).await;
+    }
+
+    /// Run every `on_start` hook to completion, in registration order.
+    ///
+    /// Returns `Err` naming the hook and carrying the panic message if one
+    /// panics — including any label the hook panicked with (Python source
+    /// hooks panic with `on_start hook for source '<label>' raised: ...`).
+    ///
+    /// Also installs the monitor registry onto the store before any hook
+    /// runs (idempotently — `SimplePvStore::set_registry` is safe to call
+    /// more than once), so a hook that writes to the store notifies
+    /// subscribed monitors, and a hook that reads the registry off the
+    /// store never sees `None`. This must happen here rather than only in
+    /// `serve_after_start_hooks`, since `run_start_hooks` can be — and, via
+    /// Python's `start_background`, is — called on its own ahead of it.
+    pub async fn run_start_hooks(&self) -> Result<(), String> {
+        self.store.set_registry(self.resolved_monitor_registry()).await;
+        for (i, hook) in self.start_hooks.iter().enumerate() {
+            let fut = hook(self.store.clone());
+            let result =
+                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
+            if let Err(payload) = result {
+                // Fold the panic payload into the message. Without this the
+                // real cause ("ValueError: DB connection refused", or the
+                // source label a Python source hook panics with) reached the
+                // user only via the default panic hook on stderr, and the
+                // returned error named the hook by an index that does not
+                // correspond to anything the user wrote — builder hooks and
+                // source hooks share one list.
+                return Err(format!(
+                    "on_start hook #{i} panicked; aborting startup: {}",
+                    panic_message(payload.as_ref())
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Mint a typed handle to any record in this server's store — the
@@ -643,30 +790,68 @@ impl PvaServer {
     /// This lets external code (for example Python `Source` adapters)
     /// hold onto the registry and publish monitor updates to subscribed
     /// PVAccess clients from outside `run()`.
+    ///
+    /// Must be called before the registry has been resolved by any other
+    /// path (`monitor_registry()`, `run_start_hooks()`, or
+    /// `serve_after_start_hooks()`) — in normal usage this is always right
+    /// after `build()`, before any of those run. If the registry was
+    /// already resolved, this is a no-op: the earlier instance wins.
     pub fn set_monitor_registry(&mut self, registry: Arc<MonitorRegistry>) {
-        self.monitor_registry = Some(registry);
+        let _ = self.monitor_registry.set(registry);
     }
 
     /// Get a shared handle to the [`MonitorRegistry`] that will be used
     /// when [`Self::run`] starts.  Creates (and stores) a new registry
     /// on first call so external code can register before run.
     pub fn monitor_registry(&mut self) -> Arc<MonitorRegistry> {
-        if self.monitor_registry.is_none() {
-            self.monitor_registry = Some(Arc::new(MonitorRegistry::new()));
-        }
-        self.monitor_registry.as_ref().unwrap().clone()
+        self.resolved_monitor_registry()
+    }
+
+    /// Get-or-create the single [`MonitorRegistry`] instance this server
+    /// will use for its whole lifetime. Shared by `monitor_registry()`,
+    /// `run_start_hooks()`, and `serve_after_start_hooks()` so they always
+    /// agree on the exact same `Arc`, regardless of call order.
+    fn resolved_monitor_registry(&self) -> Arc<MonitorRegistry> {
+        self.monitor_registry
+            .get_or_init(|| Arc::new(MonitorRegistry::new()))
+            .clone()
     }
 
     /// Start the PVA server (UDP search + TCP handler + beacon + scan tasks).
     ///
     /// This blocks until the server is shut down or an error occurs.
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
-        // Create the monitor registry early so scan tasks can notify
-        // PVAccess monitor clients when values change.
-        let registry = self
-            .monitor_registry
-            .clone()
-            .unwrap_or_else(|| Arc::new(MonitorRegistry::new()));
+        // 1. Run every on_start hook to completion. Nothing else has started,
+        //    so a hook observes a quiescent store and no client can see a
+        //    pre-initialisation value.
+        self.run_start_hooks()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::<dyn std::error::Error>::from(e) })?;
+
+        self.serve_after_start_hooks().await
+    }
+
+    /// Continue startup on the assumption that `run_start_hooks()` has
+    /// already completed successfully.
+    ///
+    /// Builds the source registry, spawns scan tasks, starts the event
+    /// dispatcher, and binds/accepts connections — i.e. everything `run()`
+    /// does except the hook phase. Exists so a caller that needs to surface
+    /// an `on_start` failure synchronously (e.g. Python's
+    /// `start_background`, which must raise before returning rather than
+    /// only logging from a background thread) can run the hooks itself,
+    /// check the result, and only then hand the server off to a background
+    /// task — without running the hooks a second time.
+    ///
+    /// Calling this without having run the start hooks first silently skips
+    /// them; callers that need the hooks-first guarantee should use `run()`
+    /// or call `run_start_hooks()` first themselves.
+    pub async fn serve_after_start_hooks(self) -> Result<(), Box<dyn std::error::Error>> {
+        // Resolve (or reuse, if run_start_hooks or monitor_registry() already
+        // did) the single monitor registry instance so scan tasks and the
+        // running protocol notify PVAccess monitor clients through the same
+        // registry the store was already given.
+        let registry = self.resolved_monitor_registry();
         self.store.set_registry(registry.clone()).await;
 
         // Build the source registry with the built-in store at order 0.
@@ -690,7 +875,7 @@ impl PvaServer {
             sources.add(label.clone(), *order, source.clone()).await;
         }
 
-        // Spawn scan tasks.
+        // 2. Spawn scan tasks.
         for (name, period, callback) in &self.scans {
             let store = self.store.clone();
             let name = name.clone();
@@ -706,12 +891,16 @@ impl PvaServer {
             });
         }
 
+        // 3. Start the event dispatcher.
+        self.events.start_dispatcher(self.store.clone());
+
         let pv_count = self.store.pv_names().await.len();
         info!(
             "PvaServer starting: {} PVs on port {}",
             pv_count, self.config.tcp_port
         );
 
+        // 4. Bind and accept.
         run_pva_server_with_registry(sources, self.config, registry).await
     }
 }
@@ -779,6 +968,36 @@ impl ServeBuilder {
         self
     }
 
+    /// Register a startup hook. See [`PvaServerBuilder::on_start`].
+    pub fn on_start<F>(mut self, hook: F) -> Self
+    where
+        F: Fn(Arc<SimplePvStore>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.inner = self.inner.on_start(hook);
+        self
+    }
+
+    /// Register an event handler. See [`PvaServerBuilder::on_event`].
+    pub fn on_event<F>(mut self, event: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(Arc<SimplePvStore>, String) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.inner = self.inner.on_event(event, handler);
+        self
+    }
+
+    /// Register an inline event sink. See [`PvaServerBuilder::event_sink`].
+    pub fn event_sink(mut self, sink: Arc<dyn crate::events::EventSink>) -> Self {
+        self.inner = self.inner.event_sink(sink);
+        self
+    }
+
     /// Materialise records, links and scans from the handles, build the
     /// server, then bind every handle to the store.
     ///
@@ -823,22 +1042,51 @@ impl ServeBuilder {
         self.build().await.run().await
     }
 
-    /// Build and spawn; returns a handle for typed access and shutdown.
-    pub async fn start(self) -> RunningServer {
+    /// Build, run the `on_start` hooks to completion, then spawn the server;
+    /// returns a handle for typed access and shutdown.
+    ///
+    /// Returns `Err` if a hook aborts startup, mirroring Python's
+    /// `start_background`. This phase is awaited here rather than inside the
+    /// spawned task for two reasons: a hook that aborts must surface to the
+    /// caller instead of only reaching a `tracing::error!` they may have no
+    /// subscriber for, and hooks must have finished before `start()` returns
+    /// so `RunningServer::pv(...)` cannot read pre-hook values.
+    ///
+    /// A failure *after* the hook phase (a bind error, say) still cannot be
+    /// returned here — the server is serving by then — and is logged from
+    /// the spawned task as before.
+    pub async fn start(self) -> Result<RunningServer, String> {
         let server = self.build().await;
         let store = server.store().clone();
+        let events = server.events().clone();
+        server.run_start_hooks().await?;
+        // Start the dispatcher here rather than leaving it to
+        // `serve_after_start_hooks` in the spawned task: otherwise
+        // `RunningServer::post_event` immediately after `start()` races the
+        // spawn, and `events().drain()` would report a dispatcher that has
+        // not started yet. `start_dispatcher` is idempotent.
+        events.start_dispatcher(store.clone());
         let handle = tokio::spawn(async move {
-            if let Err(e) = server.run().await {
+            if let Err(e) = server.serve_after_start_hooks().await {
                 tracing::error!("PvaServer exited with error: {e}");
             }
         });
-        RunningServer { store, handle }
+        Ok(RunningServer {
+            store,
+            events,
+            handle,
+        })
     }
 }
 
 /// A started server: mint typed handles, then `abort()` to stop.
 pub struct RunningServer {
     store: Arc<SimplePvStore>,
+    /// Kept independently of the `PvaServer`, which `start()` moves into the
+    /// spawned task — otherwise `ServeBuilder::on_event` could register
+    /// handlers that nothing could ever fire. Python's `PyServer` keeps the
+    /// same handle for the same reason.
+    events: Arc<crate::events::Events>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -919,6 +1167,17 @@ impl RunningServer {
 
     pub fn store(&self) -> &Arc<SimplePvStore> {
         &self.store
+    }
+
+    /// The running server's event registry — register sinks or handlers, or
+    /// read the drop/failure counters.
+    pub fn events(&self) -> &Arc<crate::events::Events> {
+        &self.events
+    }
+
+    /// Post a named event. See [`PvaServer::post_event`].
+    pub async fn post_event(&self, event: &str) {
+        self.events.post(event).await;
     }
 
     pub fn abort(&self) {
@@ -1133,6 +1392,435 @@ pub(crate) fn make_table_record(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn on_start_hooks_are_stored_and_runnable_in_order() {
+        use std::sync::Mutex;
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        let l1 = log.clone();
+        let l2 = log.clone();
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .on_start(move |_store| {
+                let l = l1.clone();
+                Box::pin(async move { l.lock().unwrap().push("first"); })
+            })
+            .on_start(move |_store| {
+                let l = l2.clone();
+                Box::pin(async move { l.lock().unwrap().push("second"); })
+            })
+            .build();
+
+        server.run_start_hooks().await.expect("hooks must succeed");
+
+        assert_eq!(log.lock().unwrap().as_slice(), &["first", "second"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_builder_start_surfaces_a_start_hook_abort() {
+        // Previously start() spawned run() and discarded its Result, so a
+        // hook that aborted startup produced a healthy-looking RunningServer,
+        // a tracing::error! the caller may never see, and a server that never
+        // bound. Python's start_background already refuses to do that.
+        const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let started = tokio::time::timeout(
+            RUN_TIMEOUT,
+            PvaServer::serve(Vec::<crate::pv::AnyPv>::new())
+                .port(0)
+                .udp_port(0)
+                .on_start(|_store| Box::pin(async { panic!("init failed: no DB") }))
+                .start(),
+        )
+        .await
+        .expect("ServeBuilder::start() did not return within RUN_TIMEOUT");
+
+        let err = started.err().expect("an aborting hook must fail start()");
+        assert!(
+            err.contains("init failed: no DB"),
+            "start() must surface the hook's cause, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_builder_start_returns_only_after_hooks_have_run() {
+        // RunningServer::pv(...) must never be able to read a pre-hook value.
+        const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let server = tokio::time::timeout(
+            RUN_TIMEOUT,
+            PvaServer::serve(Vec::<crate::pv::AnyPv>::new())
+                .port(0)
+                .udp_port(0)
+                .on_start(|store| {
+                    Box::pin(async move {
+                        store.insert(
+                            "T:HOOKED".to_string(),
+                            make_scalar_record(
+                                "T:HOOKED",
+                                RecordType::Ai,
+                                ScalarValue::F64(7.0),
+                            ),
+                        )
+                        .await;
+                    })
+                })
+                .start(),
+        )
+        .await
+        .expect("ServeBuilder::start() did not return within RUN_TIMEOUT")
+        .expect("hooks must succeed");
+
+        assert_eq!(
+            server.store().get_value("T:HOOKED").await,
+            Some(ScalarValue::F64(7.0)),
+            "start() must not return before on_start hooks have finished"
+        );
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_server_can_post_to_a_serve_builder_handler() {
+        // ServeBuilder::on_event registered handlers that nothing could ever
+        // fire: start() moved the PvaServer into the spawned task and
+        // RunningServer had no events()/post_event().
+        const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let server = tokio::time::timeout(
+            RUN_TIMEOUT,
+            PvaServer::serve(Vec::<crate::pv::AnyPv>::new())
+                .port(0)
+                .udp_port(0)
+                .on_event("SHUTTER", |store, _event| {
+                    Box::pin(async move {
+                        store
+                            .insert(
+                                "T:FIRED".to_string(),
+                                make_scalar_record(
+                                    "T:FIRED",
+                                    RecordType::Ai,
+                                    ScalarValue::F64(1.0),
+                                ),
+                            )
+                            .await;
+                    })
+                })
+                .start(),
+        )
+        .await
+        .expect("ServeBuilder::start() did not return within RUN_TIMEOUT")
+        .expect("hooks must succeed");
+
+        server.post_event("SHUTTER").await;
+        server.events().drain().await;
+
+        assert_eq!(
+            server.store().get_value("T:FIRED").await,
+            Some(ScalarValue::F64(1.0)),
+            "a ServeBuilder-registered handler must be reachable from the handle"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_builder_registered_sink_receives_posted_events() {
+        use std::sync::Mutex;
+        struct RecordingSink(Mutex<Vec<String>>);
+        impl crate::events::EventSink for RecordingSink {
+            fn on_event(
+                &self,
+                event: &str,
+            ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+                let event = event.to_string();
+                Box::pin(async move { self.0.lock().unwrap().push(event) })
+            }
+        }
+
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .event_sink(sink.clone())
+            .build();
+
+        server.post_event("SHUTTER").await;
+
+        assert_eq!(sink.0.lock().unwrap().as_slice(), &["SHUTTER".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_on_start_hook_reports_its_cause() {
+        // The panic payload is the only place the real cause lives — for a
+        // Python hook it is "on_start hook raised: ValueError: ...", and for
+        // a Python *source* hook it also carries the source label. Losing it
+        // left the user with an index into a list they never wrote.
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .on_start(|_store| {
+                Box::pin(async {
+                    panic!("on_start hook for source 'db' raised: DB connection refused")
+                })
+            })
+            .build();
+
+        let err = server
+            .run_start_hooks()
+            .await
+            .expect_err("a panicking hook must abort startup");
+
+        assert!(
+            err.contains("DB connection refused"),
+            "error must carry the panic's cause, got: {err}"
+        );
+        assert!(
+            err.contains("source 'db'"),
+            "error must preserve the hook label the panic carried, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_start_hook_can_write_the_store() {
+        let server = PvaServer::builder()
+            .ao("T:SP", 0.0)
+            .on_start(|store| {
+                Box::pin(async move {
+                    store.set_value("T:SP", ScalarValue::F64(22.5)).await;
+                })
+            })
+            .build();
+
+        server.run_start_hooks().await.expect("hooks must succeed");
+
+        assert_eq!(
+            server.store().get_value("T:SP").await,
+            Some(ScalarValue::F64(22.5))
+        );
+    }
+
+    #[tokio::test]
+    async fn on_start_hook_write_reaches_a_subscribed_monitor() {
+        // Regression test for a real ordering bug: splitting run() into
+        // run_start_hooks() + serve_after_start_hooks() briefly moved
+        // `self.store.set_registry(...)` to run *after* the hook phase,
+        // so a hook writing the store during startup would not notify any
+        // subscriber, and a hook reading the registry off the store would
+        // see `None`. Fixed by resolving/installing the registry inside
+        // run_start_hooks() itself (see `resolved_monitor_registry`).
+        use crate::state::MonitorSub;
+
+        let mut server = PvaServer::builder()
+            .ao("T:SP", 0.0)
+            .on_start(|store| {
+                Box::pin(async move {
+                    store.set_value("T:SP", ScalarValue::F64(42.0)).await;
+                })
+            })
+            .build();
+
+        // Pre-create the registry and fake a subscriber directly, the way a
+        // real PVA client connection would register one via
+        // `update_monitor_subscription` -- but without needing a live
+        // socket for this test.
+        let registry = server.monitor_registry();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        registry.conns.lock().await.insert(1, tx);
+        registry.monitors.lock().await.insert(
+            "T:SP".to_string(),
+            vec![MonitorSub {
+                conn_id: 1,
+                ioid: 0,
+                version: 2,
+                is_be: true,
+                running: true,
+                pipeline_enabled: false,
+                nfree: 0,
+                filtered_desc: None,
+                last_snapshot: None,
+            }],
+        );
+
+        server.run_start_hooks().await.expect("hooks must succeed");
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("monitor update did not arrive within 5s -- on_start hook's write did not reach the registry")
+            .expect("monitor channel closed unexpectedly");
+        assert!(!msg.is_empty(), "monitor update message must not be empty");
+    }
+
+    #[tokio::test]
+    async fn post_event_reaches_a_builder_registered_handler() {
+        use std::sync::Mutex;
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .on_event("SHUTTER", move |_store, event| {
+                let s = s.clone();
+                Box::pin(async move { s.lock().unwrap().push(event); })
+            })
+            .build();
+
+        server.events().start_dispatcher(server.store().clone());
+        server.post_event("SHUTTER").await;
+        server.events().drain().await;
+
+        assert_eq!(seen.lock().unwrap().as_slice(), &["SHUTTER".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_tasks_do_not_run_before_start_hooks_finish() {
+        use std::sync::Mutex;
+        use std::time::Duration;
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+
+        let l = log.clone();
+        let scan_log = log.clone();
+        let server = PvaServer::builder()
+            .ai("T:TICK", 0.0)
+            .port(0)
+            .on_start(move |_store| {
+                let l = l.clone();
+                Box::pin(async move {
+                    // Yield repeatedly: a scan task spawned too early would
+                    // interleave here.
+                    for _ in 0..50 {
+                        tokio::task::yield_now().await;
+                    }
+                    l.lock().unwrap().push("hook-done");
+                })
+            })
+            .scan("T:TICK", Duration::from_millis(1), move |_name| {
+                scan_log.lock().unwrap().push("scan");
+                ScalarValue::F64(1.0)
+            })
+            .build();
+
+        // Output must be Send for tokio::spawn; discard the Result inline
+        // (mirrors ServeBuilder::start's spawn) since this test only checks
+        // ordering via `log`, not the run() outcome.
+        let handle = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.abort();
+
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(
+            entries.first(),
+            Some(&"hook-done"),
+            "start hook must complete before the first scan tick; got {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_client_can_connect_before_start_hooks_finish() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        // The hook blocks on this gate; the test releases it only after
+        // confirming the listener has not yet bound.
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let hook_entered = std::sync::Arc::new(AtomicBool::new(false));
+
+        let g = gate.clone();
+        let entered = hook_entered.clone();
+        let server = PvaServer::builder()
+            .ai("T:GATED", 0.0)
+            .port(0)
+            .on_start(move |store| {
+                let g = g.clone();
+                let entered = entered.clone();
+                Box::pin(async move {
+                    entered.store(true, Ordering::SeqCst);
+                    g.notified().await;
+                    store.set_value("T:GATED", ScalarValue::F64(99.0)).await;
+                })
+            })
+            .build();
+
+        let store = server.store().clone();
+        // Output must be Send for tokio::spawn; discard the Result inline
+        // (mirrors ServeBuilder::start's spawn) since this test only checks
+        // the gating via `store`, not the run() outcome.
+        let handle = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+
+        // Give run() time to reach the hook and block there.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(hook_entered.load(Ordering::SeqCst), "hook should have started");
+        assert_eq!(
+            store.get_value("T:GATED").await,
+            Some(ScalarValue::F64(0.0)),
+            "hook has not finished, so the initial value is still in place"
+        );
+
+        gate.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            store.get_value("T:GATED").await,
+            Some(ScalarValue::F64(99.0)),
+            "hook must have completed once released"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_aborts_when_a_start_hook_panics() {
+        let server = PvaServer::builder()
+            .ai("T:A", 1.0)
+            .port(0)
+            .on_start(|_store| Box::pin(async { panic!("init failed"); }))
+            .build();
+
+        // Bounded, like `Events::drain()` (events.rs:176): if a future
+        // regression ever swallows the hook's error again, `run()` falls
+        // through to `run_pva_server_with_registry` and serves forever —
+        // this must surface as a named panic, not a hanging `cargo test`.
+        const RUN_TIMEOUT: Duration = Duration::from_secs(5);
+        let result = tokio::time::timeout(RUN_TIMEOUT, server.run())
+            .await
+            .expect(
+                "run() did not return within 5s — the panicking on_start hook's \
+                 error was likely swallowed, so run() fell through to bind the \
+                 listener and is now serving forever instead of aborting startup",
+            );
+
+        assert!(result.is_err(), "run() must fail when a start hook panics");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("on_start"),
+            "error must name the failing hook, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_builder_forwards_on_start_and_on_event() {
+        use std::sync::Mutex;
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let l1 = log.clone();
+        let l2 = log.clone();
+
+        let temp = Pv::ai("T:TEMP", 20.0);
+        let server = PvaServer::serve([temp])
+            .on_start(move |_store| {
+                let l = l1.clone();
+                Box::pin(async move { l.lock().unwrap().push("started"); })
+            })
+            .on_event("GO", move |_store, _event| {
+                let l = l2.clone();
+                Box::pin(async move { l.lock().unwrap().push("evented"); })
+            })
+            .build()
+            .await;
+
+        server.run_start_hooks().await.expect("hooks must succeed");
+        server.events().start_dispatcher(server.store().clone());
+        server.post_event("GO").await;
+        server.events().drain().await;
+
+        assert_eq!(log.lock().unwrap().as_slice(), &["started", "evented"]);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn running_server_add_scalar_and_array() {
         use spvirit_types::{ScalarArrayValue, ScalarValue};
@@ -1141,7 +1829,8 @@ mod tests {
             .port(0)
             .udp_port(0)
             .start()
-            .await;
+            .await
+            .expect("server start hooks must succeed");
 
         // add a writable u32 scalar
         let h = server.add_scalar("RT:U32", ScalarValue::U32(7), true).await;
@@ -1180,7 +1869,8 @@ mod tests {
             .port(0)
             .udp_port(0)
             .start()
-            .await;
+            .await
+            .expect("server start hooks must succeed");
 
         // writable enum -> mbbo, choices + index preserved
         server

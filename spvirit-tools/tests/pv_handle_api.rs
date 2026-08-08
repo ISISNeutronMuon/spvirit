@@ -74,7 +74,8 @@ async fn pv_handle_api_end_to_end() {
         .udp_port(udp_port)
         .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
         .start()
-        .await;
+        .await
+        .expect("server start hooks must succeed");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // GET sees the handle-built PV with metadata.

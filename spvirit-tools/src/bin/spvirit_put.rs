@@ -55,6 +55,7 @@ fn encode_destroy_request(sid: u32, request_id: u32, version: u8, is_be: bool) -
 async fn run_get_cycle(
     stream: &mut tokio::net::TcpStream,
     timeout: Duration,
+    reassembler: &mut spvirit_client::SegmentReassembler,
     sid: u32,
     ioid: u32,
     version: u8,
@@ -69,7 +70,7 @@ async fn run_get_cycle(
         is_be,
     );
     stream.write_all(&get_init).await?;
-    let get_init_resp = read_until(stream, timeout, |cmd| {
+    let get_init_resp = read_until(stream, timeout, reassembler, |cmd| {
         matches!(
             cmd,
             PvaPacketCommand::Op(op) if op.command == 10 && (op.subcmd & 0x08) != 0
@@ -83,6 +84,7 @@ async fn run_get_cycle(
     let get_data_resp = read_until(
         stream,
         timeout,
+        reassembler,
         |cmd| matches!(cmd, PvaPacketCommand::Op(op) if op.command == 10 && op.subcmd == 0x00),
     )
     .await?;
@@ -102,10 +104,20 @@ async fn pvput_full_flow(opts: &PvGetOptions, input: &Value) -> Result<(), PvGet
         sid,
         version,
         is_be,
+        mut reassembler,
         ..
     } = conn;
 
-    run_get_cycle(&mut stream, opts.timeout, sid, 1u32, version, is_be).await?;
+    run_get_cycle(
+        &mut stream,
+        opts.timeout,
+        &mut reassembler,
+        sid,
+        1u32,
+        version,
+        is_be,
+    )
+    .await?;
 
     let put_ioid = 2u32;
 
@@ -119,7 +131,7 @@ async fn pvput_full_flow(opts: &PvGetOptions, input: &Value) -> Result<(), PvGet
     );
     stream.write_all(&put_init).await?;
 
-    let init_resp = read_until(&mut stream, opts.timeout, |cmd| {
+    let init_resp = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -152,7 +164,7 @@ async fn pvput_full_flow(opts: &PvGetOptions, input: &Value) -> Result<(), PvGet
     // EPICS-base-style probe/readback step before writing value.
     let put_get_req = encode_put_request(sid, put_ioid, 0x40, &[], version, is_be);
     stream.write_all(&put_get_req).await?;
-    let put_get_resp = read_until(&mut stream, opts.timeout, |cmd| {
+    let put_get_resp = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && (op.subcmd & 0x40) != 0)
     })
     .await?;
@@ -164,6 +176,7 @@ async fn pvput_full_flow(opts: &PvGetOptions, input: &Value) -> Result<(), PvGet
     let put_resp = read_until(
         &mut stream,
         opts.timeout,
+        &mut reassembler,
         |cmd| matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.subcmd == 0x00),
     )
     .await?;
@@ -174,7 +187,16 @@ async fn pvput_full_flow(opts: &PvGetOptions, input: &Value) -> Result<(), PvGet
     let destroy = encode_destroy_request(sid, put_ioid, version, is_be);
     stream.write_all(&destroy).await?;
 
-    run_get_cycle(&mut stream, opts.timeout, sid, 3u32, version, is_be).await?;
+    run_get_cycle(
+        &mut stream,
+        opts.timeout,
+        &mut reassembler,
+        sid,
+        3u32,
+        version,
+        is_be,
+    )
+    .await?;
 
     Ok(())
 }

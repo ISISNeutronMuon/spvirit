@@ -65,12 +65,36 @@ exists and exercises the full surface: `NtScalar`/`NtScalarArray`
 
 Cross-referenced from the per-crate chapters.
 
+> **Codec-gaps effort, 2026-08-07 (landed).** Three of the protocol/codec
+> entries below are struck through: segmentation reassembly, the heuristic
+> monitor bitset ordering, and silent array truncation. Delivered as a
+> 10-task TDD plan with per-task commits (`241f4f4`..`ef7d587`), the same
+> shape as Efforts A and B. New codec surface: `error.rs`
+> (`DecodeError`/`DecodeResult`), `segment.rs` (`SegmentReassembler`),
+> `monitor.rs` (`MonitorUpdate`, `MonitorLayout`), `DecodeLimits` on
+> `PvdDecoder`, and `DecodeMode` on `PvaOpPayload::decode_with_field_desc`.
+> Client, server, spserver, the tools and the Python bindings are all on the
+> new APIs. Breaking: `PvdDecoder` returns `DecodeResult` rather than
+> `Option`, and monitor callbacks receive a `&MonitorUpdate` rather than a
+> bare value. What is *not* done: segment **emission** — see roadmap item 6.
+
 **Protocol/codec**
 - No TLS anywhere (top roadmap item in README).
-- No segmentation *reassembly* in the codec (consumers roll their own).
-- Monitor bitset overrun ordering is heuristic (three variants + scoring).
+- ~~No segmentation *reassembly* in the codec (consumers roll their own)~~ —
+  fixed by the codec-gaps effort: `spvirit-codec/src/segment.rs`'s
+  `SegmentReassembler`, driven by the client transport, the server handler
+  and spserver. Emission is still missing (roadmap item 6).
+- ~~Monitor bitset overrun ordering is heuristic (three variants +
+  scoring)~~ — fixed: `decode_monitor_update` is spec-exact (changed bitset,
+  data, overrun bitset) and is what every workspace call site uses. The
+  scoring heuristic survives only behind `DecodeMode::Lenient`, for
+  out-of-tree packet-capture consumers.
 - No packet-capture regression corpus; four duplicated size codecs.
-- Array decode caps silently truncate; string/struct truncation can desync.
+- ~~Array decode caps silently truncate; string/struct truncation can
+  desync~~ — fixed: over-limit counts are `DecodeError::ArrayTooLarge` and
+  counts that cannot fit the remaining buffer are
+  `DecodeError::CountExceedsBuffer`, both raised before allocation. Limits
+  are configurable via `DecodeLimits`.
 
 **Server**
 - CANCEL_REQUEST unimplemented (some clients send it).
@@ -122,3 +146,10 @@ Cross-referenced from the per-crate chapters.
 4. ~~Finish the Python value-types work (Effort B)~~ — done; see above.
 5. Quality infrastructure: packet-capture regression corpus, benchmarks,
    lint gate in CI, `.pyi` stubs.
+6. Segmentation *emission* in the encoder. Reassembly landed in
+   `spvirit-codec` with the codec-gaps effort above, but nothing in the
+   workspace splits an oversized outgoing message into segments — the server
+   sends one large frame regardless of size. Needed before spvirit can serve large
+   NTNDArray images to clients that expect segmented delivery, and it would
+   also let the reassembler be tested end-to-end against our own server
+   instead of only against synthetic buffers.

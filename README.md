@@ -20,6 +20,8 @@ fundamentals, progressive examples in Rust and Python, and a page per CLI tool.
 Key areas of development in the near future include:
 - Expanding `spvirit-server` with more complete softIOC behaviours and record processing.
 - TLS support and structured put payloads in the client.
+- Segmentation emission in the encoder, so large values (NTNDArray images) can
+  be sent as segmented messages rather than one oversized frame.
 
 ## Why Rust?
 

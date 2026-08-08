@@ -11,10 +11,11 @@ client = spvirit.Client()
 seen = 0
 
 
-def on_update(value):
+def on_update(update):
+    # `update` is a MonitorUpdate: .value plus the .changed / .overrun paths.
     global seen
     seen += 1
-    print(f"{seen}: {value['value']:.3f}")
+    print(f"{seen}: {update.value['value']:.3f}")
     return seen < 5  # returning False ends the monitor
 
 

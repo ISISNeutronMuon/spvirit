@@ -12,7 +12,11 @@ authors = ["Mateusz Leputa for ISIS Neutron and Muon Source Copyright 2026"]
 
 [lib]
 name = "spvirit"
-crate-type = ["cdylib"]
+# "rlib" is only needed so `cargo test -p spvirit-py --no-default-features
+# --features test-embed` can link a standalone test binary against this
+# crate's code (see the `[features]` note below); the normal build (via
+# maturin) only ever produces/uses the "cdylib".
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 spvirit-types.workspace = true
@@ -20,8 +24,23 @@ spvirit-codec.workspace = true
 spvirit-client.workspace = true
 spvirit-server.workspace = true
 
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.24", features = ["abi3-py39"] }
 pyo3-async-runtimes = { version = "=0.24.0", features = ["tokio-runtime"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "sync", "macros", "time"] }
 serde_json = "1.0.145"
 tracing = "0.1.41"
+
+[features]
+# Default/production build: pyo3's "extension-module" (no libpython linked;
+# the hosting `python.exe`/interpreter that `import`s the built `.pyd`/`.so`
+# supplies the C API symbols). This is the only feature maturin/`cargo build`
+# ever uses.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+# Test-only: a handful of `#[cfg(test)]` unit tests need a real, running
+# Python interpreter inside the `cargo test` binary itself (e.g. the
+# asyncio-bridge race test in `source.rs`), which "extension-module" cannot
+# provide (a standalone test executable is not a Python-hosted process).
+# Run with:
+#   cargo test -p spvirit-py --no-default-features --features test-embed
+test-embed = ["pyo3/auto-initialize"]

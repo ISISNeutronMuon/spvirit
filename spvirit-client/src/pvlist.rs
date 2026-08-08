@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_codec::epics_decode::{DecodeMode, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::{
     DecodedValue, FieldDesc, FieldType, PvdDecoder, StructureDesc, extract_nt_scalar_value,
 };
@@ -27,6 +27,7 @@ use crate::client::{
 };
 use crate::transport::{read_packet, read_until};
 use crate::types::{PvGetError, PvOptions};
+use spvirit_codec::SegmentReassembler;
 
 /// Which discovery strategy succeeded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,11 +224,14 @@ pub async fn list_pvs_via_get_field(
         .await
         .map_err(|_| PvGetError::Timeout("connect"))??;
 
+    // One reassembler for this connection, shared by every read below.
+    let mut reassembler = SegmentReassembler::new();
+
     let mut version = 2u8;
     let mut is_be = false;
 
     for _ in 0..2 {
-        if let Ok(bytes) = read_packet(&mut stream, opts.timeout).await {
+        if let Ok(bytes) = read_packet(&mut stream, opts.timeout, &mut reassembler).await {
             let mut pkt = PvaPacket::new(&bytes);
             if let Some(cmd) = pkt.decode_payload() {
                 match cmd {
@@ -249,7 +253,7 @@ pub async fn list_pvs_via_get_field(
     let validation = build_client_validation(opts, version, is_be);
     stream.write_all(&validation).await?;
 
-    let _ = read_until(&mut stream, opts.timeout, |cmd| {
+    let _ = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::ConnectionValidated(_))
     })
     .await?;
@@ -260,6 +264,7 @@ pub async fn list_pvs_via_get_field(
     let field_resp = read_until(
         &mut stream,
         opts.timeout,
+        &mut reassembler,
         |cmd| matches!(cmd, PvaPacketCommand::GetField(payload) if payload.is_server),
     )
     .await?;
@@ -306,6 +311,7 @@ async fn list_pvs_via_server_rpc_channel(
         sid,
         version,
         is_be,
+        mut reassembler,
         ..
     } = establish_channel(server_addr, &rpc_opts).await?;
 
@@ -313,10 +319,17 @@ async fn list_pvs_via_server_rpc_channel(
     let rpc_init = encode_rpc_request(sid, ioid, 0x08, &PV_REQUEST_EMPTY, version, is_be);
     stream.write_all(&rpc_init).await?;
 
-    let init_resp = read_until(&mut stream, opts.timeout, |cmd| match cmd {
-        PvaPacketCommand::Op(op) => op.command == 20 && op.ioid == ioid && (op.subcmd & 0x08) != 0,
-        _ => false,
-    })
+    let init_resp = read_until(
+        &mut stream,
+        opts.timeout,
+        &mut reassembler,
+        |cmd| match cmd {
+            PvaPacketCommand::Op(op) => {
+                op.command == 20 && op.ioid == ioid && (op.subcmd & 0x08) != 0
+            }
+            _ => false,
+        },
+    )
     .await?;
     let mut pkt = PvaPacket::new(&init_resp);
     let init_cmd = pkt
@@ -337,10 +350,15 @@ async fn list_pvs_via_server_rpc_channel(
     let rpc_req = encode_rpc_request(sid, ioid, 0x00, &rpc_payload, version, is_be);
     stream.write_all(&rpc_req).await?;
 
-    let rpc_resp = read_until(&mut stream, opts.timeout, |cmd| match cmd {
-        PvaPacketCommand::Op(op) => op.command == 20 && op.ioid == ioid && op.subcmd == 0x00,
-        _ => false,
-    })
+    let rpc_resp = read_until(
+        &mut stream,
+        opts.timeout,
+        &mut reassembler,
+        |cmd| match cmd {
+            PvaPacketCommand::Op(op) => op.command == 20 && op.ioid == ioid && op.subcmd == 0x00,
+            _ => false,
+        },
+    )
     .await?;
     let mut pkt = PvaPacket::new(&rpc_resp);
     let rpc_cmd = pkt.decode_payload().ok_or(PvGetError::Protocol(
@@ -368,14 +386,14 @@ async fn list_pvs_via_server_rpc_channel(
     let decoder = PvdDecoder::new(is_be);
     let (desc, consumed) = decoder
         .parse_introspection_with_len(&op.body)
-        .ok_or_else(|| PvGetError::Decode("RPC missing introspection".to_string()))?;
+        .map_err(|_| PvGetError::Decode("RPC missing introspection".to_string()))?;
     let value_raw = op
         .body
         .get(consumed..)
         .ok_or_else(|| PvGetError::Decode("RPC malformed payload".to_string()))?;
     let (decoded, _) = decoder
         .decode_structure(value_raw, &desc)
-        .ok_or_else(|| PvGetError::Decode("RPC decode failed".to_string()))?;
+        .map_err(|_| PvGetError::Decode("RPC decode failed".to_string()))?;
 
     let mut strings = Vec::new();
     collect_strings_from_decoded(&decoded, &mut strings);
@@ -422,18 +440,24 @@ pub async fn list_pvs_via_server_get(
             sid,
             version,
             is_be,
+            mut reassembler,
             ..
         } = establish_channel(server_addr, &get_opts).await?;
 
         let ioid = 1u32;
         let init_req = encode_get_request(sid, ioid, 0x08, &PV_REQUEST_EMPTY, version, is_be);
         stream.write_all(&init_req).await?;
-        let init_resp = read_until(&mut stream, opts.timeout, |cmd| match cmd {
-            PvaPacketCommand::Op(op) => {
-                op.command == 10 && op.ioid == ioid && (op.subcmd & 0x08) != 0
-            }
-            _ => false,
-        })
+        let init_resp = read_until(
+            &mut stream,
+            opts.timeout,
+            &mut reassembler,
+            |cmd| match cmd {
+                PvaPacketCommand::Op(op) => {
+                    op.command == 10 && op.ioid == ioid && (op.subcmd & 0x08) != 0
+                }
+                _ => false,
+            },
+        )
         .await?;
         let mut pkt = PvaPacket::new(&init_resp);
         let init_cmd = pkt.decode_payload().ok_or(PvGetError::Protocol(
@@ -459,10 +483,17 @@ pub async fn list_pvs_via_server_get(
 
         let data_req = encode_get_request(sid, ioid, 0x00, &[], version, is_be);
         stream.write_all(&data_req).await?;
-        let data_resp = read_until(&mut stream, opts.timeout, |cmd| match cmd {
-            PvaPacketCommand::Op(op) => op.command == 10 && op.ioid == ioid && op.subcmd == 0x00,
-            _ => false,
-        })
+        let data_resp = read_until(
+            &mut stream,
+            opts.timeout,
+            &mut reassembler,
+            |cmd| match cmd {
+                PvaPacketCommand::Op(op) => {
+                    op.command == 10 && op.ioid == ioid && op.subcmd == 0x00
+                }
+                _ => false,
+            },
+        )
         .await?;
         let mut pkt = PvaPacket::new(&data_resp);
         let data_cmd = pkt.decode_payload().ok_or(PvGetError::Protocol(
@@ -493,7 +524,8 @@ pub async fn list_pvs_via_server_get(
             for field in &desc.fields {
                 names.push(field.name.clone());
             }
-            op.decode_with_field_desc(desc, is_be);
+            // A decode failure leaves decoded_value None, handled below.
+            let _ = op.decode_with_field_desc(desc, is_be, DecodeMode::Strict);
             if let Some(decoded) = &op.decoded_value {
                 collect_strings_from_decoded(decoded, &mut names);
             }

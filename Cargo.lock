@@ -1067,6 +1067,7 @@ dependencies = [
 name = "spvirit-server"
 version = "0.1.20"
 dependencies = [
+ "futures",
  "get_if_addrs",
  "regex",
  "serde",

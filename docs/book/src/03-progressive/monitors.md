@@ -18,9 +18,11 @@ in a loop is almost always the wrong answer.
 {{#include ../../../../spvirit-client/examples/pvmonitor.rs:core}}
 ```
 
-The callback returns a `ControlFlow`: `Continue(())` to keep going,
-`Break(())` to unsubscribe. `pvmonitor` runs until the callback breaks or
-the connection drops.
+The callback is handed a `&MonitorUpdate`, not a bare value: `update.value`
+is the decoded delta, and the update also carries which fields changed and
+which the server dropped (see [Overruns](#overruns) below). It returns a
+`ControlFlow`: `Continue(())` to keep going, `Break(())` to unsubscribe.
+`pvmonitor` runs until the callback breaks or the connection drops.
 
 `MonitorOptions::pipelined(q)` asks the server for flow control with a
 queue depth of `q` — useful on high-rate PVs where a slow consumer would
@@ -31,6 +33,10 @@ otherwise fall behind.
 ```python
 {{#include ../../../../spvirit-py/examples/demo_monitor.py:monitor}}
 ```
+
+The Python callback receives a `spvirit.lowlevel.MonitorUpdate` too —
+`update.value` is the decoded structure as a dict, so an NTScalar's number is
+`update.value["value"]`.
 
 `client.monitor(...)` **blocks** until the callback returns `False` or
 raises. For a non-blocking version use `client.subscribe(...)`, which
@@ -47,10 +53,54 @@ If a subscription ends on a network error, `sub.error` holds the message
 and `sub.is_active` becomes `False` — worth checking, because a silently
 dead subscription looks exactly like a quiet PV.
 
+## Overruns
+
+Every update carries two bitsets: **changed**, the fields this delta actually
+contains, and **overrun**, the fields for which the server dropped at least
+one earlier update before sending this one. An overrun means you are seeing
+the latest value but not every value — the server's monitor queue for your
+subscription filled up. Raising the queue depth with
+`MonitorOptions::pipelined(q)`, or doing less work in the callback, is the fix.
+
+In Rust, `update.changed` and `update.overrun` are the raw bitset bytes;
+`changed_paths()` and `overrun_paths()` resolve them to dotted field names,
+and `has_overrun()` is the cheap check:
+
+```rust,ignore
+let cb = |update: &MonitorUpdate| {
+    if update.has_overrun() {
+        eprintln!("dropped updates for: {}", update.overrun_paths().join(", "));
+    }
+    println!("{}", update.value);
+    ControlFlow::Continue(())
+};
+```
+
+In Python the resolution is already done: `.changed` and `.overrun` are lists
+of dotted paths and `.has_overrun` is a property.
+
+```python
+def on_update(update):
+    if update.has_overrun:
+        print("dropped updates for:", update.overrun)
+    print(update.value["value"])
+    return True
+```
+
+The path `"<whole structure>"` appears when bit 0 is set — the server is
+reporting the whole value rather than naming individual fields.
+
 ## From the command line
 
 ```console
 $ spmonitor SIM:TEMPERATURE
+```
+
+`spmonitor` prints overruns to stderr, one line per affected update, so they
+never contaminate the value stream on stdout:
+
+```console
+SIM:TEMPERATURE: overrun on value, alarm.severity
 ```
 
 ## What to notice

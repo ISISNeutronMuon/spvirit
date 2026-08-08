@@ -9,7 +9,7 @@ use regex::Regex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock, mpsc};
-use tracing::{Level, debug, error, info};
+use tracing::{Level, debug, error, info, warn};
 
 use spvirit_tools::spvirit_server::db::load_db;
 use spvirit_tools::spvirit_server::state::{ConnState, MonitorState, MonitorSub};
@@ -39,6 +39,8 @@ use spvirit_codec::spvirit_encode::{
 use spvirit_codec::spvirit_encode::{
     encode_monitor_data_response_delta, encode_monitor_data_response_filtered,
 };
+
+use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PvListMode {
@@ -590,6 +592,9 @@ async fn handle_connection(
     send_msg(&state, conn_id, server_validation).await;
 
     let mut last_activity = Instant::now();
+    // One reassembler for the whole connection: the segments of a message may
+    // be separated by control frames, which are handled in between.
+    let mut reassembler = SegmentReassembler::new();
 
     loop {
         let mut header = [0u8; 8];
@@ -634,77 +639,24 @@ async fn handle_connection(
             }
         }
         last_activity = Instant::now();
-        let mut full = header.to_vec();
-        full.extend_from_slice(&payload);
-        if header_pkt.header.flags.is_segmented != 0 && !header_pkt.header.flags.is_control {
-            debug!(
-                "Conn {}: segmented message cmd={} seg=0x{:02x}",
-                conn_id, header_pkt.header.command, header_pkt.header.flags.is_segmented
-            );
-            let mut payloads = vec![payload];
-            let mut seg_flags = header_pkt.header.flags;
-            while !seg_flags.is_last_segment {
-                let mut seg_header = [0u8; 8];
-                let elapsed = last_activity.elapsed();
-                if elapsed >= conn_timeout {
-                    info!("Conn {} idle timeout", conn_id);
-                    break;
-                }
-                let remaining = conn_timeout - elapsed;
-                let read_header =
-                    tokio::time::timeout(remaining, reader.read_exact(&mut seg_header)).await;
-                match read_header {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        info!("Conn {} idle timeout", conn_id);
-                        break;
-                    }
-                }
 
-                let seg_header_pkt = PvaPacket::new(&seg_header);
-                let seg_payload_len = if seg_header_pkt.header.flags.is_control {
-                    0usize
-                } else {
-                    seg_header_pkt.header.payload_length as usize
-                };
-                let mut seg_payload = vec![0u8; seg_payload_len];
-                if seg_payload_len > 0 {
-                    let elapsed = last_activity.elapsed();
-                    if elapsed >= conn_timeout {
-                        info!("Conn {} idle timeout", conn_id);
-                        break;
-                    }
-                    let remaining = conn_timeout - elapsed;
-                    let read_payload =
-                        tokio::time::timeout(remaining, reader.read_exact(&mut seg_payload)).await;
-                    match read_payload {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(_)) => break,
-                        Err(_) => {
-                            info!("Conn {} idle timeout", conn_id);
-                            break;
-                        }
-                    }
-                }
-                last_activity = Instant::now();
-
-                if seg_header_pkt.header.flags.is_control {
-                    handle_control_message(&state, conn_id, &seg_header_pkt.header).await;
-                    continue;
-                }
-                if seg_header_pkt.header.flags.is_segmented == 0 {
-                    debug!(
-                        "Conn {}: segmented message interrupted by non-segmented cmd={}",
-                        conn_id, seg_header_pkt.header.command
-                    );
-                    break;
-                }
-                payloads.push(seg_payload);
-                seg_flags = seg_header_pkt.header.flags;
+        // Segment reassembly is delegated to the shared codec state machine.
+        // Control frames come back verbatim and are answered here; they never
+        // reach command dispatch below.
+        let full = match reassembler.push(header, payload) {
+            Ok(SegmentOutcome::Complete(msg)) => msg,
+            Ok(SegmentOutcome::Pending) => continue,
+            Ok(SegmentOutcome::Control(msg)) => {
+                let ctrl = PvaPacket::new(&msg);
+                handle_control_message(&state, conn_id, &ctrl.header).await;
+                continue;
             }
-            full = assemble_segmented_message(header, payloads);
-        }
+            Err(e) => {
+                warn!("Conn {}: segmentation error: {}", conn_id, e);
+                break;
+            }
+        };
+
         let mut pkt = PvaPacket::new(&full);
         let Some(cmd) = pkt.decode_payload() else {
             continue;
@@ -3007,13 +2959,13 @@ fn decode_put_body(
     is_be: bool,
 ) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
-    if let Some((value, _)) = decoder.decode_structure_with_bitset(body, desc) {
+    if let Ok((value, _)) = decoder.decode_structure_with_bitset(body, desc) {
         if !decoded_is_empty(&value) {
             return Some(value);
         }
     }
     if !body.is_empty() && body[0] == 0xFF {
-        if let Some((value, _)) = decoder.decode_structure_with_bitset(&body[1..], desc) {
+        if let Ok((value, _)) = decoder.decode_structure_with_bitset(&body[1..], desc) {
             if !decoded_is_empty(&value) {
                 return Some(value);
             }
@@ -3038,7 +2990,7 @@ fn decode_put_body_shifted_bitset(
     is_be: bool,
 ) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
-    let (size, consumed) = decoder.decode_size(body)?;
+    let (size, consumed) = decoder.decode_size(body).ok()?;
     if size == 0 || body.len() < consumed + size {
         return None;
     }
@@ -3051,6 +3003,7 @@ fn decode_put_body_shifted_bitset(
     shifted_body.extend_from_slice(data);
     decoder
         .decode_structure_with_bitset(&shifted_body, desc)
+        .ok()
         .map(|(value, _)| value)
         .filter(|value| !decoded_is_empty(value))
 }
@@ -3061,7 +3014,7 @@ fn decode_put_body_value_only(
     is_be: bool,
 ) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
-    if let Some((size, consumed)) = decoder.decode_size(body) {
+    if let Ok((size, consumed)) = decoder.decode_size(body) {
         if consumed + size <= body.len() {
             let data = &body[consumed + size..];
             if let Some(value) = decode_value_only_from_data(data, desc, &decoder) {
@@ -3080,6 +3033,7 @@ fn decode_value_only_from_data(
     let value_field = desc.fields.iter().find(|f| f.name == "value")?;
     decoder
         .decode_value(data, &value_field.field_type)
+        .ok()
         .map(|(value, _)| DecodedValue::Structure(vec![("value".to_string(), value)]))
 }
 
@@ -3114,24 +3068,6 @@ async fn handle_control_message(state: &Arc<ServerState>, conn_id: u64, header: 
         );
         send_msg(state, conn_id, resp).await;
     }
-}
-
-fn assemble_segmented_message(first_header: [u8; 8], payloads: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut header = first_header;
-    let is_be = (header[2] & 0x80) != 0;
-    header[2] &= !0x30;
-    let total_len: usize = payloads.iter().map(|p| p.len()).sum();
-    let len_bytes = if is_be {
-        (total_len as u32).to_be_bytes()
-    } else {
-        (total_len as u32).to_le_bytes()
-    };
-    header[4..8].copy_from_slice(&len_bytes);
-    let mut out = header.to_vec();
-    for payload in payloads {
-        out.extend_from_slice(&payload);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -3190,25 +3126,6 @@ mod tests {
         } else {
             panic!("expected structure");
         }
-    }
-
-    #[test]
-    fn assemble_segmented_message_updates_length_and_clears_flags() {
-        let mut header = [0u8; 8];
-        header[0] = 0xCA;
-        header[1] = 0x02;
-        header[2] = 0x10; // first segment
-        header[3] = 11; // PUT
-        header[4..8].copy_from_slice(&3u32.to_le_bytes());
-
-        let payloads = vec![b"abc".to_vec(), b"def".to_vec()];
-        let full = assemble_segmented_message(header, payloads);
-
-        assert_eq!(full[0], 0xCA);
-        assert_eq!(full[1], 0x02);
-        assert_eq!(full[2] & 0x30, 0x00);
-        assert_eq!(u32::from_le_bytes(full[4..8].try_into().unwrap()), 6);
-        assert_eq!(&full[8..], b"abcdef");
     }
 
     #[test]

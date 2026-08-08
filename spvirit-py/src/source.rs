@@ -30,7 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple};
+use pyo3::types::{PyCFunction, PyDict, PyList, PyTuple};
 use tokio::sync::mpsc;
 
 use spvirit_codec::spvd_decode::{DecodedValue, FieldDesc, FieldType, StructureDesc};
@@ -279,24 +279,25 @@ impl PySourceAdapter {
         Self { obj: Arc::new(obj) }
     }
 
-    /// If the user's Python object has an `on_start(notifier)` method, call it.
-    pub fn invoke_on_start(&self, notifier: PyNotifier) {
+    /// If the user's Python object has an `on_start(notifier)` method, call
+    /// it. Returns `Err` if the method raises (or doesn't exist as a
+    /// callable) — the caller decides what a raise means in its context:
+    /// aborting startup (deferred hooks on the shared start_hooks list) or
+    /// propagating as a normal Python exception (the immediate
+    /// `Server.add_source` window). This must NOT swallow-and-log: a
+    /// swallowed exception here would let startup silently proceed after a
+    /// source's on_start failed, which is exactly the bug this method
+    /// used to have.
+    pub fn invoke_on_start(&self, notifier: PyNotifier) -> PyResult<()> {
         let obj = self.obj.clone();
         Python::with_gil(|py| {
             let b = obj.bind(py);
             if let Ok(method) = b.getattr("on_start") {
-                let py_notifier = match notifier.into_pyobject(py) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::error!("Notifier.into_pyobject: {e}");
-                        return;
-                    }
-                };
-                if let Err(e) = method.call1((py_notifier,)) {
-                    tracing::error!("source.on_start error: {e}");
-                }
+                let py_notifier = notifier.into_pyobject(py)?;
+                method.call1((py_notifier,))?;
             }
-        });
+            Ok(())
+        })
     }
 }
 
@@ -310,36 +311,199 @@ impl PySourceAdapter {
 /// `asyncio.run_coroutine_threadsafe`.
 fn asyncio_loop(py: Python<'_>) -> PyResult<PyObject> {
     static LOOP: std::sync::OnceLock<PyObject> = std::sync::OnceLock::new();
-    if let Some(l) = LOOP.get() {
+    static ACTIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    asyncio_loop_in(py, &LOOP, &ACTIVE_THREADS)
+}
+
+/// The guts of [`asyncio_loop`], with the `static` cell and the live-thread
+/// counter lifted into parameters so a `#[cfg(test)]` test can drive
+/// concurrent first-callers against a fresh, isolated cell instead of the
+/// real process-wide `static LOOP`. Behaviour on the production path is
+/// unchanged; `active_threads` is bumped before a bridge thread is spawned
+/// and dropped back down once that thread's loop is closed and its body
+/// returns, so tests can assert the loser's thread actually exits instead of
+/// leaking.
+fn asyncio_loop_in(
+    py: Python<'_>,
+    cell: &'static std::sync::OnceLock<PyObject>,
+    active_threads: &'static std::sync::atomic::AtomicUsize,
+) -> PyResult<PyObject> {
+    if let Some(l) = cell.get() {
         return Ok(l.clone_ref(py));
     }
+    let candidate = start_new_bridge_loop(py, active_threads)?;
+    Ok(resolve_winner_or_stop_loser(py, cell, candidate))
+}
+
+/// Build, start (on a dedicated `"spvirit-asyncio"` thread), and
+/// readiness-wait a brand new bridge loop, unconditionally — it never
+/// touches any `OnceLock`. Split out from [`asyncio_loop_in`] purely so
+/// `#[cfg(test)]` tests can construct a "loser" candidate deterministically
+/// (by calling this directly against an already-published `cell`) instead
+/// of relying on genuine thread-scheduling luck to reproduce the race.
+fn start_new_bridge_loop(
+    py: Python<'_>,
+    active_threads: &'static std::sync::atomic::AtomicUsize,
+) -> PyResult<PyObject> {
     let asyncio = py.import("asyncio")?;
+    // Policy-default loop construction (NOT `SelectorEventLoop()` — see the
+    // module-load-time `threading` import in `lib.rs`'s `#[pymodule]` fn
+    // for the real fix and full explanation of the Windows bug this used to
+    // work around by accident). Using the policy default keeps
+    // subprocess/pipe support on Windows `ProactorEventLoop` and respects a
+    // user-installed policy (uvloop, etc.) instead of silently overriding
+    // it.
     let loop_obj: PyObject = asyncio.getattr("new_event_loop")?.call0()?.unbind();
     let loop_for_thread = loop_obj.clone_ref(py);
+    // Readiness handshake: don't publish the loop via LOOP.get_or_init()
+    // until we know it is actually inside run_forever() and able to accept
+    // run_coroutine_threadsafe submissions. Without this, a submission
+    // racing loop startup can silently vanish (the coroutine object is
+    // created but never scheduled) rather than raising -- exactly the
+    // "coroutine was never awaited" symptom this bridge must not produce.
+    //
+    // `Ready` distinguishes "loop is running" from "loop could not even be
+    // armed" so a failure to install the readiness callback (below) is
+    // reported to the waiter instead of leaving it to time out after 5s
+    // against a loop that will never signal.
+    enum Ready {
+        Started,
+        ArmFailed(String),
+    }
+    let ready = Arc::new((std::sync::Mutex::new(None::<Ready>), std::sync::Condvar::new()));
+    let ready_for_thread = ready.clone();
+    // Counted before spawn (not inside the thread body) so a caller racing
+    // to observe "how many bridge threads are alive right now" never sees a
+    // window where a thread has been spawned but not yet counted.
+    active_threads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     std::thread::Builder::new()
         .name("spvirit-asyncio".into())
         .spawn(move || {
             Python::with_gil(|py| {
                 let l = loop_for_thread.bind(py);
-                // run_forever releases the GIL while blocking in the selector.
-                if let Err(e) = l.call_method0("run_forever") {
-                    tracing::error!("asyncio loop exited: {}", e);
+                // Flip the readiness flag from inside the loop itself via
+                // call_soon_threadsafe, so "ready" means "run_forever has
+                // started pumping callbacks", not just "the OS thread
+                // started".
+                let ready_cb = {
+                    let ready_for_cb = ready_for_thread.clone();
+                    PyCFunction::new_closure(py, None, None, move |_args, _kwargs| {
+                        let (lock, cvar) = &*ready_for_cb;
+                        *lock.lock().unwrap() = Some(Ready::Started);
+                        cvar.notify_all();
+                        Ok::<(), PyErr>(())
+                    })
+                };
+                let armed = ready_cb.and_then(|cb| l.call_method1("call_soon_threadsafe", (cb,)));
+                match armed {
+                    Ok(_) => {
+                        // run_forever releases the GIL while blocking in the selector.
+                        // It returns once something calls
+                        // call_soon_threadsafe(loop.stop) (see the loser-shutdown
+                        // path below) — plain loop.stop() is documented as not
+                        // thread-safe and, worse, wouldn't wake a selector
+                        // that's already blocked in run_forever: stop() only
+                        // sets a flag that run_forever re-checks *after*
+                        // _run_once() returns, and nothing would ever write to
+                        // the self-pipe to unblock the wait.
+                        if let Err(e) = l.call_method0("run_forever") {
+                            tracing::error!("asyncio loop exited: {}", e);
+                        }
+                        // Always close a loop that actually ran, on the thread
+                        // that owns it, so its selector and self-pipe fds
+                        // don't leak — both for the winner (eventually, at
+                        // interpreter shutdown) and, immediately, for a loser
+                        // that just got stopped by the winner-take-all check.
+                        if let Err(e) = l.call_method0("close") {
+                            tracing::error!("failed to close asyncio bridge loop: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        // Could not arm the readiness signal at all: do NOT
+                        // fall through into run_forever() (the loop would
+                        // run fine but nothing would ever flip the flag,
+                        // guaranteeing the waiter panics on a 5s timeout
+                        // instead of failing immediately with the real
+                        // cause). Report failure; the loop never ran, but
+                        // still close it rather than abandoning it unclosed.
+                        tracing::error!("failed to arm asyncio loop readiness signal: {e}");
+                        if let Err(ce) = l.call_method0("close") {
+                            tracing::error!("failed to close unarmed asyncio bridge loop: {ce}");
+                        }
+                        let (lock, cvar) = &*ready_for_thread;
+                        *lock.lock().unwrap() = Some(Ready::ArmFailed(e.to_string()));
+                        cvar.notify_all();
+                    }
                 }
             });
+            active_threads.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         })
         .expect("spawn asyncio thread");
-    // Give the loop a moment to actually start running so that
-    // run_coroutine_threadsafe submissions are picked up.
-    // (asyncio.run_coroutine_threadsafe is safe even before run_forever,
-    // but we want the first submission to not race with loop startup.)
-    let out = loop_obj.clone_ref(py);
-    let _ = LOOP.set(loop_obj);
-    Ok(out)
+    // Block (releasing the GIL) until the loop confirms it is running, or
+    // give up after a bounded wait rather than risk a silent race forever.
+    let outcome = py.allow_threads(|| {
+        let (lock, cvar) = &*ready;
+        let guard = lock.lock().unwrap();
+        let (guard, timeout_result) = cvar
+            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |r| r.is_none())
+            .unwrap();
+        if timeout_result.timed_out() {
+            panic!("asyncio bridge loop did not signal readiness within 5s; it may have failed to start");
+        }
+        match guard.as_ref().expect("readiness flag set before notify") {
+            Ready::Started => Ok(()),
+            Ready::ArmFailed(e) => Err(e.clone()),
+        }
+    });
+    if let Err(e) = outcome {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to start asyncio bridge loop: {e}"
+        )));
+    }
+    Ok(loop_obj)
+}
+
+/// Decide whether `candidate` (a loop already started by [`start_new_bridge_loop`])
+/// is the published winner in `cell`, publishing it if `cell` is still empty.
+/// If `candidate` loses (some other candidate already won, or wins here but
+/// isn't the one that got there first), its loop+thread must be shut down
+/// rather than leaked. Two Tokio workers can race to first-use this bridge
+/// (e.g. concurrent `async def` source/hook/handler calls), each
+/// constructing and starting its own loop+thread before either reaches this
+/// point; `OnceLock::get_or_init` makes exactly one of them the published
+/// winner atomically.
+///
+/// Must be `call_soon_threadsafe(loop.stop)`, not a direct `loop.stop()`
+/// call from this (foreign, non-owning) thread: `stop()` is documented as
+/// not thread-safe, and its entire body is just `self._stopping = True` — a
+/// flag `run_forever` only re-checks *after* `_run_once()` returns. The
+/// loser is already parked in `run_forever`'s selector wait (the handshake
+/// in `start_new_bridge_loop` guarantees it got that far), so a bare
+/// `stop()` is never observed and the thread blocks forever. Scheduling
+/// `stop` via `call_soon_threadsafe` instead writes to the loop's self-pipe,
+/// which is exactly what wakes the selector so `run_forever` (and then
+/// `close()`, in the loop's own thread body) can run.
+fn resolve_winner_or_stop_loser(
+    py: Python<'_>,
+    cell: &'static std::sync::OnceLock<PyObject>,
+    candidate: PyObject,
+) -> PyObject {
+    let winner = cell.get_or_init(|| candidate.clone_ref(py)).clone_ref(py);
+    if !winner.bind(py).is(candidate.bind(py)) {
+        let stop_result = candidate
+            .bind(py)
+            .getattr("stop")
+            .and_then(|stop| candidate.bind(py).call_method1("call_soon_threadsafe", (stop,)));
+        if let Err(e) = stop_result {
+            tracing::error!("failed to stop orphaned asyncio bridge loop: {e}");
+        }
+    }
+    winner
 }
 
 /// Call a Python method that may be sync or async; if the return value is a
 /// coroutine, submit it to the shared asyncio loop and block on the result.
-async fn call_py_await(
+pub(crate) async fn call_py_await(
     obj: Arc<PyObject>,
     method: &'static str,
     build_args: impl for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyTuple>> + Send,
@@ -614,4 +778,207 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[allow(dead_code)]
 pub(crate) fn _ensure_used(py: Python<'_>, p: NtPayload) -> PyObject {
     nt_payload_to_py(py, p)
+}
+
+#[cfg(all(test, feature = "test-embed"))]
+mod asyncio_loop_race_tests {
+    //! Requires a real embedded interpreter, which "extension-module"
+    //! deliberately does not provide (see the `[features]` note in
+    //! `Cargo.toml`). Run with:
+    //!   cargo test -p spvirit-py --no-default-features --features test-embed
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Barrier, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// Initialize the embedded interpreter and pin `threading._main_thread`
+    /// on a disposable, one-shot thread that nothing else in these tests
+    /// ever reuses — mirroring the guarantee `lib.rs`'s `#[pymodule]` init
+    /// provides in production (`import spvirit` runs once, on a thread no
+    /// later Tokio worker ever coincides with).
+    ///
+    /// This matters here specifically because `cargo test`'s harness runs
+    /// every `#[test]` function's body on its own freshly spawned OS
+    /// thread, never on the process's real main thread. If the threading
+    /// import happened inline in a test's own body thread, and that same
+    /// test later constructed a loop directly on that same thread (not via
+    /// a further spawned worker), `threading.current_thread() is
+    /// threading.main_thread()` would evaluate `True` — but since that
+    /// thread still isn't the OS's actual main thread,
+    /// `signal.set_wakeup_fd()` fails for real inside `ProactorEventLoop`'s
+    /// constructor. Doing the import on its own disposable thread instead
+    /// guarantees every thread a test later uses (its own body thread
+    /// included) is "off-main" as far as this guard is concerned, exactly
+    /// matching the normal, working production shape.
+    fn init_python_for_test() {
+        std::thread::Builder::new()
+            .name("test-py-init".into())
+            .spawn(|| {
+                pyo3::prepare_freethreaded_python();
+                Python::with_gil(|py| {
+                    py.import("threading")
+                        .expect("threading must import during test init");
+                });
+            })
+            .expect("spawn test-py-init thread")
+            .join()
+            .expect("test-py-init thread must not panic");
+    }
+
+    fn wait_for_thread_count(
+        active_threads: &'static AtomicUsize,
+        expected: usize,
+        what: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = active_threads.load(Ordering::SeqCst);
+            if count == expected {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "{what}: expected {expected} live asyncio bridge thread(s) within 5s, \
+                     still saw {count} — a thread leaked instead of exiting after being stopped"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// N threads race into `asyncio_loop_in` against a fresh, test-local
+    /// cell (never touched by the production `static LOOP`). Under the GIL,
+    /// genuine multi-loser contention here is a matter of scheduling luck
+    /// (each candidate's construction is fast enough that the "everyone
+    /// still sees `cell` empty" window is often too narrow to hit with the
+    /// interpreter serializing Python-level work) — so this test is a
+    /// sanity check on the *non-racing* path (identity of the winner is
+    /// always correct), not the mutation-testing evidence for the
+    /// loser-shutdown fix. See
+    /// `losing_candidates_are_stopped_and_do_not_leak_their_thread` below
+    /// for the deterministic reproduction.
+    #[test]
+    fn concurrent_first_callers_converge_on_one_loop() {
+        init_python_for_test();
+
+        static TEST_LOOP: OnceLock<PyObject> = OnceLock::new();
+        static TEST_ACTIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+        const N: usize = 8;
+        let barrier = Arc::new(Barrier::new(N));
+        let results: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let results = results.clone();
+                std::thread::Builder::new()
+                    .name("race-test-caller".into())
+                    .spawn(move || {
+                        barrier.wait();
+                        Python::with_gil(|py| {
+                            let loop_obj = asyncio_loop_in(py, &TEST_LOOP, &TEST_ACTIVE_THREADS)
+                                .expect("asyncio_loop_in must not fail under contention");
+                            // Identity, not equality: record the underlying
+                            // PyObject pointer so we can assert "same object"
+                            // without holding the GIL across threads.
+                            results.lock().unwrap().push(loop_obj.as_ptr() as usize);
+                        });
+                    })
+                    .expect("spawn race-test-caller thread")
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("race-test-caller thread must not panic");
+        }
+        let winners = results.lock().unwrap().clone();
+
+        assert_eq!(winners.len(), N, "every caller must get a loop back");
+        let first = winners[0];
+        assert!(
+            winners.iter().all(|&p| p == first),
+            "all {N} concurrent first-callers must converge on the same (winner's) loop, got pointers {winners:?}"
+        );
+        wait_for_thread_count(&TEST_ACTIVE_THREADS, 1, "concurrent_first_callers_converge_on_one_loop");
+    }
+
+    /// Deterministic reproduction of the round-3 defect, bypassing timing
+    /// luck entirely: publish a winner first, then directly build several
+    /// more candidate loops via `start_new_bridge_loop` (skipping
+    /// `asyncio_loop_in`'s early-return check, so every one of them is
+    /// guaranteed to actually construct and start a loop+thread), and run
+    /// each through `resolve_winner_or_stop_loser` against the
+    /// already-populated cell — guaranteeing every one of them loses.
+    ///
+    /// This is the load-bearing assertion for round 3: before the fix (a
+    /// bare `loop.stop()` from a foreign thread, which `run_forever`'s
+    /// selector wait never wakes up to observe), every loser thread hung
+    /// forever and `wait_for_thread_count` below timed out. After the fix
+    /// (`call_soon_threadsafe(loop.stop)` in `resolve_winner_or_stop_loser`,
+    /// plus `loop.close()` in the thread body of `start_new_bridge_loop`),
+    /// every loser exits promptly and only the winner's thread remains.
+    #[test]
+    fn losing_candidates_are_stopped_and_do_not_leak_their_thread() {
+        init_python_for_test();
+
+        static TEST_LOOP: OnceLock<PyObject> = OnceLock::new();
+        static TEST_ACTIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+        let winner_ptr = Python::with_gil(|py| {
+            asyncio_loop_in(py, &TEST_LOOP, &TEST_ACTIVE_THREADS)
+                .expect("winner setup must succeed")
+                .as_ptr() as usize
+        });
+        wait_for_thread_count(
+            &TEST_ACTIVE_THREADS,
+            1,
+            "losing_candidates_are_stopped_and_do_not_leak_their_thread (winner setup)",
+        );
+
+        const LOSERS: usize = 4;
+        let handles: Vec<_> = (0..LOSERS)
+            .map(|_| {
+                std::thread::Builder::new()
+                    .name("race-test-loser-builder".into())
+                    .spawn(move || {
+                        Python::with_gil(|py| {
+                            start_new_bridge_loop(py, &TEST_ACTIVE_THREADS)
+                                .expect("candidate loop construction must succeed")
+                        })
+                    })
+                    .expect("spawn race-test-loser-builder thread")
+            })
+            .collect();
+        let candidates: Vec<PyObject> = handles
+            .into_iter()
+            .map(|h| h.join().expect("loser-builder thread must not panic"))
+            .collect();
+
+        // Winner + LOSERS candidates are all live bridge threads right now.
+        wait_for_thread_count(
+            &TEST_ACTIVE_THREADS,
+            1 + LOSERS,
+            "losing_candidates_are_stopped_and_do_not_leak_their_thread (candidates started)",
+        );
+
+        Python::with_gil(|py| {
+            for candidate in candidates {
+                let resolved = resolve_winner_or_stop_loser(py, &TEST_LOOP, candidate);
+                assert_eq!(
+                    resolved.as_ptr() as usize,
+                    winner_ptr,
+                    "every candidate racing against an already-published cell must resolve to the winner"
+                );
+            }
+        });
+
+        // The load-bearing check: every loser's thread must actually exit
+        // (stopped + closed), not hang forever holding the selector open.
+        wait_for_thread_count(
+            &TEST_ACTIVE_THREADS,
+            1,
+            "losing_candidates_are_stopped_and_do_not_leak_their_thread",
+        );
+    }
 }

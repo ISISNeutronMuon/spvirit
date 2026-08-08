@@ -193,7 +193,7 @@ pub fn decode_introspection(data: &[u8], is_be: bool) -> PyResult<PyStructureDes
     decoder
         .parse_introspection(data)
         .map(PyStructureDesc::from_inner)
-        .ok_or_else(|| decode_msg_to_py_err("failed to parse introspection"))
+        .map_err(|_| decode_msg_to_py_err("failed to parse introspection"))
 }
 
 /// Decode a pvData value given the accompanying `StructureDesc`.
@@ -210,7 +210,7 @@ pub fn decode_value(
     let ft = FieldType::Structure(desc.inner().clone());
     let (decoded, _consumed) = decoder
         .decode_value(data, &ft)
-        .ok_or_else(|| decode_msg_to_py_err("failed to decode value"))?;
+        .map_err(|_| decode_msg_to_py_err("failed to decode value"))?;
     Ok(decoded_to_py(py, &decoded))
 }
 

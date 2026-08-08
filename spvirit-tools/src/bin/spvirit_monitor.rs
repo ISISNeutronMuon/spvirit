@@ -8,7 +8,7 @@ use tokio::runtime::Runtime;
 use tokio::time::interval;
 
 use spvirit_client::{MonitorOptions, client_from_opts};
-use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_codec::epics_decode::{DecodeMode, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_encode::{encode_pv_request, encode_pv_request_with_options};
 use spvirit_codec::spvirit_encode::encode_control_message;
 use spvirit_tools::spvirit_client::cli::CommonClientArgs;
@@ -35,8 +35,17 @@ async fn pvmonitor_high_level(
         render_opts.format = OutputFormat::Json;
     }
 
-    let cb = |value: &spvirit_codec::spvd_decode::DecodedValue| {
-        println!("{}", format_output(&pv_name, value, &render_opts));
+    let cb = |update: &spvirit_client::MonitorUpdate| {
+        println!("{}", format_output(&pv_name, &update.value, &render_opts));
+        // Overruns go to stderr: stdout is compared byte-for-byte by
+        // docs_verify and the interop tests.
+        if update.has_overrun() {
+            eprintln!(
+                "{}: overrun on {}",
+                pv_name,
+                update.overrun_paths().join(", ")
+            );
+        }
         ControlFlow::Continue(())
     };
     let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
@@ -66,6 +75,7 @@ async fn pvmonitor_raw(
         sid,
         version,
         is_be,
+        mut reassembler,
         ..
     } = conn;
 
@@ -93,7 +103,7 @@ async fn pvmonitor_raw(
     let mon_init = encode_monitor_request(sid, ioid, init_subcmd, &pv_request, version, is_be);
     stream.write_all(&mon_init).await?;
 
-    let init_resp = read_until(&mut stream, opts.timeout, |cmd| {
+    let init_resp = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::Op(op) if op.command == 13 && (op.subcmd & 0x08) != 0)
     })
     .await?;
@@ -128,7 +138,7 @@ async fn pvmonitor_raw(
                 echo_token = echo_token.wrapping_add(1);
                 let _ = stream.write_all(&msg).await;
             }
-            res = read_packet(&mut stream, opts.timeout) => {
+            res = read_packet(&mut stream, opts.timeout, &mut reassembler) => {
                 let bytes = match res {
                     Ok(b) => b,
                     Err(PvGetError::Timeout(_)) => continue,
@@ -144,7 +154,8 @@ async fn pvmonitor_raw(
                         if op.command != 13 || (op.subcmd != 0x00 && op.subcmd != 0x10) {
                             continue;
                         }
-                        op.decode_with_field_desc(&desc, is_be);
+                        // A decode failure leaves decoded_value None; skip the update.
+                        let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
                         if let Some(full) = op.decoded_value {
                             let mut render_opts = RenderOptions::default();
                             if json {

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde_json::json;
-use spvirit_codec::epics_decode::{PvaPacketCommand, PvaStatus};
+use spvirit_codec::epics_decode::{DecodeMode, PvaPacketCommand, PvaStatus};
 use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_tools::spvirit_client::put_encode::encode_put_payload;
 
@@ -81,7 +81,8 @@ impl ScenarioSession {
 
         match data_cmd {
             PvaPacketCommand::Op(mut op) => {
-                op.decode_with_field_desc(&desc, self.session.is_be);
+                op.decode_with_field_desc(&desc, self.session.is_be, DecodeMode::Strict)
+                    .map_err(|e| format!("GET data decode failed: {e}"))?;
                 op.decoded_value
                     .ok_or_else(|| "GET data decode produced no value".to_string())
             }

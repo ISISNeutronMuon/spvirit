@@ -52,13 +52,14 @@ async fn pvinfo_no_field_name(opts: &PvGetOptions) -> Result<StructureDesc, PvGe
         sid,
         version,
         is_be,
+        mut reassembler,
         ..
     } = establish_channel(target, opts).await?;
 
     let get_field = encode_get_field_request_without_field_name(sid, version, is_be);
     stream.write_all(&get_field).await?;
 
-    let field_resp = read_until(&mut stream, opts.timeout, |cmd| {
+    let field_resp = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::GetField(_))
     })
     .await?;

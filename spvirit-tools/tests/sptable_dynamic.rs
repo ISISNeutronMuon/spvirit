@@ -38,7 +38,8 @@ async fn dynamic_add_edit_remove_over_wire() {
         .udp_port(udp)
         .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
         .start()
-        .await;
+        .await
+        .expect("server start hooks must succeed");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // ADD: writable i32 PV appears and is gettable.
@@ -83,7 +84,8 @@ async fn dynamic_enum_add_and_set_over_wire() {
         .udp_port(udp)
         .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
         .start()
-        .await;
+        .await
+        .expect("server start hooks must succeed");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     server

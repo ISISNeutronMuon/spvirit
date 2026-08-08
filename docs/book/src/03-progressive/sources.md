@@ -53,6 +53,21 @@ monitor updates. And `subscribe` is *not* part of the Python protocol: define
 it and it is ignored (`spvirit-py/src/source.rs:535`). Monitors are driven by
 `notifier.notify(name, payload)` instead.
 
+`on_start` fires at server start (`start()`/`start_background()`/`run()`),
+not at `build()` — and it shares one ordered list with `@builder.on_start`
+hooks registered on `ServerBuilder`: whichever was registered first (a
+source via `add_source`, or a hook via `@builder.on_start`) runs first. A
+source's `order` only decides which source claims a PV name; it plays no
+part in this startup sequence. See [Lifecycle hooks and
+events](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md#lifecycle-hooks-and-events)
+in the README for the full picture, including server-wide named events
+(`post_event`/`on_event`).
+
+> **Migration note.** This is a behaviour change: a Python source's
+> `on_start` used to fire during `build()`. Code that relied on that timing
+> (e.g. publishing an initial value before `build()` returns) now needs to
+> wait until the server has started instead.
+
 ## Priority and the registry
 
 Sources are registered with an integer **order**. Lower is checked first,

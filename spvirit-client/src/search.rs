@@ -13,6 +13,7 @@ use tracing::debug;
 use crate::auth::{default_authnz_host, default_authnz_user};
 use crate::transport::read_packet;
 use crate::types::{PvGetError, PvGetOptions};
+use spvirit_codec::SegmentReassembler;
 use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvirit_encode::{
     encode_client_connection_validation, encode_search_request, ip_to_bytes,
@@ -645,6 +646,9 @@ pub async fn search_pv_tcp(
         .await
         .map_err(|_| PvGetError::Timeout("name server connect"))??;
 
+    // One reassembler for this connection, shared by every read below.
+    let mut reassembler = SegmentReassembler::new();
+
     let mut version = 2u8;
     let mut is_be = false;
 
@@ -655,7 +659,7 @@ pub async fn search_pv_tcp(
             return Err(PvGetError::Timeout("name server handshake"));
         }
         let remaining = deadline - now;
-        if let Ok(bytes) = read_packet(&mut stream, remaining).await {
+        if let Ok(bytes) = read_packet(&mut stream, remaining, &mut reassembler).await {
             let mut pkt = PvaPacket::new(&bytes);
             if let Some(cmd) = pkt.decode_payload() {
                 match cmd {
@@ -684,7 +688,7 @@ pub async fn search_pv_tcp(
             return Err(PvGetError::Timeout("name server validated"));
         }
         let remaining = deadline - now;
-        let bytes = read_packet(&mut stream, remaining).await?;
+        let bytes = read_packet(&mut stream, remaining, &mut reassembler).await?;
         let mut pkt = PvaPacket::new(&bytes);
         if let Some(cmd) = pkt.decode_payload() {
             if matches!(cmd, PvaPacketCommand::ConnectionValidated(_)) {
@@ -717,7 +721,7 @@ pub async fn search_pv_tcp(
             return Err(PvGetError::Timeout("name server search response"));
         }
         let remaining = deadline - now;
-        let bytes = read_packet(&mut stream, remaining).await?;
+        let bytes = read_packet(&mut stream, remaining, &mut reassembler).await?;
         let mut pkt = PvaPacket::new(&bytes);
         if let Some(cmd) = pkt.decode_payload() {
             if let PvaPacketCommand::SearchResponse(payload) = cmd {

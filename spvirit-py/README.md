@@ -48,6 +48,7 @@ protocol internals, and the CLI tools (`spget`, `spput`, `spmonitor`,
 - [The classic builder API](#the-classic-builder-api)
 - [Runtime store access](#runtime-store-access)
 - [Dynamic sources](#dynamic-sources)
+- [Lifecycle hooks and events](#lifecycle-hooks-and-events)
 - [Normative Type classes](#normative-type-classes)
 - [Client API](#client-api)
 - [Low-level API: spvirit.lowlevel](#low-level-api-spviritlowlevel)
@@ -642,7 +643,7 @@ class SensorSource:
     def rpc(self, name, args):             # optional: NTURI RPC support
         return spvirit.NtScalar(float(args["x"]) * 2)
 
-    def on_start(self, notifier):          # optional: called at registration
+    def on_start(self, notifier):          # optional: called at server start, not at construction
         self.notifier = notifier           # keep it to push updates later
 
 server = spvirit.Server(sources=[("sensors", 10, SensorSource())])
@@ -671,6 +672,93 @@ Key points:
 - `async def` source methods run on a dedicated background asyncio event loop
   (thread name `spvirit-asyncio`) — do not call `asyncio.run` yourself inside
   source methods.
+
+---
+
+## Lifecycle hooks and events
+
+### `@builder.on_start`
+
+Registered on the **builder**, before `build()` — there is no `server.on_start`.
+A hook runs once, at server start: after the store is built, before scan
+tasks spawn, and before the server accepts connections. No client can
+observe a pre-initialisation value.
+
+```python
+b = spvirit.ServerBuilder().ao("SETPOINT", 0.0).port(0).udp_port(0)
+
+@b.on_start
+def initialise(store):
+    store.set_value("SETPOINT", 22.5)
+
+server = b.build()
+server.start_background()
+```
+
+Hooks may be `def` or `async def` (an `async def` is awaited on the
+`spvirit-asyncio` loop) and run in registration order. A [dynamic
+source's](#dynamic-sources) `on_start(notifier)` shares that same ordered
+list — builder hooks and source hooks interleave in true registration
+order, whichever `add_source`/`@builder.on_start` call came first. A
+source's `order` value governs which source claims a PV name; it has no
+effect on this startup sequence.
+
+A hook that raises (or panics) **aborts startup** — the server does not
+serve, and the error names the hook. This is deliberate: startup is a
+barrier under your control, so failing loudly and early is safe. A handler
+firing at 3am from a live event is a different story — see below.
+
+> **Migration note.** Before this feature, a Python source's `on_start` fired
+> during `build()`. It now fires at server start (`start()` /
+> `start_background()` / `run()`), alongside `@builder.on_start` hooks. Code
+> that relied on a source's `on_start` running at `build()` time will now see
+> it run later.
+
+### `@builder.on_event` and `post_event`
+
+A named trigger that fans out across the whole server. Handlers are also
+registered on the builder, not the running server.
+
+```python
+b = spvirit.ServerBuilder().ao("SHUTTER:COUNT", 0.0).port(0).udp_port(0)
+
+@b.on_event("SHUTTER")
+async def on_shutter(store, event):
+    store.set_value("SHUTTER:COUNT", store.get_value("SHUTTER:COUNT") + 1)
+
+server = b.build()
+server.start_background()
+server.post_event("SHUTTER")
+```
+
+Handlers receive `(store, event)`; the second argument lets one function
+serve several events. They are **deferred**: `post_event` queues them and
+returns. The only guarantee is that when `post_event` returns, any IOC
+records on that event have processed and the handlers are queued — never
+read "queued" as "run". Handlers run one at a time, in registration order,
+**across all events** on a single dispatcher — a slow handler for one event
+delays every other event's handlers behind it.
+
+The record half of that guarantee is real, not aspirational: `post_event`
+blocks the calling Python thread until every registered record consumer has
+finished, releasing the GIL for the duration, so a consumer that itself
+needs the GIL cannot deadlock against the poster. (Nothing registers such a
+consumer yet; the seam exists for the scan-list work.)
+
+A handler that raises is logged and skipped; the next handler still runs
+(unlike a raising `on_start`, which aborts startup — see above). The queue
+is bounded (1024 entries); under sustained overload, invocations are
+dropped with a counter rather than growing without limit. Posting an event
+with no registered handlers is a no-op, not an error.
+
+`server.drain_events()` blocks until the queue is empty. It exists so tests
+can wait for handlers deterministically; production code should not need
+it, since it does not know when a handler will next need to fire. Calling
+it with handlers queued but the server never started fails immediately and
+says so, rather than waiting out the 10 s drain timeout.
+
+`post_event` takes a name only. Data travels through PVs, where it is
+observable and visible to both stores.
 
 ---
 
@@ -751,8 +839,8 @@ client.get("SIM:TEMP", fields="value")          # single field: plain str is fin
 client.put("SIM:SP", 21.0)                      # blocking put (fields default: ["value"])
 client.put("SIM:MODE", 2, fields=["value.index"])
 
-def on_update(value):
-    print(value)
+def on_update(update):                          # a MonitorUpdate, not a bare value
+    print(update.value)
     if done:
         return False                            # returning False stops the monitor
 client.monitor("SIM:TEMP", on_update)           # blocks until stopped;
@@ -763,11 +851,35 @@ client.info("SIM:TEMP")                         # {"struct_id": ..., "fields": [
 client.pvlist("192.168.1.10:5075")              # PV names from a specific server
 ```
 
+Every monitor callback — `Client.monitor`, `Client.subscribe` and
+`Channel.monitor` — receives a `spvirit.lowlevel.MonitorUpdate`:
+
+| Attribute | Meaning |
+|---|---|
+| `.value` | the decoded value, the dict these callbacks used to receive directly |
+| `.changed` | dotted paths of the fields this update carries, e.g. `["value", "timeStamp.secondsPastEpoch"]` |
+| `.overrun` | dotted paths of fields the server dropped at least one earlier update for |
+| `.has_overrun` | `True` when `.overrun` is non-empty |
+
+`"<whole structure>"` appears in `.changed` / `.overrun` when bit 0 is set —
+the server is reporting the entire structure rather than named fields.
+
+```python
+def on_update(update):
+    print(update.value["value"])
+    if update.has_overrun:
+        print("dropped updates for:", update.overrun)
+```
+
+> **Breaking change (0.1.20).** Monitor callbacks used to receive the decoded
+> value itself. Add `.value` to restore the previous behaviour:
+> `lambda v: print(v)` becomes `lambda u: print(u.value)`.
+
 Non-blocking monitors — `subscribe` returns immediately with a
 `Subscription` handle while updates are delivered on a background thread:
 
 ```python
-sub = client.subscribe("SIM:TEMP", lambda v: print(v))
+sub = client.subscribe("SIM:TEMP", lambda u: print(u.value))
 # ... program continues; run as many concurrent subscriptions as you like ...
 sub.pv_name       # "SIM:TEMP"
 sub.is_active     # True while updates are flowing
@@ -842,8 +954,10 @@ with Channel.connect("SIM:TEMP", "127.0.0.1:5075", timeout=5.0) as ch:
     r1 = ch.get()                   # reuses the connection — fast repeated gets
     r2 = ch.get(fields=["value"])
     ch.put(22.0)                    # fields: None -> ["value"], or str, or list
-    ch.monitor(lambda v: print(v))  # blocks; callback returns False to stop,
-                                    # a raised exception stops it and propagates
+    ch.monitor(lambda u: print(u.value))
+                                    # blocks; the callback gets a MonitorUpdate
+                                    # and returns False to stop, a raised
+                                    # exception stops it and propagates
     ch.close()                      # or rely on the context manager;
                                     # later operations raise ProtocolError
 # async variants: connect_async, get_async, put_async, introspect_async,
@@ -865,6 +979,14 @@ pkt.decode()                               # same as codec.decode_packet(pkt.byt
 pkt = ch.read_until(lambda p: p.command_name == "MONITOR", timeout=5.0,
                     max_frames=100)        # RuntimeError if max_frames exhausted
 ```
+
+> **Breaking change (0.1.20).** `read_packet` / `read_packet_async` /
+> `read_until` now reassemble segmented messages before returning. A segmented
+> message arrives as one `Packet` whose `is_segmented` is `0` and whose
+> `payload_length` covers the concatenated payload — the individual segments
+> are never surfaced. Code that stitched segments together by hand must stop
+> doing so; it would now concatenate whole messages. Control frames (echo,
+> flow control) still pass through one frame at a time and are unaffected.
 
 Operations on one channel serialize internally, so concurrent `get_async`
 calls on the same channel are safe but sequential on the wire. Monitors send

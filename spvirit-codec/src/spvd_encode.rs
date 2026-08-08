@@ -1437,7 +1437,7 @@ pub fn decode_pv_request_fields(body: &[u8], is_be: bool) -> Option<Vec<String>>
         return None;
     }
     let decoder = crate::spvd_decode::PvdDecoder::new(is_be);
-    let desc = decoder.parse_introspection(body)?;
+    let desc = decoder.parse_introspection(body).ok()?;
     for field in &desc.fields {
         if field.name == "field" {
             if let FieldType::Structure(ref inner) = field.field_type {
@@ -1481,7 +1481,7 @@ pub fn decode_pv_request_options(body: &[u8], is_be: bool) -> Option<Vec<(String
         return None;
     }
     let decoder = crate::spvd_decode::PvdDecoder::new(is_be);
-    let desc = decoder.parse_introspection(body)?;
+    let desc = decoder.parse_introspection(body).ok()?;
     let options_desc = desc.fields.iter().find_map(|f| {
         if f.name != "record" {
             return None;
@@ -1704,7 +1704,7 @@ fn decode_payload_to_structure(payload: &NtPayload, is_be: bool) -> Option<Decod
     let desc = nt_payload_desc(payload);
     let bytes = encode_nt_payload_full(payload, is_be);
     let decoder = crate::spvd_decode::PvdDecoder::new(is_be);
-    decoder.decode_structure(&bytes, &desc).map(|(v, _)| v)
+    decoder.decode_structure(&bytes, &desc).ok().map(|(v, _)| v)
 }
 
 /// Re-encode a `DecodedValue::Structure` against a (possibly narrowed)

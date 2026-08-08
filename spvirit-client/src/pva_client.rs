@@ -16,13 +16,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval};
 
+use spvirit_codec::MonitorUpdate;
 use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
-use spvirit_codec::spvd_decode::{DecodedValue, PvdDecoder, StructureDesc};
+use spvirit_codec::spvd_decode::{PvdDecoder, StructureDesc};
 use spvirit_codec::spvd_encode::{encode_pv_request, encode_pv_request_with_options};
 use spvirit_codec::spvirit_encode::{
     encode_control_message, encode_get_field_request, encode_monitor_request, encode_put_request,
@@ -31,7 +32,7 @@ use spvirit_codec::spvirit_encode::{
 use crate::client::{ChannelConn, ensure_status_ok, establish_channel, pvget as low_level_pvget};
 use crate::put_encode::encode_put_payload;
 use crate::search::resolve_pv_server;
-use crate::transport::{read_packet, read_until};
+use crate::transport::{read_frame, read_packet, read_until};
 use crate::types::{PvGetError, PvGetResult, PvOptions};
 
 /// PVA protocol version used in headers.
@@ -317,6 +318,7 @@ impl PvaClient {
             sid,
             version: _,
             is_be,
+            mut reassembler,
             ..
         } = self.open_channel(pv_name).await?;
 
@@ -328,7 +330,7 @@ impl PvaClient {
         stream.write_all(&init).await?;
 
         // Read INIT response — extract introspection
-        let init_bytes = read_until(&mut stream, self.timeout, |cmd| {
+        let init_bytes = read_until(&mut stream, self.timeout, &mut reassembler, |cmd| {
             matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && (op.subcmd & 0x08) != 0)
         })
         .await?;
@@ -345,6 +347,7 @@ impl PvaClient {
         let resp_bytes = read_until(
             &mut stream,
             self.timeout,
+            &mut reassembler,
             |cmd| matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.subcmd == 0x00),
         )
         .await?;
@@ -377,6 +380,7 @@ impl PvaClient {
             sid,
             version,
             is_be,
+            mut reassembler,
             ..
         } = self.open_channel(pv_name).await?;
 
@@ -387,7 +391,7 @@ impl PvaClient {
         let init = encode_put_request(sid, ioid, QOS_INIT, &pv_request, PVA_VERSION, is_be);
         stream.write_all(&init).await?;
 
-        let init_bytes = read_until(&mut stream, self.timeout, |cmd| {
+        let init_bytes = read_until(&mut stream, self.timeout, &mut reassembler, |cmd| {
             matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && (op.subcmd & 0x08) != 0)
         })
         .await?;
@@ -397,23 +401,22 @@ impl PvaClient {
         // Split stream; background reader logs PUT errors
         let (mut reader, writer) = stream.into_split();
         let reader_is_be = is_be;
+        // The reassembler is created once, outside the loop: a per-iteration
+        // one would discard the segments of a message split across frames.
+        // It carries over the state established during the INIT handshake.
         let reader_handle = tokio::spawn(async move {
+            // The original reader blocked indefinitely; keep that by treating
+            // a lapsed poll interval as "nothing yet, read again".
+            let poll = Duration::from_secs(3600);
             loop {
-                let mut header = [0u8; 8];
-                if reader.read_exact(&mut header).await.is_err() {
-                    break;
-                }
-                let hdr = spvirit_codec::epics_decode::PvaHeader::new(&header);
-                let len = if hdr.flags.is_control {
-                    0usize
-                } else {
-                    hdr.payload_length as usize
+                let msg = match read_frame(&mut reader, poll, &mut reassembler).await {
+                    Ok(m) => m,
+                    Err(PvGetError::Timeout(_)) => continue,
+                    Err(_) => break,
                 };
-                let mut payload = vec![0u8; len];
-                if len > 0 && reader.read_exact(&mut payload).await.is_err() {
-                    break;
-                }
-                if hdr.command == 11 && !hdr.flags.is_control && len >= 5 {
+                let hdr = spvirit_codec::epics_decode::PvaHeader::new(&msg[..8]);
+                let payload = &msg[8..];
+                if hdr.command == 11 && !hdr.flags.is_control && payload.len() >= 5 {
                     if let Some(st) =
                         spvirit_codec::epics_decode::decode_status(&payload[5..], reader_is_be).0
                     {
@@ -449,14 +452,14 @@ impl PvaClient {
     /// ```rust,ignore
     /// use std::ops::ControlFlow;
     ///
-    /// client.pvmonitor("MY:PV", |value| {
-    ///     println!("{value:?}");
+    /// client.pvmonitor("MY:PV", |update| {
+    ///     println!("{:?}", update.value);
     ///     ControlFlow::Continue(())
     /// }).await?;
     /// ```
     pub async fn pvmonitor<F>(&self, pv_name: &str, callback: F) -> Result<(), PvGetError>
     where
-        F: FnMut(&DecodedValue) -> ControlFlow<()>,
+        F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
     {
         // Default: subscribe to the entire structure. Use
         // [`pvmonitor_fields`](Self::pvmonitor_fields) for filtered subscriptions.
@@ -475,7 +478,7 @@ impl PvaClient {
         callback: F,
     ) -> Result<(), PvGetError>
     where
-        F: FnMut(&DecodedValue) -> ControlFlow<()>,
+        F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
     {
         self.pvmonitor_with_options(pv_name, fields, MonitorOptions::default(), callback)
             .await
@@ -495,13 +498,14 @@ impl PvaClient {
         mut callback: F,
     ) -> Result<(), PvGetError>
     where
-        F: FnMut(&DecodedValue) -> ControlFlow<()>,
+        F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
     {
         let ChannelConn {
             mut stream,
             sid,
             version: _,
             is_be,
+            mut reassembler,
             ..
         } = self.open_channel(pv_name).await?;
 
@@ -538,7 +542,7 @@ impl PvaClient {
         stream.write_all(&init).await?;
 
         // Read INIT response — extract introspection
-        let init_bytes = read_until(&mut stream, self.timeout, |cmd| {
+        let init_bytes = read_until(&mut stream, self.timeout, &mut reassembler, |cmd| {
             matches!(cmd, PvaPacketCommand::Op(op) if op.command == 13 && (op.subcmd & 0x08) != 0)
         })
         .await?;
@@ -571,7 +575,7 @@ impl PvaClient {
                     echo_token = echo_token.wrapping_add(1);
                     let _ = stream.write_all(&msg).await;
                 }
-                res = read_packet(&mut stream, self.timeout) => {
+                res = read_packet(&mut stream, self.timeout, &mut reassembler) => {
                     let bytes = match res {
                         Ok(b) => b,
                         Err(PvGetError::Timeout(_)) => continue,
@@ -582,10 +586,10 @@ impl PvaClient {
                         if op.command == 13 && op.ioid == ioid && op.subcmd == 0x00 {
                             let payload = &bytes[8..]; // skip header
                             let pos = 5; // skip ioid(4) + subcmd(1)
-                            if let Some((decoded, _)) =
-                                decoder.decode_structure_with_bitset(&payload[pos..], &field_desc)
+                            if let Ok(update) =
+                                decoder.decode_monitor_update(&payload[pos..], &field_desc)
                             {
-                                let flow = callback(&decoded);
+                                let flow = callback(&update);
 
                                 if pipeline_queue.is_some() {
                                     consumed_since_ack = consumed_since_ack.saturating_add(1);
@@ -651,13 +655,14 @@ impl PvaClient {
             version: _,
             is_be,
             server_addr,
+            mut reassembler,
         } = self.open_channel(pv_name).await?;
 
         let ioid = alloc_ioid();
         let msg = encode_get_field_request(sid, ioid, None, PVA_VERSION, is_be);
         stream.write_all(&msg).await?;
 
-        let resp_bytes = read_until(&mut stream, self.timeout, |cmd| {
+        let resp_bytes = read_until(&mut stream, self.timeout, &mut reassembler, |cmd| {
             matches!(cmd, PvaPacketCommand::GetField(_))
         })
         .await?;
@@ -799,7 +804,7 @@ pub async fn pvput(opts: &PvOptions, value: impl Into<Value>) -> Result<(), PvGe
 /// see [`pvmonitor_fields`] for filtered subscriptions.
 pub async fn pvmonitor<F>(opts: &PvOptions, callback: F) -> Result<(), PvGetError>
 where
-    F: FnMut(&DecodedValue) -> ControlFlow<()>,
+    F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
 {
     let client = client_from_opts(opts);
     client.pvmonitor(&opts.pv_name, callback).await
@@ -812,7 +817,7 @@ pub async fn pvmonitor_fields<F>(
     callback: F,
 ) -> Result<(), PvGetError>
 where
-    F: FnMut(&DecodedValue) -> ControlFlow<()>,
+    F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
 {
     let client = client_from_opts(opts);
     client
