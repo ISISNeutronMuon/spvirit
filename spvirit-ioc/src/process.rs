@@ -325,35 +325,55 @@ pub(crate) fn read_field(set: &LockSetData, id: RecordId, field: Field) -> Value
 ///
 /// This is also where PACT is owned. `process_inner` sets `common.pact`
 /// before calling this function; mirroring Base, where a record type's own
-/// `process()` clears `prec->pact` as the very last synchronous thing it
-/// does, this function clears it once its own work — value, limits, alarms,
-/// monitors — is done, immediately before firing the forward link. Every
-/// return from this function via `?` above (an error from `input_body` or
-/// `output_body`) skips that clear entirely, so an error leaves PACT set.
+/// `process()` clears `prec->pact` unconditionally at the bottom of the
+/// function regardless of the status its device support returned, this
+/// function clears PACT on *every* path that finishes handling the pass —
+/// whether the input/output side succeeded or failed. A `TooDeep` (or any
+/// other) error from `input_body`/`output_body` is not a two-phase-pending
+/// body; it is this pass giving up. Leaving PACT set in that case would be
+/// silent and permanent: `process()`'s own brake (`if common.pact { return
+/// Ok(()) }`) means every later call on that record would report success
+/// while doing nothing, forever, with no error and no event. So the failure
+/// branch below clears PACT explicitly, by hand — not by falling through a
+/// bare `?` and letting the clear be skipped as a side effect of control
+/// flow, which is how that bug arose the first time.
+///
+/// The one thing that is allowed to leave PACT set past this function is a
+/// future async body returning `AsyncOutcome::Pending` *by design*: see the
+/// hook point described below, which is a distinct, deliberate return, not
+/// an error.
 ///
 /// This is also the declared seam for two-phase (async) device support,
 /// which sub-project A does not implement: the hook point a future
 /// `AsyncSupport` implementation would need is inside `input_body` (INP) or
 /// `output_body` (OUT), above, at the point the value is fetched or
-/// written. An implementation whose `start()` returns
-/// `AsyncOutcome::Pending` must return from that call site without reaching
-/// this function's `common.pact = false` line below — since PACT was
-/// already set by `process_inner` before this function was ever called,
-/// simply not reaching the clear is sufficient to leave the record
-/// two-phase-pending until [`complete_async`] runs. How a record binds to
-/// an `AsyncSupport` implementation (a registry, a per-record slot, or
-/// something else) is left undecided here; see [`AsyncSupport`]'s own doc
-/// comment for why.
+/// written. An implementation whose `start()` reports
+/// `AsyncOutcome::Pending` must return `Ok(())` from that call site without
+/// having finished its work, so it takes the success branch here (not the
+/// error branch) while genuinely being incomplete — a distinction this
+/// function cannot make on its own until B builds it; today, sub-project A
+/// has no such body, so every path through here is either a real success or
+/// a real failure. How a record binds to an `AsyncSupport` implementation (a
+/// registry, a per-record slot, or something else) is left undecided here;
+/// see [`AsyncSupport`]'s own doc comment for why.
 pub(crate) fn record_body(
     set: &mut LockSetData,
     id: RecordId,
     ctx: &mut ProcCtx,
 ) -> Result<(), ProcError> {
     let kind = set.get(id).kind;
-    if kind.is_output() {
-        output_body(set, id, ctx)?;
+    let fetched = if kind.is_output() {
+        output_body(set, id, ctx)
     } else {
-        input_body(set, id, ctx)?;
+        input_body(set, id, ctx)
+    };
+    if let Err(err) = fetched {
+        // The pass did not complete, and it is not coming back on its own —
+        // this is not the deliberate "operation still outstanding" case, so
+        // PACT must not be left set for `process()`'s brake to swallow every
+        // later pass on this record. See this function's doc comment.
+        set.get_mut(id).common.pact = false;
+        return Err(err);
     }
     set.get_mut(id).time_ns = now_ns();
     if is_analogue(kind) {
@@ -1781,6 +1801,70 @@ mod tests {
         assert!(
             ctx.take_events().is_empty(),
             "process() must not post while PACT is held"
+        );
+    }
+
+    #[test]
+    fn a_too_deep_error_does_not_strand_pact_for_later_passes() {
+        // Fix round 2: a `TooDeep` error from `input_body` (via a PP link's
+        // nested `process()` call) must not leave PACT stuck on the record
+        // whose pass failed. If it did, `process()`'s own PACT brake would
+        // report every later call on that record as an unremarkable `Ok(())`
+        // while doing nothing — a silent, permanent stall, strictly worse
+        // than the recursion error it came from. That is the bug this test
+        // exists to catch; it must go red if `record_body` reverts to
+        // clearing PACT only via a bare `?` on `input_body`/`output_body`.
+        // PV:B's INP is a nonzero constant so it seeds VAL = 5.0 at load
+        // (constant links are a load-time init, not a per-pass fetch — see
+        // `a_constant_link_is_a_no_op_during_processing`), giving both
+        // records a real MDEL-worthy delta from their zero `prev_val` on
+        // their first completed pass. Without this, both would start and
+        // stay at VAL == prev_val == 0.0 and neither would post, the same
+        // "no INP, no alarm" case `mdel_suppresses_a_change_smaller_than_the_deadband`
+        // documents — which would make the final event-list assertion below
+        // pass vacuously instead of proving the recovered pass actually ran.
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"PV:B PP\")\n}\n\
+                    record(ai, \"PV:B\") {\n    field(INP, \"5\")\n}\n");
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        // Fill the depth budget to one below the cap: PV:A's own
+        // `push_depth` still succeeds (so `process_inner` enters, sets
+        // PV:A's PACT, and calls into `input_body`), but the nested
+        // `process()` call PV:A's PP link makes on PV:B pushes the depth to
+        // exactly the cap and fails.
+        for _ in 0..MAX_DEPTH - 1 {
+            ctx.push_depth("outer").expect("within the cap");
+        }
+        let first = d.with_set(a.set, |set| process(set, a, &mut ctx));
+        assert!(
+            matches!(first, Err(ProcError::TooDeep { .. })),
+            "got {first:?}"
+        );
+        // Drain this test's artificial frames back to zero. `process()`'s
+        // own push/pop pair around PV:A (and the failed push for PV:B, which
+        // never incremented the depth) already left the real bookkeeping
+        // balanced; only the setup above needs undoing.
+        for _ in 0..MAX_DEPTH - 1 {
+            ctx.pop_depth();
+        }
+        // The assertion that matters: an ordinary pass on PV:A afterwards
+        // must actually run, not be silently swallowed by a stuck PACT.
+        d.with_set(a.set, |set| {
+            process(set, a, &mut ctx)
+                .expect("a plain pass must succeed once the depth budget is free");
+            assert!(
+                set.get(a).time_ns > 0,
+                "PV:A must have actually processed, not been swallowed by a stuck PACT"
+            );
+            assert!(
+                !set.get(a).common.pact,
+                "a completed synchronous pass must leave PACT clear"
+            );
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:B".to_string(), "PV:A".to_string()],
+            "the recovered pass must run to completion, including the PP-processed target"
         );
     }
 }
