@@ -159,8 +159,9 @@ fn build_one(raw: &DbRecord) -> Result<Record, BuildError> {
             name,
             "",
             format!(
-                "record type '{}' is not supported by the processing core \
-                 (sub-project A covers ai, ao, bi, bo, longin, longout)",
+                "record type '{}' is not supported by the processing core; \
+                 sub-project A covers only ai, ao, bi, bo, longin, longout — \
+                 support for other record types is added by sub-project D",
                 raw.record_type
             ),
         )
@@ -293,6 +294,11 @@ mod tests {
             .expect("parse");
         let err = build_records(&raw).expect_err("calc belongs to sub-project D");
         assert!(err.message.contains("calc"), "got {}", err.message);
+        assert!(
+            err.message.contains("sub-project D"),
+            "the error must attribute the missing type to sub-project D, got {}",
+            err.message
+        );
         assert_eq!(err.record, "PV:C");
     }
 
