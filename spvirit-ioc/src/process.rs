@@ -338,6 +338,21 @@ pub(crate) fn read_field(set: &LockSetData, id: RecordId, field: Field) -> Value
 /// bare `?` and letting the clear be skipped as a side effect of control
 /// flow, which is how that bug arose the first time.
 ///
+/// On the success path, PACT is cleared *after* `forward_link` runs, not
+/// before — mirroring Base's `dbProcess`, where `recGblFwdLink` executes
+/// while `prec->pact` is still `TRUE` and only then is it cleared. This is
+/// what makes PACT the brake for a cycle built purely out of FLNK edges:
+/// if the forward chain re-enters this record before the clear, the
+/// re-entrant `process()` call sees PACT set and returns immediately
+/// instead of recursing. Clearing PACT before firing the forward link (as
+/// an earlier version of this function did) leaves FLNK-only cycles
+/// unguarded — they recurse until `MAX_DEPTH` reports `TooDeep` instead of
+/// terminating gracefully after one bounce, because by the time the cycle
+/// re-enters, PACT has already been cleared. PP-link cycles were never
+/// affected by that mistake: a PP input link re-enters via
+/// `fetch_link_value`'s nested `process()` call, which happens earlier in
+/// this same function, well before either PACT-clear site.
+///
 /// The one thing that is allowed to leave PACT set past this function is a
 /// future async body returning `AsyncOutcome::Pending` *by design*: see the
 /// hook point described below, which is a distinct, deliberate return, not
@@ -388,10 +403,17 @@ pub(crate) fn record_body(
     }
     let alarm_changed = reset_alarms(set, id, ctx);
     post_monitors(set, id, alarm_changed, ctx);
-    // The direct analogue of `prec->pact = FALSE` at the end of a Base
-    // record's `process()` — see this function's doc comment above.
+    // Fire the forward link while PACT is still set — this is what makes
+    // PACT the brake for FLNK cycles: if the chain re-enters this record,
+    // `process()` sees PACT set and returns immediately instead of
+    // recursing. Base does the same in `dbProcess`: `recGblFwdLink` runs
+    // before `prec->pact = FALSE`. The clear below is the direct analogue
+    // of that `prec->pact = FALSE`, and it must run unconditionally —
+    // whether `forward_link` succeeded or errored — or a failure here would
+    // strand PACT set for the rest of the IOC's life.
+    let result = forward_link(set, id, ctx);
     set.get_mut(id).common.pact = false;
-    forward_link(set, id, ctx)
+    result
 }
 
 /// Queue the record's value monitor, if the change warrants one.

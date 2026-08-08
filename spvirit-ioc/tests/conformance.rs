@@ -213,39 +213,39 @@ async fn rule_omsl_selects_the_output_source() {
     assert_eq!(scalar(&src.get("PV:SUP").await.expect("exists")), 0.0);
 }
 
-/// Rule: a PP cycle terminates. PACT is the brake.
+/// Rule: a link cycle terminates. PACT is the brake.
 ///
-/// CONCERN, not silently fixed or weakened — see the task report: this test
-/// pins the Record Reference rule and `graph.rs::DependencyGraph::report`'s
-/// own claim ("PACT breaks it at runtime; not an error", worded generically
-/// for every edge kind the graph tracks, including FLNK). It currently
-/// FAILS against the engine and is `#[ignore]`d rather than deleted,
-/// weakened, or fixed in `process.rs` — none of which this task is allowed
-/// to do unilaterally.
-///
-/// Root cause read from `record_body` (`process.rs`): PACT is cleared
-/// (`set.get_mut(id).common.pact = false;`) *before* `forward_link` is
-/// called, not after, as EPICS Base's `dbProcess` does (Base's process
-/// support routine calls `recGblFwdLink` *while* `pact` is still `TRUE`;
-/// `dbProcess` only clears it once that whole call returns). So a PP-link
-/// cycle (fetched via `fetch_link_value`, which recurses into `process()`
-/// *before* `record_body` reaches the PACT-clearing line) is correctly
-/// broken by the brake — see `a_pp_cycle_terminates_via_pact` in
-/// `process.rs`'s own tests — but an FLNK-only cycle is not: by the time
-/// `forward_link` re-enters the first record, its PACT has already been
-/// reset, so the pass reprocesses it in full and recurses forever until
-/// `ctx.push_depth`'s `MAX_DEPTH` (64) aborts it with `ProcError::TooDeep`.
-/// This is a real semantic gap between the engine and both the Record
-/// Reference and the engine's own documented invariant, not a fixture
-/// problem; flagged here for a maintainer to fix `record_body`'s ordering
-/// rather than changed quietly under this task's constraints.
+/// This test originally FAILED against the engine: `record_body`
+/// (`process.rs`) cleared PACT *before* calling `forward_link`, instead of
+/// after as EPICS Base's `dbProcess` does (Base's process support routine
+/// calls `recGblFwdLink` *while* `pact` is still `TRUE`; `dbProcess` only
+/// clears it once that whole call returns). A PP-link cycle was correctly
+/// broken by the brake (it re-enters via `fetch_link_value`, which recurses
+/// into `process()` earlier in the function, before either PACT-clear
+/// site — see `a_pp_cycle_terminates_via_pact` in `process.rs`'s own
+/// tests), but an FLNK-only cycle was not: by the time `forward_link`
+/// re-entered the first record, its PACT had already been reset, so the
+/// pass reprocessed it in full and recursed until `ctx.push_depth`'s
+/// `MAX_DEPTH` (64) aborted it with `ProcError::TooDeep`. That was a real
+/// engine defect, reported and then fixed in `record_body` by moving the
+/// PACT clear to after `forward_link` returns, matching Base's ordering;
+/// this test is now load-bearing proof of that fix and must keep failing
+/// if the ordering ever regresses.
 #[tokio::test]
-#[ignore = "engine defect: FLNK-only cycles are not broken by PACT, see the \
-            doc comment above; tracked as a concern in the Task 14 report, \
-            not fixed here per this task's constraints"]
 async fn rule_a_link_cycle_terminates() {
+    // PV:A writes PV:B.VAL directly through its (NPP) OUT link, then FLNKs
+    // to PV:B; PV:B FLNKs back to PV:A, closing the cycle. This is deliberate,
+    // not incidental: an FLNK-only cycle between two records that never
+    // change VAL (e.g. two bare `ai`s with only FLNK fields) produces no
+    // monitor for either record regardless of how PACT is ordered — MDEL
+    // suppresses a no-op post — which would make the "each record posts
+    // once" assertion pass or fail for the wrong reason. Routing PV:A's
+    // value through OUT into PV:B.VAL guarantees PV:B's VAL actually moves
+    // (from its 0.0 default) the first time it processes, so its post is
+    // real signal, not an artifact of the fixture.
     let src = IocSource::from_db_str(
-        "record(ai, \"PV:A\") {\n    field(FLNK, \"PV:B\")\n}\n\
+        "record(ao, \"PV:A\") {\n    field(OUT, \"PV:B.VAL\")\n\
+         field(FLNK, \"PV:B\")\n}\n\
          record(ai, \"PV:B\") {\n    field(FLNK, \"PV:A\")\n}\n",
     )
     .expect("load");
@@ -254,6 +254,9 @@ async fn rule_a_link_cycle_terminates() {
         .await
         .expect("the cycle must not hang");
     assert_eq!(events.len(), 2, "each record posts once per pass");
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"PV:A"), "PV:A posts once: {names:?}");
+    assert!(names.contains(&"PV:B"), "PV:B posts once: {names:?}");
     assert_eq!(
         src.graph().cycles.len(),
         1,
