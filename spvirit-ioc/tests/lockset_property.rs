@@ -34,17 +34,27 @@ impl UnionFind {
     }
 }
 
-/// Render `edges` (pairs of record indices) as a `.db` file over `n` records.
-fn render_db(n: usize, edges: &[(usize, usize)]) -> String {
-    let mut inp: HashMap<usize, usize> = HashMap::new();
-    for (from, to) in edges {
-        inp.entry(*from).or_insert(*to);
-    }
+/// The five link fields the engine partitions over, in the order
+/// [`spvirit_ioc::lockset::links_of`] enumerates them. The model does not
+/// restrict which of these a given record kind may carry — `build_records`
+/// parses all five uniformly regardless of kind — so any field is always
+/// meaningful to write on an `ai` record and no edge is ever dropped for
+/// being "the wrong field for this kind".
+const LINK_FIELDS: [&str; 5] = ["INP", "OUT", "DOL", "FLNK", "SDIS"];
+
+/// Render `edges` (from-index, to-index, field-selector triples) as a `.db`
+/// file over `n` records. Each record gets at most one target per field
+/// (matching `.db`'s one-value-per-field-name shape); when more than one
+/// edge names the same (from, field) pair, the first one in iteration order
+/// wins, exactly as `field_targets` below computes it for the oracle.
+fn render_db(n: usize, field_targets: &HashMap<(usize, usize), usize>) -> String {
     let mut out = String::new();
     for i in 0..n {
         out.push_str(&format!("record(ai, \"PV:{i}\") {{\n"));
-        if let Some(target) = inp.get(&i) {
-            out.push_str(&format!("    field(INP, \"PV:{target} PP\")\n"));
+        for (field_ix, field_name) in LINK_FIELDS.iter().enumerate() {
+            if let Some(target) = field_targets.get(&(i, field_ix)) {
+                out.push_str(&format!("    field({field_name}, \"PV:{target} PP\")\n"));
+            }
         }
         out.push_str("}\n");
     }
@@ -64,27 +74,32 @@ proptest! {
     #[test]
     fn partitioning_agrees_with_union_find(
         n in 1usize..12,
-        raw_edges in prop::collection::vec((0usize..12, 0usize..12), 0..20),
+        raw_edges in prop::collection::vec((0usize..12, 0usize..12, 0usize..LINK_FIELDS.len()), 0..20),
     ) {
-        let edges: Vec<(usize, usize)> = raw_edges
+        let edges: Vec<(usize, usize, usize)> = raw_edges
             .into_iter()
-            .filter(|(a, b)| *a < n && *b < n && a != b)
+            .filter(|(a, b, _)| *a < n && *b < n && a != b)
             .collect();
 
-        let db = render_db(n, &edges);
+        // The engine's `.db` model holds one value per field name, so a
+        // record can carry at most one target per field. Mirror that here
+        // with a first-edge-per-(from, field) rule, which both the
+        // renderer and the union-find reference use — this is the one
+        // place the "which edge wins" decision is made, so the two can
+        // never see a different edge set.
+        let mut field_targets: HashMap<(usize, usize), usize> = HashMap::new();
+        for (from, to, field) in &edges {
+            field_targets.entry((*from, *field)).or_insert(*to);
+        }
+
+        let db = render_db(n, &field_targets);
         let raw = parse_db_records(&db, "prop.db", &HashMap::new()).expect("parse");
         let records = build_records(&raw).expect("build");
         let engine = as_sets(partition(&records));
 
-        // The engine only sees the first INP per record, exactly as
-        // render_db wrote it. Mirror that when building the reference.
-        let mut first: HashMap<usize, usize> = HashMap::new();
-        for (from, to) in &edges {
-            first.entry(*from).or_insert(*to);
-        }
         let mut uf = UnionFind::new(n);
-        for (from, to) in &first {
-            uf.union(*from, *to);
+        for (&(from, _field), &to) in &field_targets {
+            uf.union(from, to);
         }
         let mut groups: HashMap<usize, BTreeSet<usize>> = HashMap::new();
         for i in 0..n {

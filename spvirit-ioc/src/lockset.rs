@@ -33,8 +33,11 @@ impl LockSetData {
     }
 }
 
-/// Every link a record holds, in a fixed order. Used by both the
-/// partitioner and the dependency graph so they can never disagree.
+/// Every link a record holds, in a fixed order: INP, OUT, DOL, FLNK, SDIS.
+/// This is the single place that enumerates the five link fields — used by
+/// the partitioner, link resolution, and (later) the dependency graph — so
+/// none of them can drift out of sync with the others. [`links_of_mut`]
+/// must enumerate the same five fields in the same order.
 pub(crate) fn links_of(record: &Record) -> [&Link; 5] {
     [
         &record.inp,
@@ -42,6 +45,20 @@ pub(crate) fn links_of(record: &Record) -> [&Link; 5] {
         &record.dol,
         &record.common.flnk,
         &record.common.sdis,
+    ]
+}
+
+/// The mutable counterpart to [`links_of`], for callers that rewrite link
+/// targets in place. Disjoint field borrows make returning five simultaneous
+/// `&mut Link`s sound. Must enumerate the same five fields in the same order
+/// as [`links_of`].
+pub(crate) fn links_of_mut(record: &mut Record) -> [&mut Link; 5] {
+    [
+        &mut record.inp,
+        &mut record.out,
+        &mut record.dol,
+        &mut record.common.flnk,
+        &mut record.common.sdis,
     ]
 }
 
@@ -223,11 +240,9 @@ fn resolve_links(
     by_name: &HashMap<String, RecordId>,
     unresolved: &mut Vec<String>,
 ) {
-    fix_link(&mut record.inp, by_name, unresolved);
-    fix_link(&mut record.out, by_name, unresolved);
-    fix_link(&mut record.dol, by_name, unresolved);
-    fix_link(&mut record.common.flnk, by_name, unresolved);
-    fix_link(&mut record.common.sdis, by_name, unresolved);
+    for link in links_of_mut(record) {
+        fix_link(link, by_name, unresolved);
+    }
 }
 
 #[cfg(test)]
