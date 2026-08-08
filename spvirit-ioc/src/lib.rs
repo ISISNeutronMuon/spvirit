@@ -7,5 +7,8 @@ pub mod graph;
 pub mod lockset;
 pub mod model;
 pub mod process;
+pub mod source;
 #[cfg(test)]
 mod test_support;
+
+pub use source::IocSource;

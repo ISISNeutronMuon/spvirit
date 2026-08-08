@@ -1218,8 +1218,10 @@ name = "spvirit-ioc"
 version = "0.1.20"
 dependencies = [
  "proptest",
+ "spvirit-codec",
  "spvirit-server",
  "spvirit-types",
+ "tokio",
  "tracing",
 ]
 
