@@ -183,9 +183,9 @@ pub(crate) fn check_udf(set: &mut LockSetData, id: RecordId) -> bool {
 ///
 /// Mirrors EPICS `checkAlarms`: an undefined record reports INVALID/UDF and
 /// nothing else — the limit ladder is skipped entirely, even if a stale VAL
-/// happens to sit outside a configured limit. Binary records have no
-/// limits; their `Limits` stay at the defaults, where every severity is
-/// `NoAlarm`, so the limit ladder is a no-op for them.
+/// happens to sit outside one of the HIHI/HIGH/LOW/LOLO thresholds. Binary
+/// records have no limits; their `Limits` stay at the defaults, where every
+/// severity is `NoAlarm`, so the limit ladder is a no-op for them.
 pub(crate) fn check_limits(set: &mut LockSetData, id: RecordId) {
     if check_udf(set, id) {
         return;
@@ -598,5 +598,142 @@ mod tests {
             assert_eq!(set.get(id).common.sevr, Severity::Invalid);
             assert_eq!(set.get(id).common.stat, Condition::Udf);
         });
+    }
+
+    // --- reset_alarms's `changed` contract -------------------------------
+    //
+    // Fix round 1: these were missing entirely. A `reset_alarms` that
+    // returned `true` unconditionally, `false` unconditionally, or computed
+    // `changed` from severity alone (ignoring the condition) would have
+    // passed the whole suite without these.
+
+    #[test]
+    fn reset_alarms_reports_true_when_the_pending_state_differs_from_committed() {
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            let r = set.get_mut(id);
+            r.common.sevr = Severity::NoAlarm;
+            r.common.stat = Condition::NoAlarm;
+            r.common.nsev = Severity::Minor;
+            r.common.nsta = Condition::Soft;
+            assert!(
+                reset_alarms(set, id, &mut ctx),
+                "pending NSEV/NSTA differ from committed SEVR/STAT: this must report a change"
+            );
+            assert_eq!(set.get(id).common.sevr, Severity::Minor);
+            assert_eq!(set.get(id).common.stat, Condition::Soft);
+        });
+    }
+
+    #[test]
+    fn reset_alarms_reports_false_when_recommitting_the_same_state() {
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            let r = set.get_mut(id);
+            r.common.sevr = Severity::Minor;
+            r.common.stat = Condition::Soft;
+            r.common.nsev = Severity::Minor;
+            r.common.nsta = Condition::Soft;
+            assert!(
+                !reset_alarms(set, id, &mut ctx),
+                "committing the same severity and condition again must not report a change"
+            );
+        });
+    }
+
+    #[test]
+    fn reset_alarms_reports_true_when_only_the_condition_differs() {
+        // Severity alone is not enough to compute `changed`: two different
+        // conditions can share a severity (e.g. HIGH and SOFT are both
+        // Minor), and a condition change is still an observable change.
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            let r = set.get_mut(id);
+            r.common.sevr = Severity::Minor;
+            r.common.stat = Condition::Soft;
+            r.common.nsev = Severity::Minor;
+            r.common.nsta = Condition::Calc;
+            assert!(
+                reset_alarms(set, id, &mut ctx),
+                "the condition changed even though the severity did not; this must report a change"
+            );
+            assert_eq!(set.get(id).common.stat, Condition::Calc);
+        });
+    }
+
+    // --- exact-boundary and ladder-order coverage -------------------------
+
+    #[test]
+    fn a_value_exactly_at_hihi_alarms_hihi() {
+        let (d, id) = limited("10", "");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Major, Condition::HiHi)
+        );
+    }
+
+    #[test]
+    fn a_value_exactly_at_high_alarms_high() {
+        let (d, id) = limited("5", "");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Minor, Condition::High)
+        );
+    }
+
+    #[test]
+    fn a_value_exactly_at_low_alarms_low() {
+        let (d, id) = limited("-5", "");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Minor, Condition::Low)
+        );
+    }
+
+    #[test]
+    fn a_value_exactly_at_lolo_alarms_lolo() {
+        let (d, id) = limited("-10", "");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Major, Condition::LoLo)
+        );
+    }
+
+    #[test]
+    fn crossing_both_hihi_and_high_yields_hihi_by_ladder_order_alone() {
+        // HSV is given the higher severity here (MAJOR vs HHSV's MINOR): if
+        // the outcome were decided by comparing severities rather than by
+        // the ladder returning on its first match, this would come out
+        // MAJOR/High instead of MINOR/HiHi.
+        let text = "record(ai, \"PV:A\") {\n    field(VAL, \"11\")\n\
+                     field(HIHI, \"10\")\n    field(HIGH, \"5\")\n\
+                     field(HHSV, \"MINOR\")\n    field(HSV, \"MAJOR\")\n}\n";
+        let d = db(text);
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Minor, Condition::HiHi),
+            "the ladder must return on HIHI before it ever reaches HIGH"
+        );
+    }
+
+    #[test]
+    fn crossing_both_lolo_and_low_yields_lolo_by_ladder_order_alone() {
+        let text = "record(ai, \"PV:A\") {\n    field(VAL, \"-11\")\n\
+                     field(LOW, \"-5\")\n    field(LOLO, \"-10\")\n\
+                     field(LSV, \"MAJOR\")\n    field(LLSV, \"MINOR\")\n}\n";
+        let d = db(text);
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Minor, Condition::LoLo),
+            "the ladder must return on LOLO before it ever reaches LOW"
+        );
     }
 }
