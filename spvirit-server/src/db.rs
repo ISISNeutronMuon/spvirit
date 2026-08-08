@@ -631,6 +631,10 @@ fn expand_macros(
 
 /// Join physical lines into logical ones so a quoted value may span newlines.
 ///
+/// Also strips trailing inline comments: an unquoted `#` runs to the end of
+/// the physical line. A `#` inside a quoted value is not a comment marker
+/// and is preserved untouched.
+///
 /// Returns `(logical_line_text, first_physical_line_number)` pairs.
 fn logical_lines(content: &str, path: &str) -> Result<Vec<(String, usize)>, DbParseError> {
     let mut out = Vec::new();
@@ -647,6 +651,9 @@ fn logical_lines(content: &str, path: &str) -> Result<Vec<(String, usize)>, DbPa
             buf.push('\n');
         }
         for ch in physical.chars() {
+            if !in_quote && ch == '#' {
+                break;
+            }
             if ch == '"' {
                 in_quote = !in_quote;
             }
@@ -753,11 +760,19 @@ fn parse_db_inner(
         let line = line.trim();
 
         if let Some(caps) = record_re.captures(line) {
+            let name = caps[2].to_string();
+            if name.is_empty() {
+                return Err(DbParseError {
+                    path: path.to_string(),
+                    line: lineno,
+                    message: "record name must not be empty".to_string(),
+                });
+            }
             if let Some(rec) = current.take() {
                 records.push(rec);
             }
             current = Some(DbRecord {
-                name: caps[2].to_string(),
+                name,
                 record_type: caps[1].to_string(),
                 fields: HashMap::new(),
             });
@@ -1011,5 +1026,66 @@ mod tests {
         assert!(err.message.contains("cycle"), "got {}", err.message);
 
         fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn trailing_inline_comments_after_a_field_value_are_stripped() {
+        let input = "record(ai, \"PV:A\") {\n    field(LOPR, \"0\")      # display low\n}\n";
+        let recs = parse_db_records(input, "t.db", &HashMap::new())
+            .expect("a trailing comment after a field must not abort the load");
+        assert_eq!(recs[0].fields.get("LOPR").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn hash_inside_a_quoted_value_is_not_treated_as_a_comment() {
+        let input = "record(ai, \"PV:A\") {\n    field(DESC, \"50% #1 unit\")\n}\n";
+        let recs =
+            parse_db_records(input, "t.db", &HashMap::new()).expect("a quoted # must survive");
+        assert_eq!(
+            recs[0].fields.get("DESC").map(String::as_str),
+            Some("50% #1 unit")
+        );
+    }
+
+    #[test]
+    fn empty_record_name_is_rejected() {
+        let input = "record(ai, \"\") {\n}\n";
+        let err = parse_db_records(input, "e.db", &HashMap::new())
+            .expect_err("an empty record name must abort the load");
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("empty"), "got {}", err.message);
+    }
+
+    #[test]
+    fn shipped_example_db_parses_and_yields_expected_records() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples")
+            .join("example.db");
+        let recs = load_db_records(path.to_str().expect("utf8 path"), &HashMap::new())
+            .expect("the shipped example.db must parse, trailing comments and all");
+        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["DEMO:TEMP", "DEMO:SETPOINT", "DEMO:ENABLE", "DEMO:SPECTRUM",]
+        );
+        // The typed loader must also accept it end-to-end.
+        load_db(path.to_str().expect("utf8 path")).expect("example.db must load as typed records");
+    }
+
+    #[test]
+    fn archiver_demo_db_parses_and_yields_expected_record_count() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("demo")
+            .join("archiver_demo.db");
+        let recs = load_db_records(path.to_str().expect("utf8 path"), &HashMap::new())
+            .expect("demo/archiver_demo.db must parse");
+        assert_eq!(
+            recs.len(),
+            14,
+            "unexpected record count in archiver_demo.db"
+        );
+        load_db(path.to_str().expect("utf8 path"))
+            .expect("archiver_demo.db must load as typed records");
     }
 }
