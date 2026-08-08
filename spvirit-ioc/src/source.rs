@@ -66,16 +66,22 @@ impl IocSource {
     pub fn process_pini(&self) -> Vec<(String, NtPayload)> {
         let mut all = Vec::new();
         for &id in self.db.order() {
-            let is_pini = self.db.with_set(id.set, |set| set.get(id).common.pini);
-            if !is_pini {
-                continue;
-            }
             let mut ctx = ProcCtx::new();
-            let result = self.db.with_set(id.set, |set| process(set, id, &mut ctx));
-            if let Err(e) = result {
-                tracing::warn!(target: "spvirit_ioc", "PINI processing failed: {e}");
+            // A single lock acquisition: check PINI and, if set, run the pass
+            // under the same guard, so there is no window between the check
+            // and the process for another pass to slip in.
+            let processed = self.db.with_set(id.set, |set| {
+                if !set.get(id).common.pini {
+                    return None;
+                }
+                Some(process(set, id, &mut ctx))
+            });
+            if let Some(result) = processed {
+                if let Err(e) = result {
+                    tracing::warn!(target: "spvirit_ioc", "PINI processing failed: {e}");
+                }
+                all.extend(self.flush(&mut ctx));
             }
-            all.extend(self.flush(&mut ctx));
         }
         all
     }

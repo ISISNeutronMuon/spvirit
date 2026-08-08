@@ -106,6 +106,11 @@ async fn a_put_to_an_unknown_pv_is_an_error_naming_it() {
     assert!(err.contains("PV:NOPE"), "got {err}");
 }
 
+/// Two singleton lock sets. This alone only rules out *alphabetical* order —
+/// with two singletons, lock-set id is assigned in the same order as
+/// definition order, so it cannot tell "definition order" apart from
+/// "ascending lock-set order". Kept alongside the three-record fixture below,
+/// which does separate the two.
 #[tokio::test]
 async fn pini_records_process_at_startup_in_definition_order() {
     let src = IocSource::from_db_str(
@@ -119,5 +124,35 @@ async fn pini_records_process_at_startup_in_definition_order() {
         names,
         vec!["PV:SECOND", "PV:FIRST"],
         "PINI order is the .db definition order, not alphabetical"
+    );
+}
+
+/// PV:FIRST and PV:THIRD share a lock set (PV:THIRD's INP names PV:FIRST,
+/// with NPP so the link doesn't cascade PV:FIRST's own processing), while
+/// PV:SECOND — defined between them — is a singleton in its own set.
+///
+/// `RecordDb::build` assigns lock-set ids in ascending order of each group's
+/// lowest original index, so the {PV:FIRST, PV:THIRD} group gets set 0 (its
+/// lowest index is 0) and {PV:SECOND} gets set 1. That makes ascending
+/// lock-set traversal (set 0's members, then set 1's) visit
+/// PV:FIRST, PV:THIRD, PV:SECOND — a different order from the `.db`
+/// definition order (PV:FIRST, PV:SECOND, PV:THIRD). Only the latter is
+/// correct PINI behaviour, so this fixture actually distinguishes the two
+/// traversals, unlike the two-singleton case above.
+#[tokio::test]
+async fn pini_definition_order_differs_from_lock_set_traversal_order() {
+    let src = IocSource::from_db_str(
+        "record(ai, \"PV:FIRST\") {\n    field(PINI, \"YES\")\n    field(INP, \"1\")\n}\n\
+         record(ai, \"PV:SECOND\") {\n    field(PINI, \"YES\")\n    field(INP, \"2\")\n}\n\
+         record(ai, \"PV:THIRD\") {\n    field(PINI, \"YES\")\n    field(INP, \"PV:FIRST NPP\")\n}\n",
+    )
+    .expect("load");
+    let events = src.process_pini();
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["PV:FIRST", "PV:SECOND", "PV:THIRD"],
+        "PINI order must be .db definition order, not ascending lock-set traversal order \
+         (which would yield PV:FIRST, PV:THIRD, PV:SECOND here)"
     );
 }
