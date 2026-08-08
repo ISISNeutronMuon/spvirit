@@ -215,14 +215,15 @@ pub(crate) fn reset_alarms(set: &mut LockSetData, id: RecordId, _ctx: &mut ProcC
 
 /// Read a link's value and the severity it contributes.
 ///
-/// Task 8 adds full input-link semantics, including PP processing and MS
-/// severity propagation. Until then, `Db` links read the target's field
-/// directly with no side effects.
+/// A `PP` db link processes its target first — this is the ordering
+/// guarantee a whole class of `.db` designs depends on. `MS` asks the
+/// caller to maximise its own severity against the target's; the caller
+/// applies it, because only the caller knows which of its links this was.
 pub(crate) fn fetch_link_value(
     set: &mut LockSetData,
     link: &Link,
     kind: Kind,
-    _ctx: &mut ProcCtx,
+    ctx: &mut ProcCtx,
 ) -> Result<(Value, Severity), ProcError> {
     match link {
         Link::Constant(v) => Ok((v.coerce_to(kind), Severity::NoAlarm)),
@@ -232,10 +233,22 @@ pub(crate) fn fetch_link_value(
         Link::Db {
             target: Target::Id(target_id),
             field,
-            ..
+            process_passive,
+            maximize_severity,
         } => {
-            let value = read_field(set, *target_id, *field);
-            Ok((value.coerce_to(kind), Severity::NoAlarm))
+            if *process_passive {
+                // Passive-only in Base; A has no scan mechanism yet, so
+                // every PP target is processed. Sub-project B narrows this
+                // to SCAN = Passive targets.
+                process(set, *target_id, ctx)?;
+            }
+            let value = read_field(set, *target_id, *field).coerce_to(kind);
+            let severity = if *maximize_severity {
+                set.get(*target_id).common.sevr
+            } else {
+                Severity::NoAlarm
+            };
+            Ok((value, severity))
         }
         Link::Db {
             target: Target::Name(name),
@@ -246,6 +259,51 @@ pub(crate) fn fetch_link_value(
             unreachable!("unresolved target '{name}' reached process()")
         }
     }
+}
+
+/// Write one field of a record in the same lock set.
+///
+/// Writing `.PROC` forces a process pass — that is the field's only
+/// meaning. Writing any other field sets it; whether that triggers
+/// processing is the caller's decision.
+///
+/// This is the write-side counterpart to [`fetch_link_value`]'s read side —
+/// the entry point a future client put (CA/PVA) or an output record's OUT
+/// write calls. Task 8 only wires up the primitive and its own test; no
+/// production caller exists yet, so it is exercised solely by
+/// `writing_dot_proc_forces_a_process_pass` until a later task adds one.
+#[allow(
+    dead_code,
+    reason = "no production caller yet; wired up by a later task's client-put or output-record path"
+)]
+pub(crate) fn write_field(
+    set: &mut LockSetData,
+    id: RecordId,
+    field: Field,
+    value: Value,
+    ctx: &mut ProcCtx,
+) -> Result<(), ProcError> {
+    if field == Field::Proc {
+        return process(set, id, ctx);
+    }
+    let kind = set.get(id).kind;
+    let r = set.get_mut(id);
+    match field {
+        Field::Val => {
+            r.val = value.coerce_to(kind);
+            r.common.udf = false;
+        }
+        Field::Disa => r.common.disa = value.as_i32(),
+        Field::Disv => r.common.disv = value.as_i32(),
+        Field::Hihi => r.limits.hihi = value.as_f64(),
+        Field::High => r.limits.high = value.as_f64(),
+        Field::Low => r.limits.low = value.as_f64(),
+        Field::Lolo => r.limits.lolo = value.as_f64(),
+        // SEVR and STAT are engine-owned outputs, not client inputs.
+        Field::Sevr | Field::Stat => {}
+        Field::Proc => unreachable!("handled above"),
+    }
+    Ok(())
 }
 
 /// Read one field of a record in the same lock set.
@@ -266,19 +324,41 @@ pub(crate) fn read_field(set: &LockSetData, id: RecordId, field: Field) -> Value
     }
 }
 
-/// The type-specific processing body. Tasks 8-10 build this out further;
-/// Task 7 adds alarm-limit checking, which every numeric record needs
-/// regardless of kind (binary records simply have every limit severity at
-/// its `NoAlarm` default, so `check_limits` is a no-op for them).
+/// The type-specific processing body. Tasks 9-10 build this out further;
+/// Task 8 adds the input-link read (PP ordering, MS severity); Task 7 adds
+/// alarm-limit checking, which every numeric record needs regardless of kind
+/// (binary records simply have every limit severity at its `NoAlarm`
+/// default, so `check_limits` is a no-op for them).
 pub(crate) fn record_body(
     set: &mut LockSetData,
     id: RecordId,
     ctx: &mut ProcCtx,
 ) -> Result<(), ProcError> {
-    set.get_mut(id).common.udf = false;
+    let kind = set.get(id).kind;
+    let inp = set.get(id).inp.clone();
+    // Input records take their value from INP; output records are Task 9.
+    // A CONSTANT link is a no-op during processing — `dbGetLink` returns
+    // immediately for `plink->type == CONSTANT` without touching the
+    // destination. Constant links are applied once, at init time, by
+    // `recGblInitConstantLink` (PINI-time initialisation is Task 13's); on
+    // every later process pass a soft record with a constant (including a
+    // never-configured, i.e. default) INP simply keeps whatever value a
+    // direct write last gave it. See the SDIS check above for the same
+    // idiom.
+    if !kind.is_output() && !matches!(inp, Link::Constant(_)) {
+        let (value, link_sev) = fetch_link_value(set, &inp, kind, ctx)?;
+        let r = set.get_mut(id);
+        r.val = value;
+        r.common.udf = false;
+        if link_sev != Severity::NoAlarm {
+            set_sevr(r, link_sev, Condition::Link);
+        }
+    } else {
+        set.get_mut(id).common.udf = false;
+    }
     set.get_mut(id).time_ns = now_ns();
     check_limits(set, id);
-    let _ = reset_alarms(set, id, ctx);
+    reset_alarms(set, id, ctx);
     Ok(())
 }
 
@@ -735,5 +815,182 @@ mod tests {
             (Severity::Minor, Condition::LoLo),
             "the ladder must return on LOLO before it ever reaches LOW"
         );
+    }
+
+    // --- Task 8: input links -----------------------------------------------
+
+    // The brief's original fixtures for these two tests tried to detect
+    // "did the target process?" by inspecting the VALUE the reader got.
+    // That evidence is unsound in principle for sub-project A: under either
+    // PP or NPP, `A` ends up reading `B.VAL` either way, and there are no
+    // device inputs yet, so processing a soft record's own body never
+    // changes its own VAL. The fixtures only appeared to discriminate
+    // because they relied on a constant INP being (re-)applied at *process*
+    // time — precisely the non-EPICS behaviour Task 8's later rulings
+    // removed (a CONSTANT link is a no-op during processing; it is applied
+    // once, at load, in `build.rs`). With that fixed, both fixtures'
+    // "B starts at its default" precondition became false (B is seeded to
+    // 5.0 at load) and the tests could no longer tell PP from NPP by value.
+    //
+    // The fix moves the evidence to the TARGET's side, onto state that
+    // processing demonstrably changes regardless of device support:
+    // `record_body` clears UDF (and stamps `time_ns`) as a side effect of
+    // being processed at all. `PV:B` has no INP, so per the init-constant
+    // rule it loads with the default VAL and UDF set; the test then writes
+    // `B.VAL` directly (standing in for an external caput) without going
+    // through `record_body`, so UDF stays set until something processes B.
+    // PP must clear it; NPP must not. This pair differs in exactly one
+    // input (the link modifier) and exactly one assertion (B's UDF), so
+    // mentally swapping the PP/NPP branches in `fetch_link_value` turns both
+    // red: skip-on-PP loses `!B.udf` in the first test, and process-on-NPP
+    // gains `!B.udf` (failing the `B.udf` assertion) in the second.
+
+    #[test]
+    fn a_pp_input_processes_its_target_before_reading() {
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"PV:B PP\")\n}\n\
+                    record(ai, \"PV:B\") {\n}\n");
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let b = d.lookup("PV:B").expect("PV:B exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            set.get_mut(b).val = Value::Double(5.0);
+            assert!(
+                set.get(b).common.udf,
+                "B starts UDF: no INP has ever supplied it a value"
+            );
+            process(set, a, &mut ctx).expect("process succeeds");
+            assert_eq!(
+                set.get(a).val.as_f64(),
+                5.0,
+                "A read B's directly-written value through the link"
+            );
+            assert!(
+                !set.get(b).common.udf,
+                "PP must have processed B as a side effect: UDF is cleared"
+            );
+            assert!(
+                set.get(b).time_ns > 0,
+                "PP must have processed B as a side effect: time_ns is stamped"
+            );
+        });
+    }
+
+    #[test]
+    fn an_npp_input_reads_without_processing_the_target() {
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"PV:B NPP\")\n}\n\
+                    record(ai, \"PV:B\") {\n}\n");
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let b = d.lookup("PV:B").expect("PV:B exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            set.get_mut(b).val = Value::Double(5.0);
+            process(set, a, &mut ctx).expect("process succeeds");
+            assert_eq!(
+                set.get(a).val.as_f64(),
+                5.0,
+                "A still reads B's value even when NPP does not process it"
+            );
+            assert!(
+                set.get(b).common.udf,
+                "NPP must not have processed B: UDF stays set"
+            );
+        });
+    }
+
+    #[test]
+    fn ms_propagates_the_targets_severity_to_the_reader() {
+        let d = db(
+            "record(ai, \"PV:A\") {\n    field(INP, \"PV:B PP MS\")\n}\n\
+                    record(ai, \"PV:B\") {\n    field(INP, \"11\")\n\
+                    field(HIHI, \"10\")\n    field(HHSV, \"MAJOR\")\n}\n",
+        );
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            process(set, a, &mut ctx).expect("process succeeds");
+            assert_eq!(
+                set.get(a).common.sevr,
+                Severity::Major,
+                "MS must carry B's MAJOR up to A"
+            );
+            assert_eq!(
+                set.get(a).common.stat,
+                Condition::Link,
+                "the propagated condition is LINK, not the target's own"
+            );
+        });
+    }
+
+    #[test]
+    fn nms_does_not_propagate_severity() {
+        let d = db(
+            "record(ai, \"PV:A\") {\n    field(INP, \"PV:B PP NMS\")\n}\n\
+                    record(ai, \"PV:B\") {\n    field(INP, \"11\")\n\
+                    field(HIHI, \"10\")\n    field(HHSV, \"MAJOR\")\n}\n",
+        );
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            process(set, a, &mut ctx).expect("process succeeds");
+            assert_eq!(set.get(a).common.sevr, Severity::NoAlarm);
+        });
+    }
+
+    #[test]
+    fn a_link_to_a_dot_field_reads_that_field() {
+        let d = db(
+            "record(ai, \"PV:A\") {\n    field(INP, \"PV:B.SEVR NPP\")\n}\n\
+                    record(ai, \"PV:B\") {\n}\n",
+        );
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let b = d.lookup("PV:B").expect("PV:B exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            set.get_mut(b).common.sevr = Severity::Major;
+            process(set, a, &mut ctx).expect("process succeeds");
+            assert_eq!(set.get(a).val.as_f64(), 2.0, "MAJOR reads as 2");
+        });
+    }
+
+    #[test]
+    fn a_pp_cycle_terminates_via_pact() {
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"PV:B PP\")\n}\n\
+                    record(ai, \"PV:B\") {\n    field(INP, \"PV:A PP\")\n}\n");
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            process(set, a, &mut ctx).expect("PACT must break the cycle, not the stack");
+        });
+        assert!(ctx.depth() == 0, "the depth counter must unwind cleanly");
+    }
+
+    #[test]
+    fn a_constant_link_is_a_no_op_during_processing() {
+        // `dbGetLink` returns immediately for a CONSTANT link; it does not
+        // touch the destination. A soft `ai` with no INP therefore keeps
+        // whatever a direct write (e.g. caput) last gave it, across any
+        // number of process passes, rather than being clobbered back to the
+        // link's default zero.
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            set.get_mut(a).val = Value::Double(42.0);
+            process(set, a, &mut ctx).expect("process succeeds");
+            assert_eq!(set.get(a).val.as_f64(), 42.0, "VAL must survive pass 1");
+            process(set, a, &mut ctx).expect("process succeeds");
+            assert_eq!(set.get(a).val.as_f64(), 42.0, "VAL must survive pass 2");
+        });
+    }
+
+    #[test]
+    fn writing_dot_proc_forces_a_process_pass() {
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            write_field(set, a, Field::Proc, Value::Long(1), &mut ctx).expect("write succeeds");
+            assert!(set.get(a).time_ns > 0, "writing PROC processes the record");
+        });
     }
 }
