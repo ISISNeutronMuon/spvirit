@@ -5,19 +5,17 @@
 //! that one process pass fans out across the database. None of them is fatal
 //! — the engine reports them once at startup and runs anyway.
 
-use crate::lockset::{RecordDb, links_of};
+use crate::lockset::{LinkField, RecordDb, links_of};
 use crate::model::{Link, Target};
 use std::collections::{HashMap, HashSet};
 
-/// Outbound degree above which a record is worth mentioning. Chosen to be
-/// quiet on ordinary databases: a hub with ten dependants is normal, a
-/// hundred usually means a `.db` generator ran away.
+/// Inbound degree above which a record is worth mentioning: how many other
+/// records hold a link that names it. Chosen to be quiet on ordinary
+/// databases: a hub with ten dependants is normal, a hundred usually means a
+/// `.db` generator ran away.
 pub const FAN_OUT_THRESHOLD: usize = 10;
 
 /// Which link field produced an edge.
-///
-/// Order matches [`links_of`]'s fixed INP, OUT, DOL, FLNK, SDIS enumeration —
-/// see the binding note on `EDGE_KINDS` below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EdgeKind {
     Inp,
@@ -27,18 +25,23 @@ pub enum EdgeKind {
     Sdis,
 }
 
-/// The `EdgeKind` for each slot of [`links_of`]'s `[&Link; 5]`, in the same
-/// INP, OUT, DOL, FLNK, SDIS order. `links_of` is the single place allowed to
-/// enumerate the five link fields (Task 4); this graph module must not grow
-/// a sixth hand-rolled list, so it zips that fixed order against this table
-/// instead of reading `record.inp` / `record.out` / ... directly.
-const EDGE_KINDS: [EdgeKind; 5] = [
-    EdgeKind::Inp,
-    EdgeKind::Out,
-    EdgeKind::Dol,
-    EdgeKind::Flnk,
-    EdgeKind::Sdis,
-];
+/// `links_of`/`links_of_mut` (Task 4) are the single place allowed to
+/// enumerate a record's five link fields; this exhaustive match — not a
+/// second, position-matched table — is what keeps `EdgeKind` from drifting
+/// out of sync with that enumeration. Adding a variant to `LinkField`
+/// without updating this match fails to compile, rather than silently
+/// mislabelling an edge.
+impl From<LinkField> for EdgeKind {
+    fn from(field: LinkField) -> EdgeKind {
+        match field {
+            LinkField::Inp => EdgeKind::Inp,
+            LinkField::Out => EdgeKind::Out,
+            LinkField::Dol => EdgeKind::Dol,
+            LinkField::Flnk => EdgeKind::Flnk,
+            LinkField::Sdis => EdgeKind::Sdis,
+        }
+    }
+}
 
 /// One directed dependency, from the record holding the link to its target.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +64,9 @@ pub struct DependencyGraph {
     pub unreachable: Vec<String>,
     /// Strongly connected components of size > 1, or self-loops.
     pub cycles: Vec<Vec<String>>,
-    /// Records with an outbound degree above [`FAN_OUT_THRESHOLD`].
+    /// Records named by more than [`FAN_OUT_THRESHOLD`] other records' link
+    /// fields — i.e. an inbound degree, the number of dependants a single
+    /// process pass would fan out to.
     pub high_fan_out: Vec<(String, usize)>,
     /// Link targets naming a record the database does not contain.
     pub unresolved: Vec<String>,
@@ -85,8 +90,8 @@ impl DependencyGraph {
         }
         for (name, degree) in &self.high_fan_out {
             out.push(format!(
-                "record '{name}' has {degree} outbound links (threshold {FAN_OUT_THRESHOLD}); \
-                 one process pass will fan out across the database"
+                "record '{name}' is linked TO by {degree} other records \
+                 (threshold {FAN_OUT_THRESHOLD}); one process pass will fan out across the database"
             ));
         }
         for name in &self.unresolved {
@@ -130,7 +135,8 @@ impl RecordDb {
                     {
                         self_processing.insert(record.name.clone());
                     }
-                    for (link, kind) in links_of(record).into_iter().zip(EDGE_KINDS) {
+                    for (field, link) in links_of(record) {
+                        let kind = EdgeKind::from(field);
                         let Link::Db {
                             target: Target::Id(id),
                             process_passive,
@@ -309,6 +315,33 @@ mod tests {
             vec![
                 ("PV:A".to_string(), "PV:B".to_string(), EdgeKind::Inp),
                 ("PV:A".to_string(), "PV:C".to_string(), EdgeKind::Flnk),
+            ]
+        );
+    }
+
+    #[test]
+    fn out_dol_and_sdis_edges_also_carry_the_right_kind() {
+        // edges_record_which_field_created_them above only exercises INP and
+        // FLNK; a mapping shifted by one position (e.g. Out mislabelled as
+        // Dol) would pass that test but fail this one.
+        let g = graph(
+            "record(ao, \"PV:A\") {\n    field(OUT, \"PV:B\")\n\
+                       field(DOL, \"PV:C\")\n    field(SDIS, \"PV:D\")\n}\n\
+                       record(ai, \"PV:B\") {\n}\nrecord(ai, \"PV:C\") {\n}\n\
+                       record(ai, \"PV:D\") {\n}\n",
+        );
+        let mut kinds: Vec<(String, String, EdgeKind)> = g
+            .edges
+            .iter()
+            .map(|e| (e.from.clone(), e.to.clone(), e.kind))
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![
+                ("PV:A".to_string(), "PV:B".to_string(), EdgeKind::Out),
+                ("PV:A".to_string(), "PV:C".to_string(), EdgeKind::Dol),
+                ("PV:A".to_string(), "PV:D".to_string(), EdgeKind::Sdis),
             ]
         );
     }

@@ -33,32 +33,49 @@ impl LockSetData {
     }
 }
 
+/// Identifies which of a record's five link fields a `(LinkField, &Link)`
+/// pair came from. Carrying this alongside the link (rather than in a
+/// separate parallel table some other module has to keep in sync by hand) is
+/// what makes it impossible for a caller to mislabel a link: the identity is
+/// attached at the one place the fields are enumerated, not re-derived by
+/// position elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkField {
+    Inp,
+    Out,
+    Dol,
+    Flnk,
+    Sdis,
+}
+
 /// Every link a record holds, in a fixed order: INP, OUT, DOL, FLNK, SDIS.
 /// This is the single place that enumerates the five link fields — used by
-/// the partitioner, link resolution, and (later) the dependency graph — so
-/// none of them can drift out of sync with the others. [`links_of_mut`]
-/// must enumerate the same five fields in the same order.
-pub(crate) fn links_of(record: &Record) -> [&Link; 5] {
+/// the partitioner, link resolution, and the dependency graph — so none of
+/// them can drift out of sync with the others. [`links_of_mut`] must
+/// enumerate the same five fields in the same order.
+pub(crate) fn links_of(record: &Record) -> [(LinkField, &Link); 5] {
     [
-        &record.inp,
-        &record.out,
-        &record.dol,
-        &record.common.flnk,
-        &record.common.sdis,
+        (LinkField::Inp, &record.inp),
+        (LinkField::Out, &record.out),
+        (LinkField::Dol, &record.dol),
+        (LinkField::Flnk, &record.common.flnk),
+        (LinkField::Sdis, &record.common.sdis),
     ]
 }
 
 /// The mutable counterpart to [`links_of`], for callers that rewrite link
 /// targets in place. Disjoint field borrows make returning five simultaneous
-/// `&mut Link`s sound. Must enumerate the same five fields in the same order
-/// as [`links_of`].
-pub(crate) fn links_of_mut(record: &mut Record) -> [&mut Link; 5] {
+/// `&mut Link`s sound; tupling each with its [`LinkField`] does not disturb
+/// that, since the identity is a plain `Copy` value held alongside the
+/// borrow, not derived from it. Must enumerate the same five fields in the
+/// same order as [`links_of`].
+pub(crate) fn links_of_mut(record: &mut Record) -> [(LinkField, &mut Link); 5] {
     [
-        &mut record.inp,
-        &mut record.out,
-        &mut record.dol,
-        &mut record.common.flnk,
-        &mut record.common.sdis,
+        (LinkField::Inp, &mut record.inp),
+        (LinkField::Out, &mut record.out),
+        (LinkField::Dol, &mut record.dol),
+        (LinkField::Flnk, &mut record.common.flnk),
+        (LinkField::Sdis, &mut record.common.sdis),
     ]
 }
 
@@ -84,7 +101,7 @@ pub fn partition(records: &[Record]) -> Vec<Vec<usize>> {
     }
 
     for (i, record) in records.iter().enumerate() {
-        for link in links_of(record) {
+        for (_, link) in links_of(record) {
             let Link::Db {
                 target: Target::Name(name),
                 ..
@@ -240,7 +257,7 @@ fn resolve_links(
     by_name: &HashMap<String, RecordId>,
     unresolved: &mut Vec<String>,
 ) {
-    for link in links_of_mut(record) {
+    for (_, link) in links_of_mut(record) {
         fix_link(link, by_name, unresolved);
     }
 }
