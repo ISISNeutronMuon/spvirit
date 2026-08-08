@@ -380,12 +380,24 @@ pub(crate) fn post_monitors(
 
     let payload = record.to_payload();
     let name = record.name.clone();
+    // MLST and ALST each advance only when their own deadband was crossed,
+    // evaluated independently — mirroring aiRecord::monitor in Base, where
+    // the MDEL and ADEL checks are two separate `if` statements, neither
+    // nested under the other or under whether an alarm caused the post.
+    // Advancing MLST unconditionally on every post (including an
+    // alarm-only one where `past_mdel` is false) would lose the reference
+    // point for the next MDEL comparison: e.g. MDEL = 10, VAL 0 -> 9 with
+    // an alarm change posts but must leave MLST at 0, so a later move to
+    // 18 is correctly seen as a 18-unit move past MDEL rather than a
+    // 9-unit move that gets suppressed.
     let archived =
         (record.val.as_f64() - record.prev_archive_val.as_f64()).abs() > record.limits.adel;
     let value = record.val;
 
     let r = set.get_mut(id);
-    r.prev_val = value;
+    if past_mdel {
+        r.prev_val = value;
+    }
     if archived {
         r.prev_archive_val = value;
     }
@@ -621,6 +633,56 @@ mod tests {
             event_names(&mut ctx).len(),
             1,
             "an alarm transition must post even inside MDEL"
+        );
+    }
+
+    #[test]
+    fn an_alarm_only_post_does_not_advance_mlst() {
+        // Pins the Base `aiRecord::monitor` contract: MLST (prev_val) only
+        // advances when the value delta itself exceeded MDEL, never merely
+        // because a post happened for some other reason (here, an alarm
+        // transition). MDEL = 10, and the first move (0 -> 9) is
+        // alarm-driven only (9 < 10, so it must NOT be seen as an MDEL-
+        // worthy move). If MLST wrongly advanced to 9 on that post, the
+        // second move (9 -> 18, an 18-unit move from the *original*
+        // reference of 0) would be measured as only 9 units from the
+        // wrongly-advanced reference and suppressed — silently losing a
+        // real MDEL-worthy change. Base computes |18 - 0| = 18 > 10 and
+        // posts; a buggy implementation computes |18 - 9| = 9 <= 10 and
+        // suppresses.
+        let d = db("record(ai, \"PV:A\") {\n    field(MDEL, \"10\")\n\
+                    field(HIHI, \"9\")\n    field(HHSV, \"MAJOR\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        // No INP, so VAL and MLST both start at 0.0: the first pass has
+        // nothing to report.
+        d.with_set(id.set, |set| process(set, id, &mut ctx).expect("process"));
+        assert!(
+            event_names(&mut ctx).is_empty(),
+            "no change on the first pass"
+        );
+        // 0 -> 9 crosses HIHI (alarm-only post; the 9-unit move itself is
+        // not past MDEL's 10).
+        d.with_set(id.set, |set| {
+            set.get_mut(id).val = Value::Double(9.0);
+            process(set, id, &mut ctx).expect("process");
+        });
+        assert_eq!(
+            event_names(&mut ctx).len(),
+            1,
+            "the alarm transition at VAL=9 must post"
+        );
+        // 9 -> 18: no further alarm change (still MAJOR/HiHi), but the move
+        // from the *original* MLST reference of 0.0 is 18, past MDEL's 10.
+        d.with_set(id.set, |set| {
+            set.get_mut(id).val = Value::Double(18.0);
+            process(set, id, &mut ctx).expect("process");
+        });
+        assert_eq!(
+            event_names(&mut ctx).len(),
+            1,
+            "MLST must not have advanced on the alarm-only post: this move is past MDEL \
+             measured from the original reference of 0.0"
         );
     }
 
