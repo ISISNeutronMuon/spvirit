@@ -128,12 +128,32 @@ impl Field {
     }
 }
 
-/// A link field, before Task 4 resolves `target` names to `RecordId`s.
+/// A db link's target: a name until [`crate::lockset::RecordDb::build`]
+/// resolves it to a slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Name(String),
+    Id(crate::lockset::RecordId),
+}
+
+impl Target {
+    /// The record name, for diagnostics. Resolved targets are looked up by
+    /// the caller, which holds the `RecordDb`.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Target::Name(n) => Some(n),
+            Target::Id(_) => None,
+        }
+    }
+}
+
+/// A link field. `target` starts as a name and is resolved to a `RecordId`
+/// by [`crate::lockset::RecordDb::build`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Link {
     Constant(Value),
     Db {
-        target: String,
+        target: Target,
         field: Field,
         process_passive: bool,
         maximize_severity: bool,

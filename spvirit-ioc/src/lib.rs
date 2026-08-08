@@ -2,4 +2,5 @@
 
 pub mod alarm;
 pub mod build;
+pub mod lockset;
 pub mod model;

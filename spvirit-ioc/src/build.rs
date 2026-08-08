@@ -1,7 +1,7 @@
 //! Build the typed [`Record`] model from the untyped `.db` parse.
 
 use crate::alarm::Severity;
-use crate::model::{Common, Field, Kind, Limits, Link, Omsl, Record, Value};
+use crate::model::{Common, Field, Kind, Limits, Link, Omsl, Record, Target, Value};
 use spvirit_server::db::DbRecord;
 use std::collections::HashMap;
 
@@ -140,7 +140,7 @@ fn link(
     };
 
     Ok(Link::Db {
-        target,
+        target: Target::Name(target),
         field,
         process_passive,
         maximize_severity,
@@ -312,7 +312,7 @@ mod tests {
                 process_passive,
                 maximize_severity,
             } => {
-                assert_eq!(target, "PV:B");
+                assert_eq!(target, &Target::Name("PV:B".to_string()));
                 assert_eq!(*field, Field::Val);
                 assert!(*process_passive, "PP must be honoured");
                 assert!(*maximize_severity, "MS must be honoured");
