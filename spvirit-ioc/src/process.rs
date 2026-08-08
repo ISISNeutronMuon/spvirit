@@ -63,8 +63,11 @@ fn process_inner(
     //    disabled when DISA == DISV.
     let sdis = set.get(id).common.sdis.clone();
     if !matches!(sdis, Link::Constant(_)) {
-        let kind = set.get(id).kind;
-        let (value, _sev) = fetch_link_value(set, &sdis, kind, ctx)?;
+        // DISA is a plain Long field regardless of the disabling record's own
+        // Kind. Coercing through the record's Kind would be wrong for a
+        // binary (Bi/Bo) disabler: Value::coerce_to forces any non-zero
+        // source to 1, so a DISV other than 0/1 could never match.
+        let (value, _sev) = fetch_link_value(set, &sdis, Kind::LongIn, ctx)?;
         set.get_mut(id).common.disa = value.as_i32();
     }
     let record = set.get(id);
@@ -73,12 +76,18 @@ fn process_inner(
         if tpro {
             ctx.trace_line(format!("{name}: disabled (DISA == DISV)"));
         }
-        // A disabled record still publishes its disabled state.
+        // A disabled record still publishes its disabled state, but only if
+        // DISS actually raises the severity. `recGblSetSevr` is raise-only:
+        // severity and condition move together, and only upward. With the
+        // default DISS (NoAlarm) a disabled record is not in alarm at all —
+        // SEVR/STAT stay NoAlarm. This is the same raise-only rule Task 7
+        // factors out into `set_sevr`; written out here so that refactor is
+        // behaviour-preserving.
         let r = set.get_mut(id);
         r.common.nsev = Severity::NoAlarm;
         r.common.nsta = Condition::NoAlarm;
-        r.common.nsev.raise(diss);
-        if diss != Severity::NoAlarm || r.common.stat != Condition::Disable {
+        if diss > r.common.nsev {
+            r.common.nsev = diss;
             r.common.nsta = Condition::Disable;
         }
         reset_alarms(set, id, ctx);
@@ -192,15 +201,7 @@ pub(crate) fn record_body(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::build_records;
-    use crate::lockset::RecordDb;
-    use spvirit_server::db::parse_db_records;
-    use std::collections::HashMap;
-
-    fn db(text: &str) -> RecordDb {
-        let raw = parse_db_records(text, "t.db", &HashMap::new()).expect("parse");
-        RecordDb::build(build_records(&raw).expect("build"))
-    }
+    use crate::test_support::db;
 
     #[test]
     fn processing_clears_udf_and_stamps_the_time() {
@@ -267,6 +268,66 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_record_with_default_diss_is_not_in_alarm() {
+        let d = db("record(ai, \"PV:A\") {\n    field(DISA, \"1\")\n    field(DISV, \"1\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            let r = set.get(id);
+            assert_eq!(
+                r.common.sevr,
+                Severity::NoAlarm,
+                "DISS defaults to NoAlarm, which raises nothing"
+            );
+            assert_eq!(
+                r.common.stat,
+                Condition::NoAlarm,
+                "disabled but not in alarm: STAT must stay NoAlarm"
+            );
+        });
+    }
+
+    #[test]
+    fn a_disabled_record_with_default_diss_does_not_oscillate_across_passes() {
+        let d = db("record(ai, \"PV:A\") {\n    field(DISA, \"1\")\n    field(DISV, \"1\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            for pass in 0..3 {
+                process(set, id, &mut ctx).expect("process succeeds");
+                let r = set.get(id);
+                assert_eq!(
+                    r.common.sevr,
+                    Severity::NoAlarm,
+                    "pass {pass}: SEVR must stay NoAlarm"
+                );
+                assert_eq!(
+                    r.common.stat,
+                    Condition::NoAlarm,
+                    "pass {pass}: STAT must stay NoAlarm, not oscillate"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_disabled_record_with_diss_major_stays_stable_across_passes() {
+        let d = db("record(ai, \"PV:A\") {\n    field(DISA, \"1\")\n\
+                    field(DISV, \"1\")\n    field(DISS, \"MAJOR\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            for pass in 0..3 {
+                process(set, id, &mut ctx).expect("process succeeds");
+                let r = set.get(id);
+                assert_eq!(r.common.sevr, Severity::Major, "pass {pass}: SEVR");
+                assert_eq!(r.common.stat, Condition::Disable, "pass {pass}: STAT");
+            }
+        });
+    }
+
+    #[test]
     fn disa_not_equal_to_disv_leaves_the_record_enabled() {
         let d = db("record(ai, \"PV:A\") {\n    field(DISA, \"0\")\n    field(DISV, \"1\")\n}\n");
         let id = d.lookup("PV:A").expect("PV:A exists");
@@ -280,8 +341,13 @@ mod tests {
 
     #[test]
     fn sdis_supplies_disa_when_it_is_a_link() {
+        // DISS is set to MAJOR (rather than left at its NoAlarm default) so
+        // that the disabled state is observable in STAT/SEVR: with the
+        // raise-only rule, a disabled record with DISS == NoAlarm is not in
+        // alarm, so it would not distinguish "disabled" from "enabled" here.
         let d = db(
-            "record(ai, \"PV:A\") {\n    field(SDIS, \"PV:S\")\n    field(DISV, \"1\")\n}\n\
+            "record(ai, \"PV:A\") {\n    field(SDIS, \"PV:S\")\n    field(DISV, \"1\")\n\
+                    field(DISS, \"MAJOR\")\n}\n\
                     record(longin, \"PV:S\") {\n    field(VAL, \"1\")\n}\n",
         );
         let a = d.lookup("PV:A").expect("PV:A exists");

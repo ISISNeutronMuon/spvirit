@@ -248,14 +248,7 @@ fn resolve_links(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build::build_records;
-    use spvirit_server::db::parse_db_records;
-    use std::collections::HashMap;
-
-    fn db(text: &str) -> RecordDb {
-        let raw = parse_db_records(text, "t.db", &HashMap::new()).expect("parse");
-        RecordDb::build(build_records(&raw).expect("build"))
-    }
+    use crate::test_support::db;
 
     #[test]
     fn linked_records_share_a_lock_set() {
