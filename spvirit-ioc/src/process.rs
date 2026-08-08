@@ -524,6 +524,47 @@ fn output_body(set: &mut LockSetData, id: RecordId, ctx: &mut ProcCtx) -> Result
     Ok(())
 }
 
+/// What a device-support `start` reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncOutcome {
+    /// The operation finished inside `start`; processing continues.
+    Complete,
+    /// The operation is outstanding. The record keeps PACT set and the
+    /// device calls [`complete_async`] when it finishes.
+    Pending,
+}
+
+/// Device support that may take longer than a processing pass.
+///
+/// Sub-project A ships no implementations — every A record is soft. The
+/// trait and [`complete_async`] exist so B's scan threads have a defined
+/// completion path, and so the PACT semantics it depends on are covered by
+/// tests written against the engine that owns them.
+pub trait AsyncSupport: Send + Sync {
+    fn start(&self, record: &str, ctx: &mut ProcCtx) -> AsyncOutcome;
+}
+
+/// Finish a record that returned from its body with PACT still set.
+///
+/// The second half of processing — value, limits, monitors, forward link —
+/// runs now. A record that is not active is left alone: a duplicate
+/// completion callback must not process the record twice.
+pub fn complete_async(
+    set: &mut LockSetData,
+    id: RecordId,
+    ctx: &mut ProcCtx,
+) -> Result<(), ProcError> {
+    if !set.get(id).common.pact {
+        return Ok(());
+    }
+    let name = set.get(id).name.clone();
+    ctx.push_depth(&name)?;
+    let result = record_body(set, id, ctx);
+    ctx.pop_depth();
+    set.get_mut(id).common.pact = false;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1621,5 +1662,96 @@ mod tests {
             );
             assert_eq!(set.get(id).common.stat, Condition::Udf);
         });
+    }
+
+    // --- Task 11: async completion -----------------------------------------
+
+    #[test]
+    fn completing_an_async_record_clears_pact_and_posts() {
+        // Inverting the `if !set.get(id).common.pact { return Ok(()); }`
+        // guard's negation (i.e. always running the body) would still pass
+        // this test, since PACT is set here — this test alone only proves
+        // the "PACT set" arm; its no-op sibling below covers the other arm.
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"3\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            // Simulate a body that returned with the operation outstanding.
+            set.get_mut(id).common.pact = true;
+            complete_async(set, id, &mut ctx).expect("completion succeeds");
+            assert!(!set.get(id).common.pact, "completion clears PACT");
+            assert_eq!(set.get(id).val.as_f64(), 3.0, "the body ran on completion");
+        });
+        assert_eq!(event_names(&mut ctx), vec!["PV:A".to_string()]);
+    }
+
+    #[test]
+    fn completing_a_record_that_is_not_active_is_a_no_op() {
+        // Inverts the same guard the other way: PACT is left clear (the
+        // record's ordinary default), so if the `if !pact { return }` check
+        // were removed or inverted, `record_body` would run, `time_ns` would
+        // become nonzero and a monitor would post — both assertions below
+        // would fail.
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"3\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            complete_async(set, id, &mut ctx).expect("no-op succeeds");
+            assert_eq!(set.get(id).time_ns, 0, "nothing should have processed");
+        });
+        assert!(ctx.take_events().is_empty());
+    }
+
+    #[test]
+    fn an_async_completion_fires_the_forward_link() {
+        // If `complete_async` finished the record via some partial path that
+        // skipped `forward_link` (rather than the full `record_body`), PV:B
+        // would never process and this event list would be just ["PV:A"].
+        let d = db(
+            "record(ai, \"PV:A\") {\n    field(INP, \"1\")\n    field(FLNK, \"PV:B\")\n}\n\
+                    record(ai, \"PV:B\") {\n    field(INP, \"2\")\n}\n",
+        );
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            set.get_mut(a).common.pact = true;
+            complete_async(set, a, &mut ctx).expect("completion succeeds");
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:A".to_string(), "PV:B".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_ordinary_process_still_returns_early_while_pact_is_set() {
+        // Confirms the PACT brake and the completion path do not fight: a
+        // record whose PACT is set by an async body still bounces off the
+        // Task 6 brake in `process()`, even though `complete_async` can
+        // finish that same record. Without this test, a change that made
+        // `complete_async` clear PACT *before* running the body (letting a
+        // reentrant `process()` call slip through and double-process) would
+        // not be caught by the three tests above alone.
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"3\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            set.get_mut(id).common.pact = true;
+            set.get_mut(id).time_ns = 0;
+            process(set, id, &mut ctx).expect("an active record is not an error");
+            assert_eq!(
+                set.get(id).time_ns,
+                0,
+                "process() must not have run the body"
+            );
+            assert!(
+                set.get(id).common.pact,
+                "PACT is left set for the completion path"
+            );
+        });
+        assert!(
+            ctx.take_events().is_empty(),
+            "process() must not post while PACT is held"
+        );
     }
 }
