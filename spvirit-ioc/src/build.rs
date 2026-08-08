@@ -271,8 +271,15 @@ fn build_one(raw: &DbRecord) -> Result<Record, BuildError> {
         common,
         limits,
         val,
-        prev_val: val,
-        prev_archive_val: val,
+        // MLST/ALST have no DBD default in EPICS: they are zero-initialised,
+        // and `recGblInitConstantLink` seeds VAL without touching them. That
+        // asymmetry is load-bearing — a record loaded with a non-zero
+        // constant VAL genuinely differs from its "last posted" value and
+        // must post a monitor on its first process pass; a record loaded at
+        // the kind's default must not. Seeding these from `val` here would
+        // silently suppress every record's first monitor.
+        prev_val: Value::default_for(kind),
+        prev_archive_val: Value::default_for(kind),
         prev_sevr: Severity::NoAlarm,
         prev_stat: crate::alarm::Condition::NoAlarm,
         inp: link(f, "INP", name, kind)?,

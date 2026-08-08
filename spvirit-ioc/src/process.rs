@@ -85,7 +85,8 @@ fn process_inner(
         r.common.nsev = Severity::NoAlarm;
         r.common.nsta = Condition::NoAlarm;
         set_sevr(r, diss, Condition::Disable);
-        let _ = reset_alarms(set, id, ctx);
+        let alarm_changed = reset_alarms(set, id, ctx);
+        post_monitors(set, id, alarm_changed, ctx);
         return Ok(());
     }
 
@@ -350,8 +351,70 @@ pub(crate) fn record_body(
         // to INVALID/UDF, so bi/bo call `check_udf` directly here.
         check_udf(set, id);
     }
-    reset_alarms(set, id, ctx);
-    Ok(())
+    let alarm_changed = reset_alarms(set, id, ctx);
+    post_monitors(set, id, alarm_changed, ctx);
+    forward_link(set, id, ctx)
+}
+
+/// Queue the record's value monitor, if the change warrants one.
+///
+/// A post happens when the alarm state changed, or when the value moved
+/// further than MDEL from the last posted value. ADEL governs the archive
+/// stream the same way; `spvirit` publishes one monitor stream, so ADEL only
+/// advances its own reference for now and sub-project E revisits it against
+/// a real archiver.
+pub(crate) fn post_monitors(
+    set: &mut LockSetData,
+    id: RecordId,
+    alarm_changed: bool,
+    ctx: &mut ProcCtx,
+) {
+    let record = set.get(id);
+    let moved = (record.val.as_f64() - record.prev_val.as_f64()).abs();
+    let value_changed = record.val != record.prev_val;
+    let past_mdel = moved > record.limits.mdel || (value_changed && record.limits.mdel == 0.0);
+
+    if !alarm_changed && !past_mdel {
+        return;
+    }
+
+    let payload = record.to_payload();
+    let name = record.name.clone();
+    let archived =
+        (record.val.as_f64() - record.prev_archive_val.as_f64()).abs() > record.limits.adel;
+    let value = record.val;
+
+    let r = set.get_mut(id);
+    r.prev_val = value;
+    if archived {
+        r.prev_archive_val = value;
+    }
+    r.prev_sevr = r.common.sevr;
+    r.prev_stat = r.common.stat;
+
+    ctx.post(&name, payload);
+}
+
+/// `recGblFwdLink`: process the forward link target.
+///
+/// This runs after the record's own monitors are queued, so a client sees
+/// this record's update before the downstream record's — one of the
+/// ordering guarantees the conformance suite pins down.
+fn forward_link(set: &mut LockSetData, id: RecordId, ctx: &mut ProcCtx) -> Result<(), ProcError> {
+    let flnk = set.get(id).common.flnk.clone();
+    match flnk {
+        Link::Db {
+            target: Target::Id(target_id),
+            ..
+        } => process(set, target_id, ctx),
+        Link::Constant(_) | Link::Unresolved { .. } => Ok(()),
+        Link::Db {
+            target: Target::Name(name),
+            ..
+        } => {
+            unreachable!("unresolved FLNK target '{name}' reached process()")
+        }
+    }
 }
 
 /// Only `ai`/`ao`/`longin`/`longout` carry HIHI/HIGH/LOW/LOLO limit fields
@@ -454,6 +517,168 @@ mod tests {
     use super::*;
     use crate::lockset::RecordDb;
     use crate::test_support::db;
+    use spvirit_types::{NtPayload, ScalarValue};
+
+    fn event_names(ctx: &mut ProcCtx) -> Vec<String> {
+        ctx.take_events().into_iter().map(|(n, _)| n).collect()
+    }
+
+    #[test]
+    fn processing_posts_a_monitor_for_the_record() {
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"1\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds")
+        });
+        assert_eq!(event_names(&mut ctx), vec!["PV:A".to_string()]);
+    }
+
+    #[test]
+    fn flnk_posts_after_the_records_own_monitor() {
+        let d = db(
+            "record(ai, \"PV:A\") {\n    field(INP, \"1\")\n    field(FLNK, \"PV:B\")\n}\n\
+                    record(ai, \"PV:B\") {\n    field(INP, \"2\")\n}\n",
+        );
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            process(set, a, &mut ctx).expect("process succeeds")
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:A".to_string(), "PV:B".to_string()],
+            "the forward link must fire after this record's monitors"
+        );
+    }
+
+    #[test]
+    fn mdel_suppresses_a_change_smaller_than_the_deadband() {
+        // NOTE: the brief's original fixture mutated `record.inp` between
+        // process() calls to simulate an input change, and its first
+        // assertion claimed "First pass always posts: the record was UDF."
+        // Both are wrong. A CONSTANT link (which an absent INP is) is a
+        // no-op during processing (Task 8), so re-assigning `.inp` never
+        // reaches VAL — the mutation could not have moved the value on any
+        // of the later passes. And the "always posts" claim is false in
+        // this engine *and* in EPICS Base: MLST/ALST (this engine's
+        // prev_val/prev_archive_val) have no DBD default and start at the
+        // kind's zero, independently of whatever `recGblInitConstantLink`
+        // seeds VAL to. A record with no INP loads with VAL == prev_val
+        // == 0.0, so its first pass has no delta to report and posts
+        // nothing — matching Base exactly. See
+        // `processing_posts_a_monitor_for_the_record` below for the
+        // complementary case (a non-zero seeded VAL, which *does* post on
+        // pass 1).
+        //
+        // The fix mutates VAL directly through the lock set, the idiom
+        // Task 7's `hyst_holds_an_alarm_until_the_value_clears_the_deadband`
+        // already uses — sound here because this record's INP is constant,
+        // so `record_body` never overwrites a directly-written VAL.
+        let d = db("record(ai, \"PV:A\") {\n    field(MDEL, \"1\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| process(set, id, &mut ctx).expect("process"));
+        assert!(
+            event_names(&mut ctx).is_empty(),
+            "no INP, no alarm: the first pass has nothing to report"
+        );
+        // 0.5 is inside MDEL of the last-posted reference, which is still
+        // 0.0 (nothing has posted yet).
+        d.with_set(id.set, |set| {
+            set.get_mut(id).val = Value::Double(0.5);
+            process(set, id, &mut ctx).expect("process");
+        });
+        assert!(
+            event_names(&mut ctx).is_empty(),
+            "MDEL must suppress the post"
+        );
+        // 2.0 exceeds MDEL measured from that same reference.
+        d.with_set(id.set, |set| {
+            set.get_mut(id).val = Value::Double(2.0);
+            process(set, id, &mut ctx).expect("process");
+        });
+        assert_eq!(event_names(&mut ctx).len(), 1, "a change past MDEL posts");
+    }
+
+    #[test]
+    fn an_alarm_change_posts_regardless_of_mdel() {
+        // As above: the value is moved by writing VAL directly, not by
+        // reassigning the (constant, process-time-inert) INP link. The move
+        // is 2.0, far inside MDEL's 1000, so a post here can only be
+        // attributed to the alarm transition, not to MDEL.
+        let d = db("record(ai, \"PV:A\") {\n    field(MDEL, \"1000\")\n\
+                    field(HIHI, \"1\")\n    field(HHSV, \"MAJOR\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| process(set, id, &mut ctx).expect("process"));
+        let _ = ctx.take_events();
+        d.with_set(id.set, |set| {
+            set.get_mut(id).val = Value::Double(2.0);
+            process(set, id, &mut ctx).expect("process");
+        });
+        assert_eq!(
+            event_names(&mut ctx).len(),
+            1,
+            "an alarm transition must post even inside MDEL"
+        );
+    }
+
+    #[test]
+    fn the_posted_payload_carries_the_records_alarm_state() {
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"11\")\n\
+                    field(HIHI, \"10\")\n    field(HHSV, \"MAJOR\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| process(set, id, &mut ctx).expect("process"));
+        let events = ctx.take_events();
+        match &events[0].1 {
+            NtPayload::Scalar(s) => {
+                assert_eq!(s.value, ScalarValue::F64(11.0));
+                assert_eq!(s.alarm_severity, 2);
+                assert_eq!(s.alarm_message, "HIHI");
+            }
+            other => panic!("expected a scalar payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_disabled_record_does_not_fire_its_forward_link() {
+        // Base does not run FLNK for a disabled record either. PV:B's INP
+        // is a non-zero constant, so if `process_inner`'s disabled branch
+        // wrongly called `forward_link`, PV:B would process and post its
+        // own monitor — this discriminates the guard, not just presence.
+        let d = db(
+            "record(ai, \"PV:A\") {\n    field(DISA, \"1\")\n    field(DISV, \"1\")\n\
+                    field(DISS, \"MAJOR\")\n    field(FLNK, \"PV:B\")\n}\n\
+                    record(ai, \"PV:B\") {\n    field(INP, \"2\")\n}\n",
+        );
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            process(set, a, &mut ctx).expect("process succeeds")
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:A".to_string()],
+            "a disabled record posts its own monitor but must not fire FLNK"
+        );
+    }
+
+    #[test]
+    fn a_disabled_record_still_posts_its_disabled_state() {
+        let d = db("record(ai, \"PV:A\") {\n    field(DISA, \"1\")\n\
+                    field(DISV, \"1\")\n    field(DISS, \"MAJOR\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| process(set, id, &mut ctx).expect("process"));
+        let events = ctx.take_events();
+        assert_eq!(events.len(), 1, "a disable transition is observable");
+        match &events[0].1 {
+            NtPayload::Scalar(s) => assert_eq!(s.alarm_message, "DISABLE"),
+            other => panic!("expected a scalar payload, got {other:?}"),
+        }
+    }
 
     #[test]
     fn processing_clears_udf_and_stamps_the_time() {

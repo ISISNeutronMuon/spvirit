@@ -5,7 +5,9 @@
 //! carries the processing state (PACT, UDF, NSEV/NSTA, previous values for
 //! MDEL/ADEL) that a `dbProcess` equivalent needs.
 
+use crate::alarm::to_nt_alarm;
 use crate::alarm::{Condition, Severity};
+use spvirit_types::{NtPayload, NtScalar, NtTimeStamp, ScalarValue};
 
 /// The six record types sub-project A processes. Everything else is D.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -269,4 +271,41 @@ pub struct Record {
     pub omsl: Omsl,
     /// The epoch-nanosecond timestamp of the last process pass.
     pub time_ns: u64,
+}
+
+impl Record {
+    /// The PVA payload a client sees for this record's current state.
+    ///
+    /// The value's native type follows the record type: `ai`/`ao` are
+    /// doubles, `longin`/`longout` are 32-bit ints, and binary records are
+    /// unsigned shorts, matching what `softIoc` publishes over QSRV.
+    pub fn to_payload(&self) -> NtPayload {
+        let value = match self.val {
+            Value::Double(v) => ScalarValue::F64(v),
+            Value::Long(v) => ScalarValue::I32(v),
+            Value::Enum(v) => ScalarValue::U16(v),
+        };
+        let mut scalar = NtScalar::from_value(value);
+        let (severity, status, message) = to_nt_alarm(self.common.sevr, self.common.stat);
+        scalar.alarm_severity = severity;
+        scalar.alarm_status = status;
+        scalar.alarm_message = message;
+        scalar.display_description = self.common.desc.clone();
+        if self.limits.configured {
+            scalar.alarm_hihi = Some(self.limits.hihi);
+            scalar.alarm_high = Some(self.limits.high);
+            scalar.alarm_low = Some(self.limits.low);
+            scalar.alarm_lolo = Some(self.limits.lolo);
+        }
+        // A stable timestamp taken at process time, so monitor deltas carry
+        // when the value changed rather than when it was encoded.
+        if self.time_ns > 0 {
+            scalar.time_stamp = Some(NtTimeStamp {
+                seconds_past_epoch: (self.time_ns / 1_000_000_000) as i64,
+                nanoseconds: (self.time_ns % 1_000_000_000) as i32,
+                user_tag: 0,
+            });
+        }
+        NtPayload::Scalar(scalar)
+    }
 }
