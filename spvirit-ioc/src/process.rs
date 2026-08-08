@@ -10,7 +10,7 @@ use crate::alarm::{Condition, Severity};
 use crate::ctx::MAX_DEPTH;
 use crate::ctx::{ProcCtx, ProcError};
 use crate::lockset::{LockSetData, RecordId};
-use crate::model::{Field, Kind, Link, Target, Value};
+use crate::model::{Field, Kind, Limits, Link, Record, Target, Value};
 
 /// Wall-clock nanoseconds since the epoch, for the record's timestamp.
 ///
@@ -80,17 +80,12 @@ fn process_inner(
         // DISS actually raises the severity. `recGblSetSevr` is raise-only:
         // severity and condition move together, and only upward. With the
         // default DISS (NoAlarm) a disabled record is not in alarm at all —
-        // SEVR/STAT stay NoAlarm. This is the same raise-only rule Task 7
-        // factors out into `set_sevr`; written out here so that refactor is
-        // behaviour-preserving.
+        // SEVR/STAT stay NoAlarm.
         let r = set.get_mut(id);
         r.common.nsev = Severity::NoAlarm;
         r.common.nsta = Condition::NoAlarm;
-        if diss > r.common.nsev {
-            r.common.nsev = diss;
-            r.common.nsta = Condition::Disable;
-        }
-        reset_alarms(set, id, ctx);
+        set_sevr(r, diss, Condition::Disable);
+        let _ = reset_alarms(set, id, ctx);
         return Ok(());
     }
 
@@ -121,16 +116,101 @@ fn is_async_pending(_set: &LockSetData, _id: RecordId) -> bool {
     false
 }
 
-/// Commit `NSEV`/`NSTA` into `SEVR`/`STAT` and clear the pass state.
+/// `recGblSetSevr`: raise the pending alarm state, never lower it.
 ///
-/// This is `recGblResetAlarms`. Task 7 extends it to post an alarm monitor;
-/// here it only commits.
-pub(crate) fn reset_alarms(set: &mut LockSetData, id: RecordId, _ctx: &mut ProcCtx) {
+/// Returns whether the state changed, so callers can tell an ignored
+/// duplicate from a real escalation.
+pub(crate) fn set_sevr(record: &mut Record, sev: Severity, cond: Condition) -> bool {
+    if record.common.nsev.raise(sev) {
+        record.common.nsta = cond;
+        true
+    } else {
+        false
+    }
+}
+
+/// Which limit a value has crossed, honouring HYST.
+///
+/// `current` is the record's committed condition: an alarm already in force
+/// must stay in force until the value clears the limit by HYST, otherwise a
+/// value hovering on a limit produces an unbounded stream of monitors.
+fn limit_crossed(value: f64, limits: &Limits, current: Condition) -> Option<(Severity, Condition)> {
+    let hyst = limits.hyst;
+    let held = |cond: Condition| current == cond;
+
+    if limits.hhsv != Severity::NoAlarm
+        && (value >= limits.hihi || (held(Condition::HiHi) && value >= limits.hihi - hyst))
+    {
+        return Some((limits.hhsv, Condition::HiHi));
+    }
+    if limits.llsv != Severity::NoAlarm
+        && (value <= limits.lolo || (held(Condition::LoLo) && value <= limits.lolo + hyst))
+    {
+        return Some((limits.llsv, Condition::LoLo));
+    }
+    if limits.hsv != Severity::NoAlarm
+        && (value >= limits.high || (held(Condition::High) && value >= limits.high - hyst))
+    {
+        return Some((limits.hsv, Condition::High));
+    }
+    if limits.lsv != Severity::NoAlarm
+        && (value <= limits.low || (held(Condition::Low) && value <= limits.low + hyst))
+    {
+        return Some((limits.lsv, Condition::Low));
+    }
+    None
+}
+
+/// Promote a record that has never been given a value to INVALID/UDF.
+///
+/// This is the UDF check every EPICS record type's `checkAlarms` routine
+/// does for itself (e.g. `aiRecord.c`'s `if (prec->udf) { recGblSetSevr(...);
+/// return; }`) — it is not part of `recGblResetAlarms`, which only commits.
+/// Routed through `set_sevr` so there is exactly one raise-only
+/// implementation. `pub(crate)` because every record kind must call this,
+/// including the ones (bi/bo/longin/longout) that never call
+/// [`check_limits`] — see Task 9's binding note.
+pub(crate) fn check_udf(set: &mut LockSetData, id: RecordId) -> bool {
     let r = set.get_mut(id);
+    if r.common.udf {
+        set_sevr(r, Severity::Invalid, Condition::Udf)
+    } else {
+        false
+    }
+}
+
+/// Apply the record's alarm limits to its current value.
+///
+/// Mirrors EPICS `checkAlarms`: an undefined record reports INVALID/UDF and
+/// nothing else — the limit ladder is skipped entirely, even if a stale VAL
+/// happens to sit outside a configured limit. Binary records have no
+/// limits; their `Limits` stay at the defaults, where every severity is
+/// `NoAlarm`, so the limit ladder is a no-op for them.
+pub(crate) fn check_limits(set: &mut LockSetData, id: RecordId) {
+    if check_udf(set, id) {
+        return;
+    }
+    let value = set.get(id).val.as_f64();
+    let current = set.get(id).common.stat;
+    let crossed = limit_crossed(value, &set.get(id).limits, current);
+    if let Some((sev, cond)) = crossed {
+        set_sevr(set.get_mut(id), sev, cond);
+    }
+}
+
+/// `recGblResetAlarms`: commit the pass's pending alarm state.
+///
+/// A pure commit — it does not decide alarms itself, only publishes what
+/// [`check_udf`]/[`check_limits`]/`set_sevr` accumulated into NSEV/NSTA.
+/// Returns whether the committed state changed.
+pub(crate) fn reset_alarms(set: &mut LockSetData, id: RecordId, _ctx: &mut ProcCtx) -> bool {
+    let r = set.get_mut(id);
+    let changed = r.common.sevr != r.common.nsev || r.common.stat != r.common.nsta;
     r.common.sevr = r.common.nsev;
     r.common.stat = r.common.nsta;
     r.common.nsev = Severity::NoAlarm;
     r.common.nsta = Condition::NoAlarm;
+    changed
 }
 
 /// Read a link's value and the severity it contributes.
@@ -186,21 +266,26 @@ pub(crate) fn read_field(set: &LockSetData, id: RecordId, field: Field) -> Value
     }
 }
 
-/// The type-specific processing body. Tasks 7-10 build this out.
+/// The type-specific processing body. Tasks 8-10 build this out further;
+/// Task 7 adds alarm-limit checking, which every numeric record needs
+/// regardless of kind (binary records simply have every limit severity at
+/// its `NoAlarm` default, so `check_limits` is a no-op for them).
 pub(crate) fn record_body(
     set: &mut LockSetData,
     id: RecordId,
-    _ctx: &mut ProcCtx,
+    ctx: &mut ProcCtx,
 ) -> Result<(), ProcError> {
-    let r = set.get_mut(id);
-    r.common.udf = false;
-    r.time_ns = now_ns();
+    set.get_mut(id).common.udf = false;
+    set.get_mut(id).time_ns = now_ns();
+    check_limits(set, id);
+    let _ = reset_alarms(set, id, ctx);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lockset::RecordDb;
     use crate::test_support::db;
 
     #[test]
@@ -372,5 +457,146 @@ mod tests {
             .with_set(id.set, |set| process(set, id, &mut ctx))
             .expect_err("processing at the cap must fail");
         assert!(matches!(err, ProcError::TooDeep { .. }), "got {err:?}");
+    }
+
+    fn limited(val: &str, extra: &str) -> (RecordDb, RecordId) {
+        let text = format!(
+            "record(ai, \"PV:A\") {{\n    field(VAL, \"{val}\")\n\
+             field(HIHI, \"10\")\n    field(HIGH, \"5\")\n\
+             field(LOW, \"-5\")\n    field(LOLO, \"-10\")\n\
+             field(HHSV, \"MAJOR\")\n    field(HSV, \"MINOR\")\n\
+             field(LSV, \"MINOR\")\n    field(LLSV, \"MAJOR\")\n{extra}}}\n"
+        );
+        let d = db(&text);
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        (d, id)
+    }
+
+    fn sevr_stat_after_process(d: &RecordDb, id: RecordId) -> (Severity, Condition) {
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            (set.get(id).common.sevr, set.get(id).common.stat)
+        })
+    }
+
+    #[test]
+    fn a_value_above_hihi_is_major_hihi() {
+        let (d, id) = limited("11", "");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Major, Condition::HiHi)
+        );
+    }
+
+    #[test]
+    fn a_value_above_high_is_minor_high() {
+        let (d, id) = limited("7", "");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Minor, Condition::High)
+        );
+    }
+
+    #[test]
+    fn a_value_below_lolo_is_major_lolo() {
+        let (d, id) = limited("-11", "");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Major, Condition::LoLo)
+        );
+    }
+
+    #[test]
+    fn a_value_inside_the_limits_clears_the_alarm() {
+        let (d, id) = limited("0", "");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::NoAlarm, Condition::NoAlarm)
+        );
+    }
+
+    #[test]
+    fn a_zero_severity_limit_does_not_alarm() {
+        let d = db("record(ai, \"PV:A\") {\n    field(VAL, \"99\")\n\
+                    field(HIHI, \"10\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::NoAlarm, Condition::NoAlarm),
+            "HHSV defaults to NO_ALARM, so HIHI alone must not alarm"
+        );
+    }
+
+    #[test]
+    fn hyst_holds_an_alarm_until_the_value_clears_the_deadband() {
+        let (d, id) = limited("7", "    field(HYST, \"2\")\n");
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Minor, Condition::High)
+        );
+        // 4.0 is below HIGH but within HYST of it: the alarm must persist.
+        d.with_set(id.set, |set| set.get_mut(id).val = Value::Double(4.0));
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::Minor, Condition::High)
+        );
+        // 2.0 clears HIGH - HYST = 3.0.
+        d.with_set(id.set, |set| set.get_mut(id).val = Value::Double(2.0));
+        assert_eq!(
+            sevr_stat_after_process(&d, id),
+            (Severity::NoAlarm, Condition::NoAlarm)
+        );
+    }
+
+    #[test]
+    fn severity_only_ever_rises_within_one_pass() {
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        d.with_set(id.set, |set| {
+            let r = set.get_mut(id);
+            assert!(set_sevr(r, Severity::Minor, Condition::Soft));
+            assert!(
+                !set_sevr(r, Severity::NoAlarm, Condition::Calc),
+                "a lower severity must not overwrite"
+            );
+            assert_eq!(r.common.nsta, Condition::Soft);
+            assert!(set_sevr(r, Severity::Major, Condition::Calc));
+            assert_eq!(r.common.nsta, Condition::Calc);
+        });
+    }
+
+    #[test]
+    fn an_undefined_record_is_invalid_udf() {
+        // A record whose body never ran keeps UDF; checking its alarms
+        // and committing them must report INVALID/UDF, as EPICS does for a
+        // never-processed PV. The promotion is `check_limits`'s job (via
+        // `check_udf`), not `reset_alarms`'s: `reset_alarms` only commits.
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            set.get_mut(id).common.udf = true;
+            check_limits(set, id);
+            reset_alarms(set, id, &mut ctx);
+            assert_eq!(set.get(id).common.sevr, Severity::Invalid);
+            assert_eq!(set.get(id).common.stat, Condition::Udf);
+        });
+    }
+
+    #[test]
+    fn an_undefined_record_reports_udf_not_a_limit_alarm() {
+        // EPICS's checkAlarms returns immediately after the UDF check,
+        // skipping the limit ladder entirely. A record whose stale VAL sits
+        // above HIHI must still come out INVALID/UDF, not MAJOR/HiHi.
+        let (d, id) = limited("11", "");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            set.get_mut(id).common.udf = true;
+            check_limits(set, id);
+            reset_alarms(set, id, &mut ctx);
+            assert_eq!(set.get(id).common.sevr, Severity::Invalid);
+            assert_eq!(set.get(id).common.stat, Condition::Udf);
+        });
     }
 }
