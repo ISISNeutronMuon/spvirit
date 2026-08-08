@@ -272,6 +272,11 @@ pub(crate) fn fetch_link_value(
 /// write calls. Task 8 only wires up the primitive and its own test; no
 /// production caller exists yet, so it is exercised solely by
 /// `writing_dot_proc_forces_a_process_pass` until a later task adds one.
+///
+/// Note for Task 10: the `.VAL` branch below sets the field and clears UDF
+/// only — it does not touch `prev_val` or post any monitor. Monitor
+/// bookkeeping (comparing against `prev_val`/`MDEL`/`ADEL` and queuing the
+/// update) is Task 10's territory, not this one's.
 #[allow(
     dead_code,
     reason = "no production caller yet; wired up by a later task's client-put or output-record path"
@@ -345,6 +350,18 @@ pub(crate) fn record_body(
     // never-configured, i.e. default) INP simply keeps whatever value a
     // direct write last gave it. See the SDIS check above for the same
     // idiom.
+    // UDF is cleared unconditionally here, not on some success condition —
+    // and that is deliberate, not a shortcut. `aiRecord::process` clears UDF
+    // on a successful read (`if (status == 0) prec->udf = FALSE;`), and in
+    // this plan every input path *is* a success: `fetch_link_value` returns
+    // `Ok` even for `Link::Unresolved` (the record's default, reported once
+    // at load rather than failing every pass) and constant links are a
+    // processing-time no-op rather than a fetch that can fail. There is no
+    // failure path for "clear on success" to diverge from "clear
+    // unconditionally" against — do not add a conditional here expecting to
+    // "fix" a bug; there isn't one. See
+    // `a_record_reports_invalid_udf_before_the_first_process_pass` /
+    // `_and_no_alarm_after_it` below for the transition this produces.
     if !kind.is_output() && !matches!(inp, Link::Constant(_)) {
         let (value, link_sev) = fetch_link_value(set, &inp, kind, ctx)?;
         let r = set.get_mut(id);
@@ -664,6 +681,58 @@ mod tests {
         });
     }
 
+    // --- pinning the UDF -> INVALID/UDF transition around a process pass -
+    //
+    // Fix round 1: the reviewer flagged that `record_body` clears UDF
+    // unconditionally on every pass and asked for the transition itself to
+    // be pinned in both directions — before the first `process()` and after
+    // it — rather than trusting the surrounding tests to imply it.
+
+    #[test]
+    fn a_record_reports_invalid_udf_before_the_first_process_pass() {
+        // A record that has never been processed keeps the UDF default a
+        // fresh build gives it (see `build.rs`'s `init_constant`: with no
+        // INP there is nothing to seed VAL from, so UDF stays set). There is
+        // no "peek without processing" API — `check_limits` (via
+        // `check_udf`) and `reset_alarms` are themselves the accessor that
+        // computes and commits observable alarm state, so this test drives
+        // them directly instead of a full `process()` pass. This is the same
+        // pair `an_undefined_record_is_invalid_udf` above exercises; the
+        // difference here is that UDF is never forced — it is the record's
+        // ordinary, never-processed default.
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            assert!(
+                set.get(id).common.udf,
+                "a never-processed record is UDF by default"
+            );
+            check_limits(set, id);
+            reset_alarms(set, id, &mut ctx);
+            assert_eq!(set.get(id).common.sevr, Severity::Invalid);
+            assert_eq!(set.get(id).common.stat, Condition::Udf);
+        });
+    }
+
+    #[test]
+    fn a_record_reports_no_alarm_and_clear_udf_after_the_first_process_pass() {
+        // The complement: one full `process()` pass reads (or, with no INP,
+        // no-ops on) the input side, clears UDF, and the limit ladder then
+        // commits NO_ALARM. Together with the test above, this pins the
+        // transition `record_body`'s unconditional `udf = false` produces —
+        // the point the reviewer's Important finding was about.
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            assert!(!set.get(id).common.udf, "processing clears UDF");
+            assert_eq!(set.get(id).common.sevr, Severity::NoAlarm);
+            assert_eq!(set.get(id).common.stat, Condition::NoAlarm);
+        });
+    }
+
     #[test]
     fn an_undefined_record_reports_udf_not_a_limit_alarm() {
         // EPICS's checkAlarms returns immediately after the UDF check,
@@ -962,6 +1031,46 @@ mod tests {
             process(set, a, &mut ctx).expect("PACT must break the cycle, not the stack");
         });
         assert!(ctx.depth() == 0, "the depth counter must unwind cleanly");
+    }
+
+    #[test]
+    fn a_pp_self_link_terminates_via_pact_not_the_depth_cap() {
+        // A record whose INP is a PP link to itself is the degenerate
+        // one-node cycle. `process()` checks PACT *before* `push_depth`
+        // (step 1 runs ahead of the depth-counted call to `process_inner`),
+        // so the recursive `process()` call this self-link makes finds PACT
+        // already set and returns immediately without ever pushing a second
+        // depth frame. Termination is therefore via the PACT brake, not the
+        // MAX_DEPTH cap: TPRO tracing below shows "process entered" exactly
+        // once, not once per recursion up to MAX_DEPTH, and "PACT already
+        // set" firing on that same first (and only) re-entry.
+        let d =
+            db("record(ai, \"PV:A\") {\n    field(INP, \"PV:A PP\")\n    field(TPRO, \"1\")\n}\n");
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(a.set, |set| {
+            process(set, a, &mut ctx).expect("PACT must break the self-link, not the stack");
+            assert!(
+                !set.get(a).common.pact,
+                "PACT must be clear again once the outer pass unwinds"
+            );
+        });
+        assert!(ctx.depth() == 0, "the depth counter must unwind cleanly");
+        let entered = ctx
+            .trace
+            .iter()
+            .filter(|l| l.contains("process entered"))
+            .count();
+        assert_eq!(
+            entered, 1,
+            "PACT must stop the recursion on its first re-entry, not run it out to MAX_DEPTH"
+        );
+        assert!(
+            ctx.trace
+                .iter()
+                .any(|l| l.contains("PACT already set, returning")),
+            "the self-link's recursive process() call must observe PACT already set"
+        );
     }
 
     #[test]
