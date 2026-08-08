@@ -147,6 +147,25 @@ fn link(
     })
 }
 
+/// The `recGblInitConstantLink` equivalent: whether `name` was given as a
+/// bare numeric constant, and if so, that value coerced to `kind`.
+///
+/// Only `Some` when the field was explicitly present in the `.db` text and
+/// parsed as a number — never for an absent field, which is exactly the
+/// "no data yet" case `Link::Constant`'s own representation cannot
+/// distinguish from "initialised to zero" (both parse the same way once
+/// `link()` has run). The decision is made here, from the raw field map,
+/// while that information still exists.
+fn init_constant(fields: &HashMap<String, String>, name: &str, kind: Kind) -> Option<Value> {
+    let raw = fields.get(name)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse::<f64>()
+        .ok()
+        .map(|v| Value::Double(v).coerce_to(kind))
+}
+
 /// Build every record, or fail naming the first record that cannot be built.
 pub fn build_records(raw: &[DbRecord]) -> Result<Vec<Record>, BuildError> {
     raw.iter().map(build_one).collect()
@@ -167,6 +186,28 @@ fn build_one(raw: &DbRecord) -> Result<Record, BuildError> {
         )
     })?;
     let f = &raw.fields;
+
+    let val = match f.get("VAL") {
+        None => Value::default_for(kind),
+        Some(raw_val) => {
+            let parsed = raw_val
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| err(name, "VAL", format!("'{raw_val}' is not a number")))?;
+            Value::Double(parsed).coerce_to(kind)
+        }
+    };
+
+    // `recGblInitConstantLink`: dbLoadRecords applies field(VAL, ...) first
+    // (above); a *specified* constant INP (input kinds) or DOL (output
+    // kinds) then overrides it here, at init_record time, and clears UDF.
+    // An absent link does neither — that is the "no data yet" state a
+    // never-processed record must keep.
+    let init_field = if kind.is_output() { "DOL" } else { "INP" };
+    let (val, udf) = match init_constant(f, init_field, kind) {
+        Some(seeded) => (seeded, false),
+        None => (val, true),
+    };
 
     let common = Common {
         desc: f.get("DESC").cloned().unwrap_or_default(),
@@ -189,7 +230,7 @@ fn build_one(raw: &DbRecord) -> Result<Record, BuildError> {
         flnk: link(f, "FLNK", name, kind)?,
         tse: int(f, "TSE", name, 0)?,
         tpro: int(f, "TPRO", name, 0)? != 0,
-        udf: true,
+        udf,
         sevr: Severity::NoAlarm,
         stat: crate::alarm::Condition::NoAlarm,
         nsev: Severity::NoAlarm,
@@ -222,17 +263,6 @@ fn build_one(raw: &DbRecord) -> Result<Record, BuildError> {
         None | Some("supervisory") => Omsl::Supervisory,
         Some("closed_loop") => Omsl::ClosedLoop,
         Some(other) => return Err(err(name, "OMSL", format!("'{other}' is not an OMSL mode"))),
-    };
-
-    let val = match f.get("VAL") {
-        None => Value::default_for(kind),
-        Some(raw_val) => {
-            let parsed = raw_val
-                .trim()
-                .parse::<f64>()
-                .map_err(|_| err(name, "VAL", format!("'{raw_val}' is not a number")))?;
-            Value::Double(parsed).coerce_to(kind)
-        }
     };
 
     Ok(Record {
@@ -368,5 +398,80 @@ mod tests {
             Value::Enum(1),
             "any non-zero input sets a binary record"
         );
+    }
+
+    // --- recGblInitConstantLink equivalent: init-time constant seeding ----
+
+    #[test]
+    fn a_specified_numeric_inp_seeds_val_and_clears_udf_at_load() {
+        let recs = build("record(ai, \"PV:A\") {\n    field(INP, \"5\")\n}\n");
+        let r = &recs[0];
+        assert_eq!(r.val, Value::Double(5.0), "the constant INP must seed VAL");
+        assert!(
+            !r.common.udf,
+            "a specified constant link clears UDF at load"
+        );
+    }
+
+    #[test]
+    fn an_absent_inp_does_not_seed_val_or_clear_udf() {
+        let recs = build("record(ai, \"PV:A\") {\n}\n");
+        let r = &recs[0];
+        assert_eq!(
+            r.val,
+            Value::Double(0.0),
+            "no INP at all leaves VAL at the kind's default"
+        );
+        assert!(
+            r.common.udf,
+            "no data has ever been supplied, so UDF must stay set"
+        );
+    }
+
+    #[test]
+    fn a_specified_constant_inp_overrides_an_explicit_val_field() {
+        // dbLoadRecords applies field(VAL, ...) first; init_record's
+        // recGblInitConstantLink then overrides it from the constant link.
+        let recs =
+            build("record(ai, \"PV:A\") {\n    field(VAL, \"3\")\n    field(INP, \"5\")\n}\n");
+        let r = &recs[0];
+        assert_eq!(
+            r.val,
+            Value::Double(5.0),
+            "the constant INP link must win over a bare field(VAL, ...)"
+        );
+        assert!(!r.common.udf);
+    }
+
+    #[test]
+    fn a_specified_numeric_dol_seeds_val_and_clears_udf_for_an_output_record() {
+        let recs = build("record(ao, \"PV:O\") {\n    field(DOL, \"7\")\n}\n");
+        let r = &recs[0];
+        assert_eq!(r.val, Value::Double(7.0), "the constant DOL must seed VAL");
+        assert!(
+            !r.common.udf,
+            "a specified constant link clears UDF at load"
+        );
+    }
+
+    #[test]
+    fn an_absent_dol_does_not_seed_val_or_clear_udf_for_an_output_record() {
+        let recs = build("record(ao, \"PV:O\") {\n}\n");
+        let r = &recs[0];
+        assert_eq!(r.val, Value::Double(0.0));
+        assert!(r.common.udf);
+    }
+
+    #[test]
+    fn a_db_link_inp_does_not_seed_val_at_load() {
+        // A non-constant INP is not applied at init at all; it is read
+        // during processing (Task 8's `fetch_link_value`), not at load.
+        let recs = build(
+            "record(ai, \"PV:A\") {\n    field(INP, \"PV:B\")\n}\n\
+             record(ai, \"PV:B\") {\n}\n",
+        );
+        let r = &recs[0];
+        assert_eq!(r.val, Value::Double(0.0));
+        assert!(r.common.udf);
     }
 }
