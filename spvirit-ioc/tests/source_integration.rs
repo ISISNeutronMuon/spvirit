@@ -156,3 +156,33 @@ async fn pini_definition_order_differs_from_lock_set_traversal_order() {
          (which would yield PV:FIRST, PV:THIRD, PV:SECOND here)"
     );
 }
+
+/// A put to a record whose `INP` names another record produces two monitors:
+/// the raw written value, then the value processing recomputes from the link.
+/// EPICS Base does the same — `dbPut` posts the field write before
+/// `dbProcess` runs — so the intermediate value reaches subscribers there
+/// too. This pins the sequence so the behaviour cannot change silently.
+#[tokio::test]
+async fn a_put_to_a_linked_input_posts_the_written_value_then_the_linked_one() {
+    const LINKED: &str = "record(ai, \"PV:SRC\") {
+    field(INP, \"99\")
+}
+record(ai, \"PV:DST\") {
+    field(INP, \"PV:SRC NPP\")
+}
+";
+    let src = IocSource::from_db_str(LINKED).expect("the linked database loads");
+    let events = src
+        .put("PV:DST", &double(1.0))
+        .await
+        .expect("the put succeeds");
+    let seen: Vec<(String, f64)> = events
+        .iter()
+        .map(|(name, payload)| (name.clone(), scalar_of(payload)))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![("PV:DST".to_string(), 1.0), ("PV:DST".to_string(), 99.0),],
+        "the written value must be posted before the value the INP link recomputes"
+    );
+}

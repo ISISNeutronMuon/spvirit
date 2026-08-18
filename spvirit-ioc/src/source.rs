@@ -142,6 +142,18 @@ impl Source for IocSource {
         })
     }
 
+    /// Write `VAL` and then process the record, returning every monitor the
+    /// put caused.
+    ///
+    /// A put can produce *two* events for the same record. `write_field`
+    /// posts the raw written value immediately, and processing then posts
+    /// again if the body recomputes `VAL` — an input record whose `INP`
+    /// names another record overwrites the put value from its link, so a
+    /// subscriber sees the written value followed by the linked one. This is
+    /// EPICS Base's behaviour, not an artifact: `dbPut` posts the field
+    /// write before `dbProcess` runs, so the intermediate value goes on the
+    /// wire there too. `a_put_to_a_linked_input_posts_the_written_value_then_the_linked_one`
+    /// in `tests/source_integration.rs` pins the sequence.
     fn put(
         &self,
         name: &str,
