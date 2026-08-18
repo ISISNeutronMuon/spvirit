@@ -7,15 +7,19 @@
 
 use crate::build::build_records;
 use crate::ctx::ProcCtx;
+use crate::fields::{record_field_kind, record_field_value};
 use crate::graph::DependencyGraph;
 use crate::lockset::RecordDb;
 use crate::model::{Field, Value};
 use crate::process::{process, write_field};
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::db::{DbRecord, load_db_records, parse_db_records};
+use spvirit_server::field_provider::{
+    RecordFieldDesc, RecordFieldProvider, resolve_field_info, resolve_field_payload,
+};
 use spvirit_server::pvstore::{PvInfo, Source};
 use spvirit_server::simple_store::descriptor_for_payload;
-use spvirit_types::NtPayload;
+use spvirit_types::{NtPayload, ScalarValue};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -28,7 +32,20 @@ const SUBSCRIBER_QUEUE: usize = 64;
 
 pub struct IocSource {
     db: RecordDb,
+    /// Each record's kind, by name. Lets `field_descriptor` answer a channel
+    /// search without taking the record's lock set, which is the whole point
+    /// of the `dbNameToAddr`/`dbGetField` split.
+    kinds: HashMap<String, crate::model::Kind>,
+    /// Each record's name, by slot id — how a resolved link target gets
+    /// rendered back to a name without reaching into another lock set.
+    id_names: HashMap<crate::lockset::RecordId, String>,
     subscribers: Mutex<HashMap<String, Vec<mpsc::Sender<NtPayload>>>>,
+    /// Senders for open *field* subscriptions. Field values are served as a
+    /// one-shot snapshot in A2 — live field monitors arrive with the field
+    /// writes in sub-project B — so these are retained only to keep the
+    /// channels open, exactly as `RecordFieldSource::open_subs` does for
+    /// tier 2.
+    field_subs: Mutex<Vec<mpsc::Sender<NtPayload>>>,
 }
 
 impl IocSource {
@@ -45,10 +62,22 @@ impl IocSource {
 
     fn from_raw(raw: Vec<DbRecord>) -> Result<IocSource, String> {
         let records = build_records(&raw).map_err(|e| e.to_string())?;
+        let kinds = records
+            .iter()
+            .map(|r| (r.name.clone(), r.kind))
+            .collect::<HashMap<_, _>>();
         let db = RecordDb::build(records);
+        let id_names = db
+            .names()
+            .into_iter()
+            .filter_map(|name| db.lookup(&name).map(|id| (id, name)))
+            .collect::<HashMap<_, _>>();
         let source = IocSource {
             db,
+            kinds,
+            id_names,
             subscribers: Mutex::new(HashMap::new()),
+            field_subs: Mutex::new(Vec::new()),
         };
         // Report the load-time diagnostics once, here, rather than on every
         // pass. None of them is fatal.
@@ -108,6 +137,18 @@ impl IocSource {
         events
     }
 
+    /// Run `f` while holding `name`'s lock set. Exists so a test can prove a
+    /// field claim does not contend for it.
+    #[doc(hidden)]
+    pub fn with_lock_set_for_test<R>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut crate::lockset::LockSetData) -> R,
+    ) -> Option<R> {
+        let id = self.db.lookup(name)?;
+        Some(self.db.with_set(id.set, f))
+    }
+
     fn value_of(decoded: &DecodedValue) -> Result<Value, String> {
         match decoded {
             DecodedValue::Float64(v) => Ok(Value::Double(*v)),
@@ -121,11 +162,46 @@ impl IocSource {
     }
 }
 
+impl RecordFieldProvider for IocSource {
+    fn field_value(
+        &self,
+        base: &str,
+        field: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<ScalarValue>> + Send + '_>> {
+        let (base, field) = (base.to_string(), field.to_string());
+        Box::pin(async move {
+            let id = self.db.lookup(&base)?;
+            let names = |target: &crate::lockset::RecordId| self.id_names.get(target).cloned();
+            self.db
+                .with_set(id.set, |set| record_field_value(set.get(id), &field, &names))
+        })
+    }
+
+    /// Answers from the name-to-kind map and the static field table, so a
+    /// channel search never contends for a lock set that a processing pass
+    /// may be holding.
+    fn field_descriptor(
+        &self,
+        base: &str,
+        field: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<RecordFieldDesc>> + Send + '_>> {
+        let (base, field) = (base.to_string(), field.to_string());
+        Box::pin(async move {
+            let kind = *self.kinds.get(&base)?;
+            record_field_kind(kind, &field).map(|kind| RecordFieldDesc { kind })
+        })
+    }
+}
+
 impl Source for IocSource {
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            let id = self.db.lookup(&name)?;
+            // A record name wins over a field reference: an exact record
+            // called `A.B` is still that record, not `A`'s `B` field.
+            let Some(id) = self.db.lookup(&name) else {
+                return resolve_field_info(self, &name).await;
+            };
             let payload = self.db.with_set(id.set, |set| set.get(id).to_payload());
             Some(PvInfo {
                 descriptor: descriptor_for_payload(&payload),
@@ -137,7 +213,9 @@ impl Source for IocSource {
     fn get(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            let id = self.db.lookup(&name)?;
+            let Some(id) = self.db.lookup(&name) else {
+                return resolve_field_payload(self, &name).await;
+            };
             Some(self.db.with_set(id.set, |set| set.get(id).to_payload()))
         })
     }
@@ -162,10 +240,13 @@ impl Source for IocSource {
         let name = name.to_string();
         let value = value.clone();
         Box::pin(async move {
-            let id = self
-                .db
-                .lookup(&name)
-                .ok_or_else(|| format!("no record named '{name}'"))?;
+            let id = match self.db.lookup(&name) {
+                Some(id) => id,
+                None if resolve_field_info(self, &name).await.is_some() => {
+                    return Err(format!("field PV '{name}' is read-only"));
+                }
+                None => return Err(format!("no record named '{name}'")),
+            };
             let parsed = Self::value_of(&value)?;
             let mut ctx = ProcCtx::new();
             self.db
@@ -184,7 +265,16 @@ impl Source for IocSource {
     ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            self.db.lookup(&name)?;
+            if self.db.lookup(&name).is_none() {
+                let initial = resolve_field_payload(self, &name).await?;
+                let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
+                let _ = tx.try_send(initial);
+                self.field_subs
+                    .lock()
+                    .expect("field subscriber list poisoned")
+                    .push(tx);
+                return Some(rx);
+            }
             let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
             self.subscribers
                 .lock()
