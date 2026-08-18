@@ -257,6 +257,10 @@ pub struct Record {
     pub kind: Kind,
     pub common: Common,
     pub limits: Limits,
+    /// Engineering units. Not a dbCommon field in Base — it is declared per
+    /// record type — but all six of A's types carry it, so it lives on the
+    /// record rather than in [`Common`].
+    pub egu: String,
     pub val: Value,
     /// Last value posted as a value monitor — the MDEL reference.
     pub prev_val: Value,
@@ -291,6 +295,7 @@ impl Record {
         scalar.alarm_status = status;
         scalar.alarm_message = message;
         scalar.display_description = self.common.desc.clone();
+        scalar.units = self.egu.clone();
         if self.limits.configured {
             scalar.alarm_hihi = Some(self.limits.hihi);
             scalar.alarm_high = Some(self.limits.high);
@@ -307,5 +312,38 @@ impl Record {
             });
         }
         NtPayload::Scalar(scalar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record_with_egu(egu: &str) -> Record {
+        let raw = spvirit_server::db::parse_db_records(
+            &format!("record(ai, \"A\") {{\n    field(EGU, \"{egu}\")\n}}\n"),
+            "t.db",
+            &std::collections::HashMap::new(),
+        )
+        .expect("parse");
+        crate::build::build_records(&raw).expect("build").remove(0)
+    }
+
+    #[test]
+    fn to_payload_carries_egu_as_units() {
+        let r = record_with_egu("C");
+        match r.to_payload() {
+            NtPayload::Scalar(nt) => assert_eq!(nt.units, "C"),
+            other => panic!("expected scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_record_without_egu_serves_empty_units() {
+        let r = record_with_egu("");
+        match r.to_payload() {
+            NtPayload::Scalar(nt) => assert_eq!(nt.units, ""),
+            other => panic!("expected scalar, got {other:?}"),
+        }
     }
 }

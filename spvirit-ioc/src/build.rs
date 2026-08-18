@@ -270,6 +270,7 @@ fn build_one(raw: &DbRecord) -> Result<Record, BuildError> {
         kind,
         common,
         limits,
+        egu: f.get("EGU").cloned().unwrap_or_default(),
         val,
         // MLST/ALST have no DBD default in EPICS: they are zero-initialised,
         // and `recGblInitConstantLink` seeds VAL without touching them. That
@@ -467,6 +468,15 @@ mod tests {
         let r = &recs[0];
         assert_eq!(r.val, Value::Double(0.0));
         assert!(r.common.udf);
+    }
+
+    #[test]
+    fn egu_is_parsed_and_defaults_to_empty() {
+        let recs = build(
+            "record(ai, \"A\") {\n    field(EGU, \"C\")\n}\nrecord(ai, \"B\") {\n}\n",
+        );
+        assert_eq!(recs[0].egu, "C");
+        assert_eq!(recs[1].egu, "");
     }
 
     #[test]
