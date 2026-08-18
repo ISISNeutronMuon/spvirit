@@ -120,9 +120,10 @@ async fn claiming_a_field_does_not_take_the_records_lock_set() {
     holder.join().expect("holder thread");
 }
 
-/// Tier 3 answers the same `.FIELD` script as tiers 1 and 2: known fields
-/// from the model, unknown-but-real fields from dbCommon, invented fields
-/// not at all.
+/// Tier 2 (the IOC engine, `IocSource`) answers the same `.FIELD` script as
+/// tier 1 (`SimplePvStore`, in `spvirit-server/tests/tier_parity.rs`): known
+/// fields from the model, unknown-but-real fields from dbCommon, invented
+/// fields not at all.
 #[tokio::test]
 async fn the_ioc_matches_the_field_contract_the_other_tiers_serve() {
     let src = IocSource::from_db_str(DB).expect("loads");

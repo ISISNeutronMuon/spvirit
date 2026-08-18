@@ -1,10 +1,20 @@
 //! What a client can observe must not depend on which tier serves a PV.
 //!
-//! Tier 1 is a hand-written `Source`; tier 2 is the builtin `SimplePvStore`;
-//! tier 3 (the processing engine) lives in `spvirit-ioc`, which depends on
-//! this crate, so its half of the parity check is
-//! `spvirit-ioc/tests/field_access.rs`. What is compared here is the
-//! contract both tiers in this crate must satisfy identically.
+//! Per the A2 spec, the three tiers are numbered: tier 1 is the direct
+//! store, `SimplePvStore`; tier 2 is the IOC engine,
+//! `spvirit_ioc::IocSource`; tier 3 is a Python source via the `fields()`
+//! protocol. `spvirit-ioc` depends on this crate, so tier 2's half of the
+//! `.FIELD` parity check lives in `spvirit-ioc/tests/field_access.rs`, not
+//! here. Tier 3 is not exercised anywhere in this file either — its
+//! `.FIELD` parity is pinned separately in
+//! `spvirit-py/tests/test_source_fields.py` (Task 8); the split is
+//! deliberate, not an oversight.
+//!
+//! What this file compares is `SimplePvStore` (tier 1) against
+//! `EchoSource`, a hand-written `Source` standing in for an arbitrary
+//! custom source rather than any one of the three numbered tiers — the
+//! same "what a client can observe" contract every tier must satisfy
+//! identically.
 
 use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::field_provider::{
@@ -161,23 +171,29 @@ fn simple_store_with_desc(name: &str, initial: f64, desc: &str) -> Arc<SimplePvS
 
 #[tokio::test]
 async fn a_custom_source_and_the_builtin_store_are_indistinguishable() {
-    let tier1: Arc<dyn Source> = Arc::new(EchoSource::new("PV:X", 1.0));
-    let tier2: Arc<dyn Source> = builtin_store_with("PV:X", 1.0);
+    let custom_source: Arc<dyn Source> = Arc::new(EchoSource::new("PV:X", 1.0));
+    let direct_store: Arc<dyn Source> = builtin_store_with("PV:X", 1.0);
 
-    let a = observe(&*tier1, "PV:X").await;
-    let b = observe(&*tier2, "PV:X").await;
-    assert_eq!(a, b, "tier 1 and tier 2 must present the same contract");
+    let a = observe(&*custom_source, "PV:X").await;
+    let b = observe(&*direct_store, "PV:X").await;
+    assert_eq!(
+        a, b,
+        "EchoSource and SimplePvStore (tier 1) must present the same contract"
+    );
     assert_eq!(a.after_put, Some(ScalarValue::F64(42.0)));
     assert_eq!(a.monitor_names, vec!["PV:X".to_string()]);
 }
 
 #[tokio::test]
 async fn an_unknown_pv_looks_the_same_on_both_tiers() {
-    let tier1: Arc<dyn Source> = Arc::new(EchoSource::new("PV:X", 1.0));
-    let tier2: Arc<dyn Source> = builtin_store_with("PV:X", 1.0);
-    let a = observe(&*tier1, "PV:NOPE").await;
-    let b = observe(&*tier2, "PV:NOPE").await;
-    assert_eq!(a, b);
+    let custom_source: Arc<dyn Source> = Arc::new(EchoSource::new("PV:X", 1.0));
+    let direct_store: Arc<dyn Source> = builtin_store_with("PV:X", 1.0);
+    let a = observe(&*custom_source, "PV:NOPE").await;
+    let b = observe(&*direct_store, "PV:NOPE").await;
+    assert_eq!(
+        a, b,
+        "EchoSource and SimplePvStore (tier 1) must agree on an unclaimed PV"
+    );
     assert!(!a.claimed);
 }
 
@@ -250,7 +266,10 @@ async fn field_resolution_matches_across_providers() {
         let from_fake = resolve_field_payload(&fake, field)
             .await
             .map(|p| value_of(&p));
-        assert_eq!(from_store, from_fake, "{field}");
+        assert_eq!(
+            from_store, from_fake,
+            "{field}: SimplePvStore and FakeProvider must resolve the same value"
+        );
     }
 }
 
