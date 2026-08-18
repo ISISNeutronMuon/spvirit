@@ -556,8 +556,9 @@ impl PvaServerBuilder {
     ///
     /// Unlike [`PvaServerBuilder::source`], this asserts the engine owns its
     /// record names outright: `build` panics if any of them collide with a
-    /// record added through [`PvaServerBuilder::record`], or if a `.scan`,
-    /// `.link` or `on_put` handler names one of them. Those callbacks drive
+    /// record added to the builtin store (`.ai()`, `.db_file()` and
+    /// friends), or if a `.scan`, `.link` or `on_put` handler names one of
+    /// them. Those callbacks drive
     /// the builtin store's direct-write semantics and would be silently
     /// inert against an engine record.
     ///
@@ -642,6 +643,59 @@ impl PvaServerBuilder {
 
     /// Build the [`PvaServer`].
     pub fn build(self) -> PvaServer {
+        if let Some((ioc_names, _)) = &self.ioc {
+            let engine: std::collections::HashSet<&str> =
+                ioc_names.iter().map(String::as_str).collect();
+
+            // Sorted, because `records` and `on_put` are HashMaps: an
+            // unsorted diagnostic would name the same fault differently on
+            // each run.
+            let mut overlap: Vec<&str> = self
+                .records
+                .keys()
+                .map(String::as_str)
+                .filter(|n| engine.contains(n))
+                .collect();
+            overlap.sort_unstable();
+            assert!(
+                overlap.is_empty(),
+                "the builtin store and the engine store both own {}: stores must be \
+                 disjoint. Remove the .record() call, or rename the engine's record.",
+                overlap.join(", ")
+            );
+
+            let mut misdirected: Vec<String> = Vec::new();
+            for (name, _, _) in &self.scans {
+                if engine.contains(name.as_str()) {
+                    misdirected.push(format!(".scan(\"{name}\")"));
+                }
+            }
+            for link in &self.links {
+                if engine.contains(link.output.as_str()) {
+                    misdirected.push(format!(".link(\"{}\", …)", link.output));
+                }
+                for input in &link.inputs {
+                    if engine.contains(input.as_str()) {
+                        misdirected.push(format!(".link(…, input \"{input}\")"));
+                    }
+                }
+            }
+            for name in self.on_put.keys() {
+                if engine.contains(name.as_str()) {
+                    misdirected.push(format!(".on_put(\"{name}\")"));
+                }
+            }
+            misdirected.sort_unstable();
+            misdirected.dedup();
+            assert!(
+                misdirected.is_empty(),
+                "these builtin-store callbacks name a record the engine store owns, so \
+                 they would never fire: {}. Express the behaviour in the engine's .db \
+                 instead.",
+                misdirected.join(", ")
+            );
+        }
+
         let store = Arc::new(SimplePvStore::new(
             self.records,
             self.on_put,
