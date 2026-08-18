@@ -18,5 +18,9 @@ tracing = "0.1.41"
 tokio = { version = "1.47.1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
 
 [dev-dependencies]
+# Only the end-to-end test in `tests/ioc_server.rs` needs a client: it is the
+# one test that proves `.ioc()` reaches the wire. `spvirit-client` does not
+# depend on `spvirit-server`, so this dev-dependency introduces no cycle.
+spvirit-client = { workspace = true }
 proptest = "1"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "time"] }
