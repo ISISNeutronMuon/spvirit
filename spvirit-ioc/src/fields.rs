@@ -118,6 +118,12 @@ pub fn record_field_value(record: &Record, field: &str, names: TargetNames) -> O
         "SEVR" => s(c.sevr.epics_string()),
         "STAT" => s(c.stat.epics_string()),
         // PROC reads as zero and writes trigger processing; writes are B's.
+        // This arm is an equivalent mutant under `cargo mutants`: PROC's
+        // dbCommon default (DBCOMMON_DEFAULTS, "0") is the same literal
+        // value, so deleting this arm and falling through to
+        // `dbcommon_default_value` produces an identical answer for every
+        // input. No value-based test can distinguish the two; see Task 11's
+        // mutation report.
         "PROC" => i(0),
         "HIHI" => d(l.hihi),
         "HIGH" => d(l.high),
@@ -242,6 +248,38 @@ mod tests {
         assert_eq!(value(&r, "PRIO"), Some(ScalarValue::Str("LOW".into())));
         assert_eq!(value(&r, "ASG"), Some(ScalarValue::Str("".into())));
         assert_eq!(value(&r, "NOTAFIELD"), None);
+    }
+
+    /// Fields whose dbCommon fallback default happens to equal the typed
+    /// model's own default (0, "0", "NO_ALARM", ...) need a record where the
+    /// `.db` sets them away from that default — otherwise a match arm that
+    /// reads the typed model and one that falls through to
+    /// [`dbcommon_default_value`] would produce the same answer and the test
+    /// suite could not tell them apart.
+    #[test]
+    fn explicit_fields_reflect_the_db_not_the_dbcommon_default() {
+        let r = build(
+            "record(ao, \"PV:X\") {\n\
+             field(DISA, \"5\")\n\
+             field(DISV, \"7\")\n\
+             field(DISS, \"MAJOR\")\n\
+             field(SDIS, \"9\")\n\
+             field(TSE, \"3\")\n\
+             field(TPRO, \"1\")\n\
+             field(ADEL, \"2.5\")\n\
+             field(DOL, \"1\")\n\
+             }\n",
+        )
+        .remove(0);
+        assert_eq!(value(&r, "DISA"), Some(ScalarValue::I32(5)));
+        assert_eq!(value(&r, "DISV"), Some(ScalarValue::I32(7)));
+        assert_eq!(value(&r, "DISS"), Some(ScalarValue::Str("MAJOR".into())));
+        assert_eq!(value(&r, "SDIS"), Some(ScalarValue::Str("9".into())));
+        assert_eq!(value(&r, "TSE"), Some(ScalarValue::I32(3)));
+        assert_eq!(value(&r, "TPRO"), Some(ScalarValue::I32(1)));
+        assert_eq!(value(&r, "ADEL"), Some(ScalarValue::F64(2.5)));
+        // A specified constant DOL clears UDF at init — recGblInitConstantLink.
+        assert_eq!(value(&r, "UDF"), Some(ScalarValue::I32(0)));
     }
 
     /// The descriptor path must never disagree with the value path — that is
