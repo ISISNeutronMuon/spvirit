@@ -106,6 +106,14 @@ pub fn dbcommon_default(field: &str) -> Option<(FieldKind, &'static str)> {
         .map(|(_, kind, default)| (*kind, *default))
 }
 
+/// The dbCommon default for `field`, already parsed to its declared type.
+///
+/// The fallback both stores use for fields their own model does not carry —
+/// the analogue of `dbCommon.dbd` being included in every record type.
+pub fn dbcommon_default_value(field: &str) -> Option<ScalarValue> {
+    dbcommon_default(field).map(|(kind, default)| typed_value(kind, default))
+}
+
 /// The `.db` record-type name for a [`RecordType`] (what `RTYP` reports).
 pub fn record_type_name(rt: &RecordType) -> &'static str {
     match rt {
