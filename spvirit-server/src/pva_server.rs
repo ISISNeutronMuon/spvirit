@@ -873,13 +873,13 @@ impl PvaServer {
 
         // IOC/QSRV-style record field access (<name>.<FIELD>, <FIELD>$) so
         // tools like the EPICS Archiver Appliance can fetch record metadata.
+        let field_provider: Arc<dyn crate::field_provider::RecordFieldProvider> =
+            self.store.clone();
         sources
             .add(
                 "record-fields",
                 10,
-                Arc::new(crate::record_fields::RecordFieldSource::new(
-                    self.store.clone(),
-                )),
+                Arc::new(crate::record_fields::RecordFieldSource::new(field_provider)),
             )
             .await;
 

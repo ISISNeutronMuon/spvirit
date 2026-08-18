@@ -92,7 +92,7 @@ impl TypeCode {
 }
 
 /// Field type description
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     Scalar(TypeCode),
     ScalarArray(TypeCode),
@@ -146,14 +146,14 @@ impl FieldType {
 }
 
 /// Field description (name + type)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FieldDesc {
     pub name: String,
     pub field_type: FieldType,
 }
 
 /// Structure description with optional ID
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructureDesc {
     pub struct_id: Option<String>,
     pub fields: Vec<FieldDesc>,

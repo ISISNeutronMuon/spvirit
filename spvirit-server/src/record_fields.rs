@@ -17,8 +17,8 @@ use tokio::sync::{Mutex, mpsc};
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue};
 
+use crate::field_provider::{RecordFieldProvider, resolve_field_info, resolve_field_payload};
 use crate::pvstore::{PvInfo, Source};
-use crate::simple_store::{SimplePvStore, descriptor_for_payload};
 use crate::types::{RecordInstance, RecordType, ScalarValue};
 
 /// A parsed `<base>.<FIELD>[$]` channel-name reference.
@@ -220,49 +220,38 @@ pub fn payload_for(record: &RecordInstance, field_ref: &FieldRef) -> Option<NtPa
     payload_for_value(value, &record.common.desc, field_ref.long_string)
 }
 
-/// A read-only [`Source`] serving `<pvname>.<FIELD>` channels derived from
-/// the records in a [`SimplePvStore`].
+/// A read-only [`Source`] serving `<pvname>.<FIELD>` channels for any
+/// [`RecordFieldProvider`].
 ///
 /// Registered by `PvaServer::run` after the builtin store; the builtin only
 /// claims exact record names, so the two never compete.
 pub struct RecordFieldSource {
-    store: Arc<SimplePvStore>,
-    /// Senders for open field-PV subscriptions. Field values are static, so
-    /// each channel only ever carries the initial snapshot; the senders are
-    /// retained here purely to keep the channels open.
+    provider: Arc<dyn RecordFieldProvider>,
+    /// Senders for open field-PV subscriptions. Field values are static in
+    /// A2 (field writes are B's), so each channel only ever carries the
+    /// initial snapshot; the senders are retained here purely to keep the
+    /// channels open.
     open_subs: Mutex<Vec<mpsc::Sender<NtPayload>>>,
 }
 
 impl RecordFieldSource {
-    pub fn new(store: Arc<SimplePvStore>) -> Self {
+    pub fn new(provider: Arc<dyn RecordFieldProvider>) -> Self {
         Self {
-            store,
+            provider,
             open_subs: Mutex::new(Vec::new()),
         }
-    }
-
-    async fn resolve(&self, name: &str) -> Option<NtPayload> {
-        let field_ref = parse_field_ref(name)?;
-        let record = self.store.get_record(&field_ref.base).await?;
-        payload_for(&record, &field_ref)
     }
 }
 
 impl Source for RecordFieldSource {
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
-        Box::pin(async move {
-            let payload = self.resolve(&name).await?;
-            Some(PvInfo {
-                descriptor: descriptor_for_payload(&payload),
-                writable: false,
-            })
-        })
+        Box::pin(async move { resolve_field_info(self.provider.as_ref(), &name).await })
     }
 
     fn get(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
         let name = name.to_string();
-        Box::pin(async move { self.resolve(&name).await })
+        Box::pin(async move { resolve_field_payload(self.provider.as_ref(), &name).await })
     }
 
     fn put(
@@ -280,7 +269,7 @@ impl Source for RecordFieldSource {
     ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            let initial = self.resolve(&name).await?;
+            let initial = resolve_field_payload(self.provider.as_ref(), &name).await?;
             let (tx, rx) = mpsc::channel(4);
             let _ = tx.try_send(initial);
             self.open_subs.lock().await.push(tx);
@@ -413,8 +402,14 @@ record(ao, "SIM:AO") {
 }"#,
         )
         .expect("parse");
-        let store = SimplePvStore::new(recs, std::collections::HashMap::new(), Vec::new(), false);
-        RecordFieldSource::new(Arc::new(store))
+        let store = crate::simple_store::SimplePvStore::new(
+            recs,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            false,
+        );
+        let provider: Arc<dyn RecordFieldProvider> = Arc::new(store);
+        RecordFieldSource::new(provider)
     }
 
     #[tokio::test]
