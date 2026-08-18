@@ -660,7 +660,8 @@ impl PvaServerBuilder {
             assert!(
                 overlap.is_empty(),
                 "the builtin store and the engine store both own {}: stores must be \
-                 disjoint. Remove the .record() call, or rename the engine's record.",
+                 disjoint. Remove the builtin-store record (`.ai()`, `.db_file()` and \
+                 friends), or rename the engine's record.",
                 overlap.join(", ")
             );
 

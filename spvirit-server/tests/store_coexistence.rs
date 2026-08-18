@@ -80,6 +80,19 @@ fn two_stores_owning_the_same_record_is_a_build_error() {
 }
 
 #[test]
+#[should_panic(expected = "Remove the builtin-store record (`.ai()`, `.db_file()` and friends)")]
+fn the_overlap_panic_names_a_real_builder_method() {
+    // The diagnostic used to tell users to "remove the .record() call" —
+    // no such method exists on `PvaServerBuilder`. Pin the corrected
+    // wording so a future edit can't silently reintroduce a fictional API
+    // reference into user-facing panic text.
+    PvaServer::builder()
+        .ai("PV:SHARED", 1.0)
+        .ioc(FakeStore::new(&["PV:SHARED"]))
+        .build();
+}
+
+#[test]
 #[should_panic(expected = "PV:A, PV:B")]
 fn every_overlapping_name_is_reported_at_once_and_sorted() {
     PvaServer::builder()
