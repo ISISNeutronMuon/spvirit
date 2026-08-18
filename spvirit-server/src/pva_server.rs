@@ -393,26 +393,39 @@ impl PvaServerBuilder {
     // ─── .db file loading ────────────────────────────────────────────
 
     /// Load records from an EPICS `.db` file.
+    ///
+    /// A malformed `.db` is a startup configuration error, not a runtime
+    /// condition to log and shrug off: `build()` returns `PvaServer`, not a
+    /// `Result`, so there is no channel to report the failure through other
+    /// than refusing to start. Silently continuing with zero records from
+    /// this file would leave the server up and answering PVA requests while
+    /// serving none of the PVs its `.db` was supposed to define, which is
+    /// worse than failing loudly at startup. `load_db`'s error already names
+    /// the file and the line that failed to parse (see `DbParseError`'s
+    /// `Display`), so that detail reaches the panic message unmodified.
     pub fn db_file(mut self, path: impl AsRef<str>) -> Self {
         match load_db(path.as_ref()) {
             Ok(records) => {
                 self.records.extend(records);
             }
             Err(e) => {
-                tracing::error!("Failed to load db file '{}': {}", path.as_ref(), e);
+                panic!("failed to load db file '{}': {e}", path.as_ref());
             }
         }
         self
     }
 
     /// Parse records from an EPICS `.db` string.
+    ///
+    /// See [`Self::db_file`]'s doc comment for why a parse failure panics
+    /// here rather than logging and continuing with zero records.
     pub fn db_string(mut self, content: &str) -> Self {
         match parse_db(content) {
             Ok(records) => {
                 self.records.extend(records);
             }
             Err(e) => {
-                tracing::error!("Failed to parse db string: {}", e);
+                panic!("failed to parse db string: {e}");
             }
         }
         self
@@ -1962,6 +1975,44 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "failed to parse db string")]
+    fn a_malformed_db_string_aborts_the_builder_rather_than_serving_nothing() {
+        // Finding 2: a parse failure must not be swallowed into a server
+        // with zero records from this source -- it must abort loudly at
+        // startup instead.
+        let _ = PvaServer::builder().db_string("not a valid db line").build();
+    }
+
+    #[test]
+    fn a_malformed_db_file_aborts_the_builder_rather_than_serving_nothing() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "spvirit-bad-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "not a valid db line").expect("write temp db file");
+        let path_str = path.to_string_lossy().into_owned();
+        let result = std::panic::catch_unwind(|| {
+            let _ = PvaServer::builder().db_file(&path_str).build();
+        });
+        let _ = std::fs::remove_file(&path);
+        let payload = result.expect_err("db_file must panic on a malformed file");
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("failed to load db file"),
+            "panic message must name the failure, got: {message}"
+        );
+    }
+
+    #[test]
     fn builder_waveform() {
         let data = ScalarArrayValue::F64(vec![1.0, 2.0, 3.0]);
         let server = PvaServer::builder().waveform("T:WF", data).build();
@@ -2093,8 +2144,10 @@ mod tests {
     #[tokio::test]
     async fn running_server_mints_handles_to_db_records() {
         // parse_db is line-oriented (one `record(...)`/`field(...)`
-        // statement per line); a packed one-liner silently drops its
-        // fields, so this uses the same multi-line shape as the other
+        // statement per line); a packed one-liner is an "unrecognised line"
+        // parse error (which now aborts the whole file/string rather than
+        // silently dropping the one bad record, see `db_string`'s doc
+        // comment), so this uses the same multi-line shape as the other
         // db_string tests in this module.
         let server = PvaServer::serve(Vec::<AnyPv>::new())
             .db_string("record(ao, \"DB:X\") {\n    field(VAL, \"2.5\")\n}")
