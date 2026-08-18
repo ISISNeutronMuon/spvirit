@@ -138,3 +138,34 @@ async fn the_ioc_matches_the_field_contract_the_other_tiers_serve() {
     );
     assert!(src.get("PV:A.NOTAFIELD").await.is_none());
 }
+
+/// `field(EGU, …)` must reach both the record payload's units and the
+/// `.EGU` field PV. Tier 2 has always served units; before A2 the engine
+/// dropped them at build time, so a client could tell the tiers apart by
+/// asking for units.
+#[tokio::test]
+async fn egu_survives_from_db_text_to_the_served_payload() {
+    let src = IocSource::from_db_str(DB).expect("loads");
+    match src.get("PV:A").await.expect("gettable") {
+        NtPayload::Scalar(s) => assert_eq!(s.units, "C"),
+        other => panic!("expected a scalar, got {other:?}"),
+    }
+    assert_eq!(
+        src.get("PV:A.EGU").await.map(|p| scalar(&p)),
+        Some(ScalarValue::Str("C".into()))
+    );
+}
+
+/// A record with no EGU serves empty units, not a missing field.
+#[tokio::test]
+async fn a_record_without_egu_serves_empty_units() {
+    let src = IocSource::from_db_str("record(ai, \"PV:N\") {\n}\n").expect("loads");
+    match src.get("PV:N").await.expect("gettable") {
+        NtPayload::Scalar(s) => assert_eq!(s.units, ""),
+        other => panic!("expected a scalar, got {other:?}"),
+    }
+    assert_eq!(
+        src.get("PV:N.EGU").await.map(|p| scalar(&p)),
+        Some(ScalarValue::Str(String::new()))
+    );
+}

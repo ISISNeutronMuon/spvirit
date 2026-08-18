@@ -102,7 +102,7 @@ fn a_scan_naming_an_engine_record_is_a_build_error() {
 }
 
 #[test]
-#[should_panic(expected = ".link")]
+#[should_panic(expected = ".link(\"PV:ENGINE\", …)")]
 fn a_link_naming_an_engine_record_is_a_build_error() {
     PvaServer::builder()
         .ai("PV:IN", 1.0)
@@ -127,4 +127,50 @@ fn disjoint_stores_build_cleanly() {
         .ioc(FakeStore::new(&["PV:ENGINE"]))
         .build();
     drop(server);
+}
+
+use spvirit_server::pvstore::SourceRegistry;
+
+/// Both stores serve their own records through one registry, and neither
+/// can see the other's.
+#[tokio::test]
+async fn two_disjoint_stores_each_serve_their_own_records() {
+    let reg = SourceRegistry::new();
+    reg.add_store("builtin", 0, FakeStore::new(&["PV:DIRECT"])).await;
+    reg.add_store("ioc", 5, FakeStore::new(&["PV:ENGINE"])).await;
+
+    assert!(reg.claim("PV:DIRECT").await.is_some());
+    assert!(reg.claim("PV:ENGINE").await.is_some());
+    assert!(reg.claim("PV:NEITHER").await.is_none());
+
+    let mut names = reg.names().await;
+    names.sort();
+    assert_eq!(names, vec!["PV:DIRECT".to_string(), "PV:ENGINE".to_string()]);
+}
+
+/// `names()` must be deterministic — it is what a `pvlist` client sees.
+///
+/// `SourceRegistry::names` aggregates through a `HashSet` (for dedup) before
+/// sorting the result (see `SourceRegistry::names` in `pvstore.rs`), and
+/// `StoreSource::record_names`'s doc contract states the returned list "must
+/// be deterministic (sorted)". This test rebuilds the registry many times —
+/// not just twice — and additionally pins the exact sorted order, so a
+/// regression that dropped the final `sort()` (leaving output at the mercy
+/// of `HashMap`/`HashSet` iteration order) would be caught even though a
+/// single process run tends to reuse one hasher state across repeats.
+#[tokio::test]
+async fn the_combined_name_list_is_stable_across_runs() {
+    async fn build() -> Vec<String> {
+        let reg = SourceRegistry::new();
+        reg.add_store("ioc", 5, FakeStore::new(&["PV:B", "PV:A"])).await;
+        reg.add_store("builtin", 0, FakeStore::new(&["PV:C"])).await;
+        reg.names().await
+    }
+
+    let expected = vec!["PV:A".to_string(), "PV:B".to_string(), "PV:C".to_string()];
+    let first = build().await;
+    assert_eq!(first, expected, "names() must be sorted");
+    for _ in 0..20 {
+        assert_eq!(build().await, first, "names() must be stable across rebuilds");
+    }
 }
