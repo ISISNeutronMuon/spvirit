@@ -646,6 +646,11 @@ class SensorSource:
     def on_start(self, notifier):          # optional: called at server start, not at construction
         self.notifier = notifier           # keep it to push updates later
 
+    def fields(self, name):                # optional: `.FIELD` access support
+        if not name.startswith("SENSOR:"):
+            return None
+        return {"DESC": "a sensor reading", "EGU": "C"}
+
 server = spvirit.Server(sources=[("sensors", 10, SensorSource())])
 server.start()
 ```
@@ -672,6 +677,24 @@ Key points:
 - `async def` source methods run on a dedicated background asyncio event loop
   (thread name `spvirit-asyncio`) — do not call `asyncio.run` yourself inside
   source methods.
+
+### `fields(self, name) -> dict | None` (optional)
+
+Return a mapping of EPICS field name to value for the record `name`, or
+`None` if this source does not own it. Defining it makes `<name>.<FIELD>`
+resolvable for this source's records, matching what the builtin store and
+the processing engine already serve. Fields you omit read as their
+`dbCommon` defaults, so a source usually only lists `DESC`, `EGU`, `RTYP`
+and whatever else it genuinely knows.
+
+```python
+def fields(self, name):
+    if name != "PY:A":
+        return None
+    return {"DESC": "a python record", "EGU": "mm"}
+```
+
+Field PVs are read-only.
 
 ---
 

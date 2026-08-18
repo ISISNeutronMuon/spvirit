@@ -20,6 +20,7 @@
 //!     def rpc(self, name, args): ...  # optional -> NtPayload
 //!     def subscribe(self, name): ...  # optional (ignored; use notifier)
 //!     def on_start(self, notifier): ...# optional: receive PyNotifier
+//!     def fields(self, name): ...     # optional -> dict[str, object] | None
 //! ```
 //!
 //! Register via `ServerBuilder.add_source(label, order, source)` before
@@ -34,12 +35,14 @@ use pyo3::types::{PyCFunction, PyDict, PyList, PyTuple};
 use tokio::sync::mpsc;
 
 use spvirit_codec::spvd_decode::{DecodedValue, FieldDesc, FieldType, StructureDesc};
+use spvirit_server::field_provider::{RecordFieldDesc, RecordFieldProvider, field_kind_of};
 use spvirit_server::monitor::MonitorRegistry;
 use spvirit_server::pvstore::{PvInfo, Source};
-use spvirit_types::NtPayload;
+use spvirit_types::{NtPayload, ScalarValue};
 
 use crate::convert::decoded_to_py;
 use crate::convert::parse_type_code;
+use crate::convert::py_to_scalar;
 use crate::nt::{nt_payload_to_py, py_to_nt_payload};
 use crate::runtime::RUNTIME;
 
@@ -271,7 +274,7 @@ impl PyNotifier {
 // ─── PySourceAdapter — Source trait impl ─────────────────────────────────────
 
 pub struct PySourceAdapter {
-    obj: Arc<PyObject>,
+    pub(crate) obj: Arc<PyObject>,
 }
 
 impl PySourceAdapter {
@@ -696,12 +699,16 @@ impl Source for PySourceAdapter {
         })
     }
 
+    /// Python sources do not implement `subscribe`: monitor updates are
+    /// pushed from Python via `notifier.notify()` rather than pulled through
+    /// a channel the adapter owns. Returning `None` makes the registry fall
+    /// through to the next source, which is correct — no other source claims
+    /// these names, so the client gets its initial value from `get` and
+    /// subsequent values from the notifier.
     fn subscribe<'a>(
         &'a self,
         _name: &str,
     ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + 'a>> {
-        // Python sources publish monitor updates via `notifier.notify()` — no
-        // Source-level subscribe channel needed.
         Box::pin(async { None })
     }
 
@@ -762,6 +769,103 @@ impl Source for PySourceAdapter {
                     }
                 }
             })
+        })
+    }
+}
+
+impl RecordFieldProvider for PySourceAdapter {
+    /// Resolve `<base>.<field>` through the Python source's `fields()`
+    /// method. A field the source did not mention still reads as its
+    /// dbCommon default — the same fallback tiers 2 and 3 use.
+    fn field_value(
+        &self,
+        base: &str,
+        field: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<ScalarValue>> + Send + '_>> {
+        let (base, field) = (base.to_string(), field.to_string());
+        Box::pin(async move {
+            let dict = self.fields_dict(&base).await?;
+            match dict.get(&field) {
+                Some(value) => Some(value.clone()),
+                None => spvirit_server::record_fields::dbcommon_default_value(&field),
+            }
+        })
+    }
+
+    /// A Python dict carries no schema, so the only honest descriptor is the
+    /// one the value itself implies. This is the one tier that cannot answer
+    /// a search without producing the value.
+    fn field_descriptor(
+        &self,
+        base: &str,
+        field: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<RecordFieldDesc>> + Send + '_>> {
+        let (base, field) = (base.to_string(), field.to_string());
+        Box::pin(async move {
+            let value = self.field_value(&base, &field).await?;
+            Some(RecordFieldDesc {
+                kind: field_kind_of(&value),
+            })
+        })
+    }
+}
+
+impl PySourceAdapter {
+    /// `fields(name)` converted to a `ScalarValue` map, or `None` when the
+    /// source does not own `name` (or its `fields()` returned `None`).
+    ///
+    /// Only called through `RecordFieldSource`, which is registered solely
+    /// for sources that have a `fields` attribute (checked once, at
+    /// registration in `server.rs`) — so there is no need to re-check for
+    /// the method's existence on every lookup here.
+    async fn fields_dict(&self, name: &str) -> Option<std::collections::HashMap<String, ScalarValue>> {
+        let obj = self.obj.clone();
+        let name = name.to_string();
+        let ret = match call_py_await(obj, "fields", move |py| {
+            PyTuple::new(py, &[name.into_pyobject(py)?.into_any()])
+        })
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log_err("fields", e);
+                return None;
+            }
+        };
+        Python::with_gil(|py| {
+            let bound = ret.bind(py);
+            if bound.is_none() {
+                return None;
+            }
+            let dict = match bound.downcast::<PyDict>() {
+                Ok(d) => d,
+                Err(e) => {
+                    log_err("fields", e);
+                    return None;
+                }
+            };
+            // Ordering doesn't matter here — the result is a HashMap keyed
+            // by field name, looked up by exact key, never iterated for
+            // output.
+            let mut out = std::collections::HashMap::new();
+            for (k, v) in dict.iter() {
+                let key: String = match k.extract() {
+                    Ok(k) => k,
+                    Err(e) => {
+                        log_err("fields", e);
+                        return None;
+                    }
+                };
+                let value = match py_to_scalar(&v) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log_err("fields", e);
+                        return None;
+                    }
+                };
+                out.insert(key.to_ascii_uppercase(), value);
+            }
+            Some(out)
         })
     }
 }

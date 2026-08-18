@@ -517,6 +517,20 @@ impl PyServerBuilder {
         let label_for_hook = label.clone();
         let b = b.source(label, order, as_dyn);
 
+        // Only sources that opt in get a `.FIELD` tier — otherwise every
+        // Python source would start claiming dotted names it cannot answer.
+        let has_fields =
+            Python::with_gil(|py| adapter.obj.bind(py).hasattr("fields").unwrap_or(false));
+        let b = if has_fields {
+            let provider: Arc<dyn spvirit_server::field_provider::RecordFieldProvider> =
+                adapter.clone();
+            let field_source: Arc<dyn spvirit_server::pvstore::Source> =
+                Arc::new(spvirit_server::record_fields::RecordFieldSource::new(provider));
+            b.source(format!("{label_for_hook}-fields"), order + 10, field_source)
+        } else {
+            b
+        };
+
         // Register the source's on_start on the shared hook list, so it
         // interleaves with builder-registered on_start hooks in true
         // registration order (the spec's "one list" rule). The notifier
@@ -689,6 +703,19 @@ impl PyServer {
             let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter.clone();
             let label_for_hook = label.clone();
             sb = sb.source(label, order, as_dyn);
+
+            // Only sources that opt in get a `.FIELD` tier — otherwise every
+            // Python source would start claiming dotted names it cannot answer.
+            let has_fields =
+                Python::with_gil(|py| adapter.obj.bind(py).hasattr("fields").unwrap_or(false));
+            if has_fields {
+                let provider: Arc<dyn spvirit_server::field_provider::RecordFieldProvider> =
+                    adapter.clone();
+                let field_source: Arc<dyn spvirit_server::pvstore::Source> = Arc::new(
+                    spvirit_server::record_fields::RecordFieldSource::new(provider),
+                );
+                sb = sb.source(format!("{label_for_hook}-fields"), order + 10, field_source);
+            }
 
             // Same deferred hook as PyServerBuilder::add_source: fires at
             // server start, not here, and interleaves on the shared list.
