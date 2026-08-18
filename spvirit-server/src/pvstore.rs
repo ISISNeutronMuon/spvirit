@@ -128,9 +128,8 @@ struct SourceEntry {
     source: Arc<dyn Source>,
     /// True for entries registered via [`SourceRegistry::add_store`].
     ///
-    /// Read by tests today; Task 6's disjointness check and Task 7's
-    /// shadow detection are the production consumers still to come.
-    #[allow(dead_code)]
+    /// Consumed by `PvaServerBuilder::build`'s disjointness check and by
+    /// `SourceRegistry::claim`'s shadow-warning.
     is_store: bool,
 }
 
@@ -144,6 +143,10 @@ struct SourceEntry {
 /// delegates to the first source that claims the name.
 pub struct SourceRegistry {
     sources: RwLock<Vec<SourceEntry>>,
+    /// PVs whose shadowing status has already been determined. Bounded by
+    /// the number of distinct names clients search for, and only ever grown
+    /// by a claim that a non-store source won.
+    shadow_checked: RwLock<HashSet<String>>,
 }
 
 impl SourceRegistry {
@@ -151,6 +154,7 @@ impl SourceRegistry {
     pub fn new() -> Self {
         Self {
             sources: RwLock::new(Vec::new()),
+            shadow_checked: RwLock::new(HashSet::new()),
         }
     }
 
@@ -196,10 +200,43 @@ impl SourceRegistry {
         let sources = self.sources.read().await;
         for entry in sources.iter() {
             if let Some(info) = entry.source.claim(name).await {
+                if !entry.is_store {
+                    self.warn_if_shadowing_a_store(&sources, &entry.label, name)
+                        .await;
+                }
                 return Some(info);
             }
         }
         None
+    }
+
+    /// Log once if `winner` — an ordinary source — beat a store to `name`.
+    ///
+    /// Shadowing between sources is legal and often deliberate, so this
+    /// warns rather than failing. Overlap between two *stores* is the error
+    /// case, and `PvaServerBuilder::build` rejects it outright.
+    ///
+    /// Only `claim` calls this. `get`/`put`/`subscribe`/`rpc` re-resolve the
+    /// same name through the same ordered list, and a client always searches
+    /// before operating, so the first claim is where the diagnostic belongs.
+    async fn warn_if_shadowing_a_store(&self, sources: &[SourceEntry], winner: &str, name: &str) {
+        if self.shadow_checked.read().await.contains(name) {
+            return;
+        }
+        if !self.shadow_checked.write().await.insert(name.to_string()) {
+            // Another task got there between the read and the write.
+            return;
+        }
+        for entry in sources.iter().filter(|e| e.is_store) {
+            if entry.source.claim(name).await.is_some() {
+                tracing::warn!(
+                    "source '{winner}' shadows store '{}' for PV '{name}': the store's \
+                     value will never be served",
+                    entry.label
+                );
+                return;
+            }
+        }
     }
 
     /// Check whether any source claims the given PV name.
@@ -295,18 +332,25 @@ mod tests {
     /// A minimal [`Source`] over a fixed name list, for registry tests.
     struct StubSource {
         names: Vec<String>,
+        claims: std::sync::atomic::AtomicUsize,
     }
 
     impl StubSource {
         fn new(names: &[&str]) -> Self {
             Self {
                 names: names.iter().map(|s| s.to_string()).collect(),
+                claims: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        fn claim_count(&self) -> usize {
+            self.claims.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
     impl Source for StubSource {
         fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            self.claims.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let claimed = self.names.iter().any(|n| n == name);
             Box::pin(async move {
                 claimed.then(|| PvInfo {
@@ -373,5 +417,61 @@ mod tests {
             .map(|e| e.label.clone())
             .collect();
         assert_eq!(labels, vec!["builtin".to_string(), "custom".to_string()]);
+    }
+
+    /// A source registered ahead of a store wins the claim — that is the
+    /// documented behaviour, and it stays. The registry just says so.
+    #[tokio::test]
+    async fn a_source_shadowing_a_store_still_wins_the_claim() {
+        let reg = SourceRegistry::new();
+        reg.add("override", -1, Arc::new(StubSource::new(&["PV:X"]))).await;
+        reg.add_store("builtin", 0, Arc::new(StubSource::new(&["PV:X"]))).await;
+        assert!(reg.claim("PV:X").await.is_some());
+    }
+
+    /// The warning is emitted at most once per PV, so a client that searches
+    /// in a loop does not flood the log.
+    #[tokio::test]
+    async fn the_shadow_check_runs_once_per_pv() {
+        let reg = SourceRegistry::new();
+        let store = Arc::new(StubSource::new(&["PV:X"]));
+        reg.add("override", -1, Arc::new(StubSource::new(&["PV:X"]))).await;
+        reg.add_store("builtin", 0, store.clone()).await;
+        let before = store.claim_count();
+        for _ in 0..5 {
+            reg.claim("PV:X").await;
+        }
+        assert_eq!(
+            store.claim_count() - before,
+            1,
+            "the shadowed store must be consulted exactly once"
+        );
+    }
+
+    /// A source claiming a name no store owns is the ordinary case and must
+    /// not cost a scan of every store on every search after the first.
+    #[tokio::test]
+    async fn an_unshadowed_source_claim_is_also_checked_only_once() {
+        let reg = SourceRegistry::new();
+        let store = Arc::new(StubSource::new(&["PV:OTHER"]));
+        reg.add("plain", -1, Arc::new(StubSource::new(&["PV:X"]))).await;
+        reg.add_store("builtin", 0, store.clone()).await;
+        let before = store.claim_count();
+        for _ in 0..5 {
+            reg.claim("PV:X").await;
+        }
+        assert_eq!(store.claim_count() - before, 1);
+    }
+
+    /// A store winning its own claim triggers no check at all.
+    #[tokio::test]
+    async fn a_store_winning_its_own_claim_consults_nothing_else() {
+        let reg = SourceRegistry::new();
+        let other = Arc::new(StubSource::new(&["PV:X"]));
+        reg.add_store("builtin", 0, Arc::new(StubSource::new(&["PV:X"]))).await;
+        reg.add_store("second", 5, other.clone()).await;
+        let before = other.claim_count();
+        reg.claim("PV:X").await;
+        assert_eq!(other.claim_count() - before, 0);
     }
 }
