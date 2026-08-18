@@ -77,6 +77,24 @@ async fn the_record_pv_is_unaffected_by_field_routing() {
     assert_eq!(scalar(&src.get("PV:A").await.expect("gettable")), ScalarValue::F64(5.0));
 }
 
+/// The IOC registers itself as a store, so `.ioc()` is one call instead of
+/// `.source("ioc", 0, …)` plus a second registration for `.FIELD`.
+#[tokio::test]
+async fn the_builder_registers_an_ioc_as_a_store() {
+    let ioc = std::sync::Arc::new(IocSource::from_db_str(DB).expect("loads"));
+    assert_eq!(
+        spvirit_server::pvstore::StoreSource::record_names(&*ioc),
+        vec!["PV:A".to_string()],
+        "record_names must be the sorted record list"
+    );
+    let server = spvirit_server::pva_server::PvaServer::builder()
+        .port(0)
+        .udp_port(0)
+        .ioc(ioc)
+        .build();
+    drop(server);
+}
+
 /// `claim` must not take a lock set. Proven by holding one: a claim issued
 /// while another task owns the record's lock set still answers.
 #[tokio::test]

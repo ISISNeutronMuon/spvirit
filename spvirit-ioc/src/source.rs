@@ -17,7 +17,7 @@ use spvirit_server::db::{DbRecord, load_db_records, parse_db_records};
 use spvirit_server::field_provider::{
     RecordFieldDesc, RecordFieldProvider, resolve_field_info, resolve_field_payload,
 };
-use spvirit_server::pvstore::{PvInfo, Source};
+use spvirit_server::pvstore::{PvInfo, Source, StoreSource};
 use spvirit_server::simple_store::descriptor_for_payload;
 use spvirit_types::{NtPayload, ScalarValue};
 use std::collections::HashMap;
@@ -288,5 +288,12 @@ impl Source for IocSource {
 
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
         Box::pin(async move { self.db.names() })
+    }
+}
+
+impl StoreSource for IocSource {
+    /// `RecordDb::names` is already sorted, which the trait requires.
+    fn record_names(&self) -> Vec<String> {
+        self.db.names()
     }
 }

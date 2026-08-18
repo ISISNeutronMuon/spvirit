@@ -33,7 +33,7 @@ use crate::db::{load_db, parse_db};
 use crate::handler::PvListMode;
 use crate::monitor::MonitorRegistry;
 use crate::pv::scalar_family_record_type;
-use crate::pvstore::{Source, SourceRegistry};
+use crate::pvstore::{Source, SourceRegistry, StoreSource};
 use crate::server::{PvaServerConfig, run_pva_server_with_registry};
 use crate::simple_store::{LinkDef, OnPutCallback, ScanCallback, SimplePvStore};
 use crate::types::{DbCommonState, OutputMode, RecordData, RecordInstance, RecordType};
@@ -56,6 +56,10 @@ pub struct PvaServerBuilder {
     scans: Vec<(String, Duration, ScanCallback)>,
     links: Vec<LinkDef>,
     extra_sources: Vec<(String, i32, Arc<dyn Source>)>,
+    /// The record store registered via [`PvaServerBuilder::ioc`], as the
+    /// names it owns (captured at registration so `build`'s disjointness
+    /// check can run synchronously) and the source itself.
+    ioc: Option<(Vec<String>, Arc<dyn Source>)>,
     tcp_port: u16,
     udp_port: u16,
     listen_ip: Option<IpAddr>,
@@ -79,6 +83,7 @@ impl PvaServerBuilder {
             scans: Vec::new(),
             links: Vec::new(),
             extra_sources: Vec::new(),
+            ioc: None,
             tcp_port: 5075,
             udp_port: 5076,
             listen_ip: None,
@@ -547,6 +552,32 @@ impl PvaServerBuilder {
         self
     }
 
+    /// Register a processing engine as a second *store*.
+    ///
+    /// Unlike [`PvaServerBuilder::source`], this asserts the engine owns its
+    /// record names outright: `build` panics if any of them collide with a
+    /// record added through [`PvaServerBuilder::record`], or if a `.scan`,
+    /// `.link` or `on_put` handler names one of them. Those callbacks drive
+    /// the builtin store's direct-write semantics and would be silently
+    /// inert against an engine record.
+    ///
+    /// Generic rather than `Arc<dyn StoreSource>` so the names can be read
+    /// before the value is erased to `Arc<dyn Source>`.
+    ///
+    /// # Panics
+    /// If called more than once.
+    pub fn ioc<S: StoreSource + 'static>(mut self, ioc: Arc<S>) -> Self {
+        assert!(
+            self.ioc.is_none(),
+            "PvaServerBuilder::ioc may only be called once; \
+             register additional engines with .source()"
+        );
+        let names = ioc.record_names();
+        let source: Arc<dyn Source> = ioc;
+        self.ioc = Some((names, source));
+        self
+    }
+
     // ─── Configuration ───────────────────────────────────────────────
 
     /// Set the TCP port (default 5075).
@@ -643,6 +674,7 @@ impl PvaServerBuilder {
         PvaServer {
             store,
             extra_sources: self.extra_sources,
+            ioc: self.ioc.map(|(_, source)| source),
             config,
             scans: self.scans,
             monitor_registry: Arc::new(std::sync::OnceLock::new()),
@@ -689,6 +721,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 pub struct PvaServer {
     store: Arc<SimplePvStore>,
     extra_sources: Vec<(String, i32, Arc<dyn Source>)>,
+    /// The engine registered via [`PvaServerBuilder::ioc`], if any.
+    ioc: Option<Arc<dyn Source>>,
     config: PvaServerConfig,
     scans: Vec<(String, Duration, ScanCallback)>,
     /// The monitor registry, lazily created on first access (by whichever
@@ -869,7 +903,14 @@ impl PvaServer {
 
         // Build the source registry with the built-in store at order 0.
         let sources = Arc::new(SourceRegistry::new());
-        sources.add("builtin", 0, self.store.clone()).await;
+        sources.add_store("builtin", 0, self.store.clone()).await;
+
+        if let Some(ioc) = &self.ioc {
+            // Order 5: after the builtin store, before `record-fields`, so
+            // the IOC's own `.FIELD` routing answers for its records and
+            // tier 2's field source answers for the builtin store's.
+            sources.add_store("ioc", 5, ioc.clone()).await;
+        }
 
         // IOC/QSRV-style record field access (<name>.<FIELD>, <FIELD>$) so
         // tools like the EPICS Archiver Appliance can fetch record metadata.

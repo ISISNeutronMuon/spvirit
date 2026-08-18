@@ -100,18 +100,38 @@ pub trait Source: Send + Sync {
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>>;
 }
 
+/// A source that owns a fixed, enumerable set of record names.
+///
+/// The distinction matters because the two tiers have different rules:
+/// **stores must be disjoint** — two stores claiming the same name is a
+/// configuration error caught at `build()` — while **sources may shadow**,
+/// which is a legitimate way to override a PV and only warrants a warning.
+/// `record_names` is synchronous because the disjointness check runs inside
+/// `PvaServerBuilder::build`, which is not async.
+///
+/// The returned list must be deterministic (sorted) so overlap diagnostics
+/// are stable between runs.
+pub trait StoreSource: Source {
+    fn record_names(&self) -> Vec<String>;
+}
+
 // ---------------------------------------------------------------------------
 // SourceEntry — one registered source with its priority
 // ---------------------------------------------------------------------------
 
 struct SourceEntry {
     /// Human-readable label for debugging / logging.
-    #[allow(dead_code)]
     label: String,
     /// Lower values are checked first.
     order: i32,
     /// The actual source implementation.
     source: Arc<dyn Source>,
+    /// True for entries registered via [`SourceRegistry::add_store`].
+    ///
+    /// Read by tests today; Task 6's disjointness check and Task 7's
+    /// shadow detection are the production consumers still to come.
+    #[allow(dead_code)]
+    is_store: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,20 +154,30 @@ impl SourceRegistry {
         }
     }
 
-    /// Register a new source at the given priority.
+    /// Register an ordinary source. Sources may shadow stores and each other.
     ///
     /// Lower `order` values are queried first.
     pub async fn add(&self, label: impl Into<String>, order: i32, source: Arc<dyn Source>) {
-        let label = label.into();
+        self.insert(label.into(), order, source, false).await;
+    }
+
+    /// Register a store — a source whose record set is fixed and must not
+    /// overlap another store's. See [`StoreSource`].
+    pub async fn add_store(&self, label: impl Into<String>, order: i32, source: Arc<dyn Source>) {
+        self.insert(label.into(), order, source, true).await;
+    }
+
+    async fn insert(&self, label: String, order: i32, source: Arc<dyn Source>, is_store: bool) {
         debug!(
-            "SourceRegistry: adding source '{}' at order {}",
-            label, order
+            "SourceRegistry: adding source '{}' at order {} (store: {})",
+            label, order, is_store
         );
         let mut sources = self.sources.write().await;
         sources.push(SourceEntry {
             label,
             order,
             source,
+            is_store,
         });
         sources.sort_by_key(|e| e.order);
     }
@@ -255,5 +285,93 @@ impl SourceRegistry {
 impl Default for SourceRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal [`Source`] over a fixed name list, for registry tests.
+    struct StubSource {
+        names: Vec<String>,
+    }
+
+    impl StubSource {
+        fn new(names: &[&str]) -> Self {
+            Self {
+                names: names.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+    }
+
+    impl Source for StubSource {
+        fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            let claimed = self.names.iter().any(|n| n == name);
+            Box::pin(async move {
+                claimed.then(|| PvInfo {
+                    descriptor: StructureDesc::default(),
+                    writable: true,
+                })
+            })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            let names = self.names.clone();
+            Box::pin(async move { names })
+        }
+    }
+
+    #[tokio::test]
+    async fn stores_are_recorded_as_stores_and_sources_are_not() {
+        let reg = SourceRegistry::new();
+        reg.add_store("builtin", 0, Arc::new(StubSource::new(&["A"]))).await;
+        reg.add("custom", 10, Arc::new(StubSource::new(&["B"]))).await;
+        let flags: Vec<(String, bool)> = reg
+            .sources
+            .read()
+            .await
+            .iter()
+            .map(|e| (e.label.clone(), e.is_store))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![("builtin".to_string(), true), ("custom".to_string(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_added_late_still_sorts_by_order() {
+        let reg = SourceRegistry::new();
+        reg.add("custom", 10, Arc::new(StubSource::new(&["B"]))).await;
+        reg.add_store("builtin", 0, Arc::new(StubSource::new(&["A"]))).await;
+        let labels: Vec<String> = reg
+            .sources
+            .read()
+            .await
+            .iter()
+            .map(|e| e.label.clone())
+            .collect();
+        assert_eq!(labels, vec!["builtin".to_string(), "custom".to_string()]);
     }
 }
