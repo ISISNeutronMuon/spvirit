@@ -265,10 +265,18 @@ pub(crate) fn fetch_link_value(
 /// the entry point a future client put (CA/PVA) or an output record's OUT
 /// write calls. Task 9's `output_body` is its first production caller.
 ///
-/// Note for Task 10: the `.VAL` branch below sets the field and clears UDF
-/// only — it does not touch `prev_val` or post any monitor. Monitor
-/// bookkeeping (comparing against `prev_val`/`MDEL`/`ADEL` and queuing the
-/// update) is Task 10's territory, not this one's.
+/// The `.VAL` branch reuses [`post_monitors`] rather than duplicating its
+/// MDEL/ADEL comparison. A raw field write is not itself a process pass, so
+/// nothing else would otherwise queue this record's monitor or advance its
+/// `prev_val`/`prev_archive_val` reference points — this mirrors Base's
+/// `dbPut`, which posts the field's monitor immediately on a direct write
+/// rather than waiting for the target to be processed. `alarm_changed` is
+/// always `false` here because a raw write cannot itself change the alarm
+/// state. When the caller (`output_body`) goes on to reprocess this record
+/// for a `PP` link, `record_body`'s own `post_monitors` call sees a
+/// `prev_val` that already reflects this write, so it only posts again if
+/// reprocessing produces a genuine alarm transition — the value change
+/// itself is not posted twice.
 pub(crate) fn write_field(
     set: &mut LockSetData,
     id: RecordId,
@@ -280,18 +288,19 @@ pub(crate) fn write_field(
         return process(set, id, ctx);
     }
     let kind = set.get(id).kind;
-    let r = set.get_mut(id);
     match field {
         Field::Val => {
+            let r = set.get_mut(id);
             r.val = value.coerce_to(kind);
             r.common.udf = false;
+            post_monitors(set, id, false, ctx);
         }
-        Field::Disa => r.common.disa = value.as_i32(),
-        Field::Disv => r.common.disv = value.as_i32(),
-        Field::Hihi => r.limits.hihi = value.as_f64(),
-        Field::High => r.limits.high = value.as_f64(),
-        Field::Low => r.limits.low = value.as_f64(),
-        Field::Lolo => r.limits.lolo = value.as_f64(),
+        Field::Disa => set.get_mut(id).common.disa = value.as_i32(),
+        Field::Disv => set.get_mut(id).common.disv = value.as_i32(),
+        Field::Hihi => set.get_mut(id).limits.hihi = value.as_f64(),
+        Field::High => set.get_mut(id).limits.high = value.as_f64(),
+        Field::Low => set.get_mut(id).limits.low = value.as_f64(),
+        Field::Lolo => set.get_mut(id).limits.lolo = value.as_f64(),
         // SEVR and STAT are engine-owned outputs, not client inputs.
         Field::Sevr | Field::Stat => {}
         Field::Proc => unreachable!("handled above"),
@@ -1630,6 +1639,92 @@ mod tests {
         d.with_set(o.set, |set| {
             process(set, o, &mut ctx).expect("process succeeds");
             assert_eq!(set.get(t).val.as_f64(), 4.0, "OUT must write the target");
+        });
+    }
+
+    #[test]
+    fn an_npp_out_write_posts_a_monitor_naming_the_target() {
+        // OUT with no PP suffix is NPP (the default link mode). Nothing
+        // reprocesses PV:T, so if write_field doesn't post the monitor
+        // itself, no subscriber ever hears about the change -- this is
+        // Finding 1's core bug.
+        let d = db("record(ao, \"PV:O\") {\n    field(VAL, \"4\")\n\
+                    field(OUT, \"PV:T.VAL\")\n}\n\
+                    record(ai, \"PV:T\") {\n}\n");
+        let o = d.lookup("PV:O").expect("PV:O exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(o.set, |set| {
+            process(set, o, &mut ctx).expect("process succeeds");
+        });
+        let names = event_names(&mut ctx);
+        assert!(
+            names.contains(&"PV:T".to_string()),
+            "the NPP OUT write must post a monitor naming the target, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn an_npp_out_write_advances_the_targets_prev_val_for_the_next_mdel_check() {
+        // PV:T has MDEL = 10. The first OUT write moves it 0 -> 15, which
+        // is past MDEL, so it posts and (per post_monitors' existing
+        // contract) advances prev_val to 15. If write_field left prev_val
+        // stale at 0.0 instead (Finding 1's bug), a second write moving
+        // PV:T from 15 to 20 -- only a 5-unit move from the correct
+        // reference, well inside MDEL -- would instead be measured from the
+        // stale 0.0 reference as a 20-unit move and wrongly posted.
+        let d = db("record(ao, \"PV:O\") {\n    field(VAL, \"15\")\n\
+                    field(OUT, \"PV:T.VAL\")\n}\n\
+                    record(ai, \"PV:T\") {\n    field(MDEL, \"10\")\n}\n");
+        let o = d.lookup("PV:O").expect("PV:O exists");
+        let t = d.lookup("PV:T").expect("PV:T exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(o.set, |set| {
+            process(set, o, &mut ctx).expect("process succeeds");
+            assert_eq!(
+                set.get(t).prev_val.as_f64(),
+                15.0,
+                "a past-MDEL write must advance PV:T's prev_val, not leave it stale"
+            );
+        });
+        let _ = ctx.take_events();
+        // A second OUT write moving PV:T from 15 to 20 is only a 5-unit
+        // move from the correctly-advanced reference, inside MDEL's 10, so
+        // it must be suppressed.
+        d.with_set(o.set, |set| {
+            set.get_mut(o).val = Value::Double(20.0);
+            process(set, o, &mut ctx).expect("process succeeds");
+        });
+        let names = event_names(&mut ctx);
+        assert!(
+            !names.contains(&"PV:T".to_string()),
+            "a sub-MDEL move from the correctly-advanced prev_val must be suppressed, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_pp_out_write_posts_exactly_once() {
+        // OUT with PP: output_body calls write_field (which posts the
+        // target's monitor itself under Finding 1's fix) and then
+        // reprocesses the target because process_passive is set. The
+        // target's own process() must not repost the same value change --
+        // only one monitor should reach the subscriber for one write.
+        let d = db("record(ao, \"PV:O\") {\n    field(VAL, \"4\")\n\
+                    field(OUT, \"PV:T.VAL PP\")\n}\n\
+                    record(ai, \"PV:T\") {\n}\n");
+        let o = d.lookup("PV:O").expect("PV:O exists");
+        let t = d.lookup("PV:T").expect("PV:T exists");
+        let mut ctx = ProcCtx::new();
+        d.with_set(o.set, |set| {
+            process(set, o, &mut ctx).expect("process succeeds");
+        });
+        let names = event_names(&mut ctx);
+        let target_posts = names.iter().filter(|n| *n == "PV:T").count();
+        assert_eq!(
+            target_posts, 1,
+            "a PP OUT write must post exactly one monitor for the target, got {names:?}"
+        );
+        d.with_set(o.set, |set| {
+            assert_eq!(set.get(t).prev_val.as_f64(), 4.0);
         });
     }
 
