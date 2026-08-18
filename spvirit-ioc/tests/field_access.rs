@@ -119,3 +119,21 @@ async fn claiming_a_field_does_not_take_the_records_lock_set() {
     assert!(!claimed.writable);
     holder.join().expect("holder thread");
 }
+
+/// Tier 3 answers the same `.FIELD` script as tiers 1 and 2: known fields
+/// from the model, unknown-but-real fields from dbCommon, invented fields
+/// not at all.
+#[tokio::test]
+async fn the_ioc_matches_the_field_contract_the_other_tiers_serve() {
+    let src = IocSource::from_db_str(DB).expect("loads");
+    assert_eq!(
+        src.get("PV:A.DESC").await.map(|p| scalar(&p)),
+        Some(ScalarValue::Str("a sample".into()))
+    );
+    assert_eq!(
+        src.get("PV:A.PRIO").await.map(|p| scalar(&p)),
+        Some(ScalarValue::Str("LOW".into())),
+        "a field the engine does not model still reads as its dbCommon default"
+    );
+    assert!(src.get("PV:A.NOTAFIELD").await.is_none());
+}
