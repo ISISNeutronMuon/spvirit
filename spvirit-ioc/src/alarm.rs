@@ -25,6 +25,16 @@ impl Severity {
             false
         }
     }
+
+    /// The EPICS `menuAlarmSevr` entry, as `SEVR` reports it to a client.
+    pub fn epics_string(self) -> &'static str {
+        match self {
+            Severity::NoAlarm => "NO_ALARM",
+            Severity::Minor => "MINOR",
+            Severity::Major => "MAJOR",
+            Severity::Invalid => "INVALID",
+        }
+    }
 }
 
 /// EPICS `epicsAlarmCondition`, in the canonical `alarmString` order.
@@ -167,6 +177,14 @@ pub fn to_nt_alarm(sev: Severity, cond: Condition) -> (i32, i32, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn severity_renders_the_epics_menu_strings() {
+        assert_eq!(Severity::NoAlarm.epics_string(), "NO_ALARM");
+        assert_eq!(Severity::Minor.epics_string(), "MINOR");
+        assert_eq!(Severity::Major.epics_string(), "MAJOR");
+        assert_eq!(Severity::Invalid.epics_string(), "INVALID");
+    }
 
     #[test]
     fn severity_raises_but_never_lowers() {
