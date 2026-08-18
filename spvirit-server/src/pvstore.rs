@@ -474,4 +474,57 @@ mod tests {
         reg.claim("PV:X").await;
         assert_eq!(other.claim_count() - before, 0);
     }
+
+    /// An `io::Write` sink over a shared buffer, for capturing `tracing`
+    /// output during a test. Only ever touched synchronously by the
+    /// subscriber's own formatting call — never held across an `.await`.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The counter-based tests above prove the shadow check runs at most
+    /// once per name, but they infer "warned" from how many times the
+    /// store's `claim` ran — which can't tell a real warning apart from a
+    /// silent scan. This test observes the actual `tracing::warn!` event.
+    #[tokio::test]
+    async fn the_shadow_warning_is_emitted_once_not_just_counted() {
+        let buffer = CaptureWriter::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let reg = SourceRegistry::new();
+        reg.add("override", -1, Arc::new(StubSource::new(&["PV:X"]))).await;
+        reg.add_store("builtin", 0, Arc::new(StubSource::new(&["PV:X"]))).await;
+
+        reg.claim("PV:X").await;
+        reg.claim("PV:X").await;
+
+        let captured = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        let warnings: Vec<&str> = captured.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning event, got: {captured:?}"
+        );
+        assert!(warnings[0].contains("PV:X"), "missing PV name: {captured:?}");
+        assert!(warnings[0].contains("override"), "missing source label: {captured:?}");
+        assert!(warnings[0].contains("builtin"), "missing store label: {captured:?}");
+    }
 }

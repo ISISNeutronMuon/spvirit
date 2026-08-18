@@ -1254,6 +1254,7 @@ dependencies = [
  "spvirit-types",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
