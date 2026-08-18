@@ -50,7 +50,7 @@ class MySource:
 Two differences from Rust worth knowing up front. `on_start` has no Rust
 counterpart — it is how a Python source gets the `Notifier` it needs to push
 monitor updates. And `subscribe` is *not* part of the Python protocol: define
-it and it is ignored (`spvirit-py/src/source.rs:535`). Monitors are driven by
+it and it is ignored (`spvirit-py/src/source.rs:702`). Monitors are driven by
 `notifier.notify(name, payload)` instead.
 
 `on_start` fires at server start (`start()`/`start_background()`/`run()`),

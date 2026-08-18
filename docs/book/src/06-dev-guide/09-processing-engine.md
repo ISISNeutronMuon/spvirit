@@ -12,22 +12,59 @@ use std::sync::Arc;
 use spvirit_ioc::IocSource;
 use spvirit_server::PvaServer;
 
-let ioc = IocSource::from_db_file("plant.db")?;
+let ioc = Arc::new(IocSource::from_db_file("plant.db")?);
 for line in ioc.graph().report() {
     eprintln!("{line}");
 }
 let server = PvaServer::builder()
-    .source("ioc", 0, Arc::new(ioc))
+    .ai("PV:DIRECT", 0.0)
+    .ioc(ioc.clone())
     .build();
 # let _ = server;
 # Ok(())
 # }
 ```
 
-`spvirit-ioc` depends on `spvirit-server`, so it cannot add a method to
-`PvaServerBuilder` (`PvaServer::builder()`'s return type). Register it
-through `source()` like any other source; the `order` argument decides
-which source answers a name first when several could.
+`spvirit-ioc` depends on `spvirit-server`, never the reverse, so the engine
+cannot reach into the builder. The seam is the other way round:
+`spvirit-server` declares the `StoreSource` trait and the
+`PvaServerBuilder::ioc` method, and the engine implements the trait. That
+also lets the builder check at construction time that the engine's records
+and the builtin store's do not overlap — see
+[Two stores, one server](#two-stores-one-server) below.
+
+Registering through `.ioc()` rather than `.source()` is what makes
+`<record>.<FIELD>` resolve for engine records and what enables the
+disjointness check. A `.source()` registration still works and is the right
+call for anything that is not a record store.
+
+## Two stores, one server
+
+A `PvaServer` can carry two independent record stores at once: the builtin
+store (`.ai()`, `.ao()`, `.db_file()` and friends) and, optionally, an
+engine registered through `.ioc()`. Three rules govern how they and any
+other sources interact:
+
+- **The two stores must be disjoint.** `build()` panics, naming every
+  colliding record, if the builtin store and the engine store both claim
+  the same name. A `.scan`, `.link`, or `on_put` callback that names an
+  engine record is the same class of mistake — those callbacks drive the
+  builtin store's direct-write semantics and would never fire against an
+  engine record — so `build()` panics on those too.
+- **Ordinary sources may legally shadow either store.** A source registered
+  with `.source()` ahead of a store in resolution order can override one of
+  its PVs on purpose; the registry logs a warning the first time a client
+  searches for the shadowed name, but does not fail. This is the difference
+  between the two tiers: stores are static, enumerable, and must be
+  disjoint from each other; sources are dynamic, ordered, and may legally
+  shadow.
+- **Field PVs follow the winning store.** `<record>.<FIELD>` resolves
+  through whichever store claims `<record>`, so a client cannot tell which
+  store served a PV except by the differences documented in the A2 spec's
+  "Deviations" section.
+
+Registration order is builtin at 0, the engine (if any) at 5, and the
+`record-fields` tier-2 field source at 10.
 
 ## What it processes
 
