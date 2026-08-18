@@ -190,14 +190,17 @@ pub fn field_value(record: &RecordInstance, field: &str) -> Option<ScalarValue> 
     dbcommon_default(field).map(|(kind, default)| typed_value(kind, default))
 }
 
-/// Build the wire payload for a resolved field reference.
+/// Wrap a resolved field value as a wire payload.
 ///
 /// Regular fields are served as an NTScalar; the `$` long-string form is
 /// served as an NTScalarArray of Int8 holding the UTF-8 bytes (QSRV
-/// long-string semantics). `$` on a non-string field resolves to `None`.
-pub fn payload_for(record: &RecordInstance, field_ref: &FieldRef) -> Option<NtPayload> {
-    let value = field_value(record, &field_ref.field)?;
-    if field_ref.long_string {
+/// long-string semantics). `$` on a non-string value resolves to `None`.
+///
+/// Both the record-level [`payload_for`] and the provider-level
+/// `resolve_field_payload` go through here, so the two stores cannot drift
+/// in how they wrap.
+pub fn payload_for_value(value: ScalarValue, desc: &str, long_string: bool) -> Option<NtPayload> {
+    if long_string {
         let ScalarValue::Str(s) = value else {
             return None;
         };
@@ -207,8 +210,14 @@ pub fn payload_for(record: &RecordInstance, field_ref: &FieldRef) -> Option<NtPa
         )));
     }
     let mut nt = NtScalar::from_value(value);
-    nt.display_description = record.common.desc.clone();
+    nt.display_description = desc.to_string();
     Some(NtPayload::Scalar(nt))
+}
+
+/// Build the wire payload for a resolved field reference on a record.
+pub fn payload_for(record: &RecordInstance, field_ref: &FieldRef) -> Option<NtPayload> {
+    let value = field_value(record, &field_ref.field)?;
+    payload_for_value(value, &record.common.desc, field_ref.long_string)
 }
 
 /// A read-only [`Source`] serving `<pvname>.<FIELD>` channels derived from
@@ -463,5 +472,30 @@ record(ao, "SIM:AO") {
         }
         // Channel stays open (sender retained) — no immediate close.
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn payload_for_value_wraps_a_scalar_with_its_description() {
+        let p = payload_for_value(ScalarValue::F64(2.34), "A test output", false)
+            .expect("scalars always wrap");
+        match p {
+            NtPayload::Scalar(nt) => {
+                assert_eq!(nt.value, ScalarValue::F64(2.34));
+                assert_eq!(nt.display_description, "A test output");
+            }
+            other => panic!("expected scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payload_for_value_long_string_needs_a_string() {
+        assert!(payload_for_value(ScalarValue::F64(1.0), "", true).is_none());
+        let p = payload_for_value(ScalarValue::Str("hi".into()), "", true).expect("string wraps");
+        match p {
+            NtPayload::ScalarArray(arr) => {
+                assert_eq!(arr.value, ScalarArrayValue::I8(vec![104, 105]));
+            }
+            other => panic!("expected scalar array, got {other:?}"),
+        }
     }
 }
