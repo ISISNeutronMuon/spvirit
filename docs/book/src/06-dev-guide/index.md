@@ -26,6 +26,7 @@ a landing page that points here.
 | 06 | [Testing Guide](06-testing.md) | Before writing tests; how to run the interop suites |
 | 07 | [Build, CI, and Release](07-build-ci-release.md) | Before releasing anything; repo conventions |
 | 08 | [Current State & Roadmap](08-current-state.md) | **First**, if you're picking up work — uncommitted changes, the in-flight Python value-types plan, known-gaps triage list |
+| 09 | [The record-processing engine](09-processing-engine.md) | Before touching `spvirit-ioc`: lock sets, load-time diagnostics, and what sub-projects B, C and D still owe |
 
 ## Day-one checklist
 

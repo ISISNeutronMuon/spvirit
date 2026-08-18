@@ -1,0 +1,22 @@
+[package]
+name = "spvirit-ioc"
+version.workspace = true
+edition = "2024"
+description = "Synchronous EPICS record-processing engine"
+license = "BSD-3-Clause"
+repository = "https://github.com/ISISNeutronMuon/spvirit"
+readme = "../README.md"
+keywords = ["epics", "ioc", "records"]
+categories = ["science"]
+authors = ["Mateusz Leputa for ISIS Neutron and Muon Source Copyright 2026"]
+
+[dependencies]
+spvirit-types = { workspace = true }
+spvirit-codec = { workspace = true }
+spvirit-server = { workspace = true }
+tracing = "0.1.41"
+tokio = { version = "1.47.1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "time"] }

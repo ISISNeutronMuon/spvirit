@@ -1,0 +1,188 @@
+//! The engine as the server sees it: a `Source` that answers gets, accepts
+//! puts, and returns the monitors a put caused.
+
+use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_ioc::IocSource;
+use spvirit_server::pvstore::Source;
+use spvirit_types::{NtPayload, ScalarValue};
+
+const CHAIN: &str = "\
+record(ao, \"PV:SET\") {
+    field(OUT, \"PV:MID.VAL\")
+    field(FLNK, \"PV:MID\")
+}
+record(ai, \"PV:MID\") {
+    field(INP, \"PV:MID.VAL NPP\")
+    field(FLNK, \"PV:OUT\")
+}
+record(ai, \"PV:OUT\") {
+    field(INP, \"PV:MID PP\")
+}
+";
+
+fn source() -> IocSource {
+    IocSource::from_db_str(CHAIN).expect("the chain database loads")
+}
+
+fn double(v: f64) -> DecodedValue {
+    DecodedValue::Float64(v)
+}
+
+fn scalar_of(payload: &NtPayload) -> f64 {
+    match payload {
+        NtPayload::Scalar(s) => match s.value {
+            ScalarValue::F64(v) => v,
+            ScalarValue::I32(v) => v as f64,
+            ScalarValue::U16(v) => v as f64,
+            ref other => panic!("unexpected scalar type {other:?}"),
+        },
+        other => panic!("expected a scalar payload, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn every_record_is_claimable_and_gettable() {
+    let src = source();
+    let names = src.names().await;
+    assert_eq!(names.len(), 3, "got {names:?}");
+    for name in &names {
+        let info = src
+            .claim(name)
+            .await
+            .unwrap_or_else(|| panic!("{name} must be claimable"));
+        assert!(info.writable, "records accept puts");
+        assert!(src.get(name).await.is_some(), "{name} must answer a get");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_pv_is_not_claimed() {
+    let src = source();
+    assert!(src.claim("PV:NOPE").await.is_none());
+    assert!(src.get("PV:NOPE").await.is_none());
+}
+
+#[tokio::test]
+async fn a_put_propagates_along_the_chain_and_returns_every_monitor() {
+    let src = source();
+    let events = src.put("PV:SET", &double(7.0)).await.expect("put succeeds");
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["PV:SET", "PV:MID", "PV:OUT"],
+        "the put must return every monitor the pass produced, in order"
+    );
+    for (name, payload) in &events {
+        assert_eq!(
+            scalar_of(payload),
+            7.0,
+            "{name} must carry the written value"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_subscriber_receives_the_monitors_a_later_put_causes() {
+    let src = source();
+    let mut rx = src
+        .subscribe("PV:OUT")
+        .await
+        .expect("PV:OUT is subscribable");
+    src.put("PV:SET", &double(3.0)).await.expect("put succeeds");
+    let payload = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a monitor must arrive within 5s")
+        .expect("the channel must stay open");
+    assert_eq!(scalar_of(&payload), 3.0);
+}
+
+#[tokio::test]
+async fn a_put_to_an_unknown_pv_is_an_error_naming_it() {
+    let src = source();
+    let err = src
+        .put("PV:NOPE", &double(1.0))
+        .await
+        .expect_err("unknown PVs are errors");
+    assert!(err.contains("PV:NOPE"), "got {err}");
+}
+
+/// Two singleton lock sets. This alone only rules out *alphabetical* order —
+/// with two singletons, lock-set id is assigned in the same order as
+/// definition order, so it cannot tell "definition order" apart from
+/// "ascending lock-set order". Kept alongside the three-record fixture below,
+/// which does separate the two.
+#[tokio::test]
+async fn pini_records_process_at_startup_in_definition_order() {
+    let src = IocSource::from_db_str(
+        "record(ai, \"PV:SECOND\") {\n    field(PINI, \"YES\")\n    field(INP, \"2\")\n}\n\
+         record(ai, \"PV:FIRST\") {\n    field(PINI, \"YES\")\n    field(INP, \"1\")\n}\n",
+    )
+    .expect("load");
+    let events = src.process_pini();
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["PV:SECOND", "PV:FIRST"],
+        "PINI order is the .db definition order, not alphabetical"
+    );
+}
+
+/// PV:FIRST and PV:THIRD share a lock set (PV:THIRD's INP names PV:FIRST,
+/// with NPP so the link doesn't cascade PV:FIRST's own processing), while
+/// PV:SECOND — defined between them — is a singleton in its own set.
+///
+/// `RecordDb::build` assigns lock-set ids in ascending order of each group's
+/// lowest original index, so the {PV:FIRST, PV:THIRD} group gets set 0 (its
+/// lowest index is 0) and {PV:SECOND} gets set 1. That makes ascending
+/// lock-set traversal (set 0's members, then set 1's) visit
+/// PV:FIRST, PV:THIRD, PV:SECOND — a different order from the `.db`
+/// definition order (PV:FIRST, PV:SECOND, PV:THIRD). Only the latter is
+/// correct PINI behaviour, so this fixture actually distinguishes the two
+/// traversals, unlike the two-singleton case above.
+#[tokio::test]
+async fn pini_definition_order_differs_from_lock_set_traversal_order() {
+    let src = IocSource::from_db_str(
+        "record(ai, \"PV:FIRST\") {\n    field(PINI, \"YES\")\n    field(INP, \"1\")\n}\n\
+         record(ai, \"PV:SECOND\") {\n    field(PINI, \"YES\")\n    field(INP, \"2\")\n}\n\
+         record(ai, \"PV:THIRD\") {\n    field(PINI, \"YES\")\n    field(INP, \"PV:FIRST NPP\")\n}\n",
+    )
+    .expect("load");
+    let events = src.process_pini();
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["PV:FIRST", "PV:SECOND", "PV:THIRD"],
+        "PINI order must be .db definition order, not ascending lock-set traversal order \
+         (which would yield PV:FIRST, PV:THIRD, PV:SECOND here)"
+    );
+}
+
+/// A put to a record whose `INP` names another record produces two monitors:
+/// the raw written value, then the value processing recomputes from the link.
+/// EPICS Base does the same — `dbPut` posts the field write before
+/// `dbProcess` runs — so the intermediate value reaches subscribers there
+/// too. This pins the sequence so the behaviour cannot change silently.
+#[tokio::test]
+async fn a_put_to_a_linked_input_posts_the_written_value_then_the_linked_one() {
+    const LINKED: &str = "record(ai, \"PV:SRC\") {
+    field(INP, \"99\")
+}
+record(ai, \"PV:DST\") {
+    field(INP, \"PV:SRC NPP\")
+}
+";
+    let src = IocSource::from_db_str(LINKED).expect("the linked database loads");
+    let events = src
+        .put("PV:DST", &double(1.0))
+        .await
+        .expect("the put succeeds");
+    let seen: Vec<(String, f64)> = events
+        .iter()
+        .map(|(name, payload)| (name.clone(), scalar_of(payload)))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![("PV:DST".to_string(), 1.0), ("PV:DST".to_string(), 99.0),],
+        "the written value must be posted before the value the INP link recomputes"
+    );
+}
