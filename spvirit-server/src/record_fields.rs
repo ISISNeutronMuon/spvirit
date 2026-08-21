@@ -114,6 +114,97 @@ pub fn dbcommon_default_value(field: &str) -> Option<ScalarValue> {
     dbcommon_default(field).map(|(kind, default)| typed_value(kind, default))
 }
 
+/// The record fields whose value is a link, and which therefore render
+/// through [`render_link_text`] rather than as the raw `.db` text.
+///
+/// Shared so that a store holding raw `.db` strings and a store holding a
+/// parsed link model cannot disagree about which fields are links.
+pub const LINK_FIELDS: &[&str] = &["INP", "OUT", "DOL", "SDIS", "FLNK"];
+
+/// Whether `field` is one of [`LINK_FIELDS`].
+pub fn is_link_field(field: &str) -> bool {
+    LINK_FIELDS.contains(&field)
+}
+
+/// Render a link the way EPICS Base prints one: the target, an optional
+/// `.FIELD`, then both modifiers, however terse the `.db` was.
+///
+/// Base stores a link's modifiers as a bit mask and re-renders them from it
+/// (`dbGetString`'s `DBF_INLINK` arm), so `field(INP, "PV:B PP")` reads back
+/// as `PV:B PP NMS` — the modifiers are always both present and always
+/// spelled out. The target, by contrast, Base prints verbatim from
+/// `pv_link.pvname`: it never *adds* a `.VAL` the `.db` did not write.
+/// `field` is therefore `None` for a link that addresses the record itself.
+///
+/// Every tier renders links through this one function, so a client cannot
+/// tell tier 1 (`SimplePvStore`, raw `.db` strings) from tier 2
+/// (`spvirit_ioc::IocSource`, a parsed link model) by reading `.INP`.
+pub fn render_link_text(
+    target: &str,
+    field: Option<&str>,
+    process_passive: bool,
+    maximize_severity: bool,
+) -> String {
+    let mut s = target.to_string();
+    if let Some(field) = field {
+        s.push('.');
+        s.push_str(field);
+    }
+    s.push(' ');
+    s.push_str(if process_passive { "PP" } else { "NPP" });
+    s.push(' ');
+    s.push_str(if maximize_severity { "MS" } else { "NMS" });
+    s
+}
+
+/// Re-render the raw `.db` text of a link field in [`render_link_text`]'s
+/// canonical form.
+///
+/// `forward` marks a forward link (`FLNK`), whose target field is dropped:
+/// Base's bare-`FLNK` semantics are "process the target record", not "read
+/// one of its fields", and the engine's `forward_link` discards the field
+/// too.
+///
+/// `None` when `raw` is not a database link — a constant, an empty field, or
+/// a link carrying a modifier this codebase does not model (`CP`/`CPP`,
+/// which `spvirit-ioc`'s loader rejects outright). The caller then serves
+/// the raw text unchanged, which is all it can honestly say.
+pub fn canonical_link_text(raw: &str, forward: bool) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.parse::<f64>().is_ok() {
+        return None;
+    }
+    let mut parts = raw.split_whitespace();
+    let target_spec = parts.next()?;
+    let mut process_passive = false;
+    let mut maximize_severity = false;
+    for modifier in parts {
+        // MSS/MSI are severity refinements the engine folds into MS; this
+        // mirrors `spvirit_ioc::build::link` so the two agree on the mask.
+        match modifier.to_ascii_uppercase().as_str() {
+            "PP" => process_passive = true,
+            "NPP" => process_passive = false,
+            "MS" | "MSS" | "MSI" => maximize_severity = true,
+            "NMS" => maximize_severity = false,
+            _ => return None,
+        }
+    }
+    // Split on the *first* dot, as `spvirit_ioc::build::link` does.
+    let (target, field) = match target_spec.split_once('.') {
+        Some((t, f)) if !t.is_empty() && !f.is_empty() => (t, Some(f)),
+        _ => (target_spec, None),
+    };
+    // `.VAL` is the implied field and is never printed: the parsed model on
+    // the other tier cannot tell "PV:B" from "PV:B.VAL", so neither may this.
+    let field = field.filter(|f| !forward && !f.eq_ignore_ascii_case("VAL"));
+    Some(render_link_text(
+        target,
+        field,
+        process_passive,
+        maximize_severity,
+    ))
+}
+
 /// The `.db` record-type name for a [`RecordType`] (what `RTYP` reports).
 pub fn record_type_name(rt: &RecordType) -> &'static str {
     match rt {
@@ -190,6 +281,14 @@ pub fn field_value(record: &RecordInstance, field: &str) -> Option<ScalarValue> 
 
     let kind = dbcommon_default(field).map(|(kind, _)| kind);
     if let Some(raw) = record.raw_fields.get(field) {
+        // Link fields are canonicalised rather than echoed, so that this
+        // store and a store holding a parsed link model serve the same text
+        // for the same `.db` — see `canonical_link_text`.
+        if is_link_field(field)
+            && let Some(rendered) = canonical_link_text(raw, field == "FLNK")
+        {
+            return Some(ScalarValue::Str(rendered));
+        }
         return Some(typed_value(kind.unwrap_or(FieldKind::Str), raw));
     }
     if field == "DESC" {
@@ -500,5 +599,82 @@ record(ao, "SIM:AO") {
             }
             other => panic!("expected scalar array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_terse_link_renders_with_both_modifiers_spelled_out() {
+        assert_eq!(
+            canonical_link_text("PV:B PP", false).as_deref(),
+            Some("PV:B PP NMS")
+        );
+        assert_eq!(
+            canonical_link_text("  PV:B   MS  ", false).as_deref(),
+            Some("PV:B NPP MS")
+        );
+        assert_eq!(
+            canonical_link_text("PV:B", false).as_deref(),
+            Some("PV:B NPP NMS")
+        );
+    }
+
+    /// The implied `.VAL` is never printed, and the explicit one is dropped
+    /// to match: the parsed link model on the IOC tier cannot tell the two
+    /// apart, so neither may this one.
+    #[test]
+    fn the_implied_val_field_is_never_printed() {
+        assert_eq!(
+            canonical_link_text("PV:B.VAL PP", false).as_deref(),
+            Some("PV:B PP NMS")
+        );
+        assert_eq!(
+            canonical_link_text("PV:B.SEVR", false).as_deref(),
+            Some("PV:B.SEVR NPP NMS")
+        );
+    }
+
+    /// A forward link addresses a record, not a field.
+    #[test]
+    fn a_forward_link_drops_its_field() {
+        assert_eq!(
+            canonical_link_text("PV:B.PROC", true).as_deref(),
+            Some("PV:B NPP NMS")
+        );
+    }
+
+    /// Anything that is not a database link is left to the caller to serve
+    /// as-is: there is nothing honest to canonicalise it into.
+    #[test]
+    fn constants_and_unmodelled_modifiers_do_not_canonicalise() {
+        assert_eq!(canonical_link_text("7", false), None);
+        assert_eq!(canonical_link_text("-1.5", false), None);
+        assert_eq!(canonical_link_text("   ", false), None);
+        assert_eq!(canonical_link_text("PV:B CPP", false), None);
+    }
+
+    #[test]
+    fn link_fields_render_canonically_out_of_the_raw_db() {
+        let recs = crate::db::parse_db(
+            r#"
+record(ai, "PV:A") {
+    field(INP, "PV:B PP")
+    field(FLNK, "PV:B")
+    field(EGU, "mm")
+}"#,
+        )
+        .expect("parse");
+        let record = recs.get("PV:A").expect("record present");
+        assert_eq!(
+            field_value(record, "INP"),
+            Some(ScalarValue::Str("PV:B PP NMS".into()))
+        );
+        assert_eq!(
+            field_value(record, "FLNK"),
+            Some(ScalarValue::Str("PV:B NPP NMS".into()))
+        );
+        // A non-link field is still served verbatim.
+        assert_eq!(
+            field_value(record, "EGU"),
+            Some(ScalarValue::Str("mm".into()))
+        );
     }
 }

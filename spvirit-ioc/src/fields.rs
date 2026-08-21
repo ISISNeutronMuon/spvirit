@@ -12,7 +12,9 @@
 //! the get then contradicts.
 
 use crate::model::{Kind, Link, Omsl, Record, Value};
-use spvirit_server::record_fields::{FieldKind, dbcommon_default, dbcommon_default_value};
+use spvirit_server::record_fields::{
+    FieldKind, dbcommon_default, dbcommon_default_value, render_link_text,
+};
 use spvirit_types::ScalarValue;
 
 /// Every field the IOC serves from its own model, in a fixed order.
@@ -32,13 +34,25 @@ pub const IOC_FIELDS: &[&str] = &[
 /// a closure over the name map it builds at load time — no lock set needed.
 pub type TargetNames<'a> = &'a dyn Fn(&crate::lockset::RecordId) -> Option<String>;
 
-/// Render a link field the way `dbpr` prints it: target, field, and both
-/// modifiers, however terse the `.db` was.
+/// Render a link field the way EPICS Base prints it: target, an optional
+/// field, and both modifiers, however terse the `.db` was.
+///
+/// The actual formatting lives in [`render_link_text`], which
+/// `SimplePvStore` renders through as well: the two stores must serve the
+/// same text for the same `.db` or a client can tell the tiers apart by
+/// reading `.INP`. That means, in particular, no synthesized `.VAL` — Base
+/// prints a link's target verbatim and never adds the implied field, and
+/// this crate's parsed [`Link`] cannot distinguish `PV:B` from `PV:B.VAL`
+/// anyway.
+///
+/// `forward` marks a forward link (`FLNK`), whose field is dropped entirely:
+/// a bare `FLNK` means "process the target", not "read a field", and
+/// `process::forward_link` ignores the field too.
 ///
 /// [`Link`] has no `Display` impl and deliberately so: this is the only place
 /// that needs a textual form, and the form is a wire value rather than a
 /// diagnostic.
-pub fn render_link(link: &Link, names: TargetNames) -> String {
+pub fn render_link(link: &Link, names: TargetNames, forward: bool) -> String {
     match link {
         Link::Constant(Value::Double(v)) => format!("{v}"),
         Link::Constant(Value::Long(v)) => format!("{v}"),
@@ -56,20 +70,9 @@ pub fn render_link(link: &Link, names: TargetNames) -> String {
                     names(id).unwrap_or_else(|| "<unresolved>".to_string())
                 }
             };
-            let mut s = name;
-            s.push('.');
-            s.push_str(&format!("{field:?}").to_ascii_uppercase());
-            if *process_passive {
-                s.push_str(" PP");
-            } else {
-                s.push_str(" NPP");
-            }
-            if *maximize_severity {
-                s.push_str(" MS");
-            } else {
-                s.push_str(" NMS");
-            }
-            s
+            let field = format!("{field:?}").to_ascii_uppercase();
+            let field = (!forward && field != "VAL").then_some(field.as_str());
+            render_link_text(&name, field, *process_passive, *maximize_severity)
         }
     }
 }
@@ -78,7 +81,7 @@ pub fn render_link(link: &Link, names: TargetNames) -> String {
 ///
 /// `names` names the targets of `record`'s own db links — see
 /// [`TargetNames`]. The IOC's own model is consulted first, then
-/// [`dbcommon_default_value`] — the same fallback tier 2 uses — then `None`.
+/// [`dbcommon_default_value`] — the same fallback tier 1 uses — then `None`.
 pub fn record_field_value(record: &Record, field: &str, names: TargetNames) -> Option<ScalarValue> {
     let s = |v: &str| Some(ScalarValue::Str(v.to_string()));
     let i = |v: i32| Some(ScalarValue::I32(v));
@@ -103,11 +106,11 @@ pub fn record_field_value(record: &Record, field: &str, names: TargetNames) -> O
         "DISA" => i(c.disa),
         "DISV" => i(c.disv),
         "DISS" => s(c.diss.epics_string()),
-        "SDIS" => s(&render_link(&c.sdis, names)),
-        "FLNK" => s(&render_link(&c.flnk, names)),
-        "INP" => s(&render_link(&record.inp, names)),
-        "OUT" => s(&render_link(&record.out, names)),
-        "DOL" => s(&render_link(&record.dol, names)),
+        "SDIS" => s(&render_link(&c.sdis, names, false)),
+        "FLNK" => s(&render_link(&c.flnk, names, true)),
+        "INP" => s(&render_link(&record.inp, names, false)),
+        "OUT" => s(&render_link(&record.out, names, false)),
+        "DOL" => s(&render_link(&record.dol, names, false)),
         "OMSL" => s(match record.omsl {
             Omsl::Supervisory => "supervisory",
             Omsl::ClosedLoop => "closed_loop",
@@ -223,21 +226,34 @@ mod tests {
         assert_eq!(value(&r, "VAL"), Some(ScalarValue::F64(0.0)));
     }
 
-    /// `dbpr` prints links fully expanded — target, field, and both
-    /// modifiers — regardless of how terse the `.db` was.
+    /// Base prints a link's modifiers from the stored mask — always both,
+    /// always spelled out — and its target verbatim, never adding the
+    /// implied `.VAL`. `SimplePvStore` renders through the same
+    /// `render_link_text`, so the two tiers agree; the cross-tier check
+    /// itself is `tests/link_parity.rs`.
     #[test]
-    fn renders_links_the_way_dbpr_would() {
+    fn renders_links_the_way_base_would() {
         let r = sample();
-        assert_eq!(value(&r, "INP"), Some(ScalarValue::Str("PV:B.VAL PP NMS".into())));
-        // FLNK's implied field is whatever `build.rs` gives a link with no
-        // explicit `.FIELD`. `build.rs::link()` defaults every link field —
-        // FLNK included — to `Field::Val`; it does not special-case FLNK to
-        // PROC the way real EPICS does. That is a pre-existing engine
-        // behaviour from sub-project A, not something A2 changes here, so
-        // the expectation below matches what the engine actually produces
-        // and the divergence from `dbpr` (which would print PROC) is
-        // reported as a concern rather than "fixed" in this task.
-        assert_eq!(value(&r, "FLNK"), Some(ScalarValue::Str("PV:B.VAL NPP NMS".into())));
+        assert_eq!(value(&r, "INP"), Some(ScalarValue::Str("PV:B PP NMS".into())));
+        // A bare FLNK means "process the target". It addresses no field, so
+        // none is printed — and `process::forward_link` discards the field
+        // anyway, so printing one would advertise behaviour the engine does
+        // not have. (`build::link` defaults every link's field to
+        // `Field::Val`, FLNK included; it does not special-case FLNK to
+        // PROC the way real EPICS does. That is sub-project A's behaviour
+        // and it is now invisible here.)
+        assert_eq!(value(&r, "FLNK"), Some(ScalarValue::Str("PV:B NPP NMS".into())));
+        // An explicit non-VAL field is printed, because Base would print it.
+        let r = build(
+            "record(ai, \"PV:A\") {
+             field(INP, \"PV:B.SEVR MS\")
+             }
+             record(ai, \"PV:B\") {
+             }
+",
+        )
+        .remove(0);
+        assert_eq!(value(&r, "INP"), Some(ScalarValue::Str("PV:B.SEVR NPP MS".into())));
         // An absent link is the constant zero EPICS leaves it at, not an error.
         assert_eq!(value(&r, "OUT"), Some(ScalarValue::Str("0".into())));
     }
