@@ -273,18 +273,21 @@ async fn field_resolution_matches_across_providers() {
     }
 }
 
-/// The documented divergence, pinned so it cannot widen silently.
+/// Field-level writability does *not* diverge between the tiers, and this
+/// pins it that way.
 ///
-/// `RecordFieldSource` reports field PVs as `writable: false`; the tier-model
-/// spec's text says tier 2 (the IOC engine, `spvirit_ioc::IocSource`) reports
-/// them writable. Tier 3 is correct and tier 2 is the outlier — the ruling
-/// recorded in the A2 spec — so this asserts the correct, uniform behaviour
-/// (`false`, on every tier, via this one seam) and exists to catch a
-/// regression *back* to the outlier: a future change that makes tier 2
-/// special-case field writability to match its record-level `writable()`
-/// instead of going through `resolve_field_info` like everyone else. Field
-/// PVs are read-only until sub-project B lands field puts everywhere at
-/// once.
+/// The A2 spec's `writable` ruling is about **record**-level writability:
+/// tier 2 (`spvirit_ioc::IocSource`) claims every record writable as Base
+/// does, tier 1 (`SimplePvStore`) claims per record kind, and tier 1 is the
+/// documented outlier. That divergence is pinned separately, by
+/// `an_input_record_is_not_writable_on_the_builtin_store` below.
+///
+/// This test guards the *field* case, where every tier agrees: all three
+/// resolve `<record>.<FIELD>` through `resolve_field_info`, which hard-codes
+/// `writable: false`. What it catches is a tier deciding to special-case
+/// field writability, most plausibly by deriving it from the record's own
+/// `writable()`, instead of going through the shared seam. Field PVs are
+/// read-only until sub-project B lands field puts everywhere at once.
 #[tokio::test]
 async fn field_pvs_report_read_only_on_every_tier() {
     let store = simple_store_with_desc("PV:X", 1.0, "shared text");
@@ -296,4 +299,57 @@ async fn field_pvs_report_read_only_on_every_tier() {
         .await
         .expect_err("a put to a dotted name must be rejected on every tier");
     assert!(err.contains("read-only"), "unexpected error: {err}");
+}
+
+/// Record-level `writable` is where the tiers genuinely differ, and the A2
+/// spec keeps the difference deliberately. Pinned in both directions so
+/// neither tier can drift silently:
+///
+/// - tier 1 (`SimplePvStore`) is type-aware. An input record claims
+///   `writable: false`, and `SimplePvStore::put` then rejects the write.
+///   Loosening it would make writes that are rejected today start
+///   succeeding for existing users, which is why it stays.
+/// - tier 2 (`spvirit_ioc::IocSource`) claims `true` for every record it
+///   owns, as Base does: you may `caput` to an `ai.VAL`, and it is simply
+///   overwritten on the next process. That half is asserted in
+///   `spvirit-ioc/tests/field_access.rs`'s
+///   `an_input_record_is_writable_on_the_ioc_engine`, which is the only
+///   side of the dependency edge that can see `IocSource`.
+///
+/// The parity comparisons elsewhere in this file build their store with
+/// `.ao()`, an output record that is writable on both tiers, so without
+/// this test the one flag the tiers are known to disagree about is never
+/// compared on the record type the disagreement is about.
+#[tokio::test]
+async fn an_input_record_is_not_writable_on_the_builtin_store() {
+    let store = PvaServer::builder()
+        .db_string(
+            "record(ai, \"PV:IN\") {\n    field(VAL, \"1.0\")\n}\n\
+             record(ao, \"PV:OUT\") {\n    field(VAL, \"1.0\")\n}\n",
+        )
+        .build()
+        .store()
+        .clone();
+
+    let input = store.claim("PV:IN").await.expect("the ai record is served");
+    assert!(
+        !input.writable,
+        "tier 1 claims an input record read-only; tier 2 claims it writable, \
+         and that divergence is deliberate"
+    );
+    let err = store
+        .put("PV:IN", &DecodedValue::Float64(2.0))
+        .await
+        .expect_err("and the flag is honest: the put is actually rejected");
+    assert!(err.contains("not writable"), "unexpected error: {err}");
+
+    let output = store
+        .claim("PV:OUT")
+        .await
+        .expect("the ao record is served");
+    assert!(
+        output.writable,
+        "an output record is writable on both tiers; the divergence is \
+         specific to input records"
+    );
 }

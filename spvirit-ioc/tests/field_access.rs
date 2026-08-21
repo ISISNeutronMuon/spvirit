@@ -169,3 +169,29 @@ async fn a_record_without_egu_serves_empty_units() {
         Some(ScalarValue::Str(String::new()))
     );
 }
+/// The other half of the record-level `writable` divergence the A2 spec
+/// keeps deliberately: tier 2 claims every record it owns writable, `ai`
+/// included, because Base lets you `caput` to an `ai.VAL` (it is simply
+/// overwritten on the next process). Tier 1's stricter per-kind rule is
+/// pinned by `spvirit-server/tests/tier_parity.rs`'s
+/// `an_input_record_is_not_writable_on_the_builtin_store`; between the two,
+/// neither tier can drift without a test going red.
+///
+/// The flag is honest here too: the put is accepted and processed, not
+/// advertised and then refused.
+#[tokio::test]
+async fn an_input_record_is_writable_on_the_ioc_engine() {
+    let src = IocSource::from_db_str(DB).expect("loads");
+    let info = src.claim("PV:A").await.expect("the ai record is served");
+    assert!(
+        info.writable,
+        "tier 2 claims an input record writable, as Base does"
+    );
+    src.put("PV:A", &DecodedValue::Float64(2.5))
+        .await
+        .expect("and it means it: the write is accepted and processed");
+    assert_eq!(
+        src.get("PV:A").await.map(|p| scalar(&p)),
+        Some(ScalarValue::F64(2.5))
+    );
+}
