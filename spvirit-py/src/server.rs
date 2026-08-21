@@ -36,6 +36,40 @@ pub struct PyServerBuilder {
     notifier_cell: Arc<std::sync::OnceLock<PyNotifier>>,
 }
 
+/// The derived `.FIELD` tier for a Python source that opts into the
+/// `fields()` protocol: `(label, order, source)`, or `None` if the object
+/// does not define `fields`.
+///
+/// Opt-in because otherwise every Python source would start claiming dotted
+/// names it cannot answer.
+///
+/// All three registration paths go through here — `ServerBuilder.add_source`,
+/// the `Server(sources=[...])` constructor, and post-`build()`
+/// `Server.add_source` — so the protocol cannot apply on some of them and
+/// silently do nothing on the others.
+///
+/// The derived label is `{label}-fields` and the derived order is
+/// `order + 10`, saturating: a source registered near `i32::MAX` must not
+/// wrap to a large negative and become the highest-priority source in the
+/// registry. The `+ 10` slot can collide by construction with a user source
+/// registered at that exact order; ties resolve by insertion order, since
+/// `SourceRegistry`'s `sort_by_key` is stable.
+fn field_tier_for(
+    adapter: &Arc<PySourceAdapter>,
+    label: &str,
+    order: i32,
+) -> Option<(String, i32, Arc<dyn spvirit_server::pvstore::Source>)> {
+    let has_fields = Python::with_gil(|py| adapter.obj.bind(py).hasattr("fields").unwrap_or(false));
+    if !has_fields {
+        return None;
+    }
+    let provider: Arc<dyn spvirit_server::field_provider::RecordFieldProvider> = adapter.clone();
+    let source: Arc<dyn spvirit_server::pvstore::Source> = Arc::new(
+        spvirit_server::record_fields::RecordFieldSource::new(provider),
+    );
+    Some((format!("{label}-fields"), order.saturating_add(10), source))
+}
+
 /// Take the inner builder, raising `RuntimeError` if `build()` already ran.
 fn take_builder(
     slf: &mut PyRefMut<'_, PyServerBuilder>,
@@ -517,18 +551,11 @@ impl PyServerBuilder {
         let label_for_hook = label.clone();
         let b = b.source(label, order, as_dyn);
 
-        // Only sources that opt in get a `.FIELD` tier — otherwise every
-        // Python source would start claiming dotted names it cannot answer.
-        let has_fields =
-            Python::with_gil(|py| adapter.obj.bind(py).hasattr("fields").unwrap_or(false));
-        let b = if has_fields {
-            let provider: Arc<dyn spvirit_server::field_provider::RecordFieldProvider> =
-                adapter.clone();
-            let field_source: Arc<dyn spvirit_server::pvstore::Source> =
-                Arc::new(spvirit_server::record_fields::RecordFieldSource::new(provider));
-            b.source(format!("{label_for_hook}-fields"), order + 10, field_source)
-        } else {
-            b
+        let b = match field_tier_for(&adapter, &label_for_hook, order) {
+            Some((field_label, field_order, field_source)) => {
+                b.source(field_label, field_order, field_source)
+            }
+            None => b,
         };
 
         // Register the source's on_start on the shared hook list, so it
@@ -704,17 +731,10 @@ impl PyServer {
             let label_for_hook = label.clone();
             sb = sb.source(label, order, as_dyn);
 
-            // Only sources that opt in get a `.FIELD` tier — otherwise every
-            // Python source would start claiming dotted names it cannot answer.
-            let has_fields =
-                Python::with_gil(|py| adapter.obj.bind(py).hasattr("fields").unwrap_or(false));
-            if has_fields {
-                let provider: Arc<dyn spvirit_server::field_provider::RecordFieldProvider> =
-                    adapter.clone();
-                let field_source: Arc<dyn spvirit_server::pvstore::Source> = Arc::new(
-                    spvirit_server::record_fields::RecordFieldSource::new(provider),
-                );
-                sb = sb.source(format!("{label_for_hook}-fields"), order + 10, field_source);
+            if let Some((field_label, field_order, field_source)) =
+                field_tier_for(&adapter, &label_for_hook, order)
+            {
+                sb = sb.source(field_label, field_order, field_source);
             }
 
             // Same deferred hook as PyServerBuilder::add_source: fires at
@@ -887,6 +907,14 @@ impl PyServer {
         }
         let as_dyn: Arc<dyn spvirit_server::pvstore::Source> = adapter.clone();
         server.add_source(label.clone(), order, as_dyn);
+        // The `fields()` protocol applies on this path too. Without this the
+        // README's unconditional "defining it makes `<name>.<FIELD>`
+        // resolvable" would be false for every post-`build()` source.
+        if let Some((field_label, field_order, field_source)) =
+            field_tier_for(&adapter, &label, order)
+        {
+            server.add_source(field_label, field_order, field_source);
+        }
         self.post_build_sources.push((label, order, adapter));
         Ok(())
     }
