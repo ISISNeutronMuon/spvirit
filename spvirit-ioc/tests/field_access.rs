@@ -95,6 +95,24 @@ async fn the_builder_registers_an_ioc_as_a_store() {
     drop(server);
 }
 
+/// A second `.ioc()` is a mistake, not a second engine: the builder holds
+/// one `Option`, so the first would be dropped silently and its records
+/// would simply stop being served. Additional engines go through
+/// `.source()`, and the panic message says so.
+#[test]
+#[should_panic(expected = "PvaServerBuilder::ioc may only be called once")]
+fn calling_ioc_twice_panics() {
+    let one = std::sync::Arc::new(IocSource::from_db_str(DB).expect("loads"));
+    let two = std::sync::Arc::new(
+        IocSource::from_db_str("record(ai, \"PV:Z\") {\n}\n").expect("loads"),
+    );
+    let _ = spvirit_server::pva_server::PvaServer::builder()
+        .port(0)
+        .udp_port(0)
+        .ioc(one)
+        .ioc(two);
+}
+
 /// `claim` must not take a lock set. Proven by holding one: a claim issued
 /// while another task owns the record's lock set still answers.
 #[tokio::test]

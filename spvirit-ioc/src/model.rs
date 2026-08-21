@@ -319,14 +319,20 @@ impl Record {
 mod tests {
     use super::*;
 
-    fn record_with_egu(egu: &str) -> Record {
+    /// Build one `ai` record from a body. `""` gives a record with no
+    /// fields at all, which is how the absent-EGU case is expressed.
+    fn record_with_body(body: &str) -> Record {
         let raw = spvirit_server::db::parse_db_records(
-            &format!("record(ai, \"A\") {{\n    field(EGU, \"{egu}\")\n}}\n"),
+            &format!("record(ai, \"A\") {{\n{body}}}\n"),
             "t.db",
             &std::collections::HashMap::new(),
         )
         .expect("parse");
         crate::build::build_records(&raw).expect("build").remove(0)
+    }
+
+    fn record_with_egu(egu: &str) -> Record {
+        record_with_body(&format!("    field(EGU, \"{egu}\")\n"))
     }
 
     #[test]
@@ -338,8 +344,22 @@ mod tests {
         }
     }
 
+    /// EGU *absent* from the `.db`, not present-and-empty: those are two
+    /// different inputs and this test names the first one, so it has to
+    /// build the first one.
     #[test]
     fn a_record_without_egu_serves_empty_units() {
+        let r = record_with_body("");
+        match r.to_payload() {
+            NtPayload::Scalar(nt) => assert_eq!(nt.units, ""),
+            other => panic!("expected scalar, got {other:?}"),
+        }
+    }
+
+    /// And an EGU that is present but empty serves the same thing, so the
+    /// two spellings agree rather than one of them being an error.
+    #[test]
+    fn an_empty_egu_serves_empty_units_too() {
         let r = record_with_egu("");
         match r.to_payload() {
             NtPayload::Scalar(nt) => assert_eq!(nt.units, ""),
