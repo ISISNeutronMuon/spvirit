@@ -963,7 +963,7 @@ impl PvaServer {
         if let Some(ioc) = &self.ioc {
             // Order 5: after the builtin store, before `record-fields`, so
             // the IOC's own `.FIELD` routing answers for its records and
-            // tier 2's field source answers for the builtin store's.
+            // tier 1's field source answers for the builtin store's.
             sources.add_store("ioc", 5, ioc.clone()).await;
         }
 

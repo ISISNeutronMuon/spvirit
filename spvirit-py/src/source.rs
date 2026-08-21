@@ -776,7 +776,7 @@ impl Source for PySourceAdapter {
 impl RecordFieldProvider for PySourceAdapter {
     /// Resolve `<base>.<field>` through the Python source's `fields()`
     /// method. A field the source did not mention still reads as its
-    /// dbCommon default — the same fallback tiers 2 and 3 use.
+    /// dbCommon default — the same fallback tiers 1 and 2 use.
     fn field_value(
         &self,
         base: &str,

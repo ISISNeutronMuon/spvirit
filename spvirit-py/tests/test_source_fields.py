@@ -29,7 +29,7 @@ def _get(client, name):
 
 
 class WithFields:
-    """A source that exposes record metadata the way tiers 2 and 3 do."""
+    """A source that exposes record metadata the way tiers 1 and 2 do."""
 
     def claim(self, name):
         return spvirit.PvInfo.nt_scalar("double") if name == "PY:A" else None

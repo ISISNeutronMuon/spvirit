@@ -140,7 +140,7 @@ async fn the_ioc_matches_the_field_contract_the_other_tiers_serve() {
 }
 
 /// `field(EGU, …)` must reach both the record payload's units and the
-/// `.EGU` field PV. Tier 2 has always served units; before A2 the engine
+/// `.EGU` field PV. Tier 1 has always served units; before A2 the engine
 /// dropped them at build time, so a client could tell the tiers apart by
 /// asking for units.
 #[tokio::test]

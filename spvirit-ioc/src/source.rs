@@ -44,7 +44,7 @@ pub struct IocSource {
     /// one-shot snapshot in A2 — live field monitors arrive with the field
     /// writes in sub-project B — so these are retained only to keep the
     /// channels open, exactly as `RecordFieldSource::open_subs` does for
-    /// tier 2.
+    /// tier 1.
     field_subs: Mutex<Vec<mpsc::Sender<NtPayload>>>,
 }
 
