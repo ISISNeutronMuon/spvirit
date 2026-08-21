@@ -115,6 +115,20 @@ impl FieldType {
             FieldType::BoundedString(_) => "string",
         }
     }
+
+    /// Bytes this type owns on the heap, walked recursively.
+    ///
+    /// Only the nesting variants own anything; scalars are pure discriminant.
+    pub fn heap_size(&self) -> usize {
+        match self {
+            FieldType::Structure(s) | FieldType::StructureArray(s) => s.heap_size(),
+            FieldType::Union(f) | FieldType::UnionArray(f) => {
+                f.capacity() * std::mem::size_of::<FieldDesc>()
+                    + f.iter().map(FieldDesc::heap_size).sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
 }
 
 /// Field description (name + type)
@@ -122,6 +136,13 @@ impl FieldType {
 pub struct FieldDesc {
     pub name: String,
     pub field_type: FieldType,
+}
+
+impl FieldDesc {
+    /// Bytes this field owns on the heap, including any nested structure.
+    pub fn heap_size(&self) -> usize {
+        self.name.capacity() + self.field_type.heap_size()
+    }
 }
 
 /// Structure description with optional ID
@@ -142,6 +163,20 @@ impl StructureDesc {
     /// Look up a field by name.
     pub fn field(&self, name: &str) -> Option<&FieldDesc> {
         self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// Bytes this description owns on the heap, walked recursively.
+    ///
+    /// Introspection is the one term in the state tracker's memory estimate
+    /// that is both large and expensive to measure: an NTScalar carries
+    /// thirty-odd nested `FieldDesc` nodes, each with its own name. Callers
+    /// are expected to cache this at assignment rather than re-walk the tree
+    /// on every accounting pass.
+    pub fn heap_size(&self) -> usize {
+        let id = self.struct_id.as_ref().map_or(0, |s| s.capacity());
+        let fields = self.fields.capacity() * std::mem::size_of::<FieldDesc>()
+            + self.fields.iter().map(FieldDesc::heap_size).sum::<usize>();
+        id + fields
     }
 }
 

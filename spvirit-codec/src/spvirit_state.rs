@@ -23,6 +23,16 @@ pub struct PvaStateConfig {
     pub max_operations: usize,
     /// Maximum update timestamps kept per connection for rate calculation (default: 10000)
     pub max_update_rate: usize,
+    /// Ceiling on tracked state in bytes, as reported by [`PvaStateTracker::memory_estimate`].
+    ///
+    /// When the estimate exceeds this, `cleanup_expired` sheds state in
+    /// priority order -- debug affordances first, decoded introspection last
+    /// -- so that a long-running passive observer accumulates coverage
+    /// without growing without bound. `0` disables the ceiling.
+    pub max_memory_bytes: usize,
+    /// Hard cap on SEARCH name-cache entries, enforced independently of the
+    /// memory ceiling so the caches cannot dominate a small budget.
+    pub max_search_cache_entries: usize,
 }
 
 impl Default for PvaStateConfig {
@@ -32,9 +42,17 @@ impl Default for PvaStateConfig {
             channel_ttl: Duration::from_secs(5 * 60), // 5 minutes
             max_operations: 10_000,
             max_update_rate: 10_000,
+            max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
+            max_search_cache_entries: DEFAULT_MAX_SEARCH_CACHE_ENTRIES,
         }
     }
 }
+
+/// 1 GiB. Chosen to be generous enough that a busy facility never sheds
+/// introspection in practice, while still bounding a multi-day passive run.
+pub const DEFAULT_MAX_MEMORY_BYTES: usize = 1024 * 1024 * 1024;
+/// Enough for a large facility's PV set several times over.
+pub const DEFAULT_MAX_SEARCH_CACHE_ENTRIES: usize = 200_000;
 
 impl PvaStateConfig {
     pub fn new(max_channels: usize, ttl_secs: u64) -> Self {
@@ -43,6 +61,8 @@ impl PvaStateConfig {
             channel_ttl: Duration::from_secs(ttl_secs),
             max_operations: 10_000,
             max_update_rate: 10_000,
+            max_memory_bytes: DEFAULT_MAX_MEMORY_BYTES,
+            max_search_cache_entries: DEFAULT_MAX_SEARCH_CACHE_ENTRIES,
         }
     }
 
@@ -50,6 +70,35 @@ impl PvaStateConfig {
         self.max_update_rate = max_update_rate;
         self
     }
+
+    /// Set the memory ceiling. `0` disables shedding entirely.
+    pub fn with_max_memory_bytes(mut self, max_memory_bytes: usize) -> Self {
+        self.max_memory_bytes = max_memory_bytes;
+        self
+    }
+
+    /// Set the per-connection operation cap.
+    pub fn with_max_operations(mut self, max_operations: usize) -> Self {
+        self.max_operations = max_operations;
+        self
+    }
+}
+
+/// Heap bytes held by a `VecDeque<String>` ring, contents included.
+fn ring_bytes(ring: &VecDeque<String>) -> usize {
+    ring.capacity() * std::mem::size_of::<String>()
+        + ring.iter().map(String::capacity).sum::<usize>()
+}
+
+/// Heap bytes held by a `VecDeque<Instant>`.
+fn instants_bytes(times: &VecDeque<Instant>) -> usize {
+    times.capacity() * std::mem::size_of::<Instant>()
+}
+
+/// Approximate bytes a hashbrown table occupies for `n` slots of `(K, V)`.
+/// One control byte per slot on top of the key/value pair.
+fn table_bytes<K, V>(capacity: usize) -> usize {
+    capacity * (std::mem::size_of::<K>() + std::mem::size_of::<V>() + 1)
 }
 
 /// Unique key for a TCP connection (canonical - order independent)
@@ -124,6 +173,14 @@ impl ChannelInfo {
     pub fn is_expired(&self, ttl: Duration) -> bool {
         self.last_seen.elapsed() > ttl
     }
+
+    /// Bytes this channel owns on the heap, excluding the struct itself
+    /// (its container accounts for that).
+    pub fn heap_bytes(&self) -> usize {
+        self.pv_name.capacity()
+            + instants_bytes(&self.update_times)
+            + ring_bytes(&self.recent_messages)
+    }
 }
 
 /// State for an active operation (GET/PUT/MONITOR etc.)
@@ -139,6 +196,12 @@ pub struct OperationState {
     pub pv_name: Option<String>,
     /// Field description from INIT response (parsed introspection)
     pub field_desc: Option<StructureDesc>,
+    /// Heap bytes held by `field_desc`, cached at assignment.
+    ///
+    /// The introspection tree is the one large term in the memory estimate
+    /// whose measurement is recursive, so it is walked once when the INIT
+    /// response lands rather than on every accounting pass.
+    field_desc_bytes: usize,
     /// Whether INIT phase completed
     pub initialized: bool,
     /// Last activity
@@ -155,6 +218,7 @@ impl OperationState {
             command,
             pv_name,
             field_desc: None,
+            field_desc_bytes: 0,
             initialized: false,
             last_seen: Instant::now(),
             update_times: VecDeque::new(),
@@ -164,6 +228,36 @@ impl OperationState {
 
     pub fn touch(&mut self) {
         self.last_seen = Instant::now();
+    }
+
+    pub fn is_expired(&self, ttl: Duration) -> bool {
+        self.last_seen.elapsed() > ttl
+    }
+
+    /// Attach introspection and cache its measured size.
+    pub fn set_field_desc(&mut self, field_desc: Option<StructureDesc>) {
+        self.field_desc_bytes = field_desc.as_ref().map_or(0, |d| d.heap_size());
+        self.field_desc = field_desc;
+    }
+
+    /// Heap bytes held by this operation's introspection, if any.
+    pub fn field_desc_bytes(&self) -> usize {
+        self.field_desc_bytes
+    }
+
+    /// True when this operation was auto-created from mid-stream traffic and
+    /// carries nothing the decoder can use: no completed INIT, no
+    /// introspection. Shed first under memory pressure.
+    pub fn is_placeholder(&self) -> bool {
+        !self.initialized && self.field_desc.is_none()
+    }
+
+    /// Bytes this operation owns on the heap, excluding the struct itself.
+    pub fn heap_bytes(&self) -> usize {
+        self.pv_name.as_ref().map_or(0, |s| s.capacity())
+            + self.field_desc_bytes
+            + instants_bytes(&self.update_times)
+            + ring_bytes(&self.recent_messages)
     }
 }
 
@@ -228,6 +322,26 @@ impl ConnectionState {
             .get(&ioid)
             .and_then(|op| op.pv_name.as_deref())
     }
+
+    /// Bytes this connection owns on the heap, excluding the struct itself:
+    /// its three tables, everything inside them, and its own rings.
+    pub fn heap_bytes(&self) -> usize {
+        table_bytes::<u32, ChannelInfo>(self.channels_by_cid.capacity())
+            + table_bytes::<u32, OperationState>(self.operations.capacity())
+            + table_bytes::<u32, u32>(self.sid_to_cid.capacity())
+            + self
+                .channels_by_cid
+                .values()
+                .map(ChannelInfo::heap_bytes)
+                .sum::<usize>()
+            + self
+                .operations
+                .values()
+                .map(OperationState::heap_bytes)
+                .sum::<usize>()
+            + instants_bytes(&self.update_times)
+            + ring_bytes(&self.recent_messages)
+    }
 }
 
 impl Default for ConnectionState {
@@ -272,6 +386,21 @@ pub struct PvaStateStats {
     pub client_messages: u64,
     /// PVA messages with is_server=true (sent by server)
     pub server_messages: u64,
+    /// Most recent value of [`PvaStateTracker::memory_estimate`], refreshed
+    /// by `cleanup_expired` so exporters need not re-walk the state.
+    pub memory_bytes: u64,
+    /// Operations aged out on their own `last_seen`, independently of any
+    /// channel. This is what reclaims mid-stream placeholders.
+    pub operations_expired: u64,
+    /// Placeholder operations discarded to stay inside the memory ceiling.
+    pub shed_placeholder_ops: u64,
+    /// Debug message rings cleared to stay inside the memory ceiling.
+    pub shed_message_rings: u64,
+    /// SEARCH cache entries discarded, by cap or by memory ceiling.
+    pub shed_search_entries: u64,
+    /// Channels evicted specifically to stay inside the memory ceiling.
+    /// These carried introspection, so this rising means coverage is being lost.
+    pub shed_channels: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -491,7 +620,7 @@ impl PvaStateTracker {
             conn.touch();
 
             if let Some(op) = conn.operations.get_mut(&ioid) {
-                op.field_desc = field_desc;
+                op.set_field_desc(field_desc);
                 op.initialized = true;
                 op.touch();
                 debug!("Operation INIT response: ioid={}", ioid);
@@ -812,7 +941,14 @@ impl PvaStateTracker {
     }
 
     /// Evict oldest channels when at capacity
-    fn evict_oldest_channels(&mut self, count: usize) {
+    /// Evict the `count` least-recently-seen channels. Returns how many went.
+    ///
+    /// Removing a channel must also remove the operations riding on it. When
+    /// it did not, those operations were orphaned permanently -- nothing else
+    /// reclaims them, and a connection is only dropped once it holds neither
+    /// channels nor operations, so every leaked operation also pinned its
+    /// connection for the life of the process.
+    fn evict_oldest_channels(&mut self, count: usize) -> usize {
         let mut oldest: Vec<(ConnectionKey, u32, Instant)> = Vec::new();
 
         for (conn_key, conn) in &self.connections {
@@ -825,17 +961,21 @@ impl PvaStateTracker {
         oldest.sort_by_key(|(_, _, t)| *t);
 
         // Remove oldest
+        let mut evicted = 0;
         for (conn_key, cid, _) in oldest.into_iter().take(count) {
             if let Some(conn) = self.connections.get_mut(&conn_key) {
                 if let Some(channel) = conn.channels_by_cid.remove(&cid) {
                     if let Some(sid) = channel.sid {
                         conn.sid_to_cid.remove(&sid);
+                        conn.operations.retain(|_, op| op.sid != sid);
                     }
                     self.total_channels = self.total_channels.saturating_sub(1);
                     self.stats.channels_evicted += 1;
+                    evicted += 1;
                 }
             }
         }
+        evicted
     }
 
     /// Periodic cleanup of expired entries
@@ -862,6 +1002,24 @@ impl PvaStateTracker {
             }
         }
 
+        // Age operations out on their own `last_seen`, independently of any
+        // channel. Channel-driven cleanup alone never reclaims a mid-stream
+        // placeholder: it is created with sid=0, so it matches no expiring
+        // channel's sid, and because a connection is retained while it holds
+        // any operation, each such placeholder pinned its connection for the
+        // life of the process. An operation carrying live traffic is touched
+        // on every update, so it is never caught here.
+        let mut expired_ops: u64 = 0;
+        for conn in self.connections.values_mut() {
+            let before = conn.operations.len();
+            conn.operations.retain(|_, op| !op.is_expired(ttl));
+            expired_ops += (before - conn.operations.len()) as u64;
+        }
+        if expired_ops > 0 {
+            self.stats.operations_expired += expired_ops;
+            debug!("Cleaned up {} expired operations", expired_ops);
+        }
+
         if expired_count > 0 {
             self.total_channels = self.total_channels.saturating_sub(expired_count);
             self.stats.channels_expired += expired_count as u64;
@@ -871,6 +1029,240 @@ impl PvaStateTracker {
         // Remove empty connections
         self.connections
             .retain(|_, conn| !conn.channels_by_cid.is_empty() || !conn.operations.is_empty());
+
+        self.enforce_search_cache_cap();
+        self.shed_to_budget();
+        self.stats.memory_bytes = self.memory_estimate() as u64;
+    }
+
+    /// Approximate bytes of live tracked state.
+    ///
+    /// Every term is measured on each call except introspection, which is
+    /// walked once when the INIT response lands and cached on the operation
+    /// -- it is the only recursive term, and the only one worth caching. A
+    /// full pass at the channel ceiling costs single-digit milliseconds, and
+    /// it runs once per second from `cleanup_expired`.
+    pub fn memory_estimate(&self) -> usize {
+        let conns = table_bytes::<ConnectionKey, ConnectionState>(self.connections.capacity())
+            + self
+                .connections
+                .values()
+                .map(ConnectionState::heap_bytes)
+                .sum::<usize>();
+        let search = table_bytes::<(IpAddr, u32), String>(self.search_cache.capacity())
+            + self
+                .search_cache
+                .values()
+                .map(String::capacity)
+                .sum::<usize>()
+            + table_bytes::<u32, String>(self.search_cache_flat.capacity())
+            + self
+                .search_cache_flat
+                .values()
+                .map(String::capacity)
+                .sum::<usize>();
+        conns + search
+    }
+
+    /// Bring tracked state back inside `max_memory_bytes`, discarding in
+    /// ascending order of how much the decoder needs it.
+    ///
+    /// The ordering is the whole point. `field_desc` is expensive to acquire:
+    /// it arrives only on a MONITOR INIT response, which a passive observer
+    /// sees only when it happens to witness a channel being created. Debug
+    /// affordances refill in seconds; introspection may not return for days.
+    /// So message rings go before caches, and caches before channels.
+    fn shed_to_budget(&mut self) {
+        let budget = self.config.max_memory_bytes;
+        if budget == 0 {
+            return;
+        }
+        let mut est = self.memory_estimate();
+        if est <= budget {
+            return;
+        }
+
+        // Tier 1: mid-stream placeholders -- no INIT seen, no introspection.
+        if self.shed_placeholder_ops(est - budget) > 0 {
+            self.shrink_containers();
+            est = self.memory_estimate();
+            if est <= budget {
+                return;
+            }
+        }
+
+        // Tier 2: debug message rings. Pure UI affordance; dropping them
+        // leaves every field_desc intact.
+        if self.shed_message_rings(est - budget) > 0 {
+            est = self.memory_estimate();
+            if est <= budget {
+                return;
+            }
+        }
+
+        // Tier 3: SEARCH name caches. Future SEARCH traffic repopulates them.
+        if self.shed_search_caches() > 0 {
+            est = self.memory_estimate();
+            if est <= budget {
+                return;
+            }
+        }
+
+        // Tier 4: oldest channels, introspection and all. Reaching here means
+        // the budget cannot hold the live channel set, so coverage is being
+        // lost -- `shed_channels` is the metric that says so.
+        let mut guard = 0;
+        while est > budget && self.total_channels > 0 && guard < 16 {
+            let per_channel = (est / self.total_channels.max(1)).max(1);
+            let batch = (((est - budget) / per_channel) + 1).clamp(100, self.total_channels);
+            let evicted = self.evict_oldest_channels(batch);
+            if evicted == 0 {
+                break;
+            }
+            self.stats.shed_channels += evicted as u64;
+            self.shrink_containers();
+            est = self.memory_estimate();
+            guard += 1;
+        }
+    }
+
+    /// Hand back the table capacity that removals left behind.
+    ///
+    /// A `HashMap` never shrinks on `remove`, so shedding entries releases
+    /// their contents but not the slots that held them. Skipping this would
+    /// leave both the estimate and the real allocation nearly where they
+    /// started -- the tiers would report progress they had not made, and the
+    /// loop would keep evicting live channels chasing a figure that could not
+    /// come down. Only reached while over budget, so the rehash is not on any
+    /// steady-state path.
+    fn shrink_containers(&mut self) {
+        for conn in self.connections.values_mut() {
+            conn.operations.shrink_to_fit();
+            conn.channels_by_cid.shrink_to_fit();
+            conn.sid_to_cid.shrink_to_fit();
+        }
+        self.connections.shrink_to_fit();
+    }
+
+    /// Discard placeholder operations, least recently seen first, until
+    /// `target` bytes are freed. Returns the bytes actually freed.
+    fn shed_placeholder_ops(&mut self, target: usize) -> usize {
+        let mut cands: Vec<(ConnectionKey, u32, Instant, usize)> = Vec::new();
+        for (ck, conn) in &self.connections {
+            for (ioid, op) in &conn.operations {
+                if op.is_placeholder() {
+                    cands.push((
+                        ck.clone(),
+                        *ioid,
+                        op.last_seen,
+                        op.heap_bytes() + std::mem::size_of::<OperationState>(),
+                    ));
+                }
+            }
+        }
+        cands.sort_by_key(|(_, _, t, _)| *t);
+
+        let mut freed = 0;
+        for (ck, ioid, _, bytes) in cands {
+            if freed >= target {
+                break;
+            }
+            let removed = self
+                .connections
+                .get_mut(&ck)
+                .and_then(|conn| conn.operations.remove(&ioid));
+            if removed.is_some() {
+                freed += bytes;
+                self.stats.shed_placeholder_ops += 1;
+            }
+        }
+        freed
+    }
+
+    /// Release `recent_messages` rings, least recently seen first, until
+    /// `target` bytes are freed. Returns the bytes actually freed.
+    fn shed_message_rings(&mut self, target: usize) -> usize {
+        let mut cands: Vec<(ConnectionKey, u32, Instant, usize)> = Vec::new();
+        for (ck, conn) in &self.connections {
+            for (ioid, op) in &conn.operations {
+                let bytes = ring_bytes(&op.recent_messages);
+                if bytes > 0 {
+                    cands.push((ck.clone(), *ioid, op.last_seen, bytes));
+                }
+            }
+        }
+        cands.sort_by_key(|(_, _, t, _)| *t);
+
+        let mut freed = 0;
+        for (ck, ioid, _, bytes) in cands {
+            if freed >= target {
+                break;
+            }
+            if let Some(op) = self
+                .connections
+                .get_mut(&ck)
+                .and_then(|conn| conn.operations.get_mut(&ioid))
+            {
+                // Assign a fresh ring rather than `clear()`, which keeps the
+                // allocation and would free nothing.
+                op.recent_messages = VecDeque::new();
+                freed += bytes;
+                self.stats.shed_message_rings += 1;
+            }
+        }
+        if freed >= target {
+            return freed;
+        }
+
+        for conn in self.connections.values_mut() {
+            if freed >= target {
+                break;
+            }
+            let bytes = ring_bytes(&conn.recent_messages);
+            if bytes > 0 {
+                conn.recent_messages = VecDeque::new();
+                freed += bytes;
+                self.stats.shed_message_rings += 1;
+            }
+        }
+        freed
+    }
+
+    /// Drop both SEARCH name caches wholesale. Returns the bytes freed.
+    ///
+    /// They are unordered best-effort lookups with no natural eviction order,
+    /// and losing one costs at most a name that a later SEARCH supplies
+    /// again, so a partial eviction would buy nothing over a clean reset.
+    fn shed_search_caches(&mut self) -> usize {
+        let freed = table_bytes::<(IpAddr, u32), String>(self.search_cache.capacity())
+            + self
+                .search_cache
+                .values()
+                .map(String::capacity)
+                .sum::<usize>()
+            + table_bytes::<u32, String>(self.search_cache_flat.capacity())
+            + self
+                .search_cache_flat
+                .values()
+                .map(String::capacity)
+                .sum::<usize>();
+        let dropped = (self.search_cache.len() + self.search_cache_flat.len()) as u64;
+        self.search_cache = HashMap::new();
+        self.search_cache_flat = HashMap::new();
+        self.stats.shed_search_entries += dropped;
+        freed
+    }
+
+    /// Keep the SEARCH caches inside their entry cap, independently of the
+    /// memory ceiling so they cannot dominate a small budget.
+    fn enforce_search_cache_cap(&mut self) {
+        let cap = self.config.max_search_cache_entries;
+        if cap == 0 {
+            return;
+        }
+        if self.search_cache.len() > cap || self.search_cache_flat.len() > cap {
+            self.shed_search_caches();
+        }
     }
 
     /// Get summary statistics
@@ -1019,9 +1411,207 @@ impl PvaStateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FieldDesc, FieldType};
 
     fn test_conn_key() -> ConnectionKey {
         ConnectionKey::from_parts("192.168.1.1", 12345, "192.168.1.2", 5075).unwrap()
+    }
+
+    /// An NTScalar-shaped description with `nested` sub-fields under
+    /// `timeStamp`, so the recursive term of `heap_size` is exercised.
+    fn desc_with_fields(nested: usize) -> StructureDesc {
+        let mut inner = StructureDesc::new();
+        for i in 0..nested {
+            inner.fields.push(FieldDesc {
+                name: format!("nested_field_name_{i}"),
+                field_type: FieldType::String,
+            });
+        }
+        let mut outer = StructureDesc::new();
+        outer.struct_id = Some("epics:nt/NTScalar:1.0".to_string());
+        outer.fields.push(FieldDesc {
+            name: "value".to_string(),
+            field_type: FieldType::String,
+        });
+        outer.fields.push(FieldDesc {
+            name: "timeStamp".to_string(),
+            field_type: FieldType::Structure(inner),
+        });
+        outer
+    }
+
+    #[test]
+    fn test_heap_size_walks_nested_fields() {
+        let flat = desc_with_fields(0);
+        let nested = desc_with_fields(20);
+
+        assert!(
+            flat.heap_size() > 0,
+            "struct_id and two field names are heap"
+        );
+        // Each nested field contributes at least its own name; a walk that
+        // stopped at the top level would miss all twenty.
+        let names_only = 20 * "nested_field_name_0".len();
+        assert!(
+            nested.heap_size() > flat.heap_size() + names_only,
+            "nested={} flat={}",
+            nested.heap_size(),
+            flat.heap_size()
+        );
+    }
+
+    #[test]
+    fn test_expired_placeholder_operations_are_reclaimed() {
+        let mut tracker = PvaStateTracker::new(PvaStateConfig::new(100, 0));
+        let key = test_conn_key();
+
+        // Mid-stream server MONITOR update: sid=0, unseen ioid. This mints a
+        // placeholder operation and no channel at all, so channel-driven
+        // cleanup alone has nothing to hang the reclamation on.
+        tracker.on_op_activity(&key, 0, 42, 13);
+        assert_eq!(tracker.connection_count(), 1);
+
+        tracker.cleanup_expired();
+
+        assert_eq!(tracker.stats.operations_expired, 1);
+        assert_eq!(
+            tracker.connection_count(),
+            0,
+            "connection must drop once its last operation ages out"
+        );
+    }
+
+    #[test]
+    fn test_active_operation_is_not_aged_out() {
+        let mut tracker = PvaStateTracker::new(PvaStateConfig::new(100, 3600));
+        let key = test_conn_key();
+
+        tracker.on_op_activity(&key, 0, 42, 13);
+        tracker.cleanup_expired();
+
+        assert_eq!(tracker.stats.operations_expired, 0);
+        assert_eq!(tracker.connection_count(), 1);
+    }
+
+    #[test]
+    fn test_eviction_removes_operations_riding_the_channel() {
+        let mut tracker = PvaStateTracker::new(PvaStateConfig::new(1, 3600));
+        let key = test_conn_key();
+
+        tracker.on_create_channel_request(&key, 1, "PV:ONE".to_string());
+        tracker.on_create_channel_response(&key, 1, 100);
+        tracker.on_op_init_request(&key, 100, 7, 13);
+        assert_eq!(tracker.connections[&key].operations.len(), 1);
+
+        // A second channel puts us at the ceiling and evicts the first.
+        tracker.on_create_channel_request(&key, 2, "PV:TWO".to_string());
+
+        assert!(tracker.stats.channels_evicted >= 1);
+        assert!(
+            tracker.connections[&key].operations.is_empty(),
+            "an operation whose channel was evicted is unreachable; nothing \
+             else reclaims it, and it pins its connection forever"
+        );
+    }
+
+    #[test]
+    fn test_shedding_drops_placeholders_before_introspection() {
+        let mut tracker = PvaStateTracker::new(PvaStateConfig::new(10_000, 3600));
+        let key = test_conn_key();
+
+        // One fully-witnessed operation carrying introspection...
+        tracker.on_create_channel_request(&key, 1, "PV:KEEP".to_string());
+        tracker.on_create_channel_response(&key, 1, 100);
+        tracker.on_op_init_request(&key, 100, 1, 13);
+        tracker.on_op_init_response(&key, 1, Some(desc_with_fields(30)));
+
+        // ...and a crowd of mid-stream placeholders carrying nothing.
+        for ioid in 100..400 {
+            tracker.on_op_activity(&key, 0, ioid, 13);
+        }
+
+        tracker.config.max_memory_bytes = tracker.memory_estimate() / 2;
+        tracker.cleanup_expired();
+
+        assert!(tracker.stats.shed_placeholder_ops > 0);
+        assert_eq!(
+            tracker.stats.shed_channels, 0,
+            "no channel should be shed while worthless placeholders remain"
+        );
+        let op = &tracker.connections[&key].operations[&1];
+        assert!(
+            op.field_desc.is_some(),
+            "introspection is the expensive thing to reacquire; it sheds last"
+        );
+        assert!(tracker.memory_estimate() <= tracker.config.max_memory_bytes);
+    }
+
+    #[test]
+    fn test_cleanup_holds_state_under_the_memory_ceiling() {
+        let mut tracker = PvaStateTracker::new(PvaStateConfig::new(40_000, 3600));
+        let key = test_conn_key();
+
+        for cid in 0..4_000u32 {
+            let sid = cid + 1;
+            tracker.on_create_channel_request(&key, cid, format!("SR:DI:BPM:{cid:04}:X:MEAN"));
+            tracker.on_create_channel_response(&key, cid, sid);
+            tracker.on_op_init_request(&key, sid, sid, 13);
+            tracker.on_op_init_response(&key, sid, Some(desc_with_fields(30)));
+        }
+
+        let unbounded = tracker.memory_estimate();
+        let budget = unbounded / 4;
+        tracker.config.max_memory_bytes = budget;
+        tracker.cleanup_expired();
+
+        assert!(
+            tracker.stats.shed_channels > 0,
+            "a quarter of the state cannot hold this channel set; coverage \
+             has to be given up, and shed_channels is what says so"
+        );
+        assert!(
+            tracker.memory_estimate() <= budget,
+            "estimate {} still over budget {}",
+            tracker.memory_estimate(),
+            budget
+        );
+        assert_eq!(
+            tracker.stats.memory_bytes as usize,
+            tracker.memory_estimate()
+        );
+    }
+
+    #[test]
+    fn test_zero_budget_disables_shedding() {
+        let mut tracker = PvaStateTracker::new(PvaStateConfig::new(10_000, 3600));
+        let key = test_conn_key();
+
+        for ioid in 0..200 {
+            tracker.on_op_activity(&key, 0, ioid, 13);
+        }
+        tracker.config.max_memory_bytes = 0;
+        tracker.cleanup_expired();
+
+        assert_eq!(tracker.stats.shed_placeholder_ops, 0);
+        assert_eq!(tracker.stats.shed_channels, 0);
+        assert_eq!(tracker.connections[&key].operations.len(), 200);
+    }
+
+    #[test]
+    fn test_search_cache_cap_is_enforced() {
+        let mut tracker = PvaStateTracker::new(PvaStateConfig::new(10_000, 3600));
+        tracker.config.max_search_cache_entries = 50;
+
+        let ip = Some("192.168.1.1".parse::<IpAddr>().unwrap());
+        let reqs: Vec<(u32, String)> = (0..200u32).map(|i| (i, format!("PV:{i}"))).collect();
+        tracker.on_search(&reqs, ip);
+        assert!(tracker.search_cache.len() > 50);
+
+        tracker.cleanup_expired();
+
+        assert!(tracker.search_cache.is_empty());
+        assert!(tracker.search_cache_flat.is_empty());
+        assert!(tracker.stats.shed_search_entries >= 200);
     }
 
     #[test]
