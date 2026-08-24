@@ -1187,11 +1187,11 @@ dependencies = [
 
 [[package]]
 name = "spvirit-calc"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "spvirit-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dns-lookup",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-codec"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hex",
  "spvirit-types",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-ioc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proptest",
  "spvirit-client",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-py"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures",
  "get_if_addrs",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-tools"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argparse",
  "chrono",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "spvirit-types"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "static_assertions"
