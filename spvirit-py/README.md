@@ -696,7 +696,7 @@ def fields(self, name):
 
 Field PVs are read-only.
 
-The `.FIELD` tier is derived automatically on every registration path —
+The `.FIELD` tier is derived automatically on every registration path â€”
 `ServerBuilder.add_source`, `Server(sources=[...])`, and post-`build()`
 `Server.add_source` alike. It is registered as a separate source labelled
 `{label}-fields` at `order + 10`, so a source of your own registered at that
