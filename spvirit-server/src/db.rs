@@ -1075,11 +1075,10 @@ mod tests {
     #[test]
     fn archiver_demo_db_parses_and_yields_expected_record_count() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("demo")
+            .join("examples")
             .join("archiver_demo.db");
         let recs = load_db_records(path.to_str().expect("utf8 path"), &HashMap::new())
-            .expect("demo/archiver_demo.db must parse");
+            .expect("examples/archiver_demo.db must parse");
         assert_eq!(
             recs.len(),
             14,
