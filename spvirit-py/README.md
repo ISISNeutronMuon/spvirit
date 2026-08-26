@@ -482,6 +482,38 @@ channels["BL:DET:CH042"].set(1234.0)    # keep the dict for later access
 
 ---
 
+### Tier 3 — an IOC you can drive from Python
+
+```python
+import spvirit
+
+sp  = spvirit.ioc.ao("RIG:SP",  OUT="RIG:RBV.VAL", FLNK="RIG:RBV")
+rbv = spvirit.ioc.ai("RIG:RBV", INP="RIG:SP PP", EGU="C",
+                     HIHI=100, HHSV="MAJOR", MDEL=0.1)
+
+ioc = spvirit.Ioc(records=[sp, rbv])
+
+sp.set(95)               # writes VAL, processes the chain, notifies monitors
+print(rbv.get())         # 95
+print(rbv["EGU"])        # "C" — field reads are read-only in A3
+
+ioc.run()                # or: spvirit.Server(ioc=ioc, pvs=[...]).run()
+```
+
+**Field names are verbatim EPICS.** `EGU=`, `HHSV=`, `MDEL=` — not tier 2's
+`units=` or `drive_limits=`. A tier-3 field has to round-trip to `.db` text
+*and* surface as a `.FIELD` PV, so `rec["EGU"]` and `EGU=` must be the same
+token. Passing a tier 2 spelling raises and names the EPICS one.
+
+**`spvirit.Server(db_file=…)` is not this.** It keeps serving a `.db` as inert
+values with `SCAN` and `FLNK` parsed and ignored. Use `spvirit.Ioc(db_file=…)`
+for a processing IOC; the separate name is deliberate.
+
+**No `on_put` on tier 3.** It would run Python inside `process()` while a lock
+set is held. `rec.on_put` raises and points at tier 2.
+
+---
+
 ## Loading EPICS .db files
 
 Existing StreamDevice/EPICS-style `.db` files load directly:

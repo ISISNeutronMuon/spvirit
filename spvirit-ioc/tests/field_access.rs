@@ -245,3 +245,54 @@ async fn building_a_server_hands_the_engine_its_monitor_registry() {
         "PvaServer must hand the engine the registry it publishes through"
     );
 }
+
+/// Host-side reads and client-side reads must agree.
+///
+/// A2 pinned parity for what a *client* observes across the tiers. A3 adds a
+/// second way to look at the same record — from inside the process — and a
+/// divergence between the two would be invisible to every existing test.
+#[tokio::test]
+async fn a_host_side_read_agrees_with_the_source_read() {
+    use spvirit_codec::spvd_decode::DecodedValue;
+
+    let ioc = spvirit_ioc::IocSource::from_records(vec![
+        spvirit_ioc::RecordSpec::ao("PAR:SP").out("PAR:RBV.VAL").flnk("PAR:RBV"),
+        spvirit_ioc::RecordSpec::ai("PAR:RBV").inp("PAR:SP PP").egu("C"),
+    ])
+    .expect("records must build");
+
+    ioc.set_value("PAR:SP", DecodedValue::Float64(42.0))
+        .await
+        .expect("host write must succeed");
+
+    for pv in ["PAR:SP", "PAR:RBV", "PAR:RBV.EGU"] {
+        let via_source = spvirit_server::pvstore::Source::get(&*ioc, pv).await;
+        assert!(via_source.is_some(), "{pv} must be readable");
+        // Reading twice must be stable: a read that processes, or that
+        // consumes a pending event, would show up here and nowhere else.
+        assert_eq!(
+            via_source,
+            spvirit_server::pvstore::Source::get(&*ioc, pv).await,
+            "{pv} must read the same twice — a read must not have side effects"
+        );
+    }
+}
+
+/// The engine claims records writable; field PVs are read-only on every tier.
+/// A3 adds a host-side write path, so the read-only half has to be re-checked
+/// against it rather than only against the wire.
+#[tokio::test]
+async fn field_pvs_stay_read_only_against_the_host_write_path() {
+    use spvirit_codec::spvd_decode::DecodedValue;
+
+    let ioc = spvirit_ioc::IocSource::from_records(vec![
+        spvirit_ioc::RecordSpec::ai("RO:A").inp("1").egu("C"),
+    ])
+    .expect("records must build");
+
+    let err = ioc
+        .set_value("RO:A.EGU", DecodedValue::Float64(1.0))
+        .await
+        .expect_err("a field PV must not be writable from host code either");
+    assert!(err.contains("read-only"), "got: {err}");
+}

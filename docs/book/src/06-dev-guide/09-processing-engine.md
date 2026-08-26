@@ -38,6 +38,43 @@ Registering through `.ioc()` rather than `.source()` is what makes
 disjointness check. A `.source()` registration still works and is the right
 call for anything that is not a record store.
 
+## Driving the engine from host code
+
+Records can be built without a `.db` file. The two paths converge before any
+field is interpreted — a `RecordSpec` lowers to the same `DbRecord` the parser
+produces — so they cannot drift:
+
+```rust
+use spvirit_ioc::{IocSource, RecordSpec};
+use spvirit_ioc::alarm::Severity;
+
+let ioc = IocSource::from_records(vec![
+    RecordSpec::ao("RIG:SP").out("RIG:RBV.VAL").flnk("RIG:RBV"),
+    RecordSpec::ai("RIG:RBV").inp("RIG:SP PP").egu("C")
+        .hihi(100.0).hhsv(Severity::Major),
+])?;
+```
+
+Writing from the host processes the chain and notifies monitor clients:
+
+```rust
+ioc.set_value("RIG:SP", DecodedValue::Float64(95.0)).await?;
+```
+
+`set_value` rather than `Source::put` matters. `put` returns its events for the
+*handler* to publish; a write that starts in host code never reaches the
+handler, so `put` alone would process correctly and notify nobody.
+
+Two things the engine will not do:
+
+- **Records cannot be added after the engine is built.** `RecordId` is
+  `{set, index}`, assigned by partitioning the link graph into lock sets; a
+  late record can join two sets and invalidate every outstanding id. Base has
+  the same restriction — `dbLoadRecords` after `iocInit` is unsupported.
+- **There is no `on_put`.** A callback would run arbitrary code inside
+  `process()` while a lock set is held. Behaviour belongs in the record graph;
+  if you need a callback, use a tier 2 PV, which has no lock sets.
+
 ## Two stores, one server
 
 A `PvaServer` can carry two independent record stores at once: the builtin
