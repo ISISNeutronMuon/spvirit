@@ -173,6 +173,22 @@ async fn writing_an_unknown_record_is_an_error_not_a_silent_no_op() {
     assert!(err.contains("RIG:NOPE"), "the error should name the record, got: {err}");
 }
 
+/// `writing_an_unknown_record_is_an_error_not_a_silent_no_op` above only
+/// checks that the record's name appears somewhere in the error, and both
+/// the "no record named" and the "field PV is read-only" messages happen to
+/// contain it — so that assertion alone cannot tell the two refusal paths
+/// apart. Pin the exact wording so a completely unknown name is never
+/// reported as a read-only field.
+#[tokio::test]
+async fn an_unknown_record_is_reported_as_missing_not_as_a_readonly_field() {
+    let ioc = IocSource::from_records(rig()).expect("records must build");
+    let err = ioc
+        .set_value("RIG:NOPE", DecodedValue::Float64(1.0))
+        .await
+        .expect_err("an unknown record must not be writable");
+    assert_eq!(err, "no record named 'RIG:NOPE'");
+}
+
 /// Field writes are sub-project B. Until then the refusal has to be explicit,
 /// because a silent no-op here is indistinguishable from a working write.
 #[tokio::test]

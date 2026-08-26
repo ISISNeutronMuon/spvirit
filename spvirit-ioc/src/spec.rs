@@ -85,6 +85,18 @@ pub fn unmodelled_fields(raw: &DbRecord) -> Vec<String> {
 }
 
 /// Render a float the way a `.db` file writes one: `100`, not `100.0`.
+///
+/// `< 1e15` (rather than `<=` or `==`) is the guard against `as i64`
+/// silently saturating on a value so large the cast can't represent it —
+/// 1e15 is comfortably inside f64's exact-integer range (2^53 ≈ 9.007e15),
+/// so every whole number this branch actually reaches round-trips through
+/// `as i64` and through `Display` identically. That makes `==` and `<=` at
+/// this comparison equivalent mutants under `cargo mutants`: they can only
+/// disagree with `<` at the single point `v.abs() == 1e15`, and at that
+/// point both branches render the same digits, so no value-based test can
+/// distinguish them. `>` is not equivalent — it is caught by
+/// `f_does_not_apply_the_terse_form_far_above_the_threshold` below, which
+/// exercises a magnitude where `as i64` actually saturates.
 fn f(v: f64) -> String {
     if v.fract() == 0.0 && v.is_finite() && v.abs() < 1e15 {
         format!("{}", v as i64)
@@ -392,6 +404,58 @@ mod tests {
         assert_eq!(yes.fields.get("TPRO").map(String::as_str), Some("1"));
         let no = RecordSpec::ai("Y").pini(false).to_db_record();
         assert_eq!(no.fields.get("PINI").map(String::as_str), Some("NO"));
+    }
+
+    /// The `Display` text is what a host sees in an error message, so its
+    /// exact wording is observable behaviour, not an implementation detail
+    /// `Debug` already covers.
+    #[test]
+    fn spec_error_display_messages_name_the_problem() {
+        assert_eq!(
+            SpecError::Unbound.to_string(),
+            "record spec is not bound to an engine yet"
+        );
+        assert_eq!(SpecError::NotFound("X".into()).to_string(), "no record named X");
+        assert_eq!(
+            SpecError::Unsupported("Bool(true)".into()).to_string(),
+            "scalar Bool(true) cannot be written to VAL"
+        );
+        assert_eq!(
+            SpecError::Write("boom".into()).to_string(),
+            "write failed: boom"
+        );
+    }
+
+    /// A record's own name is what the engine looks it up by, and what a
+    /// host reads back to identify which handle it holds — it must be the
+    /// name given at construction, not a placeholder.
+    #[test]
+    fn a_specs_name_is_the_one_it_was_constructed_with() {
+        assert_eq!(RecordSpec::ai("RIG:RBV").name(), "RIG:RBV");
+        assert_eq!(RecordSpec::ao("OTHER:PV").name(), "OTHER:PV");
+    }
+
+    /// `is_bound` is what Python's `Ioc(...)` relies on to keep a spec to
+    /// one engine (Ruling: "a RecordSpec belongs to one Ioc") — it must
+    /// read `false` before `bind` and `true` after, for real.
+    #[test]
+    fn is_bound_reflects_whether_bind_was_ever_called() {
+        let spec = RecordSpec::ai("REG:BOUND");
+        assert!(!spec.is_bound(), "a fresh spec is not yet bound");
+        let _ioc = crate::IocSource::from_records(vec![spec.clone()]).expect("must build");
+        assert!(spec.is_bound(), "building the engine must bind the spec");
+    }
+
+    /// `f`'s `< 1e15` guard exists so a value far too large for the terse
+    /// `as i64` form falls back to `f64`'s own `Display` instead of
+    /// silently saturating. Replacing `<` with `>` at that comparison would
+    /// send a huge value through the `as i64` cast, which saturates to
+    /// `i64::MAX` — a visibly wrong render this test catches. (`==` and
+    /// `<=` at the same spot are equivalent mutants — see the comment on
+    /// `f` above.)
+    #[test]
+    fn f_does_not_apply_the_terse_form_far_above_the_threshold() {
+        assert_eq!(f(1e20), format!("{}", 1e20_f64));
     }
 
     #[test]

@@ -431,3 +431,95 @@ impl StoreSource for IocSource {
         self.set_registry(registry);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal `tracing::Subscriber` that captures every event's
+    /// formatted `message` field, so a test can assert on log content
+    /// without pulling in `tracing-subscriber` as a dependency just for
+    /// this one check.
+    #[derive(Clone, Default)]
+    struct CapturingSubscriber(Arc<Mutex<Vec<String>>>);
+
+    struct MessageVisitor(String);
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().expect("captured-message lock poisoned").push(visitor.0);
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    fn raw_with_field(name: &str, record_type: &str, field: &str, value: &str) -> DbRecord {
+        let mut fields = HashMap::new();
+        fields.insert(field.to_string(), value.to_string());
+        DbRecord { name: name.to_string(), record_type: record_type.to_string(), fields }
+    }
+
+    /// The `Debug` impl is opaque by design (see the doc comment on it), but
+    /// it must still name the type rather than rendering as nothing — a
+    /// caller matching `{:?}` output against a broken record, or a test
+    /// using `expect_err`, needs to see *something* identifiable.
+    #[test]
+    fn debug_names_the_type() {
+        let source = IocSource::from_raw(vec![raw_with_field("X", "ai", "EGU", "C")])
+            .expect("must build");
+        let rendered = format!("{source:?}");
+        assert!(rendered.contains("IocSource"), "got: {rendered}");
+    }
+
+    /// Ruling 3: a field the engine doesn't model is accepted, carried, and
+    /// warned about exactly once at load — never silently. Assert the
+    /// warning actually fires and actually names the field, not just that
+    /// *some* event happens (load also emits an unrelated graph-report
+    /// warning for a record nothing ever processes, which must not be
+    /// mistaken for this one).
+    #[test]
+    fn an_unmodelled_field_is_warned_about_by_name_at_load() {
+        let messages: Arc<Mutex<Vec<String>>> = Arc::default();
+        let subscriber = CapturingSubscriber(messages.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let _source = IocSource::from_raw(vec![raw_with_field("X", "ai", "DRVH", "100")])
+            .expect("must build");
+
+        let msgs = messages.lock().expect("captured-message lock poisoned");
+        assert!(
+            msgs.iter().any(|m| m.contains("DRVH") && m.contains("does not model")),
+            "expected a warning naming the unmodelled DRVH field, got: {msgs:?}"
+        );
+    }
+
+    /// `record_names_sorted` is the inherent listing a host calls without
+    /// pulling `StoreSource` into scope; it must be every record's real
+    /// name, sorted — not an empty, placeholder, or made-up list.
+    #[test]
+    fn record_names_sorted_lists_every_real_name_in_order() {
+        let source = IocSource::from_raw(vec![
+            raw_with_field("Z:PV", "ai", "EGU", "C"),
+            raw_with_field("A:PV", "ai", "EGU", "C"),
+        ])
+        .expect("must build");
+        assert_eq!(source.record_names_sorted(), vec!["A:PV".to_string(), "Z:PV".to_string()]);
+    }
+}
