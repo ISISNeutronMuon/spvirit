@@ -48,3 +48,50 @@ def test_booleans_render_as_epics_menu_strings():
 def test_whole_floats_render_without_a_decimal_point():
     assert spvirit.ioc.ai("X", HIHI=100.0).fields()["HIHI"] == "100"
     assert spvirit.ioc.ai("X", HYST=0.5).fields()["HYST"] == "0.5"
+
+
+def test_an_ioc_can_be_built_from_records():
+    sp = spvirit.ioc.ao("RIG:SP", OUT="RIG:RBV.VAL", FLNK="RIG:RBV")
+    rbv = spvirit.ioc.ai("RIG:RBV", INP="RIG:SP PP", EGU="C")
+    ioc = spvirit.Ioc(records=[sp, rbv])
+    assert sorted(ioc.record_names()) == ["RIG:RBV", "RIG:SP"]
+
+
+def test_an_ioc_can_be_built_from_db_text():
+    ioc = spvirit.Ioc(db_string='record(ai, "A") {\n    field(INP, "7")\n}\n')
+    assert ioc.record_names() == ["A"]
+
+
+def test_building_with_neither_records_nor_db_is_an_error():
+    with pytest.raises(ValueError):
+        spvirit.Ioc()
+
+
+def test_building_with_both_records_and_db_is_an_error():
+    """Two sources of records would need a merge rule nothing has defined."""
+    rec = spvirit.ioc.ai("A", INP="1")
+    with pytest.raises(ValueError):
+        spvirit.Ioc(records=[rec], db_string='record(ai, "B") {\n}\n')
+
+
+def test_a_record_spec_belongs_to_one_ioc():
+    rec = spvirit.ioc.ai("A", INP="1")
+    spvirit.Ioc(records=[rec])
+    with pytest.raises(RuntimeError) as e:
+        spvirit.Ioc(records=[rec])
+    assert "already been built" in str(e.value)
+
+
+def test_adding_a_record_after_the_ioc_is_built_raises_with_the_reason():
+    ioc = spvirit.Ioc(records=[spvirit.ioc.ai("A", INP="1")])
+    with pytest.raises(RuntimeError) as e:
+        ioc.add_record(spvirit.ioc.ai("B", INP="2"))
+    msg = str(e.value)
+    assert "lock set" in msg
+    assert "iocInit" in msg or "dbLoadRecords" in msg
+
+
+def test_an_unsupported_record_type_names_sub_project_d():
+    with pytest.raises(ValueError) as e:
+        spvirit.Ioc(db_string='record(calc, "A") {\n}\n')
+    assert "sub-project D" in str(e.value)

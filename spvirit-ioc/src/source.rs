@@ -168,6 +168,13 @@ impl IocSource {
         self.db.dependency_graph()
     }
 
+    /// Every record name, sorted. The inherent twin of
+    /// [`StoreSource::record_names`], so callers do not need the trait in
+    /// scope for a plain listing.
+    pub fn record_names_sorted(&self) -> Vec<String> {
+        self.db.names()
+    }
+
     /// Attach the server's [`MonitorRegistry`]. Called automatically by
     /// `PvaServer` through [`StoreSource::set_monitor_registry`].
     pub fn set_registry(&self, registry: Arc<MonitorRegistry>) {

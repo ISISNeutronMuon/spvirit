@@ -101,6 +101,7 @@ fn spvirit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Tier 3. A submodule, not top-level functions, because `spvirit.ao` is
     // already tier 2's constructor and the two take different field
     // spellings — `spvirit.ioc.ao` versus `spvirit.ao` is the signpost.
+    m.add_class::<ioc::PyIoc>()?;
     ioc::register(m)?;
 
     // Module-level functions
