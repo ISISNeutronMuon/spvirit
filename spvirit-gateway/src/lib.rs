@@ -22,9 +22,13 @@
 //!   with gateway-side delta-merge) all forward to the resolved upstream. See
 //!   [`proxy`], [`bridge`], [`convert`], [`cache`].
 //! - **Loop prevention**: [`loopguard::LoopGuard`] bans the gateway's own
-//!   server interfaces and configured `ignoreaddr` hosts so it never resolves
-//!   itself. The client `interface` list is honoured and `ignoreaddr`
-//!   hostnames are DNS-resolved (failures are non-fatal).
+//!   server sockets (each interface IP + `serverport`) and configured
+//!   `ignoreaddr` hosts, and [`proxy::GatewaySource::claim`] consults it on
+//!   every resolution (via `pvinfo_full`'s returned address) so the gateway
+//!   never resolves back into itself. The ban is socket-granular for own
+//!   servers, so a legitimate upstream sharing an IP on a different port still
+//!   resolves; `ignoreaddr` hosts are DNS-resolved (failures non-fatal) and
+//!   banned at every port.
 //!
 //! # Documented M1 divergences
 //!

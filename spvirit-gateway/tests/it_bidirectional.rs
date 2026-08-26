@@ -29,7 +29,7 @@
 //! the *other* net's PV through each gateway server is what makes this
 //! bidirectional rather than a single pass-through hop.
 
-use std::net::{IpAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -142,7 +142,7 @@ async fn bidirectional_gateway_bridges_both_nets() {
         let _ = net_b.run().await;
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     let cfg_json = format!(
         r#"{{
@@ -188,20 +188,33 @@ async fn bidirectional_gateway_bridges_both_nets() {
     let cfg = GatewayConfig::from_json_str(&cfg_json).expect("parse gateway config");
 
     // LoopGuard assertion: the guard built for serverA must ban serverA's
-    // own advertise/interface address (127.0.0.1) — the gateway must never
-    // treat its own downstream-facing interface as a valid upstream
-    // resolution target, or it could loop a search back into itself.
+    // own downstream server SOCKET (127.0.0.1:gw_a_tcp) — the gateway must
+    // never treat its own listening socket as a valid upstream resolution
+    // target, or it could loop a search back into itself. Crucially, it must
+    // NOT ban the legitimate upstream on the same loopback IP but a different
+    // port (127.0.0.1:net_a_tcp), which is exactly why the ban is
+    // socket-granular rather than IP-wide.
     let guard_a = LoopGuard::build(&cfg, &cfg.servers[0]);
     assert!(
-        guard_a.is_banned("127.0.0.1".parse::<IpAddr>().unwrap()),
-        "LoopGuard must ban the gateway's own server interface address"
+        guard_a.is_banned(SocketAddr::new(
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            ports.gw_a_tcp
+        )),
+        "LoopGuard must ban the gateway's own server socket"
+    );
+    assert!(
+        !guard_a.is_banned(SocketAddr::new(
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            ports.net_a_tcp
+        )),
+        "LoopGuard must NOT ban a legitimate upstream sharing the loopback IP on a different port"
     );
 
     let runtime = Runtime::from_config(cfg).expect("valid config builds a Runtime");
     tokio::spawn(async move {
         let _ = runtime.run().await;
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     // Connect to gateway serverA (netA-facing) and ask for B:PV — this only
     // resolves if serverA's GatewaySource bridges through clientB to netB.
@@ -265,7 +278,7 @@ async fn autoaddrlist_false_with_explicit_addrlist_still_resolves() {
     tokio::spawn(async move {
         let _ = upstream.run().await;
     });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     // A standard p4p unicast client config: autoaddrlist explicitly
     // disabled, with an explicit addrlist unicast target instead.
@@ -302,5 +315,127 @@ async fn autoaddrlist_false_with_explicit_addrlist_still_resolves() {
     assert!(
         claimed.is_some(),
         "an autoaddrlist:false config with an explicit addrlist unicast target must still resolve"
+    );
+}
+
+/// Loop / self-connection prevention, exercised end-to-end through
+/// `GatewaySource::claim` (not just against a standalone `LoopGuard`).
+///
+/// A real upstream is spun up on `127.0.0.1:<tcp_port>`, and the gateway's own
+/// server is configured with `interface:["127.0.0.1"]` and `serverport` set to
+/// that same `<tcp_port>`. `LoopGuard::build` therefore bans exactly the socket
+/// the upstream resolves to — simulating the gateway resolving a search back
+/// into its own listening socket. `claim` must consult the guard, see the
+/// resolved address is banned, and refuse to bind (return `None`) even though
+/// `pvinfo_full` itself succeeds. A control assertion first proves the same
+/// upstream resolves fine when the guard does NOT ban its socket, so the
+/// `None` is attributable to the guard and not to a resolution failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claim_refuses_resolution_into_a_banned_own_server_socket() {
+    let Some(tcp_port) = free_tcp_port() else {
+        eprintln!("Skipping test: cannot bind a free TCP port in this environment");
+        return;
+    };
+    let Some(udp_port) = free_udp_port() else {
+        eprintln!("Skipping test: cannot bind a free UDP port in this environment");
+        return;
+    };
+
+    let upstream = PvaServer::builder()
+        .ai("IT:LOOP", 3.0)
+        .listen_ip("127.0.0.1".parse().unwrap())
+        .advertise_ip("127.0.0.1".parse().unwrap())
+        .port(tcp_port)
+        .udp_port(udp_port)
+        .build();
+    tokio::spawn(async move {
+        let _ = upstream.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let client_json = format!(
+        r#"{{
+            "name": "loop-client",
+            "addrlist": "127.0.0.1",
+            "bcastport": {udp_port},
+            "interface": ["127.0.0.1"]
+        }}"#
+    );
+
+    // Control: gateway server on a DIFFERENT serverport than the upstream, so
+    // the guard does not ban the upstream socket — resolution must succeed.
+    let Some(other_port) = free_tcp_port() else {
+        eprintln!("Skipping test: cannot bind a free TCP port in this environment");
+        return;
+    };
+    let control_cfg = GatewayConfig::from_json_str(&format!(
+        r#"{{
+            "version": 2,
+            "clients": [{client_json}],
+            "servers": [{{
+                "name": "loop-server",
+                "clients": ["loop-client"],
+                "interface": ["127.0.0.1"],
+                "serverport": {other_port}
+            }}]
+        }}"#
+    ))
+    .expect("parse control config");
+    let control_guard = Arc::new(LoopGuard::build(&control_cfg, &control_cfg.servers[0]));
+    let control_src = GatewaySource::new(
+        Arc::new(UpstreamPool::from_config(&control_cfg)),
+        vec!["loop-client".into()],
+        Arc::new(spvirit_gateway::cache::negative::NegativeCache::new(
+            Duration::from_secs(30),
+            128,
+        )),
+        control_guard,
+        0,
+    );
+    let control_claim = tokio::time::timeout(Duration::from_secs(5), control_src.claim("IT:LOOP"))
+        .await
+        .expect("control claim should not time out");
+    assert!(
+        control_claim.is_some(),
+        "control: the upstream must resolve when its socket is not banned"
+    );
+
+    // Now: gateway server whose serverport EQUALS the upstream's port, so the
+    // guard bans 127.0.0.1:<tcp_port> — the exact socket the upstream resolves
+    // to. claim must refuse.
+    let loop_cfg = GatewayConfig::from_json_str(&format!(
+        r#"{{
+            "version": 2,
+            "clients": [{client_json}],
+            "servers": [{{
+                "name": "loop-server",
+                "clients": ["loop-client"],
+                "interface": ["127.0.0.1"],
+                "serverport": {tcp_port}
+            }}]
+        }}"#
+    ))
+    .expect("parse loop config");
+    let loop_guard = LoopGuard::build(&loop_cfg, &loop_cfg.servers[0]);
+    assert!(
+        loop_guard.is_banned(SocketAddr::new("127.0.0.1".parse().unwrap(), tcp_port)),
+        "sanity: guard must ban the own-server socket the upstream resolves to"
+    );
+    let loop_src = GatewaySource::new(
+        Arc::new(UpstreamPool::from_config(&loop_cfg)),
+        vec!["loop-client".into()],
+        Arc::new(spvirit_gateway::cache::negative::NegativeCache::new(
+            Duration::from_secs(30),
+            128,
+        )),
+        Arc::new(loop_guard),
+        0,
+    );
+    let loop_claim = tokio::time::timeout(Duration::from_secs(5), loop_src.claim("IT:LOOP"))
+        .await
+        .expect("loop claim should not time out");
+    assert!(
+        loop_claim.is_none(),
+        "claim must refuse to bind a name that resolves into a banned own-server socket"
     );
 }

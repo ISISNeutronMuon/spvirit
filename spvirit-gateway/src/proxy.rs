@@ -57,7 +57,9 @@ pub struct GatewaySource {
     pool: Arc<UpstreamPool>,
     client_order: Vec<String>,
     neg: Arc<NegativeCache>,
-    #[allow(dead_code)] // consulted by the server-side search path, wired in Task 14
+    /// Refuses to bind a name that resolves back into one of our own
+    /// downstream server sockets (or an `ignoreaddr` host); consulted in
+    /// [`GatewaySource::claim`].
     guard: Arc<LoopGuard>,
     getholdoff_ms: u32,
     bindings: Mutex<HashMap<String, Binding>>,
@@ -67,8 +69,7 @@ pub struct GatewaySource {
 impl GatewaySource {
     /// Build a source that searches `client_order` (in order) for each
     /// downstream name, backed by `pool`, remembering upstream misses in
-    /// `neg` and (later) refusing to resolve back into our own servers via
-    /// `guard`.
+    /// `neg` and refusing to resolve back into our own servers via `guard`.
     pub fn new(
         pool: Arc<UpstreamPool>,
         client_order: Vec<String>,
@@ -108,7 +109,14 @@ impl Source for GatewaySource {
                 let Some(client) = self.pool.client(client_name) else {
                     continue;
                 };
-                if let Ok(descriptor) = client.pvinfo(&name).await {
+                if let Ok((descriptor, server_addr)) = client.pvinfo_full(&name).await {
+                    // Loop / self-connection prevention: if this name resolved
+                    // back into one of our own downstream server sockets (or an
+                    // `ignoreaddr` host), do NOT bind it — forwarding would loop
+                    // a search into ourselves. Skip to the next client.
+                    if self.guard.is_banned(server_addr) {
+                        continue;
+                    }
                     self.bindings.lock().unwrap().insert(
                         name.clone(),
                         Binding {
