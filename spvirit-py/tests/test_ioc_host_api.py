@@ -95,3 +95,68 @@ def test_an_unsupported_record_type_names_sub_project_d():
     with pytest.raises(ValueError) as e:
         spvirit.Ioc(db_string='record(calc, "A") {\n}\n')
     assert "sub-project D" in str(e.value)
+
+
+def _rig():
+    sp = spvirit.ioc.ao("RIG:SP", OUT="RIG:RBV.VAL", FLNK="RIG:RBV")
+    rbv = spvirit.ioc.ai("RIG:RBV", INP="RIG:SP PP", EGU="C", HIHI=100, HHSV="MAJOR")
+    return sp, rbv, spvirit.Ioc(records=[sp, rbv])
+
+
+def test_an_outside_in_write_processes_the_chain():
+    sp, rbv, _ioc = _rig()
+    assert sp.set(95) is None  # Python set() returns None (Ruling 4)
+    assert sp.get() == 95
+    assert rbv.get() == 95
+
+
+def test_set_async_is_awaitable_and_returns_none():
+    import asyncio
+
+    sp, rbv, _ioc = _rig()
+
+    async def drive():
+        result = await sp.set_async(95)
+        assert result is None
+
+    asyncio.run(drive())
+    assert rbv.get() == 95
+
+
+def test_reading_a_field_uses_the_epics_name():
+    _sp, rbv, _ioc = _rig()
+    assert rbv["EGU"] == "C"
+
+
+def test_field_writes_are_refused_and_name_sub_project_b():
+    _sp, rbv, _ioc = _rig()
+    with pytest.raises(TypeError) as e:
+        rbv["SCAN"] = "1 second"
+    assert "sub-project B" in str(e.value)
+
+
+def test_on_put_does_not_exist_on_tier_three():
+    """Not a silent no-op: tier 2 has a known trap where attaching on_put
+    after handing the PV to a server logs a warning and does nothing, and
+    repeating it here would be worse, because on tier 3 it can never work."""
+    _sp, rbv, _ioc = _rig()
+    with pytest.raises(AttributeError) as e:
+        rbv.on_put
+    msg = str(e.value)
+    assert "tier 2" in msg
+    assert "lock set" in msg or "GIL" in msg
+
+
+def test_an_unbound_record_says_so():
+    rec = spvirit.ioc.ai("A", INP="1")
+    with pytest.raises(RuntimeError) as e:
+        rec.get()
+    assert "Ioc" in str(e.value)
+    with pytest.raises(RuntimeError):
+        rec.set(1)
+
+
+def test_an_unknown_field_reads_as_a_key_error():
+    _sp, rbv, _ioc = _rig()
+    with pytest.raises(KeyError):
+        rbv["NOSUCHFIELD"]

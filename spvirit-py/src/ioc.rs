@@ -7,12 +7,27 @@
 //! `rec["EGU"]` and `EGU=` must be the same token. Renaming would break the
 //! 1:1 mapping that is the tier's entire value.
 
+use pyo3::IntoPyObjectExt;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyString};
 use spvirit_ioc::IocSource;
 use spvirit_ioc::RecordSpec;
+use spvirit_ioc::SpecError;
 use spvirit_ioc::model::Kind;
 use std::sync::Arc;
+
+/// Map the Rust handle's error onto the Python exception the surface promises.
+fn spec_err(e: SpecError) -> PyErr {
+    match e {
+        SpecError::Unbound => pyo3::exceptions::PyRuntimeError::new_err(
+            "record is not bound to an engine yet — pass it to \
+             Ioc(records=[...]) before reading or writing it",
+        ),
+        SpecError::NotFound(what) => pyo3::exceptions::PyKeyError::new_err(what),
+        SpecError::Unsupported(what) => pyo3::exceptions::PyValueError::new_err(what),
+        SpecError::Write(msg) => pyo3::exceptions::PyValueError::new_err(msg),
+    }
+}
 
 /// Tier 2 spellings that would otherwise be silently accepted as unmodelled
 /// fields, producing a record whose units nothing reads.
@@ -123,6 +138,90 @@ impl PyRecordSpec {
 
     fn __repr__(&self) -> String {
         format!("<spvirit.ioc.RecordSpec '{}'>", self.name)
+    }
+
+    /// The record's current `VAL`, as a bare Python scalar (Ruling 4).
+    fn get(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let handle = self.inner.clone();
+        let scalar = py
+            .allow_threads(|| crate::runtime::RUNTIME.block_on(async move { handle.get().await }))
+            .map_err(spec_err)?;
+        Ok(crate::convert::scalar_to_py(py, &scalar))
+    }
+
+    /// Write `VAL`, process the chain, and notify monitors; returns `None`.
+    ///
+    /// An outside-in write: no lock is held by the caller. It delegates to
+    /// `RecordSpec::set`, which routes through `IocSource::set_value`, so a
+    /// host write here publishes on the same path a client PUT drives.
+    fn set(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let scalar = crate::convert::py_to_scalar(value)?;
+        let handle = self.inner.clone();
+        py.allow_threads(|| {
+            crate::runtime::RUNTIME.block_on(async move { handle.set(scalar).await })
+        })
+        .map_err(spec_err)
+    }
+
+    /// Awaitable variant of `set` (tier-2 parity, `pv.rs:159`); resolves to
+    /// `None`.
+    fn set_async<'py>(
+        &self,
+        py: Python<'py>,
+        value: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let scalar = crate::convert::py_to_scalar(value)?;
+        let handle = self.inner.clone();
+        crate::runtime::future_into_py(py, async move {
+            handle.set(scalar).await.map_err(spec_err)?;
+            Python::with_gil(|py| py.None().into_py_any(py))
+        })
+    }
+
+    /// Read a field by its verbatim EPICS name: `rec["EGU"]`.
+    ///
+    /// Read-only in A3. Field *writes* are sub-project B, and they will use
+    /// this same spelling, so the capability grows without the syntax
+    /// changing. Delegates to `RecordSpec::get_field`, the single Rust home
+    /// for the binding slot.
+    fn __getitem__(&self, py: Python<'_>, field: &str) -> PyResult<PyObject> {
+        let handle = self.inner.clone();
+        let field = field.to_ascii_uppercase();
+        let scalar = py
+            .allow_threads(|| {
+                let field = field.clone();
+                crate::runtime::RUNTIME.block_on(async move { handle.get_field(&field).await })
+            })
+            .map_err(spec_err)?;
+        Ok(crate::convert::scalar_to_py(py, &scalar))
+    }
+
+    fn __setitem__(&self, field: &str, _value: &Bound<'_, PyAny>) -> PyResult<()> {
+        Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "field '{}' is read-only: writing record fields is sub-project B. \
+             Reads use this same syntax, so the spelling will not change when \
+             writes arrive.",
+            field.to_ascii_uppercase()
+        )))
+    }
+
+    /// Always raises, on attribute access rather than on call.
+    ///
+    /// Tier 3 permanently excludes `on_put`: it would run arbitrary Python
+    /// inline inside `process()`, holding a lock set while acquiring the GIL.
+    /// A getter rather than a method so `rec.on_put` and `@rec.on_put` both
+    /// fail immediately — tier 2 already has a trap where a late `on_put` is
+    /// a silent no-op that only logs, and repeating that here would be worse,
+    /// because on tier 3 it can never work at all.
+    #[getter]
+    fn on_put(&self) -> PyResult<()> {
+        Err(pyo3::exceptions::PyAttributeError::new_err(
+            "tier 3 records have no on_put: a callback would run arbitrary \
+             Python inside process(), holding a lock set while acquiring the \
+             GIL. Put the behaviour in the record graph (INP/OUT/FLNK/CALC), \
+             or use a tier 2 PV — spvirit.ao(...) — which has no lock sets and \
+             supports @pv.on_put.",
+        ))
     }
 }
 
