@@ -1,4 +1,5 @@
 //! spvirit-gateway — a p4p-compatible PVAccess gateway.
+pub mod cache;
 pub mod config;
 pub mod loopguard;
 pub mod upstream;
