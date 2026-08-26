@@ -12,6 +12,7 @@ use crate::graph::DependencyGraph;
 use crate::lockset::RecordDb;
 use crate::model::{Field, Value};
 use crate::process::{process, write_field};
+use crate::spec::{RecordSpec, unmodelled_fields};
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::db::{DbRecord, load_db_records, parse_db_records};
 use spvirit_server::field_provider::{
@@ -23,7 +24,7 @@ use spvirit_types::{NtPayload, ScalarValue};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Depth of a subscriber's monitor channel. Matches `SimplePvStore`'s
@@ -48,6 +49,15 @@ pub struct IocSource {
     field_subs: Mutex<Vec<mpsc::Sender<NtPayload>>>,
 }
 
+/// A minimal, opaque `Debug` — `RecordDb` and friends don't derive it, and
+/// the only consumer of this impl is `Result::expect_err` in
+/// `tests/programmatic.rs`, which never prints the `Ok` value anyway.
+impl std::fmt::Debug for IocSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IocSource").finish_non_exhaustive()
+    }
+}
+
 impl IocSource {
     pub fn from_db_file(path: &str) -> Result<IocSource, String> {
         let raw = load_db_records(path, &HashMap::new()).map_err(|e| e.to_string())?;
@@ -60,7 +70,27 @@ impl IocSource {
         Self::from_raw(raw)
     }
 
+    /// Build an engine from records described in host code.
+    ///
+    /// Equivalent to writing the same records as `.db` text and calling
+    /// [`IocSource::from_db_str`] — the specs lower to the very `DbRecord`s
+    /// the parser produces, so both paths converge here before any field is
+    /// interpreted. `tests/programmatic.rs` pins the equivalence as an
+    /// observable property.
+    ///
+    /// Returns an `Arc` because it binds every spec to the built engine: a
+    /// `RecordSpec` the caller kept is a live handle afterwards (Ruling 6).
+    pub fn from_records(records: Vec<RecordSpec>) -> Result<Arc<IocSource>, String> {
+        let raws = records.iter().map(RecordSpec::to_db_record).collect();
+        let source = Arc::new(Self::from_raw(raws)?);
+        for spec in &records {
+            spec.bind(&source);
+        }
+        Ok(source)
+    }
+
     fn from_raw(raw: Vec<DbRecord>) -> Result<IocSource, String> {
+        let raw_for_diagnostics = raw.clone();
         let records = build_records(&raw).map_err(|e| e.to_string())?;
         let kinds = records
             .iter()
@@ -81,8 +111,26 @@ impl IocSource {
         };
         // Report the load-time diagnostics once, here, rather than on every
         // pass. None of them is fatal.
+        //
+        // The unmodelled-field warning is emitted here, on the shared path,
+        // rather than in `from_records` — a `.db` carrying DRVH deserves the
+        // same warning as a `RecordSpec` carrying it, and warning on only one
+        // path would make the two paths distinguishable by their diagnostics
+        // even though their behaviour is identical.
         for line in source.graph().report() {
             tracing::warn!(target: "spvirit_ioc", "{line}");
+        }
+        for raw in &raw_for_diagnostics {
+            let unmodelled = unmodelled_fields(raw);
+            if !unmodelled.is_empty() {
+                tracing::warn!(
+                    target: "spvirit_ioc",
+                    "record '{}': the engine does not model {} — accepted and ignored, \
+                     exactly as dbLoadRecords ignores a field no DSET reads",
+                    raw.name,
+                    unmodelled.join(", "),
+                );
+            }
         }
         Ok(source)
     }

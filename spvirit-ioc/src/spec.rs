@@ -14,6 +14,7 @@
 
 use crate::alarm::Severity;
 use crate::model::Kind;
+use crate::source::IocSource;
 use spvirit_server::db::DbRecord;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -59,6 +60,10 @@ struct SpecShared {
     name: String,
     kind: Kind,
     fields: Mutex<HashMap<String, String>>,
+    /// `None` until [`RecordSpec::bind`] attaches the built engine. Once
+    /// `Some`, the builder setters warn-and-no-op and (Task 5) `get`/`set`
+    /// reach the engine instead of returning `Unbound`.
+    source: Mutex<Option<Arc<IocSource>>>,
 }
 
 /// A record described but not yet built.
@@ -109,6 +114,7 @@ impl RecordSpec {
             name: name.into(),
             kind,
             fields: Mutex::new(HashMap::new()),
+            source: Mutex::new(None),
         }))
     }
 
@@ -135,6 +141,15 @@ impl RecordSpec {
     /// is uppercased, so `.field("egu", …)` sets `EGU` rather than adding a
     /// second key nothing reads.
     pub fn field(self, name: &str, value: impl Into<String>) -> RecordSpec {
+        if self.0.source.lock().unwrap().is_some() {
+            tracing::warn!(
+                target: "spvirit_ioc",
+                record = %self.0.name,
+                field = name,
+                "RecordSpec field set after the record was built is ignored"
+            );
+            return self;
+        }
         self.0
             .fields
             .lock()
@@ -181,6 +196,16 @@ impl RecordSpec {
             record_type: self.0.kind.db_name().to_string(),
             fields: self.0.fields.lock().unwrap().clone(),
         }
+    }
+
+    /// Attach the built engine, flipping this handle from pending to bound.
+    ///
+    /// Called by [`crate::IocSource::from_records`] once the engine exists —
+    /// the tier-3 analogue of `ServeBuilder::build` binding its `Pv`s
+    /// (`pva_server.rs:1140-1142`). Every clone shares the slot, so binding
+    /// here binds them all.
+    pub(crate) fn bind(&self, source: &Arc<IocSource>) {
+        *self.0.source.lock().unwrap() = Some(Arc::clone(source));
     }
 }
 
@@ -273,5 +298,21 @@ mod tests {
         ] {
             assert_eq!(spec.to_db_record().record_type, want);
         }
+    }
+
+    /// Once the engine is built, the spec is a live handle, not a builder;
+    /// a late setter must not silently rewrite a record that already exists.
+    #[test]
+    fn a_builder_call_after_bind_is_ignored() {
+        let spec = RecordSpec::ai("REG:X").egu("C");
+        let _ioc = crate::IocSource::from_records(vec![spec.clone()])
+            .expect("must build");
+        let before = spec.to_db_record();
+        let _ = spec.clone().egu("K"); // ignored: REG:X is already built
+        assert_eq!(
+            spec.to_db_record().fields.get("EGU"),
+            before.fields.get("EGU"),
+            "a field set after bind must not change the spec"
+        );
     }
 }
