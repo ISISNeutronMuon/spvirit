@@ -15,9 +15,52 @@
 use crate::alarm::Severity;
 use crate::model::Kind;
 use crate::source::IocSource;
+use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::db::DbRecord;
+use spvirit_server::pvstore::Source;
+use spvirit_types::{NtPayload, ScalarValue};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+/// Errors from operating a bound [`RecordSpec`] handle.
+#[derive(Debug, Clone)]
+pub enum SpecError {
+    /// The spec has not been bound to a running engine yet.
+    Unbound,
+    /// The bound engine has no record under this name.
+    NotFound(String),
+    /// The scalar variant cannot be written to a record's `VAL`.
+    Unsupported(String),
+    /// The engine refused or failed the write.
+    Write(String),
+}
+
+impl std::fmt::Display for SpecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpecError::Unbound => write!(f, "record spec is not bound to an engine yet"),
+            SpecError::NotFound(n) => write!(f, "no record named {n}"),
+            SpecError::Unsupported(v) => write!(f, "scalar {v} cannot be written to VAL"),
+            SpecError::Write(e) => write!(f, "write failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SpecError {}
+
+/// The six scalar variants `IocSource::value_of` accepts as a `VAL` write.
+/// This is the private `ScalarValue → DecodedValue` bridge of Ruling 6.
+fn scalar_to_decoded(value: ScalarValue) -> Result<DecodedValue, SpecError> {
+    Ok(match value {
+        ScalarValue::F64(x) => DecodedValue::Float64(x),
+        ScalarValue::F32(x) => DecodedValue::Float32(x),
+        ScalarValue::I32(x) => DecodedValue::Int32(x),
+        ScalarValue::I64(x) => DecodedValue::Int64(x),
+        ScalarValue::U16(x) => DecodedValue::UInt16(x),
+        ScalarValue::Bool(x) => DecodedValue::Boolean(x),
+        other => return Err(SpecError::Unsupported(format!("{other:?}"))),
+    })
+}
 
 /// The field names in `raw` that the engine does not model, sorted.
 ///
@@ -206,6 +249,71 @@ impl RecordSpec {
     /// here binds them all.
     pub(crate) fn bind(&self, source: &Arc<IocSource>) {
         *self.0.source.lock().unwrap() = Some(Arc::clone(source));
+    }
+
+    /// The bound engine, or `Err(Unbound)` while the spec is still pending.
+    fn bound(&self) -> Result<Arc<IocSource>, SpecError> {
+        self.0
+            .source
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(SpecError::Unbound)
+    }
+
+    /// Whether the binding slot is filled — i.e. this spec (or a clone that
+    /// shares its slot) has been built into an engine. Python's `Ioc(...)`
+    /// reads this to keep a spec to one engine without a Python-side flag.
+    pub fn is_bound(&self) -> bool {
+        self.0.source.lock().unwrap().is_some()
+    }
+
+    /// Read this record's current scalar `VAL`.
+    ///
+    /// `Err(SpecError::Unbound)` before bind — the tier-3 analogue of tier 2's
+    /// `Pv::store()` on a pending handle (`pv.rs:598-603`).
+    pub async fn get(&self) -> Result<ScalarValue, SpecError> {
+        let source = self.bound()?;
+        let payload = source
+            .get(&self.0.name)
+            .await
+            .ok_or_else(|| SpecError::NotFound(self.0.name.clone()))?;
+        match payload {
+            NtPayload::Scalar(s) => Ok(s.value),
+            other => Err(SpecError::Unsupported(format!("{other:?}"))),
+        }
+    }
+
+    /// Write this record's `VAL` from host code and process, publishing the
+    /// result exactly as a client PUT would.
+    ///
+    /// Delegates to [`IocSource::set_value`] so the write goes through the one
+    /// path that publishes host-side writes (see Task 5's publication trap).
+    /// `Err(SpecError::Unbound)` before bind.
+    pub async fn set(&self, value: ScalarValue) -> Result<(), SpecError> {
+        let source = self.bound()?;
+        let decoded = scalar_to_decoded(value)?;
+        source
+            .set_value(&self.0.name, decoded)
+            .await
+            .map_err(SpecError::Write)?;
+        Ok(())
+    }
+
+    /// Read one of this record's fields by its verbatim EPICS name (e.g.
+    /// `"EGU"`). The binding slot lives only here, so the Python `rec["EGU"]`
+    /// handle delegates to this rather than reaching for the engine itself.
+    ///
+    /// `Err(SpecError::Unbound)` before bind; `Err(SpecError::NotFound)` for a
+    /// field the record does not carry. Field *writes* are sub-project B.
+    pub async fn get_field(&self, field: &str) -> Result<ScalarValue, SpecError> {
+        let source = self.bound()?;
+        let pv = format!("{}.{}", self.0.name, field.to_ascii_uppercase());
+        let payload = source.get(&pv).await.ok_or(SpecError::NotFound(pv))?;
+        match payload {
+            NtPayload::Scalar(s) => Ok(s.value),
+            other => Err(SpecError::Unsupported(format!("{other:?}"))),
+        }
     }
 }
 

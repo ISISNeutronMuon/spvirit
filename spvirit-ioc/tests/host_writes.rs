@@ -187,3 +187,72 @@ async fn writing_a_field_is_refused_with_a_reason() {
         "the error should say the field PV is read-only, got: {err}"
     );
 }
+
+use spvirit_ioc::SpecError;
+use spvirit_types::ScalarValue;
+
+/// A bound spec reads and writes its own record; the write drives the chain.
+#[tokio::test]
+async fn a_bound_spec_handle_gets_and_sets() {
+    let sp = RecordSpec::ao("RIG:SP").out("RIG:RBV.VAL").flnk("RIG:RBV");
+    let rbv = RecordSpec::ai("RIG:RBV").inp("RIG:SP PP").egu("C");
+    // Clones share the binding slot, so binding inside `from_records` binds
+    // these handles too.
+    let _ioc = IocSource::from_records(vec![sp.clone(), rbv.clone()])
+        .expect("records must build");
+
+    sp.set(ScalarValue::F64(42.0)).await.expect("bound set must succeed");
+    let read = sp.get().await.expect("bound get must succeed");
+    assert!(
+        matches!(read, ScalarValue::F64(v) if (v - 42.0).abs() < 1e-9),
+        "the setpoint should read back what was written, got: {read:?}"
+    );
+
+    let downstream = rbv.get().await.expect("bound get must succeed");
+    assert!(
+        matches!(downstream, ScalarValue::F64(v) if (v - 42.0).abs() < 1e-9),
+        "RIG:RBV should have followed RIG:SP, got: {downstream:?}"
+    );
+}
+
+/// A pending (unbound) spec refuses get and set — the tier-3 analogue of
+/// `Pv::store()` returning `Unbound` while pending.
+#[tokio::test]
+async fn a_pending_spec_handle_is_unbound() {
+    let pending = RecordSpec::ai("RIG:RBV");
+    assert!(
+        matches!(pending.get().await, Err(SpecError::Unbound)),
+        "get on a pending spec must be Unbound"
+    );
+    assert!(
+        matches!(pending.set(ScalarValue::F64(1.0)).await, Err(SpecError::Unbound)),
+        "set on a pending spec must be Unbound"
+    );
+}
+
+/// A scalar variant the engine cannot write to `VAL` is refused, not panicked.
+#[tokio::test]
+async fn a_bound_spec_refuses_an_unsupported_scalar() {
+    let sp = RecordSpec::ao("RIG:SP");
+    let _ioc = IocSource::from_records(vec![sp.clone()]).expect("records must build");
+    assert!(
+        matches!(sp.set(ScalarValue::Str("nope".into())).await, Err(SpecError::Unsupported(_))),
+        "a string is not a writable VAL scalar"
+    );
+}
+
+/// A bound spec reads its own fields by verbatim EPICS name — the Rust home
+/// the Python `rec["EGU"]` handle delegates to.
+#[tokio::test]
+async fn a_bound_spec_reads_a_field_by_epics_name() {
+    let rbv = RecordSpec::ai("RIG:RBV").egu("C");
+    let _ioc = IocSource::from_records(vec![rbv.clone()]).expect("records must build");
+    match rbv.get_field("EGU").await.expect("EGU is readable") {
+        ScalarValue::Str(s) => assert_eq!(s, "C"),
+        other => panic!("EGU should read as a string, got {other:?}"),
+    }
+    assert!(
+        matches!(rbv.get_field("NOSUCHFIELD").await, Err(SpecError::NotFound(_))),
+        "an absent field must be NotFound, not a panic"
+    );
+}

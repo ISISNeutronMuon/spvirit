@@ -28,4 +28,4 @@ pub mod spec;
 mod test_support;
 
 pub use source::IocSource;
-pub use spec::RecordSpec;
+pub use spec::{RecordSpec, SpecError};
