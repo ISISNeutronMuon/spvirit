@@ -147,6 +147,41 @@ fine; a client that enforces a maximum frame size will not. Tracked as
 roadmap item 6 in
 [Current State and Roadmap](../06-dev-guide/08-current-state.md).
 
+## Gateway (M1): passthrough only
+
+`spgateway` in M1 is a *passthrough* gateway — it resolves, reads, writes, and
+monitors PVs across networks, but the access-control and observability layers
+are not yet wired. The divergences below are deliberate for this milestone and
+are documented in full on the [`spgateway`](../04-tools/spgateway.md) page.
+
+**Representation.** The proxy round-trips through spvirit's decoded value model,
+which does not carry every PVAccess shape losslessly. An array-of-structure
+value (e.g. an `NTNDArray` `dimension`) is proxied as an index-keyed structure
+rather than a true array; `union`/`any` fields degrade; non-finite floats
+(`NaN`/`Inf`) become JSON `null` on the put path; and deeply nested structure
+IDs are best-effort.
+
+**Resolution.** Only the first token of a client's `addrlist` is used. A p4p
+config with `autoaddrlist:false` plus an explicit unicast `addrlist` now does
+perform the unicast search (an earlier defect where it searched nothing at all
+is fixed), but it still emits a subnet broadcast alongside the unicast probe —
+the underlying `spvirit-client` search branch cannot be changed from the
+gateway. Malformed `addrlist`/`interface` entries degrade silently rather than
+erroring.
+
+**Control plane.** `names()` (what a downstream `pvlist` sees) reports only the
+names this gateway has already claimed, not a true fan-out of each upstream's
+`pvlist` — the gateway resolves names dynamically and caches no upstream
+`SocketAddr` in M1. `rpc` forwarding is not implemented: there is no general
+client RPC entry point yet, so an RPC to the gateway returns
+`"gateway RPC forwarding is not implemented in M1"`.
+
+**Access control and ops.** DENY filtering and `readOnly` enforcement (the ACF
+layer) are not applied — every claimed PV is readable and writable. The
+`x-spvirit` metrics, audit, hot-reload, and rate-limit blocks are parsed and
+validated but not consumed. Ctrl-C shutdown is immediate: outstanding requests
+are hard-cancelled rather than drained gracefully.
+
 ## What is *not* on this list
 
 Behaviour that is deliberate and merely surprising lives in the chapters, not

@@ -109,6 +109,7 @@ in [Installation](https://isisneutronmuon.github.io/spvirit/02-getting-started/i
 | `spinfo` | `pvinfo` | Display field/metadata information for a PV |
 | `splist` | `pvlist` | List all available PVs on discovered servers |
 | `spserver` | `softIoc` | Not fully one-to-one — a demo, but it parses some `.db` vocabulary |
+| `spgateway` | `pvagw` | PVAccess gateway — proxy PVs between networks from a p4p-schema config |
 | `sptable` | | Interactive TUI IOC — build and drive records live |
 | `spexplore` | | Interactive TUI to browse servers, select PVs, and monitor values |
 | `spsearch` | | TUI showing PV search network traffic for diagnostics |

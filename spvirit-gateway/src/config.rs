@@ -263,13 +263,13 @@ impl GatewayConfig {
                 }
             }
 
-            if let Some(acf) = &s.acf_client {
-                if !client_names.contains(acf.as_str()) {
-                    return Err(ConfigError::Validation(format!(
-                        "server '{}' references unknown acf-client '{}'",
-                        s.name, acf
-                    )));
-                }
+            if let Some(acf) = &s.acf_client
+                && !client_names.contains(acf.as_str())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "server '{}' references unknown acf-client '{}'",
+                    s.name, acf
+                )));
             }
         }
 
