@@ -54,6 +54,7 @@
 - [spserver](04-tools/spserver.md)
 - [sptable](04-tools/sptable.md)
 - [spdodeca](04-tools/spdodeca.md)
+- [spgateway](04-tools/spgateway.md)
 
 ---
 

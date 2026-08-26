@@ -6,7 +6,7 @@
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
 
-`spvirit-tools` ships twelve binaries. They are named `sp*` rather than
+`spvirit-tools` ships thirteen binaries. They are named `sp*` rather than
 `pv*` so they can sit alongside an EPICS Base installation without
 shadowing `pvget`, `pvput`, and friends.
 
@@ -24,6 +24,7 @@ shadowing `pvget`, `pvput`, and friends.
 | [`spserver`](spserver.md) | server | serve a `.db` file |
 | [`sptable`](sptable.md) | server, TUI | an interactive spreadsheet IOC |
 | [`spdodeca`](spdodeca.md) | server | serve a rotating wireframe as an image |
+| [`spgateway`](spgateway.md) | client, server | p4p-compatible PVAccess gateway |
 
 ## Building them
 
@@ -38,6 +39,7 @@ cargo build -p spvirit-tools --all-features
 |---|---|
 | `client` | `spget`, `spput`, `spmonitor`, `spinfo`, `splist`, `spsine`, `spget_compare` |
 | `server` | `spserver`, `spdodeca` |
+| `client` + `server` | `spgateway` |
 | `client` + `tui` | `spexplore`, `spsearch` |
 | `server` + `tui` | `sptable` |
 

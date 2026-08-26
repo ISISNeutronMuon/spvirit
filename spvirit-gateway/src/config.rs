@@ -222,6 +222,52 @@ impl GatewayConfig {
     pub fn from_json_str(s: &str) -> Result<Self, ConfigError> {
         serde_json::from_str(s).map_err(|e| ConfigError::Json(e.to_string()))
     }
+
+    /// Semantic validation beyond what serde can express: uniqueness of
+    /// names and cross-references between clients/servers.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        use std::collections::HashSet;
+
+        let mut client_names: HashSet<&str> = HashSet::new();
+        for c in &self.clients {
+            if !client_names.insert(c.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate client name: {}",
+                    c.name
+                )));
+            }
+        }
+
+        let mut server_names: HashSet<&str> = HashSet::new();
+        for s in &self.servers {
+            if !server_names.insert(s.name.as_str()) {
+                return Err(ConfigError::Validation(format!(
+                    "duplicate server name: {}",
+                    s.name
+                )));
+            }
+
+            for c in &s.clients {
+                if !client_names.contains(c.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "server '{}' references unknown client '{}'",
+                        s.name, c
+                    )));
+                }
+            }
+
+            if let Some(acf) = &s.acf_client {
+                if !client_names.contains(acf.as_str()) {
+                    return Err(ConfigError::Validation(format!(
+                        "server '{}' references unknown acf-client '{}'",
+                        s.name, acf
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +326,47 @@ mod tests {
     fn unknown_p4p_key_is_ignored() {
         let s = r#"{ "version":2, "futureKey": 7, "clients":[], "servers":[] }"#;
         assert!(GatewayConfig::from_json_str(s).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_dangling_client_ref() {
+        let s = r#"{ "version":2, "clients":[{"name":"a"}],
+            "servers":[{"name":"s","clients":["nope"]}] }"#;
+        let cfg = GatewayConfig::from_json_str(s).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn validate_accepts_valid_config() {
+        let cfg = GatewayConfig::from_json_str(BIDI).expect("parse");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_client_names() {
+        let s = r#"{ "version":2, "clients":[{"name":"a"},{"name":"a"}],
+            "servers":[] }"#;
+        let cfg = GatewayConfig::from_json_str(s).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_server_names() {
+        let s = r#"{ "version":2, "clients":[{"name":"a"}],
+            "servers":[{"name":"s","clients":["a"]},{"name":"s","clients":["a"]}] }"#;
+        let cfg = GatewayConfig::from_json_str(s).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_acf_client() {
+        let s = r#"{ "version":2, "clients":[{"name":"a"}],
+            "servers":[{"name":"s","clients":["a"],"acf-client":"nope"}] }"#;
+        let cfg = GatewayConfig::from_json_str(s).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
     }
 }

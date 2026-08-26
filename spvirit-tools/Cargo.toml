@@ -21,6 +21,7 @@ spvirit-types.workspace = true
 spvirit-codec.workspace = true
 spvirit-client.workspace = true
 spvirit-server.workspace = true
+spvirit-gateway.workspace = true
 
 tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1.41"
@@ -99,3 +100,8 @@ required-features = ["client"]
 name = "sptable"
 path = "src/bin/spvirit_table/main.rs"
 required-features = ["server", "tui"]
+
+[[bin]]
+name = "spgateway"
+path = "src/bin/spgateway.rs"
+required-features = ["client", "server"]
