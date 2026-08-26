@@ -1,0 +1,25 @@
+[package]
+name = "spvirit-gateway"
+version.workspace = true
+edition = "2024"
+description = "p4p-compatible PVAccess gateway."
+license = "BSD-3-Clause"
+repository = "https://github.com/ISISNeutronMuon/spvirit"
+readme = "../README.md"
+keywords = ["epics", "pvaccess", "gateway"]
+categories = ["science"]
+authors = ["Mateusz Leputa for ISIS Neutron and Muon Source Copyright 2026"]
+
+[dependencies]
+spvirit-types.workspace = true
+spvirit-codec.workspace = true
+spvirit-client.workspace = true
+spvirit-server.workspace = true
+
+tokio = { version = "1.47.1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1.41"
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "time"] }
