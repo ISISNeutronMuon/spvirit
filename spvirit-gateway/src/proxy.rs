@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,7 +17,8 @@ use spvirit_server::pvstore::{PvInfo, Source};
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
 
-use crate::bridge::nt_payload_from_get;
+use crate::bridge::{merge_monitor_delta, nt_payload_from_decoded, nt_payload_from_get};
+use crate::cache::monitor::{MonitorCache, MonitorKey};
 use crate::cache::negative::NegativeCache;
 use crate::loopguard::LoopGuard;
 use crate::upstream::UpstreamPool;
@@ -50,6 +52,7 @@ pub struct GatewaySource {
     guard: Arc<LoopGuard>,
     getholdoff_ms: u32,
     bindings: Mutex<HashMap<String, Binding>>,
+    monitors: Arc<MonitorCache>,
 }
 
 impl GatewaySource {
@@ -71,7 +74,15 @@ impl GatewaySource {
             guard,
             getholdoff_ms,
             bindings: Mutex::new(HashMap::new()),
+            monitors: Arc::new(MonitorCache::new()),
         }
+    }
+
+    /// Number of distinct upstream monitors currently running. Exposed for
+    /// tests proving that multiple `subscribe` calls for the same PV dedup
+    /// onto a single upstream monitor task.
+    pub fn upstream_monitor_count(&self) -> usize {
+        self.monitors.upstream_count()
     }
 }
 
@@ -156,9 +167,47 @@ impl Source for GatewaySource {
 
     fn subscribe(
         &self,
-        _name: &str,
+        name: &str,
     ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
-        Box::pin(async { None })
+        let name = name.to_string();
+        Box::pin(async move {
+            let (client_name, real_name) = {
+                let bindings = self.bindings.lock().unwrap();
+                let binding = bindings.get(&name)?;
+                (binding.client_name.clone(), binding.real_name.clone())
+            };
+
+            let client = self.pool.client(&client_name)?;
+            let key: MonitorKey = (client_name, real_name.clone());
+            let monitors = self.monitors.clone();
+
+            let rx = self.monitors.subscribe(key.clone(), move |entry| {
+                tokio::spawn(async move {
+                    let mut last_full = DecodedValue::Null;
+                    let callback_entry = entry.clone();
+                    let _ = client
+                        .pvmonitor(&real_name, move |update| {
+                            merge_monitor_delta(&mut last_full, update);
+                            let payload = nt_payload_from_decoded(&last_full, String::new());
+                            if callback_entry.dispatch(payload) {
+                                ControlFlow::Continue(())
+                            } else {
+                                ControlFlow::Break(())
+                            }
+                        })
+                        .await;
+                    // Upstream monitor loop ended (subs went empty, or the
+                    // connection dropped): drop this key's entry so the
+                    // *next* subscribe starts a fresh upstream monitor
+                    // rather than reusing a dead one. `remove_if_current`
+                    // guards against a race where a new subscriber recreated
+                    // the entry in between.
+                    monitors.remove_if_current(&key, &entry);
+                });
+            });
+
+            Some(rx)
+        })
     }
 
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {

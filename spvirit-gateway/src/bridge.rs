@@ -15,7 +15,7 @@
 //! `spvirit_server::convert::decoded_to_scalar_value` (it misclassifies
 //! numeric values as `Bool`).
 
-use spvirit_client::PvGetResult;
+use spvirit_client::{MonitorUpdate, PvGetResult};
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_types::{NtPayload, PvValue, ScalarArrayValue, ScalarValue};
 
@@ -174,12 +174,114 @@ fn decoded_array_to_pv_value(items: &[DecodedValue]) -> PvValue {
 /// somewhere).
 pub fn nt_payload_from_get(result: &PvGetResult) -> NtPayload {
     let struct_id = result.introspection.struct_id.clone().unwrap_or_default();
-    match decoded_to_pv_value(&result.value) {
+    nt_payload_from_decoded(&result.value, struct_id)
+}
+
+/// Shared top-level assembly for both the `get` and `subscribe` read paths:
+/// wraps a (possibly delta-merged) [`DecodedValue`] into an
+/// [`NtPayload::Generic`] under `struct_id`.
+pub fn nt_payload_from_decoded(value: &DecodedValue, struct_id: String) -> NtPayload {
+    match decoded_to_pv_value(value) {
         PvValue::Structure { fields, .. } => NtPayload::Generic { struct_id, fields },
         other => NtPayload::Generic {
             struct_id,
             fields: vec![("value".to_string(), other)],
         },
+    }
+}
+
+// --- Monitor delta merge (Task 0 spike limitation #4) -----------------------
+//
+// `MonitorUpdate.value` from `spvirit-client`/`spvirit-codec` is a partial
+// per-tick decode: only the fields whose `changed` bit is set carry their
+// real value, everything else is a placeholder/default. `subscribe` must
+// keep a cached last-known-full `DecodedValue` per upstream PV and merge
+// each delta into it before converting to `NtPayload`, or unchanged fields
+// (e.g. `alarm`, `timeStamp`) will appear to reset to defaults on every
+// tick downstream.
+
+/// True if bit `bit` is set in `changed` (LSB-first: byte = bit/8,
+/// mask = 1 << (bit % 8)). Matches `spvirit_codec::monitor::select_paths`'s
+/// convention exactly.
+fn bit_is_set(changed: &[u8], bit: usize) -> bool {
+    let byte = bit / 8;
+    byte < changed.len() && (changed[byte] & (1 << (bit % 8))) != 0
+}
+
+/// Reads the value at dotted `path` inside `v`, descending through
+/// `DecodedValue::Structure` fields by name. Empty path or the literal
+/// `"<whole structure>"` (bit 0's path) returns `v` itself.
+fn get_at_path<'a>(v: &'a DecodedValue, path: &str) -> Option<&'a DecodedValue> {
+    if path.is_empty() || path == "<whole structure>" {
+        return Some(v);
+    }
+    let mut cur = v;
+    for segment in path.split('.') {
+        let DecodedValue::Structure(fields) = cur else {
+            return None;
+        };
+        cur = &fields.iter().find(|(n, _)| n == segment)?.1;
+    }
+    Some(cur)
+}
+
+/// Writes `val` at dotted `path` inside `target`, creating intermediate
+/// `DecodedValue::Structure(vec![])` fields as needed. Only meaningful when
+/// `target` (and each intermediate) is a `Structure`; a no-op otherwise.
+fn set_at_path(target: &mut DecodedValue, path: &str, val: DecodedValue) {
+    let segments: Vec<&str> = path.split('.').collect();
+    set_at_path_segments(target, &segments, val);
+}
+
+fn set_at_path_segments(target: &mut DecodedValue, segments: &[&str], val: DecodedValue) {
+    let DecodedValue::Structure(fields) = target else {
+        return;
+    };
+    let [head, rest @ ..] = segments else {
+        return;
+    };
+    if rest.is_empty() {
+        if let Some(entry) = fields.iter_mut().find(|(n, _)| n == head) {
+            entry.1 = val;
+        } else {
+            fields.push((head.to_string(), val));
+        }
+        return;
+    }
+    if let Some(entry) = fields.iter_mut().find(|(n, _)| n == head) {
+        set_at_path_segments(&mut entry.1, rest, val);
+    } else {
+        let mut child = DecodedValue::Structure(vec![]);
+        set_at_path_segments(&mut child, rest, val);
+        fields.push((head.to_string(), child));
+    }
+}
+
+/// Merges a monitor delta into the cached full value `last_full`.
+///
+/// - If `changed` bit 0 (the whole structure) is set, or `last_full` was
+///   `DecodedValue::Null` (no prior cached value), `last_full` is replaced
+///   wholesale with `update.value`.
+/// - Otherwise, for each set bit `i >= 1`, the field at `update.paths[i]` is
+///   read out of `update.value` and written at the same path into
+///   `last_full`, leaving every other (unchanged) field of `last_full`
+///   untouched.
+pub fn merge_monitor_delta(last_full: &mut DecodedValue, update: &MonitorUpdate) {
+    let has_prior = !matches!(last_full, DecodedValue::Null);
+    if !has_prior || bit_is_set(&update.changed, 0) {
+        *last_full = update.value.clone();
+        return;
+    }
+
+    for (bit, path) in update.paths.iter().enumerate().skip(1) {
+        if !bit_is_set(&update.changed, bit) {
+            continue;
+        }
+        let Some(new_val) = get_at_path(&update.value, path) else {
+            continue;
+        };
+        let new_val = new_val.clone();
+        set_at_path(last_full, path, new_val);
     }
 }
 
@@ -240,5 +342,136 @@ mod tests {
             decoded_to_pv_value(&v),
             PvValue::ScalarArray(ScalarArrayValue::U8(vec![1, 2, 3]))
         );
+    }
+
+    fn sample_last_full() -> DecodedValue {
+        DecodedValue::Structure(vec![
+            ("value".to_string(), DecodedValue::Float64(1.0)),
+            (
+                "alarm".to_string(),
+                DecodedValue::Structure(vec![
+                    ("severity".to_string(), DecodedValue::Int32(0)),
+                    ("message".to_string(), DecodedValue::String("ok".to_string())),
+                ]),
+            ),
+        ])
+    }
+
+    /// Mirrors `bit_paths`' layout for the sample structure: bit 0 is the
+    /// whole structure, then depth-first self-then-nested field order.
+    fn sample_paths() -> Vec<String> {
+        vec![
+            "<whole structure>".to_string(),
+            "value".to_string(),
+            "alarm".to_string(),
+            "alarm.severity".to_string(),
+            "alarm.message".to_string(),
+        ]
+    }
+
+    #[test]
+    fn merge_only_touches_the_changed_field_leaving_siblings_intact() {
+        let mut last_full = sample_last_full();
+
+        // Delta claims to update "value" only (bit 1); the alarm sub-fields
+        // in update.value are garbage/default, proving they must NOT be
+        // copied over since their bits are unset.
+        let update = MonitorUpdate {
+            value: DecodedValue::Structure(vec![
+                ("value".to_string(), DecodedValue::Float64(2.0)),
+                (
+                    "alarm".to_string(),
+                    DecodedValue::Structure(vec![
+                        ("severity".to_string(), DecodedValue::Int32(0)),
+                        ("message".to_string(), DecodedValue::String(String::new())),
+                    ]),
+                ),
+            ]),
+            changed: vec![0b0000_0010], // bit 1 = "value"
+            overrun: vec![],
+            consumed: 0,
+            paths: sample_paths(),
+        };
+
+        merge_monitor_delta(&mut last_full, &update);
+
+        let DecodedValue::Structure(fields) = &last_full else {
+            panic!("expected structure");
+        };
+        let value = &fields.iter().find(|(n, _)| n == "value").unwrap().1;
+        assert!(matches!(value, DecodedValue::Float64(x) if (*x - 2.0).abs() < 1e-9));
+        let alarm = fields
+            .iter()
+            .find_map(|(n, v)| if n == "alarm" { Some(v) } else { None })
+            .unwrap();
+        let DecodedValue::Structure(alarm_fields) = alarm else {
+            panic!("expected alarm structure");
+        };
+        let message = &alarm_fields.iter().find(|(n, _)| n == "message").unwrap().1;
+        assert!(
+            matches!(message, DecodedValue::String(s) if s == "ok"),
+            "unchanged sibling field must be preserved, not clobbered by the delta's default; got {message:?}"
+        );
+    }
+
+    #[test]
+    fn merge_with_bit_zero_set_replaces_wholesale() {
+        let mut last_full = sample_last_full();
+        let replacement =
+            DecodedValue::Structure(vec![("value".to_string(), DecodedValue::Float64(9.0))]);
+        let update = MonitorUpdate {
+            value: replacement,
+            changed: vec![0b0000_0001], // bit 0 = whole structure
+            overrun: vec![],
+            consumed: 0,
+            paths: sample_paths(),
+        };
+
+        merge_monitor_delta(&mut last_full, &update);
+        let DecodedValue::Structure(fields) = &last_full else {
+            panic!("expected structure");
+        };
+        assert_eq!(fields.len(), 1, "alarm must be gone: wholesale replace");
+        let value = &fields[0].1;
+        assert!(matches!(value, DecodedValue::Float64(x) if (*x - 9.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn merge_replaces_wholesale_when_no_prior_value() {
+        let mut last_full = DecodedValue::Null;
+        let update = MonitorUpdate {
+            value: DecodedValue::Float64(5.0),
+            changed: vec![0b0000_0010],
+            overrun: vec![],
+            consumed: 0,
+            paths: sample_paths(),
+        };
+
+        merge_monitor_delta(&mut last_full, &update);
+        assert!(matches!(last_full, DecodedValue::Float64(x) if (x - 5.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn get_at_path_descends_nested_structures() {
+        let v = sample_last_full();
+        let message = get_at_path(&v, "alarm.message").expect("alarm.message present");
+        assert!(matches!(message, DecodedValue::String(s) if s == "ok"));
+        assert!(get_at_path(&v, "<whole structure>").is_some());
+        assert!(get_at_path(&v, "missing").is_none());
+    }
+
+    #[test]
+    fn set_at_path_creates_missing_intermediate_structures() {
+        let mut v = DecodedValue::Structure(vec![]);
+        set_at_path(&mut v, "a.b", DecodedValue::Int32(7));
+        let got = get_at_path(&v, "a.b").expect("a.b present");
+        assert!(matches!(got, DecodedValue::Int32(7)));
+    }
+
+    #[test]
+    fn bit_is_set_matches_lsb_first_convention() {
+        assert!(bit_is_set(&[0b0000_0010], 1));
+        assert!(!bit_is_set(&[0b0000_0010], 0));
+        assert!(!bit_is_set(&[0b0000_0010], 8)); // out of range byte
     }
 }

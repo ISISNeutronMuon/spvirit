@@ -216,3 +216,63 @@ async fn getholdoff_holds_the_cached_value() {
         "expected getholdoff to still return ~1.0 (cached), got {value_again}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monitor_dedup_and_fanout() {
+    let Some((src, pool)) = spawn_gateway(|b| b.ao("IT:MON", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    assert!(src.claim("IT:MON").await.is_some());
+
+    let mut rx1 = src
+        .subscribe("IT:MON")
+        .await
+        .expect("first subscribe should succeed");
+    let mut rx2 = src
+        .subscribe("IT:MON")
+        .await
+        .expect("second subscribe should succeed");
+
+    assert_eq!(
+        src.upstream_monitor_count(),
+        1,
+        "two subscribes to the same PV must share a single upstream monitor"
+    );
+
+    // Give the upstream monitor a moment to complete its MONITOR INIT and
+    // deliver the initial value before we drive a change.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let upstream_client = pool.client("it-client").expect("client in pool");
+    upstream_client
+        .pvput("IT:MON", 5.0f64)
+        .await
+        .expect("direct upstream pvput should succeed");
+
+    async fn wait_for_value(rx: &mut tokio::sync::mpsc::Receiver<NtPayload>, target: f64) -> bool {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+                Ok(Some(payload)) => {
+                    let v = extract_f64_value(&payload);
+                    if (v - target).abs() < 1e-6 {
+                        return true;
+                    }
+                    // Might be the initial ~1.0 update; keep draining.
+                }
+                Ok(None) => return false, // channel closed
+                Err(_) => return false,   // timed out
+            }
+        }
+    }
+
+    assert!(
+        wait_for_value(&mut rx1, 5.0).await,
+        "first subscriber should observe the updated value ~5.0"
+    );
+    assert!(
+        wait_for_value(&mut rx2, 5.0).await,
+        "second subscriber should observe the updated value ~5.0"
+    );
+}
