@@ -23,6 +23,9 @@ spvirit-types.workspace = true
 spvirit-codec.workspace = true
 spvirit-client.workspace = true
 spvirit-server.workspace = true
+# Tier 3. spvirit-ioc depends on spvirit-server and nothing here depends on
+# spvirit-py, so this edge introduces no cycle.
+spvirit-ioc.workspace = true
 
 pyo3 = { version = "0.24", features = ["abi3-py39"] }
 pyo3-async-runtimes = { version = "=0.24.0", features = ["tokio-runtime"] }

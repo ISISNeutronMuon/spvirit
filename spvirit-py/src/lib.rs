@@ -10,6 +10,7 @@ pub mod channel;
 pub mod client;
 pub mod codec;
 pub mod discovery;
+pub mod ioc;
 pub mod monitor_update;
 pub mod nt;
 pub mod packet;
@@ -96,6 +97,11 @@ fn spvirit(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(pv::calc, m)?)?;
     m.add_function(wrap_pyfunction!(pv::pv, m)?)?;
     m.add_function(wrap_pyfunction!(pv::scalar, m)?)?;
+
+    // Tier 3. A submodule, not top-level functions, because `spvirit.ao` is
+    // already tier 2's constructor and the two take different field
+    // spellings — `spvirit.ioc.ao` versus `spvirit.ao` is the signpost.
+    ioc::register(m)?;
 
     // Module-level functions
     m.add_function(wrap_pyfunction!(client::py_discover_servers, m)?)?;

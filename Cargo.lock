@@ -1235,6 +1235,7 @@ dependencies = [
  "serde_json",
  "spvirit-client",
  "spvirit-codec",
+ "spvirit-ioc",
  "spvirit-server",
  "spvirit-types",
  "tokio",
