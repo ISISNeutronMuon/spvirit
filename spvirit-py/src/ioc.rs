@@ -324,6 +324,27 @@ impl PyIoc {
     fn __repr__(&self) -> String {
         format!("<spvirit.Ioc {} records>", self.source.record_names_sorted().len())
     }
+
+    /// Serve this engine and block — the two-line quickstart.
+    ///
+    /// Equivalent to `spvirit.Server(ioc=self).run()`. For anything more than
+    /// one store, build a `Server` and pass `ioc=` alongside `pvs=` and
+    /// `sources=`.
+    #[pyo3(signature = (*, port=None, udp_port=None))]
+    fn run(&self, py: Python<'_>, port: Option<u16>, udp_port: Option<u16>) -> PyResult<()> {
+        let mut sb = spvirit_server::pva_server::PvaServer::serve(Vec::<spvirit_server::pv::AnyPv>::new())
+            .ioc(self.source.clone());
+        if let Some(p) = port {
+            sb = sb.port(p);
+        }
+        if let Some(p) = udp_port {
+            sb = sb.udp_port(p);
+        }
+        py.allow_threads(|| {
+            crate::runtime::RUNTIME.block_on(async move { sb.run().await.map_err(|e| e.to_string()) })
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
 }
 
 /// Build the `spvirit.ioc` submodule.

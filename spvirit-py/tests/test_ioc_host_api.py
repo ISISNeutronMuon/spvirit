@@ -160,3 +160,41 @@ def test_an_unknown_field_reads_as_a_key_error():
     _sp, rbv, _ioc = _rig()
     with pytest.raises(KeyError):
         rbv["NOSUCHFIELD"]
+
+
+def test_a_server_hosts_an_ioc():
+    ioc = spvirit.Ioc(records=[spvirit.ioc.ai("SRV:A", INP="7")])
+    server = spvirit.Server(ioc=ioc, port=0)
+    assert server is not None
+
+
+def test_all_three_tiers_can_share_one_process():
+    """Disjoint ownership is what makes the mixed form safe."""
+    ioc = spvirit.Ioc(records=[spvirit.ioc.ai("MIX:IOC", INP="1")])
+    pv = spvirit.ao("MIX:STORE", 0.0)
+    server = spvirit.Server(ioc=ioc, pvs=[pv], port=0)
+    assert server is not None
+
+
+def test_an_ioc_and_a_store_pv_may_not_share_a_name():
+    """The builder's disjointness check owns this; the test pins that Ioc
+    goes through it rather than around it."""
+    ioc = spvirit.Ioc(records=[spvirit.ioc.ai("CLASH:A", INP="1")])
+    pv = spvirit.ao("CLASH:A", 0.0)
+    with pytest.raises(BaseException):
+        spvirit.Server(ioc=ioc, pvs=[pv], port=0)
+
+
+def test_an_ioc_exposes_run():
+    assert callable(spvirit.Ioc(records=[spvirit.ioc.ai("R:A", INP="1")]).run)
+
+
+def test_server_db_file_is_still_tier_two(tmp_path):
+    """Frozen behaviour. Routing Server(db_file=...) to RecordDb would turn
+    every existing user's bag of values into a self-processing IOC on
+    upgrade; the separate name is the whole point."""
+    db = tmp_path / "rig.db"
+    db.write_text('record(ai, "FROZEN:A") {\n    field(INP, "RIG:SP PP")\n}\n')
+    server = spvirit.Server(db_file=str(db), port=0)
+    # Served as an inert value: no engine, so no processing and no link pull.
+    assert server.store().get_value("FROZEN:A") == 0.0

@@ -671,13 +671,14 @@ impl PyServer {
     /// tuples of Python `Source` objects; remaining kwargs mirror
     /// `ServerBuilder` configuration.
     #[new]
-    #[pyo3(signature = (*, pvs=None, db_file=None, db_string=None, sources=None,
+    #[pyo3(signature = (*, pvs=None, ioc=None, db_file=None, db_string=None, sources=None,
                         port=None, udp_port=None, listen_ip=None, advertise_ip=None,
                         compute_alarms=None, beacon_period=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         pvs: Option<Vec<crate::pv::PyPv>>,
+        ioc: Option<Py<crate::ioc::PyIoc>>,
         db_file: Option<String>,
         db_string: Option<String>,
         sources: Option<Vec<(String, i32, PyObject)>>,
@@ -691,6 +692,12 @@ impl PyServer {
         let handles: Vec<spvirit_server::pv::AnyPv> =
             pvs.unwrap_or_default().iter().map(|p| p.any()).collect();
         let mut sb = PvaServer::serve(handles);
+        // Tier 3. `db_file`/`db_string` below stay tier 2 and inert: routing
+        // them to the engine would silently convert every existing user's bag
+        // of values into a self-processing IOC on upgrade.
+        if let Some(ioc) = ioc {
+            sb = sb.ioc(ioc.borrow(py).source());
+        }
         if let Some(p) = db_file {
             sb = sb.db_file(p);
         }

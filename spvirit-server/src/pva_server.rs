@@ -1071,6 +1071,11 @@ impl ServeBuilder {
         self.inner = self.inner.source(label, order, source);
         self
     }
+    /// Host a tier-3 engine. See [`PvaServerBuilder::ioc`].
+    pub fn ioc<S: StoreSource + 'static>(mut self, ioc: Arc<S>) -> Self {
+        self.inner = self.inner.ioc(ioc);
+        self
+    }
     pub fn port(mut self, port: u16) -> Self {
         self.inner = self.inner.port(port);
         self
