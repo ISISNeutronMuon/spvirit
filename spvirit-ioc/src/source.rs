@@ -222,6 +222,38 @@ impl IocSource {
         Some(self.db.with_set(id.set, f))
     }
 
+    /// Write `VAL` from host code and process, exactly as a client PUT would.
+    ///
+    /// Returns the monitors the pass produced, and publishes them to the
+    /// server's registry if this engine has been handed one.
+    ///
+    /// The publication is the reason this method exists rather than callers
+    /// using [`Source::put`] directly. `put` returns its events for the
+    /// *handler* to publish (`handler.rs`, `notify_changed_records`); a write
+    /// that starts here never goes through the handler, so nothing would
+    /// publish them. `flush` — which `put` already ran — only feeds
+    /// `subscribers`, which is populated exclusively by the PV-group
+    /// machinery, so a plain `spmonitor` is not in it.
+    ///
+    /// An engine that has not been handed to a server still processes; it
+    /// simply has nobody to publish to, which is correct for a bare engine
+    /// under test.
+    pub async fn set_value(
+        &self,
+        name: &str,
+        value: DecodedValue,
+    ) -> Result<Vec<(String, NtPayload)>, String> {
+        let events = Source::put(self, name, &value).await?;
+        // Clone the Arc out and drop the guard before awaiting: no lock in
+        // this crate crosses an await.
+        if let Some(registry) = self.monitor_registry() {
+            for (pv, payload) in &events {
+                registry.notify_monitors(pv, payload).await;
+            }
+        }
+        Ok(events)
+    }
+
     fn value_of(decoded: &DecodedValue) -> Result<Value, String> {
         match decoded {
             DecodedValue::Float64(v) => Ok(Value::Double(*v)),
