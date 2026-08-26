@@ -64,7 +64,7 @@ other sources interact:
   "Deviations" section.
 
 Registration order is builtin at 0, the engine (if any) at 5, and the
-`record-fields` tier-1 field source at 10.
+`record-fields` tier-2 (`SimplePvStore`) field source at 10.
 
 ## What it processes
 

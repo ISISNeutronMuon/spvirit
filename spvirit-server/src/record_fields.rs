@@ -137,7 +137,7 @@ pub fn is_link_field(field: &str) -> bool {
 /// `field` is therefore `None` for a link that addresses the record itself.
 ///
 /// Every tier renders links through this one function, so a client cannot
-/// tell tier 1 (`SimplePvStore`, raw `.db` strings) from tier 2
+/// tell tier 2 (`SimplePvStore`, raw `.db` strings) from tier 3
 /// (`spvirit_ioc::IocSource`, a parsed link model) by reading `.INP`.
 pub fn render_link_text(
     target: &str,

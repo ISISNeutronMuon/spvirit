@@ -148,7 +148,7 @@ impl RecordFieldProvider for SimplePvStore {
         })
     }
 
-    /// Tier 1's cheap path is the same read: `field_value` resolves through
+    /// Tier 2's (`SimplePvStore`'s) cheap path is the same read: `field_value` resolves through
     /// an in-memory string map, so there is nothing cheaper to do. The split
     /// pays off on the IOC path, where a value read takes a lock-set mutex
     /// and a descriptor read does not.

@@ -138,8 +138,8 @@ async fn claiming_a_field_does_not_take_the_records_lock_set() {
     holder.join().expect("holder thread");
 }
 
-/// Tier 2 (the IOC engine, `IocSource`) answers the same `.FIELD` script as
-/// tier 1 (`SimplePvStore`, in `spvirit-server/tests/tier_parity.rs`): known
+/// Tier 3 (the IOC engine, `IocSource`) answers the same `.FIELD` script as
+/// tier 2 (`SimplePvStore`, in `spvirit-server/tests/tier_parity.rs`): known
 /// fields from the model, unknown-but-real fields from dbCommon, invented
 /// fields not at all.
 #[tokio::test]
@@ -158,9 +158,9 @@ async fn the_ioc_matches_the_field_contract_the_other_tiers_serve() {
 }
 
 /// `field(EGU, …)` must reach both the record payload's units and the
-/// `.EGU` field PV. Tier 1 has always served units; before A2 the engine
-/// dropped them at build time, so a client could tell the tiers apart by
-/// asking for units.
+/// `.EGU` field PV. Tier 2 (`SimplePvStore`) has always served units; before
+/// A2 the engine dropped them at build time, so a client could tell the
+/// tiers apart by asking for units.
 #[tokio::test]
 async fn egu_survives_from_db_text_to_the_served_payload() {
     let src = IocSource::from_db_str(DB).expect("loads");
@@ -188,10 +188,11 @@ async fn a_record_without_egu_serves_empty_units() {
     );
 }
 /// The other half of the record-level `writable` divergence the A2 spec
-/// keeps deliberately: tier 2 claims every record it owns writable, `ai`
-/// included, because Base lets you `caput` to an `ai.VAL` (it is simply
-/// overwritten on the next process). Tier 1's stricter per-kind rule is
-/// pinned by `spvirit-server/tests/tier_parity.rs`'s
+/// keeps deliberately: tier 3 (`IocSource`) claims every record it owns
+/// writable, `ai` included, because Base lets you `caput` to an `ai.VAL`
+/// (it is simply overwritten on the next process). Tier 2's
+/// (`SimplePvStore`'s) stricter per-kind rule is pinned by
+/// `spvirit-server/tests/tier_parity.rs`'s
 /// `an_input_record_is_not_writable_on_the_builtin_store`; between the two,
 /// neither tier can drift without a test going red.
 ///
@@ -203,7 +204,7 @@ async fn an_input_record_is_writable_on_the_ioc_engine() {
     let info = src.claim("PV:A").await.expect("the ai record is served");
     assert!(
         info.writable,
-        "tier 2 claims an input record writable, as Base does"
+        "tier 3 (`IocSource`) claims an input record writable, as Base does"
     );
     src.put("PV:A", &DecodedValue::Float64(2.5))
         .await

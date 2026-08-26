@@ -1,7 +1,7 @@
-//! Link fields read the same on tier 1 and tier 2, from the same `.db`.
+//! Link fields read the same on tier 2 and tier 3, from the same `.db`.
 //!
-//! `SimplePvStore` (tier 1) keeps the raw `.db` strings; `IocSource`
-//! (tier 2) threw them away for a parsed link model. Before this test the
+//! `SimplePvStore` (tier 2) keeps the raw `.db` strings; `IocSource`
+//! (tier 3) threw them away for a parsed link model. Before this test the
 //! two served different text for the same input — `PV:B PP` against
 //! `PV:B.VAL PP NMS` — which is a client-visible way to tell the tiers
 //! apart, the one thing the `.FIELD` parity claim rules out. Both now render
@@ -69,7 +69,7 @@ async fn the_two_stores_render_link_fields_identically() {
             .map(|p| scalar(&p));
         assert_eq!(
             from_ioc, from_builtin,
-            "{name}: tier 1 and tier 2 must serve the same link text"
+            "{name}: tier 2 and tier 3 must serve the same link text"
         );
         assert_eq!(
             from_ioc,

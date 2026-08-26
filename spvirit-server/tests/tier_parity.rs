@@ -1,20 +1,18 @@
 //! What a client can observe must not depend on which tier serves a PV.
 //!
-//! Per the A2 spec, the three tiers are numbered: tier 1 is the direct
-//! store, `SimplePvStore`; tier 2 is the IOC engine,
-//! `spvirit_ioc::IocSource`; tier 3 is a Python source via the `fields()`
-//! protocol. `spvirit-ioc` depends on this crate, so tier 2's half of the
-//! `.FIELD` parity check lives in `spvirit-ioc/tests/field_access.rs`, not
-//! here. Tier 3 is not exercised anywhere in this file either — its
-//! `.FIELD` parity is pinned separately in
-//! `spvirit-py/tests/test_source_fields.py` (Task 8); the split is
-//! deliberate, not an oversight.
+//! Per the axis document (`specs/2026-08-07-source-tier-model-design.md`),
+//! the three tiers are numbered left to right: tier 1 is a Python or custom
+//! `Source`; tier 2 (`SimplePvStore`) is the direct store; tier 3
+//! (`spvirit_ioc::IocSource`) is the processing engine. `spvirit-ioc`
+//! depends on this crate, so tier 3's half of the `.FIELD` parity check
+//! lives in `spvirit-ioc/tests/field_access.rs`, not here. Tier 1 is not
+//! exercised in this file either — its `.FIELD` parity is pinned separately
+//! in `spvirit-py/tests/test_source_fields.py`; the split is deliberate,
+//! not an oversight.
 //!
-//! What this file compares is `SimplePvStore` (tier 1) against
-//! `EchoSource`, a hand-written `Source` standing in for an arbitrary
-//! custom source rather than any one of the three numbered tiers — the
-//! same "what a client can observe" contract every tier must satisfy
-//! identically.
+//! What this file compares is `SimplePvStore` (tier 2) against `EchoSource`,
+//! a hand-written `Source` standing in for tier 1 — the same "what a client
+//! can observe" contract every tier must satisfy identically.
 
 use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::field_provider::{
@@ -178,7 +176,7 @@ async fn a_custom_source_and_the_builtin_store_are_indistinguishable() {
     let b = observe(&*direct_store, "PV:X").await;
     assert_eq!(
         a, b,
-        "EchoSource and SimplePvStore (tier 1) must present the same contract"
+        "EchoSource and SimplePvStore (tier 2) must present the same contract"
     );
     assert_eq!(a.after_put, Some(ScalarValue::F64(42.0)));
     assert_eq!(a.monitor_names, vec!["PV:X".to_string()]);
@@ -192,7 +190,7 @@ async fn an_unknown_pv_looks_the_same_on_both_tiers() {
     let b = observe(&*direct_store, "PV:NOPE").await;
     assert_eq!(
         a, b,
-        "EchoSource and SimplePvStore (tier 1) must agree on an unclaimed PV"
+        "EchoSource and SimplePvStore (tier 2) must agree on an unclaimed PV"
     );
     assert!(!a.claimed);
 }
@@ -277,8 +275,8 @@ async fn field_resolution_matches_across_providers() {
 /// pins it that way.
 ///
 /// The A2 spec's `writable` ruling is about **record**-level writability:
-/// tier 2 (`spvirit_ioc::IocSource`) claims every record writable as Base
-/// does, tier 1 (`SimplePvStore`) claims per record kind, and tier 1 is the
+/// tier 3 (`spvirit_ioc::IocSource`) claims every record writable as Base
+/// does, tier 2 (`SimplePvStore`) claims per record kind, and tier 2 is the
 /// documented outlier. That divergence is pinned separately, by
 /// `an_input_record_is_not_writable_on_the_builtin_store` below.
 ///
@@ -305,11 +303,11 @@ async fn field_pvs_report_read_only_on_every_tier() {
 /// spec keeps the difference deliberately. Pinned in both directions so
 /// neither tier can drift silently:
 ///
-/// - tier 1 (`SimplePvStore`) is type-aware. An input record claims
+/// - tier 2 (`SimplePvStore`) is type-aware. An input record claims
 ///   `writable: false`, and `SimplePvStore::put` then rejects the write.
 ///   Loosening it would make writes that are rejected today start
 ///   succeeding for existing users, which is why it stays.
-/// - tier 2 (`spvirit_ioc::IocSource`) claims `true` for every record it
+/// - tier 3 (`spvirit_ioc::IocSource`) claims `true` for every record it
 ///   owns, as Base does: you may `caput` to an `ai.VAL`, and it is simply
 ///   overwritten on the next process. That half is asserted in
 ///   `spvirit-ioc/tests/field_access.rs`'s
@@ -334,8 +332,8 @@ async fn an_input_record_is_not_writable_on_the_builtin_store() {
     let input = store.claim("PV:IN").await.expect("the ai record is served");
     assert!(
         !input.writable,
-        "tier 1 claims an input record read-only; tier 2 claims it writable, \
-         and that divergence is deliberate"
+        "tier 2 (`SimplePvStore`) claims an input record read-only; tier 3 \
+         (`spvirit_ioc::IocSource`) claims it writable, and that divergence is deliberate"
     );
     let err = store
         .put("PV:IN", &DecodedValue::Float64(2.0))
@@ -351,5 +349,37 @@ async fn an_input_record_is_not_writable_on_the_builtin_store() {
         output.writable,
         "an output record is writable on both tiers; the divergence is \
          specific to input records"
+    );
+}
+
+/// The tier numerals in this file follow the axis document
+/// (`specs/2026-08-07-source-tier-model-design.md`): tier 1 is a custom
+/// `Source`, tier 2 is `SimplePvStore`, tier 3 is `IocSource`.
+///
+/// This test does not check behaviour. It pins the *vocabulary*, which
+/// drifted twice before it was written: A2's sweep standardised on the
+/// reverse order, and A3's spec on the axis order. A grep-based guard is
+/// crude, but the failure it catches is a reader being told the wrong thing,
+/// and no behavioural test can catch that.
+#[test]
+fn tier_numerals_in_this_file_name_the_axis_tiers() {
+    let src = include_str!("tier_parity.rs");
+    // The two claims that were wrong before the A3 sweep.
+    assert!(
+        src.contains("tier 2 (`SimplePvStore`)"),
+        "tier 2 must name SimplePvStore, per the axis document"
+    );
+    assert!(
+        src.contains("tier 3 (`spvirit_ioc::IocSource`)"),
+        "tier 3 must name IocSource, per the axis document"
+    );
+    // The pre-A3 spellings must be gone entirely. Built at runtime, not
+    // written as contiguous literals, so this assertion's own source line
+    // does not match itself.
+    let stale_tier1 = format!("tier {} (`{}`)", 1, "SimplePvStore");
+    let stale_tier2 = format!("tier {} (`{}`)", 2, "spvirit_ioc::IocSource");
+    assert!(
+        !src.contains(&stale_tier1) && !src.contains(&stale_tier2),
+        "a pre-A3 tier numeral survived the sweep"
     );
 }

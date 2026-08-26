@@ -81,7 +81,7 @@ pub fn render_link(link: &Link, names: TargetNames, forward: bool) -> String {
 ///
 /// `names` names the targets of `record`'s own db links — see
 /// [`TargetNames`]. The IOC's own model is consulted first, then
-/// [`dbcommon_default_value`] — the same fallback tier 1 uses — then `None`.
+/// [`dbcommon_default_value`] — the same fallback tier 2 (`SimplePvStore`) uses — then `None`.
 pub fn record_field_value(record: &Record, field: &str, names: TargetNames) -> Option<ScalarValue> {
     let s = |v: &str| Some(ScalarValue::Str(v.to_string()));
     let i = |v: i32| Some(ScalarValue::I32(v));
