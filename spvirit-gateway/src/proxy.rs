@@ -40,6 +40,13 @@ use crate::upstream::UpstreamPool;
 pub struct Binding {
     pub client_name: String,
     pub real_name: String,
+    /// The upstream introspection's `StructureDesc.struct_id` (e.g.
+    /// `"epics:nt/NTScalar:1.0"`), captured at `claim` time so `subscribe`
+    /// can stamp monitored payloads with the same struct id `get` already
+    /// reports (`nt_payload_from_get` sources it from
+    /// `PvGetResult::introspection` directly; `subscribe` has no per-tick
+    /// introspection round-trip, so it must carry this forward from claim).
+    struct_id: Option<String>,
     last_get: Mutex<Option<(Instant, NtPayload)>>,
 }
 
@@ -105,6 +112,7 @@ impl Source for GatewaySource {
                         Binding {
                             client_name: client_name.clone(),
                             real_name: name.clone(),
+                            struct_id: descriptor.struct_id.clone(),
                             last_get: Mutex::new(None),
                         },
                     );
@@ -171,10 +179,14 @@ impl Source for GatewaySource {
     ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            let (client_name, real_name) = {
+            let (client_name, real_name, struct_id) = {
                 let bindings = self.bindings.lock().unwrap();
                 let binding = bindings.get(&name)?;
-                (binding.client_name.clone(), binding.real_name.clone())
+                (
+                    binding.client_name.clone(),
+                    binding.real_name.clone(),
+                    binding.struct_id.clone().unwrap_or_default(),
+                )
             };
 
             let client = self.pool.client(&client_name)?;
@@ -185,24 +197,27 @@ impl Source for GatewaySource {
                 tokio::spawn(async move {
                     let mut last_full = DecodedValue::Null;
                     let callback_entry = entry.clone();
+                    let callback_monitors = monitors.clone();
+                    let callback_key = key.clone();
                     let _ = client
                         .pvmonitor(&real_name, move |update| {
                             merge_monitor_delta(&mut last_full, update);
-                            let payload = nt_payload_from_decoded(&last_full, String::new());
-                            if callback_entry.dispatch(payload) {
+                            let payload = nt_payload_from_decoded(&last_full, struct_id.clone());
+                            if callback_monitors.dispatch_or_retire(
+                                &callback_key,
+                                &callback_entry,
+                                payload,
+                            ) {
                                 ControlFlow::Continue(())
                             } else {
                                 ControlFlow::Break(())
                             }
                         })
                         .await;
-                    // Upstream monitor loop ended (subs went empty, or the
-                    // connection dropped): drop this key's entry so the
-                    // *next* subscribe starts a fresh upstream monitor
-                    // rather than reusing a dead one. `remove_if_current`
-                    // guards against a race where a new subscriber recreated
-                    // the entry in between.
-                    monitors.remove_if_current(&key, &entry);
+                    // `dispatch_or_retire` already removed this key's entry
+                    // from the map (atomically, under the map lock) the
+                    // moment it decided the upstream loop should end, so
+                    // there is nothing left to clean up here.
                 });
             });
 

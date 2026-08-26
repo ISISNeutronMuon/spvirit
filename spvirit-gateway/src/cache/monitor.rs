@@ -8,16 +8,19 @@
 //!
 //! Cancellation for M1 is "next-tick": the upstream task notices its
 //! `subs` list is empty only when it goes to deliver the *next* update, at
-//! which point it returns `ControlFlow::Break(())` and the `MonitorEntry`
-//! is dropped from the map on the following `subscribe`/lookup that finds
-//! it stale (the entry is removed proactively by the upstream task itself,
-//! see `MonitorCache::retain_and_maybe_remove`). A PV that goes silent
-//! forever right after its last subscriber leaves does *not* get its
-//! upstream monitor torn down promptly — this "idle-linger" is a
-//! documented M1 simplification (see task-11-report.md), not a correctness
-//! bug: no downstream traffic is leaked, only an idle upstream monitor task
-//! outlives its last subscriber until the PV next changes (or forever, for
-//! a PV that never changes again).
+//! which point `MonitorCache::dispatch_or_retire` atomically (under the
+//! entries-map lock) removes the `MonitorEntry` from the map and reports
+//! that the upstream loop should end. That atomicity — retiring the entry
+//! and deciding to stop the loop as one map-locked step — is what prevents
+//! a concurrent `subscribe()` from attaching a new subscriber to an entry
+//! whose upstream loop has already (or is about to have) ended; see
+//! `dispatch_or_retire`'s doc comment for the exact race it closes. A PV
+//! that goes silent forever right after its last subscriber leaves does
+//! *not* get its upstream monitor torn down promptly — this "idle-linger"
+//! is a documented M1 simplification (see task-11-report.md), not a
+//! correctness bug: no downstream traffic is leaked, only an idle upstream
+//! monitor task outlives its last subscriber until the PV next changes (or
+//! forever, for a PV that never changes again).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -118,17 +121,59 @@ impl MonitorCache {
         rx
     }
 
-    /// Removes `key`'s entry if it is still the exact entry passed in (an
-    /// `Arc` pointer-equality check guards against races where a new
-    /// subscriber recreated the entry between the upstream task observing
-    /// an empty `subs` list and calling this).
-    pub fn remove_if_current(&self, key: &MonitorKey, entry: &Arc<MonitorEntry>) {
+    /// Fans `payload` out to `entry`'s subscribers, then — if the
+    /// subscriber list is now empty — atomically decides whether to retire
+    /// `entry` from the map, returning whether the caller's upstream loop
+    /// should continue (`true`) or break (`false`).
+    ///
+    /// This closes a race in the previous split `dispatch` +
+    /// `remove_if_current` design: `dispatch` alone could observe an empty
+    /// `subs` list, return `false`, and — before the caller got around to
+    /// removing the entry — a fresh `subscribe()` for the same key could
+    /// attach a new sender to that same (about-to-be-removed) entry, since
+    /// `subscribe`'s existing-entry branch only checks the entries map, not
+    /// whether the entry's upstream loop already decided to stop. That new
+    /// subscriber would then be permanently silent: wired to an entry whose
+    /// upstream loop already broke, with no upstream left to feed it, and no
+    /// way to detect this until an even-later resubscribe re-registers the
+    /// key. Folding the "subs empty -> remove from map" decision into a
+    /// single map-locked critical section (this method) closes that window:
+    /// `subscribe`'s existing-entry branch and this retire check are
+    /// serialized on the same `entries` mutex, so either the new subscriber
+    /// attaches before retirement is decided (subs non-empty at recheck ->
+    /// entry survives) or strictly after (entry already gone -> `subscribe`
+    /// takes the `None` branch and spawns a fresh upstream). No interleaving
+    /// leaves a subscriber wired to a retired entry.
+    ///
+    /// Lock ordering: map lock, then (inside `fan_out`) the entry's `subs`
+    /// lock — never the reverse — matching `subscribe`'s ordering, so the
+    /// two can never deadlock against each other.
+    pub fn dispatch_or_retire(
+        &self,
+        key: &MonitorKey,
+        entry: &Arc<MonitorEntry>,
+        payload: NtPayload,
+    ) -> bool {
+        if entry.dispatch(payload) {
+            return true;
+        }
+
+        // subs was empty right after fan-out; take the map lock and
+        // re-check under it before deciding to retire, so a concurrent
+        // `subscribe()` that attaches a sender while we're mid-decision is
+        // never lost.
         let mut entries = self.entries.lock().unwrap();
+        if !entry.subs.lock().unwrap().is_empty() {
+            // A new subscriber attached between our fan-out and taking the
+            // map lock: keep the entry (and the upstream loop) alive.
+            return true;
+        }
         if let Some(current) = entries.get(key)
             && Arc::ptr_eq(current, entry)
         {
             entries.remove(key);
         }
+        false
     }
 
     /// Number of distinct upstream monitors currently tracked (live
@@ -205,5 +250,129 @@ mod tests {
         let entry = captured_entry.expect("spawn_upstream captured the entry");
         let still_live = entry.dispatch(payload(1.0));
         assert!(!still_live, "no live subscribers left after drop");
+    }
+
+    /// Proves the FIX-1 invariant across the "retire wins" interleave: the
+    /// last subscriber drops, THEN `dispatch_or_retire` runs with nothing
+    /// else attached in between. It must retire the entry from the map and
+    /// report the upstream loop should break; a fresh `subscribe()` for the
+    /// same key afterward must spawn a brand-new upstream (proving the old,
+    /// now-orphaned entry was actually removed, not left dangling for a
+    /// subscriber to attach to silently).
+    #[test]
+    fn dispatch_or_retire_removes_the_entry_when_last_subscriber_is_gone() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let spawn_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut captured_entry = None;
+        let spawns = spawn_calls.clone();
+        let rx1 = cache.subscribe(key.clone(), |entry| {
+            captured_entry = Some(entry);
+            spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let entry = captured_entry.expect("spawn_upstream captured the entry");
+        assert_eq!(cache.upstream_count(), 1);
+
+        // Last (only) subscriber drops.
+        drop(rx1);
+
+        let should_continue = cache.dispatch_or_retire(&key, &entry, payload(1.0));
+        assert!(
+            !should_continue,
+            "upstream loop must break once its last subscriber is gone"
+        );
+        assert_eq!(
+            cache.upstream_count(),
+            0,
+            "the retired entry must actually be removed from the map"
+        );
+
+        // A fresh subscribe for the same key must NOT reuse the retired
+        // entry — it must spawn a brand-new upstream and produce a receiver
+        // wired to a live one.
+        let spawns2 = spawn_calls.clone();
+        let mut captured_entry2 = None;
+        let _rx2 = cache.subscribe(key.clone(), |entry| {
+            captured_entry2 = Some(entry);
+            spawns2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "resubscribing after retirement must spawn a fresh upstream"
+        );
+        assert_eq!(cache.upstream_count(), 1);
+        let entry2 = captured_entry2.expect("second spawn_upstream captured the entry");
+        assert!(
+            !Arc::ptr_eq(&entry, &entry2),
+            "resubscribe must attach to a brand-new entry, not the retired one"
+        );
+    }
+
+    /// Proves the FIX-1 invariant across the OTHER interleave: a new
+    /// subscriber attaches to the entry (via the map lock) after the last
+    /// old subscriber dropped, but before `dispatch_or_retire` gets a
+    /// chance to run its map-locked re-check. This reproduces exactly the
+    /// orphaned-subscriber race the reviewer flagged: without the fix,
+    /// `dispatch_or_retire`/the old split `dispatch`+`remove_if_current`
+    /// would tear the entry down anyway, leaving the newly-attached
+    /// subscriber wired to a dead upstream. With the fix, the map-locked
+    /// re-check inside `dispatch_or_retire` observes the new subscriber and
+    /// backs off: the entry survives, no second upstream is spawned, and
+    /// the attached receiver stays live.
+    #[test]
+    fn dispatch_or_retire_keeps_the_entry_if_a_subscriber_attaches_first() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let spawn_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut captured_entry = None;
+        let spawns = spawn_calls.clone();
+        let rx1 = cache.subscribe(key.clone(), |entry| {
+            captured_entry = Some(entry);
+            spawns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let entry = captured_entry.expect("spawn_upstream captured the entry");
+
+        // Last old subscriber drops...
+        drop(rx1);
+
+        // ...but a new subscriber attaches to the *same still-present*
+        // entry (the `Some` branch in `subscribe`) before anyone calls
+        // `dispatch_or_retire`. This is the interleave: subs is non-empty
+        // by the time the retire check runs.
+        let spawns2 = spawn_calls.clone();
+        let mut rx2 = cache.subscribe(key.clone(), |_entry| {
+            spawns2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "attaching to a still-present entry must not spawn a second upstream"
+        );
+
+        let should_continue = cache.dispatch_or_retire(&key, &entry, payload(2.0));
+        assert!(
+            should_continue,
+            "a subscriber attached in the meantime must save the entry from retirement"
+        );
+        assert_eq!(
+            cache.upstream_count(),
+            1,
+            "the entry must not be removed while a live subscriber is attached"
+        );
+        assert_eq!(
+            spawn_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no second upstream should ever be spawned for this key"
+        );
+
+        // And the attached subscriber actually got the payload dispatched
+        // to it — it is not a silent orphan.
+        let NtPayload::Generic { fields, .. } = rx2.try_recv().unwrap() else {
+            panic!("expected Generic");
+        };
+        assert!(matches!(fields[0].1, PvValue::Scalar(ScalarValue::F64(x)) if (x - 2.0).abs() < 1e-9));
     }
 }

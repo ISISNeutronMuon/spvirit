@@ -276,3 +276,74 @@ async fn monitor_dedup_and_fanout() {
         "second subscriber should observe the updated value ~5.0"
     );
 }
+
+/// FIX 2 regression: monitored payloads must carry the real upstream
+/// `struct_id`, not an empty string — a downstream NT-aware client can't
+/// recognize monitored values otherwise (`get` already reports this
+/// correctly via `nt_payload_from_get`; `subscribe` used to hardcode
+/// `String::new()` in its call to `nt_payload_from_decoded`).
+///
+/// The in-process `ao` record's `pvinfo` reports
+/// `struct_id: Some("epics:nt/NTScalar:1.0")` (see
+/// `spvirit_server::simple_store::nt_scalar_desc`), so this asserts the
+/// exact literal rather than only asserting parity with `get`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monitor_payload_carries_the_real_struct_id() {
+    let Some((src, pool)) = spawn_gateway(|b| b.ao("IT:MON2", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    assert!(src.claim("IT:MON2").await.is_some());
+
+    // Parity check: `get`'s struct_id is the ground truth this PV reports.
+    let get_payload = src.get("IT:MON2").await.expect("get should return Some");
+    let NtPayload::Generic {
+        struct_id: get_struct_id,
+        ..
+    } = &get_payload
+    else {
+        panic!("expected NtPayload::Generic from get");
+    };
+    assert_eq!(
+        get_struct_id, "epics:nt/NTScalar:1.0",
+        "sanity check: an ao record must report NTScalar via get"
+    );
+
+    let mut rx = src
+        .subscribe("IT:MON2")
+        .await
+        .expect("subscribe should succeed");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let upstream_client = pool.client("it-client").expect("client in pool");
+    upstream_client
+        .pvput("IT:MON2", 9.0f64)
+        .await
+        .expect("direct upstream pvput should succeed");
+
+    let payload = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("monitor update should arrive within timeout")
+        .expect("channel should not be closed");
+    let NtPayload::Generic {
+        struct_id: sub_struct_id,
+        ..
+    } = &payload
+    else {
+        panic!("expected NtPayload::Generic from subscribe");
+    };
+
+    assert!(
+        !sub_struct_id.is_empty(),
+        "monitored payload must carry a non-empty struct_id"
+    );
+    assert_eq!(
+        sub_struct_id, get_struct_id,
+        "subscribe's struct_id must match get's struct_id for the same PV"
+    );
+    assert_eq!(
+        sub_struct_id, "epics:nt/NTScalar:1.0",
+        "exact upstream struct_id for an ao/NTScalar record"
+    );
+}
