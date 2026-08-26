@@ -32,6 +32,12 @@ use tokio::sync::mpsc;
 /// `mpsc::channel(64)` in `Source::subscribe`.
 const SUBSCRIBER_QUEUE: usize = 64;
 
+/// The processing engine as a `Source`.
+///
+/// Immutable after construction. There is deliberately no `add_record`: see
+/// [`IocSource::LOCK_SET_IMMUTABILITY_REASON`]. In Rust the absence of the
+/// method is the refusal, checked by the compiler; Python, which has no such
+/// check, raises with that same text from `Ioc.add_record`.
 pub struct IocSource {
     db: RecordDb,
     /// Each record's kind, by name. Lets `field_descriptor` answer a channel
@@ -69,6 +75,18 @@ impl std::fmt::Debug for IocSource {
 }
 
 impl IocSource {
+    /// Why records cannot be added after construction.
+    ///
+    /// Lives here as a constant so the Rust documentation and the Python
+    /// exception message are the same words. Two wordings would drift, and
+    /// the Python one is the only one most users will ever read.
+    pub const LOCK_SET_IMMUTABILITY_REASON: &'static str =
+        "records are fixed when the engine is built: RecordId is {set, index}, \
+         assigned by partitioning the link graph into lock sets, so a record \
+         whose links join two existing sets would invalidate every outstanding \
+         id. EPICS Base has the same restriction — dbLoadRecords after iocInit \
+         is unsupported. Pass every record to Ioc(records=[...]) at once.";
+
     pub fn from_db_file(path: &str) -> Result<IocSource, String> {
         let raw = load_db_records(path, &HashMap::new()).map_err(|e| e.to_string())?;
         Self::from_raw(raw)

@@ -140,3 +140,27 @@ async fn a_record_type_the_engine_does_not_support_is_rejected() {
         "the error should point at sub-project D, got: {err}"
     );
 }
+
+/// Records are fixed at build. The reason is `RecordId`, which is
+/// `{set, index}` assigned by `RecordDb::build` partitioning the link graph:
+/// a record whose links join two existing sets forces a repartition and
+/// invalidates every outstanding id. Base has the same restriction, for the
+/// same reason — `dbLoadRecords` after `iocInit` is unsupported.
+///
+/// Rust enforces this by having no method to call (ruling 5), so what this
+/// test can check is that the wording Python raises with actually explains
+/// the reason. A refusal that says only "not supported" would send a user
+/// looking for a flag to turn on.
+#[test]
+fn the_immutability_reason_names_lock_sets_and_the_base_precedent() {
+    let reason = spvirit_ioc::IocSource::LOCK_SET_IMMUTABILITY_REASON;
+    assert!(reason.contains("lock set"), "the reason must name lock sets: {reason}");
+    assert!(
+        reason.contains("dbLoadRecords") || reason.contains("iocInit"),
+        "the reason should cite the Base precedent: {reason}"
+    );
+    assert!(
+        reason.contains("Ioc("),
+        "the reason should point at the constructor that does work: {reason}"
+    );
+}
