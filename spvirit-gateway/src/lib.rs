@@ -2,6 +2,7 @@
 pub mod bridge;
 pub mod cache;
 pub mod config;
+pub mod convert;
 pub mod loopguard;
 pub mod proxy;
 pub mod upstream;

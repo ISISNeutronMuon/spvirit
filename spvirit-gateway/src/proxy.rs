@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::bridge::{merge_monitor_delta, nt_payload_from_decoded, nt_payload_from_get};
 use crate::cache::monitor::{MonitorCache, MonitorKey};
+use crate::convert::decoded_to_json;
 use crate::cache::negative::NegativeCache;
 use crate::loopguard::LoopGuard;
 use crate::upstream::UpstreamPool;
@@ -167,10 +168,40 @@ impl Source for GatewaySource {
 
     fn put(
         &self,
-        _name: &str,
-        _value: &DecodedValue,
+        name: &str,
+        value: &DecodedValue,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>> {
-        Box::pin(async { Err("not implemented in Task 9".to_string()) })
+        let name = name.to_string();
+        let json = decoded_to_json(value);
+        Box::pin(async move {
+            let json = json?;
+
+            // Resolve the binding and clone out what's needed before the
+            // `.await` below — never hold the bindings-map MutexGuard across
+            // an await point, matching `get`'s discipline.
+            let (client_name, real_name) = {
+                let bindings = self.bindings.lock().unwrap();
+                let binding = bindings
+                    .get(&name)
+                    .ok_or_else(|| format!("no binding for unclaimed PV {name:?}"))?;
+                (binding.client_name.clone(), binding.real_name.clone())
+            };
+
+            let client = self
+                .pool
+                .client(&client_name)
+                .ok_or_else(|| format!("no upstream client named {client_name:?}"))?;
+
+            client
+                .pvput(&real_name, json)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // A gateway just forwards the write; there is no forward-link
+            // propagation to report back (that is server-side record
+            // behavior, out of scope for a pass-through proxy).
+            Ok(vec![])
+        })
     }
 
     fn subscribe(

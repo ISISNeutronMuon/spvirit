@@ -16,6 +16,7 @@ use std::net::{TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
+use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_gateway::cache::negative::NegativeCache;
 use spvirit_gateway::config::GatewayConfig;
 use spvirit_gateway::loopguard::LoopGuard;
@@ -346,4 +347,51 @@ async fn monitor_payload_carries_the_real_struct_id() {
         sub_struct_id, "epics:nt/NTScalar:1.0",
         "exact upstream struct_id for an ao/NTScalar record"
     );
+}
+
+/// Task 12: `Source::put` resolves the binding, converts the `DecodedValue`
+/// to JSON, and forwards it upstream via `pvput`. Uses `getholdoff_ms = 0`
+/// so the post-put `get` round-trips upstream instead of returning the
+/// getholdoff-cached pre-put value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_forwards_the_value_upstream() {
+    let Some((src, _pool)) = spawn_gateway(|b| b.ao("IT:SETPOINT", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    assert!(src.claim("IT:SETPOINT").await.is_some());
+
+    let result = src
+        .put("IT:SETPOINT", &DecodedValue::Float64(5.0))
+        .await
+        .expect("put to a claimed PV should succeed");
+    assert!(
+        result.is_empty(),
+        "gateway put has no forward-link propagation to report"
+    );
+
+    let payload = src
+        .get("IT:SETPOINT")
+        .await
+        .expect("get should return Some");
+    let value = extract_f64_value(&payload);
+    assert!(
+        (value - 5.0).abs() < 1e-6,
+        "expected the get to reflect the put, got {value}"
+    );
+}
+
+/// A `put` to a name that has never been `claim`ed has no binding to resolve
+/// and must fail rather than silently succeed or panic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_to_unclaimed_name_is_an_error() {
+    let Some((src, _pool)) = spawn_gateway(|b| b.ao("IT:SETPOINT2", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    // Deliberately not calling `src.claim(...)` first.
+    let result = src.put("IT:SETPOINT2", &DecodedValue::Float64(5.0)).await;
+    assert!(result.is_err(), "put to an unclaimed name must return Err");
 }
