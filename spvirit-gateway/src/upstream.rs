@@ -41,7 +41,9 @@ impl UpstreamPool {
 /// Map a p4p-compatible [`ClientCfg`] onto a [`PvaClient`] via its builder.
 ///
 /// - `bcastport` -> UDP search port.
-/// - `autoaddrlist == false` -> disable UDP broadcast search.
+/// - `autoaddrlist == false` with no usable `addrlist` target -> disable UDP
+///   search entirely (see the `has_search_target` note below for why this is
+///   narrower than "just `autoaddrlist == false`").
 /// - first whitespace-separated `addrlist` entry (parsed as [`IpAddr`]) ->
 ///   search target address.
 /// - first `interface` entry (parsed as [`IpAddr`]) -> local bind address for
@@ -55,7 +57,23 @@ impl UpstreamPool {
 fn build_client(c: &ClientCfg) -> PvaClient {
     let mut b = PvaClient::builder().udp_port(c.bcastport);
 
-    if !c.autoaddrlist {
+    // Only fully disable UDP search when the user opted out of automatic
+    // address-list discovery AND gave no explicit search target. spvirit-client's
+    // no_broadcast() suppresses the WHOLE UDP search branch — including the
+    // unicast search_addr — so calling it while a search target is set would
+    // silently resolve nothing (a standard p4p `{autoaddrlist:false, addrlist:"<ip>"}`
+    // unicast config). When an explicit addrlist target is present we therefore
+    // keep UDP search enabled so search_addr is honored. Residual (documented
+    // §14 gap): a subnet broadcast is still emitted alongside the unicast search
+    // in that case — spvirit-client offers no "unicast-only UDP search" mode
+    // without modifying that crate.
+    let has_search_target = c
+        .addrlist
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<IpAddr>().ok())
+        .is_some();
+    if !c.autoaddrlist && !has_search_target {
         b = b.no_broadcast();
     }
 

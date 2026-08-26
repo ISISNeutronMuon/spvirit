@@ -5,6 +5,7 @@ pub mod config;
 pub mod convert;
 pub mod loopguard;
 pub mod proxy;
+pub mod runtime;
 pub mod upstream;
 #[cfg(test)]
 mod smoke {
