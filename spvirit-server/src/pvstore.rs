@@ -113,6 +113,16 @@ pub trait Source: Send + Sync {
 /// are stable between runs.
 pub trait StoreSource: Source {
     fn record_names(&self) -> Vec<String>;
+
+    /// Receive the server's [`MonitorRegistry`] so writes that originate in
+    /// host code — rather than arriving as a client PUT through the handler —
+    /// still reach monitor clients.
+    ///
+    /// Defaulted to a no-op because a store that offers no host-side write
+    /// path needs nothing here. `PvaServer` calls it once, before serving.
+    fn set_monitor_registry(&self, registry: Arc<crate::monitor::MonitorRegistry>) {
+        let _ = registry;
+    }
 }
 
 // ---------------------------------------------------------------------------

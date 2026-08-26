@@ -59,7 +59,7 @@ pub struct PvaServerBuilder {
     /// The record store registered via [`PvaServerBuilder::ioc`], as the
     /// names it owns (captured at registration so `build`'s disjointness
     /// check can run synchronously) and the source itself.
-    ioc: Option<(Vec<String>, Arc<dyn Source>)>,
+    ioc: Option<(Vec<String>, Arc<dyn StoreSource>)>,
     tcp_port: u16,
     udp_port: u16,
     listen_ip: Option<IpAddr>,
@@ -563,7 +563,9 @@ impl PvaServerBuilder {
     /// inert against an engine record.
     ///
     /// Generic rather than `Arc<dyn StoreSource>` so the names can be read
-    /// before the value is erased to `Arc<dyn Source>`.
+    /// without an extra dynamic dispatch. The handle is kept as
+    /// `Arc<dyn StoreSource>`, not narrowed to `Arc<dyn Source>`, because
+    /// `serve_after_start_hooks` has to call `set_monitor_registry` on it.
     ///
     /// # Panics
     /// If called more than once.
@@ -574,7 +576,7 @@ impl PvaServerBuilder {
              register additional engines with .source()"
         );
         let names = ioc.record_names();
-        let source: Arc<dyn Source> = ioc;
+        let source: Arc<dyn StoreSource> = ioc;
         self.ioc = Some((names, source));
         self
     }
@@ -777,7 +779,7 @@ pub struct PvaServer {
     store: Arc<SimplePvStore>,
     extra_sources: Vec<(String, i32, Arc<dyn Source>)>,
     /// The engine registered via [`PvaServerBuilder::ioc`], if any.
-    ioc: Option<Arc<dyn Source>>,
+    ioc: Option<Arc<dyn StoreSource>>,
     config: PvaServerConfig,
     scans: Vec<(String, Duration, ScanCallback)>,
     /// The monitor registry, lazily created on first access (by whichever
@@ -836,6 +838,13 @@ impl PvaServer {
     /// Python's `start_background`, is — called on its own ahead of it.
     pub async fn run_start_hooks(&self) -> Result<(), String> {
         self.store.set_registry(self.resolved_monitor_registry()).await;
+        if let Some(ioc) = &self.ioc {
+            // Same reasoning as the store above: a hook (or any host-side
+            // write issued before `serve_after_start_hooks` runs) must reach
+            // monitor clients too, and `run_start_hooks` can run well ahead
+            // of that — see Python's `start_background`.
+            ioc.set_monitor_registry(self.resolved_monitor_registry());
+        }
         for (i, hook) in self.start_hooks.iter().enumerate() {
             let fut = hook(self.store.clone());
             let result =
@@ -961,10 +970,20 @@ impl PvaServer {
         sources.add_store("builtin", 0, self.store.clone()).await;
 
         if let Some(ioc) = &self.ioc {
+            // The engine publishes host-side writes itself, so it needs the
+            // same registry the handler uses. Without this a `set_value` runs
+            // the pass, updates the record, and notifies nobody — the one
+            // failure mode that looks exactly like success from inside the
+            // engine. Also done in `run_start_hooks`, which can run this far
+            // ahead of `serve_after_start_hooks`; `resolved_monitor_registry`
+            // is idempotent so the two calls agree on the same instance.
+            ioc.set_monitor_registry(registry.clone());
+
             // Order 5: after the builtin store, before `record-fields`, so
             // the IOC's own `.FIELD` routing answers for its records and
             // tier 2's (`SimplePvStore`'s) field source answers for the builtin store's.
-            sources.add_store("ioc", 5, ioc.clone()).await;
+            let as_source: Arc<dyn Source> = ioc.clone();
+            sources.add_store("ioc", 5, as_source).await;
         }
 
         // IOC/QSRV-style record field access (<name>.<FIELD>, <FIELD>$) so

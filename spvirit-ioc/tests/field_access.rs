@@ -214,3 +214,34 @@ async fn an_input_record_is_writable_on_the_ioc_engine() {
         Some(ScalarValue::F64(2.5))
     );
 }
+
+/// The registry the server owns must reach the engine, or a host-side write
+/// has nowhere to publish. This asserts the wiring, not the publishing —
+/// `tests/host_writes.rs` proves a monitor client actually sees the result.
+///
+/// Without this, `set_value` would look correct and notify nobody: for a
+/// source-backed PV the only publication site is the handler, reading `put`'s
+/// return value, and a host-side write never goes through the handler.
+#[tokio::test]
+async fn building_a_server_hands_the_engine_its_monitor_registry() {
+    let ioc = std::sync::Arc::new(
+        spvirit_ioc::IocSource::from_db_str(
+            "record(ai, \"REG:A\") {\n    field(INP, \"1\")\n}\n",
+        )
+        .expect("db must build"),
+    );
+    assert!(
+        ioc.monitor_registry().is_none(),
+        "an engine that has never been served has no registry"
+    );
+
+    let server = spvirit_server::pva_server::PvaServer::builder()
+        .ioc(ioc.clone())
+        .build();
+    server.run_start_hooks().await.expect("hooks must succeed");
+
+    assert!(
+        ioc.monitor_registry().is_some(),
+        "PvaServer must hand the engine the registry it publishes through"
+    );
+}

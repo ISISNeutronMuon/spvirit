@@ -18,13 +18,14 @@ use spvirit_server::db::{DbRecord, load_db_records, parse_db_records};
 use spvirit_server::field_provider::{
     RecordFieldDesc, RecordFieldProvider, resolve_field_info, resolve_field_payload,
 };
+use spvirit_server::monitor::MonitorRegistry;
 use spvirit_server::pvstore::{PvInfo, Source, StoreSource};
 use spvirit_server::simple_store::descriptor_for_payload;
 use spvirit_types::{NtPayload, ScalarValue};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 
 /// Depth of a subscriber's monitor channel. Matches `SimplePvStore`'s
@@ -47,6 +48,15 @@ pub struct IocSource {
     /// channels open, exactly as `RecordFieldSource::open_subs` does for
     /// tier 2 (`SimplePvStore`).
     field_subs: Mutex<Vec<mpsc::Sender<NtPayload>>>,
+    /// The server's monitor registry, handed over by
+    /// `PvaServer::serve_after_start_hooks` before serving begins.
+    ///
+    /// A `std::sync::RwLock` rather than tokio's: it is written once at
+    /// startup and read once per host-side write, and the guard is never held
+    /// across an await — `set_value` clones the `Arc` out and drops the guard
+    /// before it publishes. That is load-bearing, not incidental; A2's review
+    /// established that no lock in this crate crosses an await.
+    registry: RwLock<Option<Arc<MonitorRegistry>>>,
 }
 
 /// A minimal, opaque `Debug` — `RecordDb` and friends don't derive it, and
@@ -108,6 +118,7 @@ impl IocSource {
             id_names,
             subscribers: Mutex::new(HashMap::new()),
             field_subs: Mutex::new(Vec::new()),
+            registry: RwLock::new(None),
         };
         // Report the load-time diagnostics once, here, rather than on every
         // pass. None of them is fatal.
@@ -137,6 +148,20 @@ impl IocSource {
 
     pub fn graph(&self) -> DependencyGraph {
         self.db.dependency_graph()
+    }
+
+    /// Attach the server's [`MonitorRegistry`]. Called automatically by
+    /// `PvaServer` through [`StoreSource::set_monitor_registry`].
+    pub fn set_registry(&self, registry: Arc<MonitorRegistry>) {
+        *self.registry.write().expect("registry lock poisoned") = Some(registry);
+    }
+
+    /// The attached registry, if this engine has been handed to a server.
+    ///
+    /// Returns a clone rather than a guard so a caller cannot hold the lock
+    /// across an await.
+    pub fn monitor_registry(&self) -> Option<Arc<MonitorRegistry>> {
+        self.registry.read().expect("registry lock poisoned").clone()
     }
 
     /// Process every PINI record, in `.db` definition order.
@@ -343,5 +368,9 @@ impl StoreSource for IocSource {
     /// `RecordDb::names` is already sorted, which the trait requires.
     fn record_names(&self) -> Vec<String> {
         self.db.names()
+    }
+
+    fn set_monitor_registry(&self, registry: Arc<MonitorRegistry>) {
+        self.set_registry(registry);
     }
 }
