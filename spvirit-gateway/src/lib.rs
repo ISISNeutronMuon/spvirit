@@ -1,5 +1,6 @@
 //! spvirit-gateway — a p4p-compatible PVAccess gateway.
 pub mod config;
+pub mod loopguard;
 pub mod upstream;
 #[cfg(test)]
 mod smoke {
