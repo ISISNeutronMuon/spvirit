@@ -395,3 +395,50 @@ async fn put_to_unclaimed_name_is_an_error() {
     let result = src.put("IT:SETPOINT2", &DecodedValue::Float64(5.0)).await;
     assert!(result.is_err(), "put to an unclaimed name must return Err");
 }
+
+/// M1's `names()` deliberately reports the set of PVs this `GatewaySource`
+/// has already claimed (the keys of its binding cache), not a full upstream
+/// namespace enumeration via `pvlist` fan-out — the gateway has no per-
+/// upstream `SocketAddr` to drive `pvlist`/`pvlist_with_fallback` with (see
+/// the doc comment on `GatewaySource::names` for the full rationale). This
+/// test pins that contract: empty before any `claim`, and exactly the
+/// claimed names (sorted, deduped) afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn names_reflects_claimed_bindings() {
+    let Some((src, _pool)) =
+        spawn_gateway(|b| b.ai("IT:AAA", 1.0).ai("IT:BBB", 2.0), 0).await
+    else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    assert!(
+        src.names().await.is_empty(),
+        "names() must be empty before anything is claimed"
+    );
+
+    assert!(src.claim("IT:AAA").await.is_some());
+    assert!(src.claim("IT:BBB").await.is_some());
+
+    let mut names = src.names().await;
+    names.sort();
+    assert_eq!(names, vec!["IT:AAA".to_string(), "IT:BBB".to_string()]);
+}
+
+/// RPC forwarding to upstream servers is out of scope for M1: `PvaClient`
+/// exposes no general-purpose RPC call, only an internal `pvlist`-via-RPC
+/// helper. `GatewaySource::rpc` therefore always returns an explicit,
+/// gateway-specific error rather than silently inheriting the `Source`
+/// trait's generic default (spec §14 gap, deferred to a later milestone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rpc_is_not_implemented_in_m1() {
+    let Some((src, _pool)) = spawn_gateway(|b| b.ai("IT:AAA", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    assert!(src.claim("IT:AAA").await.is_some());
+
+    let result = src.rpc("IT:AAA", &DecodedValue::Null).await;
+    assert!(result.is_err(), "gateway rpc() must return Err in M1");
+}

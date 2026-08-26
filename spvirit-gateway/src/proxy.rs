@@ -1,9 +1,10 @@
 //! `GatewaySource` — the [`spvirit_server::pvstore::Source`] implementation
 //! that bridges downstream requests to upstream [`spvirit_client::PvaClient`]s.
 //!
-//! M1 only wires up `claim`: search each configured upstream client in order
-//! and cache the first hit. `get`/`put`/`subscribe`/`names` are placeholder
-//! stubs replaced in later tasks (10-13).
+//! M1 wires up `claim`/`get`/`put`/`subscribe`/`names` (Tasks 10-13); `rpc`
+//! remains an explicit "not implemented" stub (see its doc comment) and
+//! `names` reports claimed bindings rather than a full upstream `pvlist`
+//! fan-out (see its doc comment) — both documented M1/§14 gaps.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -256,8 +257,45 @@ impl Source for GatewaySource {
         })
     }
 
+    /// RPC forwarding to upstream servers is out of scope for M1:
+    /// `PvaClient` (`spvirit-client`) exposes no general-purpose RPC call —
+    /// the only "rpc" in the client is an internal `pvlist`-via-server-RPC
+    /// helper, not a channel-addressed RPC primitive a gateway could forward
+    /// arbitrary requests through. Rather than silently inheriting the
+    /// `Source` trait's generic `"RPC not supported"` default, this override
+    /// makes the gap explicit and greppable. Real forwarding is deferred
+    /// until `spvirit-client` grows a general RPC call (spec §14 gap).
+    fn rpc(
+        &self,
+        _name: &str,
+        _args: &DecodedValue,
+    ) -> Pin<Box<dyn Future<Output = Result<NtPayload, String>> + Send + '_>> {
+        Box::pin(async {
+            Err("gateway RPC forwarding is not implemented in M1".to_string())
+        })
+    }
+
+    /// Returns the sorted, deduplicated set of PV names this gateway has
+    /// already successfully `claim`ed (the keys of `bindings`), *not* a full
+    /// enumeration of every name available upstream.
+    ///
+    /// The plan's original design called for the union of `pvlist` results
+    /// across `client_order`, but `PvaClient::pvlist`/`pvlist_with_fallback`
+    /// both require a concrete upstream `SocketAddr`, and the gateway never
+    /// caches one per client — `UpstreamPool` resolves upstreams dynamically
+    /// via search per-name, so no single "the server address for this
+    /// client" value exists to drive `pvlist` with. This is a documented M1
+    /// divergence: full upstream namespace enumeration via `pvlist` fan-out
+    /// is deferred until per-upstream server addresses are wired up (spec
+    /// §14 / M2).
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
-        Box::pin(async { vec![] })
+        let mut names: Vec<String> = {
+            let bindings = self.bindings.lock().unwrap();
+            bindings.keys().cloned().collect()
+        };
+        names.sort();
+        names.dedup();
+        Box::pin(async move { names })
     }
 }
 
