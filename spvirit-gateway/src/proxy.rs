@@ -9,13 +9,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::pvstore::{PvInfo, Source};
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
 
+use crate::bridge::nt_payload_from_get;
 use crate::cache::negative::NegativeCache;
 use crate::loopguard::LoopGuard;
 use crate::upstream::UpstreamPool;
@@ -23,13 +24,21 @@ use crate::upstream::UpstreamPool;
 /// Record of which upstream client resolved a downstream PV name, and under
 /// what name it is known upstream.
 ///
-/// Kept minimal (just the two fields Tasks 10-13 need to route `get`/`put`/
+/// Kept minimal (just the fields Tasks 10-13 need to route `get`/`put`/
 /// `subscribe` back to the right client) so it doubles as the binding cache
 /// value with no rework required.
-#[derive(Debug, Clone)]
+///
+/// `last_get` is the getholdoff cache for the *read* path (`get`, and later
+/// `subscribe`'s initial value): the last successful upstream fetch plus the
+/// instant it was fetched. It lives on the binding (rather than a parallel
+/// map keyed by name) so it is naturally torn down together with the
+/// binding and cannot desync from it; Task 12's `put` does not need a slot
+/// here since a put's own reply value is not subject to getholdoff.
+#[derive(Debug)]
 pub struct Binding {
     pub client_name: String,
     pub real_name: String,
+    last_get: Mutex<Option<(Instant, NtPayload)>>,
 }
 
 /// A [`Source`] that resolves and forwards PVs to upstream PVA servers.
@@ -39,7 +48,6 @@ pub struct GatewaySource {
     neg: Arc<NegativeCache>,
     #[allow(dead_code)] // consulted by the server-side search path, wired in Task 14
     guard: Arc<LoopGuard>,
-    #[allow(dead_code)] // consumed by `get`'s holdoff logic, wired in Task 10
     getholdoff_ms: u32,
     bindings: Mutex<HashMap<String, Binding>>,
 }
@@ -86,6 +94,7 @@ impl Source for GatewaySource {
                         Binding {
                             client_name: client_name.clone(),
                             real_name: name.clone(),
+                            last_get: Mutex::new(None),
                         },
                     );
                     return Some(PvInfo {
@@ -100,8 +109,41 @@ impl Source for GatewaySource {
         })
     }
 
-    fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
-        Box::pin(async { None })
+    fn get(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+        let name = name.to_string();
+        Box::pin(async move {
+            // Resolve the binding and, while still holding the bindings-map
+            // lock, check the per-binding getholdoff cache. Both locks
+            // (outer map, inner `last_get`) are acquired and released
+            // within this block, before any `.await` — never held across
+            // one.
+            let (client_name, real_name) = {
+                let bindings = self.bindings.lock().unwrap();
+                let binding = bindings.get(&name)?;
+
+                let cache = binding.last_get.lock().unwrap();
+                if let Some((t_last, payload)) = cache.as_ref()
+                    && Instant::now() < *t_last + Duration::from_millis(self.getholdoff_ms as u64)
+                {
+                    return Some(payload.clone());
+                }
+                drop(cache);
+
+                (binding.client_name.clone(), binding.real_name.clone())
+            };
+
+            let client = self.pool.client(&client_name)?;
+            match client.pvget(&real_name).await {
+                Ok(result) => {
+                    let payload = nt_payload_from_get(&result);
+                    if let Some(binding) = self.bindings.lock().unwrap().get(&name) {
+                        *binding.last_get.lock().unwrap() = Some((Instant::now(), payload.clone()));
+                    }
+                    Some(payload)
+                }
+                Err(_) => None,
+            }
+        })
     }
 
     fn put(
