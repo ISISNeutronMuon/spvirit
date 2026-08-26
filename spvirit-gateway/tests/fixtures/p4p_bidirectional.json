@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "clients": [
+    { "name": "docker-client-network", "autoaddrlist": false,
+      "addrlist": "172.18.255.255", "interface": ["172.18.0.1"] },
+    { "name": "external-client-network", "autoaddrlist": false,
+      "addrlist": "10.0.91.255", "interface": ["10.0.90.203"] }
+  ],
+  "servers": [
+    { "name": "external-server-network", "clients": ["docker-client-network"],
+      "interface": ["10.0.90.203"], "addrlist": "10.0.91.255", "autoaddrlist": false,
+      "statusprefix": "DEV:GW:STS:", "pvlist": "/etc/pvagw/pvacl.conf" },
+    { "name": "docker-server-network", "clients": ["external-client-network"],
+      "interface": ["172.18.0.1"], "addrlist": "172.18.255.255",
+      "ignoreaddr": "gw.example.org 172.18.0.1", "autoaddrlist": false,
+      "statusprefix": "DEV:GW:STS:" }
+  ]
+}
