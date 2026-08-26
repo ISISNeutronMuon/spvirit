@@ -760,11 +760,11 @@ pub async fn run_tcp_server(
         let id = conn_id.fetch_add(1, Ordering::SeqCst);
         info!("TCP connection {} from {}", id, peer);
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        tokio::spawn(crate::request_ctx::scope(peer, async move {
             if let Err(e) = handle_connection(state_clone, stream, id, conn_timeout).await {
                 error!("Connection {} error: {}", id, e);
             }
-        });
+        }));
     }
 }
 

@@ -42,6 +42,7 @@ pub mod pv;
 pub mod pva_server;
 pub mod pvstore;
 pub mod record_fields;
+pub mod request_ctx;
 pub mod server;
 pub mod simple_store;
 pub mod state;
