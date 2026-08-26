@@ -26,7 +26,7 @@ fn default_getholdoff() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
     pub version: u32,
-    #[serde(rename = "read-only", default)]
+    #[serde(rename = "readOnly", default)]
     pub read_only: bool,
     #[serde(default)]
     pub clients: Vec<ClientCfg>,
@@ -131,5 +131,12 @@ mod tests {
         assert_eq!(ss.clients, vec!["docker-client-network".to_string()]);
         assert_eq!(ss.serverport, 5075); // default applied
         assert_eq!(cfg.servers[1].ignoreaddr, "gw.example.org 172.18.0.1");
+    }
+
+    #[test]
+    fn parses_read_only_camel_case_key() {
+        let cfg = GatewayConfig::from_json_str(r#"{"version": 2, "readOnly": true}"#)
+            .expect("parse");
+        assert!(cfg.read_only);
     }
 }
