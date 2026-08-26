@@ -247,6 +247,13 @@ impl GatewayConfig {
                 )));
             }
 
+            if s.clients.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "server '{}' has no clients (no upstream source)",
+                    s.name
+                )));
+            }
+
             for c in &s.clients {
                 if !client_names.contains(c.as_str()) {
                     return Err(ConfigError::Validation(format!(
@@ -356,6 +363,15 @@ mod tests {
     fn validate_rejects_duplicate_server_names() {
         let s = r#"{ "version":2, "clients":[{"name":"a"}],
             "servers":[{"name":"s","clients":["a"]},{"name":"s","clients":["a"]}] }"#;
+        let cfg = GatewayConfig::from_json_str(s).unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn validate_rejects_server_with_no_clients() {
+        let s = r#"{ "version":2, "clients":[{"name":"a"}],
+            "servers":[{"name":"s","clients":[]}] }"#;
         let cfg = GatewayConfig::from_json_str(s).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
