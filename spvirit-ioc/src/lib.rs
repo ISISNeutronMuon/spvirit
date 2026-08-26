@@ -23,7 +23,9 @@ pub mod lockset;
 pub mod model;
 pub mod process;
 pub mod source;
+pub mod spec;
 #[cfg(test)]
 mod test_support;
 
 pub use source::IocSource;
+pub use spec::RecordSpec;
