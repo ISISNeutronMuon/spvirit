@@ -85,7 +85,22 @@ impl Runtime {
                 .build();
 
             servers.push(server);
+
+            tracing::info!(
+                "spgateway: server '{}' -> {}:{} (udp {}), upstreams [{}]",
+                server_cfg.name,
+                interface_ip,
+                server_cfg.serverport,
+                server_cfg.bcastport,
+                server_cfg.clients.join(", "),
+            );
         }
+
+        tracing::info!(
+            "spgateway: {} server(s), {} upstream(s) configured",
+            cfg.servers.len(),
+            cfg.clients.len(),
+        );
 
         Ok(Runtime { servers })
     }
@@ -94,6 +109,11 @@ impl Runtime {
     /// exit, one of them errors, or Ctrl-C is received (in which case `run`
     /// returns `Ok(())` — a graceful stop, not a failure).
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error>> {
+        tracing::info!(
+            "spgateway: starting {} server(s); press Ctrl-C to stop",
+            self.servers.len()
+        );
+
         let mut set = tokio::task::JoinSet::new();
         for server in self.servers {
             // `PvaServer::run`'s error type (`Box<dyn std::error::Error>`,

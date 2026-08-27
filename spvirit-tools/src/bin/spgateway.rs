@@ -11,8 +11,15 @@
 //! the same way, then builds a [`spvirit_gateway::runtime::Runtime`] from the
 //! config and runs it until it exits (all servers stop) or Ctrl-C is
 //! received.
+//!
+//! `-v`/`--verbose` raises the log level from the default `INFO` to `DEBUG`.
+//! Without it, `spgateway` still logs a one-line-per-server startup banner
+//! (which port each server listens on and which upstreams it proxies) plus
+//! any warnings/errors, so a normal start is no longer silent.
 
 use std::process::ExitCode;
+
+use tracing::Level;
 
 use spvirit_gateway::config::GatewayConfig;
 use spvirit_gateway::runtime::Runtime;
@@ -21,10 +28,13 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     let test_config = args.iter().any(|a| a == "-T" || a == "--test-config");
-    let path = args.iter().find(|a| *a != "-T" && *a != "--test-config");
+    let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
+    let path = args
+        .iter()
+        .find(|a| !matches!(a.as_str(), "-T" | "--test-config" | "-v" | "--verbose"));
 
     let Some(path) = path else {
-        eprintln!("usage: spgateway [-T|--test-config] <config.json>");
+        eprintln!("usage: spgateway [-T|--test-config] [-v|--verbose] <config.json>");
         return ExitCode::FAILURE;
     };
 
@@ -48,6 +58,13 @@ fn main() -> ExitCode {
             }
         };
     }
+
+    // Serving path: install a tracing subscriber so the gateway is no longer
+    // silent. `PvaServer` and the runtime banner emit at INFO; `-v` adds the
+    // per-module DEBUG detail. Mirrors the `spvirit_server` binary's setup.
+    tracing_subscriber::fmt::fmt()
+        .with_max_level(if verbose { Level::DEBUG } else { Level::INFO })
+        .init();
 
     let cfg = match GatewayConfig::from_json_str(&contents) {
         Ok(cfg) => cfg,
