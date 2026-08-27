@@ -80,7 +80,10 @@ mapping.
 
 Two write entry points converge on the store: wire PUTs (via the handler →
 registry → `Source::put`) and internal writes (scan callbacks, `Pv::set`,
-link evaluation → `store.set_value`). Both end at
+link evaluation → `store.set_value`). A third, for sources whose values
+change upstream (gateway, group), is a per-PV pump task that drains
+`Source::subscribe` — started at monitor init for any source that does not
+self-notify (`Source::pushes_own_updates`). All three end at
 `MonitorRegistry::notify_monitors`, which builds full-or-delta frames per
 subscriber and pushes bytes into each connection's writer channel.
 

@@ -112,11 +112,26 @@ the registry via `set_registry`). So there are two notification origins:
 protocol PUTs notify from the handler, internal writes from the store. Note
 the beacon change counter is only bumped on the protocol-PUT path.
 
+**Subscribe-only sources** (gateway proxies, group PVs, async backends) have a
+third origin. Their values change upstream, never through a local PUT or store
+write, so neither path above fires. At monitor init the handler checks
+`state.sources.pushes_own_updates(name)` (handler.rs); if the source does *not*
+self-notify, it calls `subscribe(name)` and hands the channel to
+`MonitorRegistry::ensure_pump` (monitor.rs), which spawns one task per PV that
+drains the channel into `notify_monitors`. The pump is shared across every
+subscriber of that PV and retired (`retire_pump_if_idle`) when the last one
+goes away; it holds a `Weak` reference to the registry to avoid a cycle.
+Self-notifying sources (`SimplePvStore`, `IocSource`, `PySourceAdapter`) return
+`true` and are skipped, so their updates are never delivered twice. Without this
+pump a monitor through the gateway received only its initial snapshot and then
+nothing.
+
 ### Concurrency summary
 
 Tokio tasks: UDP-search loop, TCP-accept loop, beacon loop, one per
 connection + one writer task per connection, one per `.scan()`, detached
-`on_put` tasks, one per group-subscription fan-in. Locks: store `pvs`
+`on_put` tasks, one per group-subscription fan-in, one monitor pump per
+subscribe-only PV under monitor. Locks: store `pvs`
 (`RwLock`), monitor registry (`Mutex`), source registry (`RwLock`); each
 `Pv` handle's shared state is a **std `Mutex`** held only briefly, never
 across `.await`. Channels: per-connection outbound (128), per-subscriber

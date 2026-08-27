@@ -23,6 +23,7 @@ fn claim(&self, name: &str)   -> Option<PvInfo>;   // do I own this name?
 fn get(&self, name: &str)     -> Option<NtPayload>;
 fn put(&self, name, value)    -> Result<Vec<(String, NtPayload)>, String>;
 fn subscribe(&self, name)     -> Option<Receiver<NtPayload>>;
+fn pushes_own_updates(&self)  -> bool;                        // default false
 fn rpc(&self, name, args)     -> Result<NtPayload, String>;   // has a default
 fn names(&self)               -> Vec<String>;
 ```
@@ -50,7 +51,7 @@ class MySource:
 Two differences from Rust worth knowing up front. `on_start` has no Rust
 counterpart — it is how a Python source gets the `Notifier` it needs to push
 monitor updates. And `subscribe` is *not* part of the Python protocol: define
-it and it is ignored (`spvirit-py/src/source.rs:702`). Monitors are driven by
+it and it is ignored (`spvirit-py/src/source.rs:716`). Monitors are driven by
 `notifier.notify(name, payload)` instead.
 
 `on_start` fires at server start (`start()`/`start_background()`/`run()`),
@@ -142,6 +143,29 @@ thread produces the data:
 ```python
 {{#include ../../../../spvirit-py/examples/demo_source_sensor.py:notify}}
 ```
+
+**Two delivery paths, and why `pushes_own_updates` exists.** There are two
+ways a source's changes reach a monitoring client, and a source must use
+exactly one:
+
+- **Return a channel from `subscribe`** and leave `pushes_own_updates` at its
+  default `false`. When a client starts a monitor, the server calls your
+  `subscribe`, then runs one pump task per PV that drains the channel into the
+  monitor registry — so every value you send reaches the client. This is the
+  path for gateway proxies, group PVs, and any source whose values originate
+  elsewhere. It is what makes a monitor through the gateway deliver *ongoing*
+  updates, not just the first value.
+- **Push into the monitor registry yourself** — the built-in record store and
+  the IOC engine already call `notify_monitors` on every write. Such a source
+  returns `pushes_own_updates() -> true`, which tells the server *not* to also
+  pump `subscribe`; pumping a source that already self-notifies would deliver
+  every update twice.
+
+Most custom sources take the first path and never touch `pushes_own_updates`.
+Override it to `true` only if your source itself drives the monitor registry.
+In Python the choice does not arise: `subscribe` is ignored and the `Notifier`
+is the self-notifying path, so Python sources behave as if `pushes_own_updates`
+were `true`.
 
 ## RPC
 
