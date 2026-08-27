@@ -105,7 +105,7 @@ async fn do_connect(
     let mut opts = PvGetOptions::new(pv_name.clone());
     opts.timeout = timeout;
     opts.server_addr = Some(server_addr);
-    let conn = establish_channel(server_addr, &opts).await?;
+    let conn = establish_channel(server_addr, [0u8; 12], &opts).await?;
     Ok(ChannelState {
         conn: Some(conn),
         pv_name,

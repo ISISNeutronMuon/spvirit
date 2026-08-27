@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Anything else: treat it as a PV name — locate it, then describe it.
         Some(pv) => {
             // ANCHOR: search
-            let server_addr = search_pv(&pv, udp_port, timeout, &targets, false).await?;
+            let (server_addr, _guid) = search_pv(&pv, udp_port, timeout, &targets, false).await?;
             println!("{pv} is served by {server_addr}");
             // ANCHOR_END: search
 

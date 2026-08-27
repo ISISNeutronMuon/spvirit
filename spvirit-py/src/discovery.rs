@@ -125,7 +125,7 @@ fn search_pv_udp(
 ) -> PyResult<String> {
     let tgts = resolve_targets(targets)?;
     let dur = Duration::from_secs_f64(timeout);
-    let addr = block_on_py(py, async move {
+    let (addr, _guid) = block_on_py(py, async move {
         search_pv(&pv_name, udp_port, dur, &tgts, debug).await
     })
     .map_err(to_py_err)?;
@@ -146,7 +146,7 @@ fn search_pv_udp_async<'py>(
     let tgts = resolve_targets(targets)?;
     let dur = Duration::from_secs_f64(timeout);
     future_into_py(py, async move {
-        let addr = search_pv(&pv_name, udp_port, dur, &tgts, debug)
+        let (addr, _guid) = search_pv(&pv_name, udp_port, dur, &tgts, debug)
             .await
             .map_err(to_py_err)?;
         Ok(addr.to_string())
@@ -167,7 +167,7 @@ fn search_pv_tcp_py(
         pyo3::exceptions::PyValueError::new_err(format!("invalid name server {name_server}: {e}"))
     })?;
     let dur = Duration::from_secs_f64(timeout);
-    let addr = block_on_py(
+    let (addr, _guid) = block_on_py(
         py,
         async move { search_pv_tcp(&pv_name, ns, dur, debug).await },
     )

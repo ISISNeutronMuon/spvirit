@@ -109,7 +109,7 @@ impl Source for GatewaySource {
                 let Some(client) = self.pool.client(client_name) else {
                     continue;
                 };
-                if let Ok((descriptor, server_addr)) = client.pvinfo_full(&name).await {
+                if let Ok((descriptor, server_addr, _guid)) = client.pvinfo_full(&name).await {
                     // Loop / self-connection prevention: if this name resolved
                     // back into one of our own downstream server sockets (or an
                     // `ignoreaddr` host), do NOT bind it — forwarding would loop

@@ -264,8 +264,8 @@ impl PvaClient {
     /// Resolve a PV server and establish a channel, returning the raw connection.
     async fn open_channel(&self, pv_name: &str) -> Result<ChannelConn, PvGetError> {
         let opts = self.opts(pv_name);
-        let target = resolve_pv_server(&opts).await?;
-        establish_channel(target, &opts).await
+        let (target, guid) = resolve_pv_server(&opts).await?;
+        establish_channel(target, guid, &opts).await
     }
 
     // ─── pvget ───────────────────────────────────────────────────────────
@@ -648,13 +648,14 @@ impl PvaClient {
     pub async fn pvinfo_full(
         &self,
         pv_name: &str,
-    ) -> Result<(StructureDesc, SocketAddr), PvGetError> {
+    ) -> Result<(StructureDesc, SocketAddr, [u8; 12]), PvGetError> {
         let ChannelConn {
             mut stream,
             sid,
             version: _,
             is_be,
             server_addr,
+            guid,
             mut reassembler,
         } = self.open_channel(pv_name).await?;
 
@@ -685,7 +686,7 @@ impl PvaClient {
                 let desc = payload.introspection.ok_or_else(|| {
                     PvGetError::Decode("missing GET_FIELD introspection".to_string())
                 })?;
-                Ok((desc, server_addr))
+                Ok((desc, server_addr, guid))
             }
             _ => Err(PvGetError::Protocol(
                 "unexpected GET_FIELD response".to_string(),

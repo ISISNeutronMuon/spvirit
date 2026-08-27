@@ -313,7 +313,7 @@ async fn list_pvs_via_server_rpc_channel(
         is_be,
         mut reassembler,
         ..
-    } = establish_channel(server_addr, &rpc_opts).await?;
+    } = establish_channel(server_addr, [0u8; 12], &rpc_opts).await?;
 
     let ioid = 1u32;
     let rpc_init = encode_rpc_request(sid, ioid, 0x08, &PV_REQUEST_EMPTY, version, is_be);
@@ -442,7 +442,7 @@ pub async fn list_pvs_via_server_get(
             is_be,
             mut reassembler,
             ..
-        } = establish_channel(server_addr, &get_opts).await?;
+        } = establish_channel(server_addr, [0u8; 12], &get_opts).await?;
 
         let ioid = 1u32;
         let init_req = encode_get_request(sid, ioid, 0x08, &PV_REQUEST_EMPTY, version, is_be);

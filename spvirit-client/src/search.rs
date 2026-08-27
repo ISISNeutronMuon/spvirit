@@ -345,7 +345,7 @@ pub async fn search_pv(
     timeout_dur: Duration,
     targets: &[SearchTarget],
     debug_enabled: bool,
-) -> Result<SocketAddr, PvGetError> {
+) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
     if targets.is_empty() {
         return Err(PvGetError::Search("no search targets"));
     }
@@ -556,7 +556,7 @@ pub async fn search_pv(
                     if debug_enabled {
                         debug!("pva search response from {}", addr);
                     }
-                    return Ok(addr);
+                    return Ok((addr, payload.guid));
                 }
             }
             _ = tokio::time::sleep_until(wake_at) => {
@@ -639,7 +639,7 @@ pub async fn search_pv_tcp(
     name_server: SocketAddr,
     timeout_dur: Duration,
     debug_enabled: bool,
-) -> Result<SocketAddr, PvGetError> {
+) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
     let deadline = tokio::time::Instant::now() + timeout_dur;
 
     let mut stream = tokio::time::timeout(timeout_dur, tokio::net::TcpStream::connect(name_server))
@@ -738,7 +738,7 @@ pub async fn search_pv_tcp(
                         name_server, addr
                     );
                 }
-                return Ok(addr);
+                return Ok((addr, payload.guid));
             }
         }
     }
@@ -750,9 +750,11 @@ pub async fn search_pv_tcp(
 /// - Tries each name server from `opts.name_servers` and `EPICS_PVA_NAME_SERVERS`
 ///   via TCP search.
 /// - Falls back to UDP search using `build_search_targets()`.
-pub async fn resolve_pv_server(opts: &PvGetOptions) -> Result<SocketAddr, PvGetError> {
+pub async fn resolve_pv_server(opts: &PvGetOptions) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
     if let Some(addr) = opts.server_addr {
-        return Ok(addr);
+        // Unicast shortcut — there's no search response to read a guid
+        // from, so the caller gets the "unknown" sentinel.
+        return Ok((addr, [0u8; 12]));
     }
 
     let mut name_servers = opts.name_servers.clone();
@@ -783,8 +785,8 @@ pub async fn resolve_pv_server(opts: &PvGetOptions) -> Result<SocketAddr, PvGetE
     for ns in name_servers {
         let pv = pv.clone();
         set.spawn(async move {
-            let addr = search_pv_tcp(&pv, ns, timeout_dur, debug_enabled).await?;
-            Ok::<SocketAddr, PvGetError>(addr)
+            let result = search_pv_tcp(&pv, ns, timeout_dur, debug_enabled).await?;
+            Ok::<(SocketAddr, [u8; 12]), PvGetError>(result)
         });
     }
 
@@ -792,17 +794,17 @@ pub async fn resolve_pv_server(opts: &PvGetOptions) -> Result<SocketAddr, PvGetE
         let pv = pv.clone();
         let targets = targets.clone();
         set.spawn(async move {
-            let addr = search_pv(&pv, udp_port, timeout_dur, &targets, debug_enabled).await?;
-            Ok(addr)
+            let result = search_pv(&pv, udp_port, timeout_dur, &targets, debug_enabled).await?;
+            Ok(result)
         });
     }
 
     let mut last_err = None;
     while let Some(result) = set.join_next().await {
         match result {
-            Ok(Ok(addr)) => {
+            Ok(Ok(result)) => {
                 set.abort_all();
-                return Ok(addr);
+                return Ok(result);
             }
             Ok(Err(e)) => {
                 if debug_enabled {
@@ -1052,6 +1054,56 @@ pub async fn discover_servers(
 mod tests {
     use super::*;
     use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+    use spvirit_server::pva_server::PvaServer;
+    use std::net::TcpListener;
+    use std::net::UdpSocket as StdUdpSocket;
+
+    fn free_tcp_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("bind tcp")
+            .local_addr()
+            .expect("local_addr")
+            .port()
+    }
+
+    fn free_udp_port() -> u16 {
+        StdUdpSocket::bind("127.0.0.1:0")
+            .expect("bind udp")
+            .local_addr()
+            .expect("local_addr")
+            .port()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_pv_server_returns_responder_guid() {
+        let g = [9u8; 12];
+        let tcp_port = free_tcp_port();
+        let udp_port = free_udp_port();
+
+        let server = PvaServer::builder()
+            .ai("GUIDPV", 1.0)
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .guid(g)
+            .build();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut opts = PvGetOptions::new("GUIDPV".to_string());
+        opts.udp_port = udp_port;
+        opts.tcp_port = tcp_port;
+        // CI containers often do not route UDP broadcast to loopback
+        // listeners, so force explicit loopback discovery/bind.
+        opts.search_addr = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        opts.bind_addr = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        let (addr, guid) = resolve_pv_server(&opts).await.expect("resolve");
+        assert_eq!(guid, g);
+        assert!(addr.ip().is_loopback());
+    }
 
     #[test]
     fn encode_decode_search_request_roundtrip() {

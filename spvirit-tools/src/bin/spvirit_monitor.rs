@@ -67,9 +67,9 @@ async fn pvmonitor_raw(
     fields: Vec<String>,
     pipeline: Option<u32>,
 ) -> Result<(), PvGetError> {
-    let target = resolve_pv_server(&opts).await?;
+    let (target, guid) = resolve_pv_server(&opts).await?;
 
-    let conn = establish_channel(target, &opts).await?;
+    let conn = establish_channel(target, guid, &opts).await?;
     let ChannelConn {
         mut stream,
         sid,

@@ -96,9 +96,9 @@ async fn run_get_cycle(
 }
 
 async fn pvput_full_flow(opts: &PvGetOptions, input: &Value) -> Result<(), PvGetError> {
-    let target = resolve_pv_server(opts).await?;
+    let (target, guid) = resolve_pv_server(opts).await?;
 
-    let conn = establish_channel(target, opts).await?;
+    let conn = establish_channel(target, guid, opts).await?;
     let ChannelConn {
         mut stream,
         sid,

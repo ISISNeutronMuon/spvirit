@@ -53,6 +53,10 @@ pub struct ChannelConn {
     pub version: u8,
     pub is_be: bool,
     pub server_addr: std::net::SocketAddr,
+    /// The responder's GUID, as reported by the search response that
+    /// resolved `server_addr` (all-zero when resolved via the unicast
+    /// shortcut, which has no search response to read a guid from).
+    pub guid: [u8; 12],
     /// Segment reassembly state for this connection.
     ///
     /// It lives on the connection rather than on each read call because a
@@ -64,6 +68,7 @@ pub struct ChannelConn {
 
 pub async fn establish_channel(
     target: std::net::SocketAddr,
+    guid: [u8; 12],
     opts: &PvGetOptions,
 ) -> Result<ChannelConn, PvGetError> {
     let mut stream = timeout(opts.timeout, TcpStream::connect(target))
@@ -145,6 +150,7 @@ pub async fn establish_channel(
         version,
         is_be,
         server_addr: target,
+        guid,
         reassembler,
     })
 }
@@ -159,9 +165,9 @@ pub async fn pvget(opts: &PvGetOptions) -> Result<PvGetResult, PvGetError> {
 /// If `fields` is empty, requests all fields (equivalent to `-r ""`).
 /// Otherwise, encodes a pvRequest like `field(value,alarm,timeStamp)`.
 pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetResult, PvGetError> {
-    let target = resolve_pv_server(opts).await?;
+    let (target, guid) = resolve_pv_server(opts).await?;
 
-    let conn = establish_channel(target, opts).await?;
+    let conn = establish_channel(target, guid, opts).await?;
     let ChannelConn {
         mut stream,
         sid,

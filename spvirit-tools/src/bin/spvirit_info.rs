@@ -46,7 +46,7 @@ fn should_fallback_to_pvget(err: &PvGetError) -> bool {
 
 /// Legacy fallback: GET_FIELD without field name string.
 async fn pvinfo_no_field_name(opts: &PvGetOptions) -> Result<StructureDesc, PvGetError> {
-    let target = resolve_pv_server(opts).await?;
+    let (target, guid) = resolve_pv_server(opts).await?;
     let ChannelConn {
         mut stream,
         sid,
@@ -54,7 +54,7 @@ async fn pvinfo_no_field_name(opts: &PvGetOptions) -> Result<StructureDesc, PvGe
         is_be,
         mut reassembler,
         ..
-    } = establish_channel(target, opts).await?;
+    } = establish_channel(target, guid, opts).await?;
 
     let get_field = encode_get_field_request_without_field_name(sid, version, is_be);
     stream.write_all(&get_field).await?;
