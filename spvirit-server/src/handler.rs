@@ -661,29 +661,33 @@ pub async fn run_udp_search(
                     continue;
                 }
                 let all_names = state.sources.names().await;
-                let visible_names = collect_visible_pv_names(
-                    &all_names,
-                    state.pvlist_mode,
-                    state.pvlist_allow_pattern.as_ref(),
-                    state.pvlist_max,
-                );
-                let mut cids = Vec::new();
-                for (cid, name) in &payload.pv_requests {
-                    if state.sources.has_pv(name).await
-                        || is_virtual_event_pv(name)
-                        || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
-                        || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
-                    {
-                        cids.push(*cid);
-                        continue;
+                let cids = crate::request_ctx::scope(peer, async {
+                    let visible_names = collect_visible_pv_names(
+                        &all_names,
+                        state.pvlist_mode,
+                        state.pvlist_allow_pattern.as_ref(),
+                        state.pvlist_max,
+                    );
+                    let mut cids = Vec::new();
+                    for (cid, name) in &payload.pv_requests {
+                        if state.sources.has_pv(name).await
+                            || is_virtual_event_pv(name)
+                            || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
+                            || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
+                        {
+                            cids.push(*cid);
+                            continue;
+                        }
+                        if state.pvlist_mode != PvListMode::Off
+                            && is_pattern_query(name)
+                            && visible_names.iter().any(|pv| wildcard_match(name, pv))
+                        {
+                            cids.push(*cid);
+                        }
                     }
-                    if state.pvlist_mode != PvListMode::Off
-                        && is_pattern_query(name)
-                        && visible_names.iter().any(|pv| wildcard_match(name, pv))
-                    {
-                        cids.push(*cid);
-                    }
-                }
+                    cids
+                })
+                .await;
                 let response_required = (payload.mask & 0x01) != 0;
                 let server_discovery_ping = payload.pv_requests.is_empty();
                 let found = server_discovery_ping || !cids.is_empty();
@@ -1828,4 +1832,127 @@ pub async fn handle_connection(
     state.registry.cleanup_connection(conn_id).await;
     let _ = writer_task.await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::monitor::MonitorRegistry;
+    use crate::pvstore::PvInfo;
+    use crate::request_ctx::RequestContext;
+    use spvirit_codec::spvirit_encode::encode_search_request;
+    use spvirit_types::NtPayload;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration as StdDuration;
+    use tokio::net::UdpSocket as TokioUdpSocket;
+
+    /// A `Source` that records the [`RequestContext`] visible to it (if any)
+    /// the last time `claim` was called, so a test can assert on what peer
+    /// identity was in scope during UDP search handling.
+    struct ProbeSource {
+        name: String,
+        seen: Arc<StdMutex<Option<RequestContext>>>,
+    }
+
+    impl crate::pvstore::Source for ProbeSource {
+        fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            let owned = name == self.name;
+            *self.seen.lock().unwrap() = crate::request_ctx::current_request();
+            Box::pin(async move {
+                owned.then(|| PvInfo {
+                    descriptor: StructureDesc::default(),
+                    writable: false,
+                })
+            })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &spvirit_codec::spvd_decode::DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Err("read-only probe".to_string()) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            let name = self.name.clone();
+            Box::pin(async move { vec![name] })
+        }
+    }
+
+    /// Picks a free loopback UDP port by binding to port 0 and immediately
+    /// releasing it. There is an inherent (tiny) race between releasing the
+    /// port here and `run_udp_search` rebinding it below; the retrying send
+    /// loop in the test absorbs that race instead of sleeping blindly.
+    async fn free_udp_port() -> u16 {
+        let sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn udp_search_scopes_the_peer_identity() {
+        let seen: Arc<StdMutex<Option<RequestContext>>> = Arc::new(StdMutex::new(None));
+        let probe = Arc::new(ProbeSource {
+            name: "PROBE:PV".to_string(),
+            seen: seen.clone(),
+        });
+
+        let sources = Arc::new(SourceRegistry::new());
+        sources.add("probe", 0, probe.clone()).await;
+
+        let state = Arc::new(ServerState::new(
+            sources,
+            Arc::new(MonitorRegistry::new()),
+            false,
+            PvListMode::List,
+            1024,
+            None,
+            rand_guid(),
+            5075,
+            None,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ));
+
+        let server_port = free_udp_port().await;
+        let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+        tokio::spawn(async move {
+            let _ = run_udp_search(state, server_addr, 5075, rand_guid(), None).await;
+        });
+
+        let client = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let request = encode_search_request(1, 0x01, 0, [0u8; 16], &[(1, "PROBE:PV")], 2, false);
+
+        let mut recorded = None;
+        for _ in 0..50 {
+            client.send_to(&request, server_addr).await.unwrap();
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+            if let Some(ctx) = seen.lock().unwrap().clone() {
+                recorded = Some(ctx);
+                break;
+            }
+        }
+
+        let ctx = recorded
+            .expect("ProbeSource::claim saw no RequestContext (current_request() was None)");
+        assert_eq!(ctx.peer, client_addr);
+    }
 }
