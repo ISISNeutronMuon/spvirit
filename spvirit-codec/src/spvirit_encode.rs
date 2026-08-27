@@ -240,6 +240,70 @@ pub fn encode_client_connection_validation(
     out
 }
 
+/// Encode just the payload of a client->server CONNECTION_VALIDATION message
+/// carrying a "ca"-style auth method plus its trailing (user, host) credentials
+/// PVStructure. Returns payload bytes only (no PVA header) — suitable for
+/// feeding directly to `PvaConnectionValidationPayload::new`.
+pub fn encode_connection_validation_client_ca(
+    buffer_size: u32,
+    introspection_registry_size: u16,
+    qos: u16,
+    method: &str,
+    user: &str,
+    host: &str,
+    is_be: bool,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&if is_be {
+        buffer_size.to_be_bytes()
+    } else {
+        buffer_size.to_le_bytes()
+    });
+    payload.extend_from_slice(&if is_be {
+        introspection_registry_size.to_be_bytes()
+    } else {
+        introspection_registry_size.to_le_bytes()
+    });
+    payload.extend_from_slice(&if is_be {
+        qos.to_be_bytes()
+    } else {
+        qos.to_le_bytes()
+    });
+    payload.extend_from_slice(&encode_string_pva(method, is_be));
+    payload.extend_from_slice(&encode_authnz_user_host(user, host, is_be));
+    payload
+}
+
+/// Encode just the payload of a client->server CONNECTION_VALIDATION message
+/// with no trailing credentials structure (e.g. "anonymous" auth). Returns
+/// payload bytes only (no PVA header).
+pub fn encode_connection_validation_client_anon(
+    buffer_size: u32,
+    introspection_registry_size: u16,
+    qos: u16,
+    method: &str,
+    is_be: bool,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&if is_be {
+        buffer_size.to_be_bytes()
+    } else {
+        buffer_size.to_le_bytes()
+    });
+    payload.extend_from_slice(&if is_be {
+        introspection_registry_size.to_be_bytes()
+    } else {
+        introspection_registry_size.to_le_bytes()
+    });
+    payload.extend_from_slice(&if is_be {
+        qos.to_be_bytes()
+    } else {
+        qos.to_le_bytes()
+    });
+    payload.extend_from_slice(&encode_string_pva(method, is_be));
+    payload
+}
+
 pub fn encode_create_channel_request(cid: u32, pv_name: &str, version: u8, is_be: bool) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&if is_be {

@@ -490,6 +490,8 @@ pub struct PvaConnectionValidationPayload {
     pub introspection_registry_size: u16,
     pub qos: u16,
     pub authz: Option<String>,
+    pub user: Option<String>,
+    pub host: Option<String>,
 }
 
 impl PvaConnectionValidationPayload {
@@ -543,6 +545,8 @@ impl PvaConnectionValidationPayload {
                 introspection_registry_size,
                 qos: 0,
                 authz,
+                user: None,
+                host: None,
             })
         } else {
             // Client→server: buffer_size(u32) + isize(u16) + qos(u16) + auth_method(string) [+ FieldDesc cred]
@@ -554,19 +558,20 @@ impl PvaConnectionValidationPayload {
             } else {
                 u16::from_le_bytes(raw[6..8].try_into().ok()?)
             };
-            let authz = if raw.len() > 8 {
+            let (authz, user, host) = if raw.len() > 8 {
                 if let Some((s, consumed)) = decode_string(&raw[8..], is_be) {
-                    if 8 + consumed == raw.len() {
-                        Some(s)
+                    let off = 8 + consumed;
+                    let (user, host) = if off < raw.len() {
+                        decode_ca_credentials(&raw[off..], is_be)
                     } else {
-                        // Has trailing FieldDesc for credentials; auth name is the string.
-                        Some(s)
-                    }
+                        (None, None)
+                    };
+                    (Some(s), user, host)
                 } else {
-                    None
+                    (None, None, None)
                 }
             } else {
-                None
+                (None, None, None)
             };
 
             Some(Self {
@@ -575,9 +580,48 @@ impl PvaConnectionValidationPayload {
                 introspection_registry_size,
                 qos,
                 authz,
+                user,
+                host,
             })
         }
     }
+}
+
+/// Decode the trailing credentials PVStructure of a client ConnectionValidation.
+/// Returns (user, host); either may be None if absent or the struct is unreadable.
+/// Unreadable trailing bytes are tolerated (returns (None, None)) — the auth
+/// method string is authoritative; a malformed credential blob must not fail the
+/// whole ConnectionValidation decode.
+fn decode_ca_credentials(bytes: &[u8], is_be: bool) -> (Option<String>, Option<String>) {
+    let dec = PvdDecoder::new(is_be);
+    // The blob is a FieldDesc followed by the packed value for that structure.
+    let (desc, consumed) = match dec.parse_introspection_with_len(bytes) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let value_bytes = &bytes[consumed..];
+    match dec.decode_structure(value_bytes, &desc) {
+        Ok((decoded, _)) => (
+            decoded_string_field(&decoded, "user"),
+            decoded_string_field(&decoded, "host"),
+        ),
+        Err(_) => (None, None),
+    }
+}
+
+/// Extract a named string field from a decoded PVStructure value, mirroring the
+/// field-lookup pattern used by `extract_nt_scalar_value` in `spvd_decode.rs`.
+fn decoded_string_field(decoded: &DecodedValue, name: &str) -> Option<String> {
+    if let DecodedValue::Structure(fields) = decoded {
+        for (field_name, value) in fields {
+            if field_name == name
+                && let DecodedValue::String(s) = value
+            {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -2042,5 +2086,36 @@ mod tests {
             .expect("status");
         assert!(status.is_error());
         assert_eq!(status.message.as_deref(), Some("bad"));
+    }
+
+    #[test]
+    fn connection_validation_decodes_ca_user_and_host() {
+        // Client->server ConnectionValidation with method "ca" and a trailing
+        // credentials structure { string user; string host }.
+        // Build via the crate encoder to avoid hand-rolling PVD bytes.
+        let raw = crate::spvirit_encode::encode_connection_validation_client_ca(
+            0x10000, // buffer_size
+            1,       // introspection size
+            0,       // qos
+            "ca",    // method
+            "operator1",
+            "ws-42.lab",
+            /* is_be = */ true,
+        );
+        let p = PvaConnectionValidationPayload::new(&raw, true, false).expect("decode");
+        assert_eq!(p.authz.as_deref(), Some("ca"));
+        assert_eq!(p.user.as_deref(), Some("operator1"));
+        assert_eq!(p.host.as_deref(), Some("ws-42.lab"));
+    }
+
+    #[test]
+    fn connection_validation_anonymous_has_no_user() {
+        let raw = crate::spvirit_encode::encode_connection_validation_client_anon(
+            0x10000, 1, 0, "anonymous", true,
+        );
+        let p = PvaConnectionValidationPayload::new(&raw, true, false).expect("decode");
+        assert_eq!(p.authz.as_deref(), Some("anonymous"));
+        assert_eq!(p.user, None);
+        assert_eq!(p.host, None);
     }
 }
