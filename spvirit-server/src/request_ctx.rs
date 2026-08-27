@@ -53,9 +53,8 @@ where
 
 /// Update the user/host credentials for the current connection's context.
 ///
-/// Intended for use after `ConnectionValidation` decodes `ca` credentials
-/// (M2). In M1 this is unused but kept as part of the seam's public surface.
-#[allow(dead_code)]
+/// Wired at `ConnectionValidation` (cmd=1): the handler calls this after
+/// decoding `ca` credentials from the client's validation payload.
 pub(crate) fn set_credentials(user: Option<String>, host: Option<String>) {
     let _ = CONN_IDENTITY.try_with(|identity| {
         *identity.creds.lock().unwrap() = Some((user, host));
@@ -99,5 +98,19 @@ mod tests {
     #[tokio::test]
     async fn context_absent_outside_scope() {
         assert!(current_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_credentials_visible_via_current_request() {
+        let peer = "127.0.0.1:5075".parse().unwrap();
+        scope(peer, async {
+            assert_eq!(current_request().unwrap().user, None);
+            set_credentials(Some("operator1".into()), Some("ws-42".into()));
+            let ctx = current_request().unwrap();
+            assert_eq!(ctx.user.as_deref(), Some("operator1"));
+            assert_eq!(ctx.host.as_deref(), Some("ws-42"));
+            assert_eq!(ctx.peer, peer);
+        })
+        .await;
     }
 }

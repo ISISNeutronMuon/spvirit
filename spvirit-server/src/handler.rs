@@ -916,6 +916,7 @@ pub async fn handle_connection(
                     "Conn {}: validation request (cmd=1) ver={} be={} buf={} qos={} authz={:?}",
                     conn_id, version, is_be, val.buffer_size, val.qos, val.authz
                 );
+                crate::request_ctx::set_credentials(val.user.clone(), val.host.clone());
                 let resp = spvirit_codec::spvirit_encode::encode_connection_validated(
                     true, version, is_be,
                 );
