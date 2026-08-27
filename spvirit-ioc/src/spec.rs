@@ -108,9 +108,9 @@ fn f(v: f64) -> String {
 /// The shared inner state of a [`RecordSpec`].
 ///
 /// `name` and `kind` are fixed at construction; `fields` is what the builder
-/// setters accumulate. Task 3 adds a binding slot to this struct so the same
-/// handle can address the record after the engine is built; until then a
-/// `RecordSpec` is a pure build-time description.
+/// setters accumulate; `source` is the binding slot that lets the same
+/// handle address the record once the engine is built. A `RecordSpec` is a
+/// build-time description that also carries this binding slot once bound.
 struct SpecShared {
     name: String,
     kind: Kind,

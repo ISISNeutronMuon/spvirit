@@ -44,10 +44,7 @@ fn programmatic() -> Vec<RecordSpec> {
 fn observable(p: &NtPayload) -> (ScalarValue, i32, i32, String, String) {
     match p {
         NtPayload::Scalar(s) => (
-            match &s.value {
-                ScalarValue::F64(v) => ScalarValue::F64(*v),
-                other => other.clone(),
-            },
+            s.value.clone(),
             s.alarm_severity,
             s.alarm_status,
             s.alarm_message.clone(),

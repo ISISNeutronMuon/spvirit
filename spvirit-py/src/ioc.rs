@@ -186,11 +186,9 @@ impl PyRecordSpec {
     /// for the binding slot.
     fn __getitem__(&self, py: Python<'_>, field: &str) -> PyResult<PyObject> {
         let handle = self.inner.clone();
-        let field = field.to_ascii_uppercase();
         let scalar = py
             .allow_threads(|| {
-                let field = field.clone();
-                crate::runtime::RUNTIME.block_on(async move { handle.get_field(&field).await })
+                crate::runtime::RUNTIME.block_on(async move { handle.get_field(field).await })
             })
             .map_err(spec_err)?;
         Ok(crate::convert::scalar_to_py(py, &scalar))

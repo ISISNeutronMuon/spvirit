@@ -118,7 +118,6 @@ impl IocSource {
     }
 
     fn from_raw(raw: Vec<DbRecord>) -> Result<IocSource, String> {
-        let raw_for_diagnostics = raw.clone();
         let records = build_records(&raw).map_err(|e| e.to_string())?;
         let kinds = records
             .iter()
@@ -149,14 +148,14 @@ impl IocSource {
         for line in source.graph().report() {
             tracing::warn!(target: "spvirit_ioc", "{line}");
         }
-        for raw in &raw_for_diagnostics {
-            let unmodelled = unmodelled_fields(raw);
+        for r in &raw {
+            let unmodelled = unmodelled_fields(r);
             if !unmodelled.is_empty() {
                 tracing::warn!(
                     target: "spvirit_ioc",
                     "record '{}': the engine does not model {} — accepted and ignored, \
                      exactly as dbLoadRecords ignores a field no DSET reads",
-                    raw.name,
+                    r.name,
                     unmodelled.join(", "),
                 );
             }
