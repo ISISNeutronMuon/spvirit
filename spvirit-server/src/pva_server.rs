@@ -73,6 +73,7 @@ pub struct PvaServerBuilder {
     start_hooks: Vec<crate::events::StartHook>,
     event_handlers: Vec<(String, crate::events::EventHandler)>,
     event_sinks: Vec<Arc<dyn crate::events::EventSink>>,
+    guid: Option<[u8; 12]>,
 }
 
 impl PvaServerBuilder {
@@ -97,6 +98,7 @@ impl PvaServerBuilder {
             start_hooks: Vec::new(),
             event_handlers: Vec::new(),
             event_sinks: Vec::new(),
+            guid: None,
         }
     }
 
@@ -607,6 +609,12 @@ impl PvaServerBuilder {
         self
     }
 
+    /// Override the server's GUID instead of minting a random one.
+    pub fn guid(mut self, guid: [u8; 12]) -> Self {
+        self.guid = Some(guid);
+        self
+    }
+
     /// Enable alarm computation from limits.
     pub fn compute_alarms(mut self, enabled: bool) -> Self {
         self.compute_alarms = enabled;
@@ -719,6 +727,7 @@ impl PvaServerBuilder {
         config.pvlist_mode = self.pvlist_mode;
         config.pvlist_max = self.pvlist_max;
         config.pvlist_allow_pattern = self.pvlist_allow_pattern;
+        config.guid = self.guid;
 
         let events = Arc::new(crate::events::Events::new());
         for (name, handler) in self.event_handlers {
@@ -805,6 +814,15 @@ impl PvaServer {
     /// Get a reference to the underlying store for runtime get/put.
     pub fn store(&self) -> &Arc<SimplePvStore> {
         &self.store
+    }
+
+    /// The configured GUID override, if `.guid()` was called on the builder.
+    ///
+    /// `None` means the server mints a random GUID at start time. This is a
+    /// minimal test/inspection seam, not a general accessor.
+    #[cfg(test)]
+    pub(crate) fn configured_guid(&self) -> Option<[u8; 12]> {
+        self.config.guid
     }
 
     /// The server's event registry — register sinks or post events.
@@ -1547,6 +1565,13 @@ mod tests {
         server.run_start_hooks().await.expect("hooks must succeed");
 
         assert_eq!(log.lock().unwrap().as_slice(), &["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn builder_guid_overrides_the_minted_guid() {
+        let g = [7u8; 12];
+        let server = PvaServer::builder().port(0).udp_port(0).guid(g).build();
+        assert_eq!(server.configured_guid(), Some(g));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

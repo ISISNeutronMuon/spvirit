@@ -40,6 +40,8 @@ pub struct PvaServerConfig {
     pub pvlist_max: usize,
     /// Optional regex filter for pvlist.
     pub pvlist_allow_pattern: Option<Regex>,
+    /// Override for the server's GUID (default: `None`, mints a random one).
+    pub guid: Option<[u8; 12]>,
 }
 
 impl Default for PvaServerConfig {
@@ -56,6 +58,7 @@ impl Default for PvaServerConfig {
             pvlist_mode: PvListMode::List,
             pvlist_max: 1024,
             pvlist_allow_pattern: None,
+            guid: None,
         }
     }
 }
@@ -79,7 +82,7 @@ impl PvaServerState {
         config: &PvaServerConfig,
         registry: Arc<MonitorRegistry>,
     ) -> Self {
-        let guid = rand_guid();
+        let guid = config.guid.unwrap_or_else(rand_guid);
         let inner = Arc::new(ServerState::new(
             sources,
             registry.clone(),
