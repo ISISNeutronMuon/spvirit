@@ -323,6 +323,14 @@ impl RecordFieldProvider for IocSource {
 }
 
 impl Source for IocSource {
+    /// The IOC engine self-notifies: record processing pushes updates into the
+    /// monitor registry via `notify_monitors` (wired through
+    /// `set_monitor_registry`), so the monitor handler must not also pump
+    /// `subscribe` — doing so would double-deliver.
+    fn pushes_own_updates(&self) -> bool {
+        true
+    }
+
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {

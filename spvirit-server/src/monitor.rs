@@ -3,6 +3,7 @@
 //! Tracks per-PV subscriber lists and dispatches monitor update messages.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 use tokio::sync::{Mutex, mpsc};
 use tracing::debug;
@@ -21,6 +22,12 @@ pub struct MonitorRegistry {
     pub monitors: Mutex<HashMap<String, Vec<MonitorSub>>>,
     /// Connection id → message sender.
     pub conns: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    /// PV name → the task draining a subscribe-only source's update stream
+    /// into `notify_monitors`. One pump per PV, shared by every subscriber of
+    /// that PV; retired once the last subscriber goes away. Sources that
+    /// deliver their own updates ([`Source::pushes_own_updates`]) never get a
+    /// pump entry — pumping them would double-deliver.
+    pumps: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl MonitorRegistry {
@@ -28,6 +35,57 @@ impl MonitorRegistry {
         Self {
             monitors: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
+            pumps: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Ensure a single pump task is draining `rx` (a subscribe-only source's
+    /// update stream) into `notify_monitors` for `pv_name`.
+    ///
+    /// If a pump already exists for this PV, `rx` is dropped and this is a
+    /// no-op — the existing pump already fans out to every subscriber via the
+    /// shared monitor list. Otherwise a task is spawned that forwards each
+    /// payload until the source closes the stream or the registry is dropped.
+    ///
+    /// The task holds only a [`Weak`] reference to the registry so it never
+    /// keeps the registry (which owns the pump's `JoinHandle`) alive — that
+    /// would be a reference cycle. When the registry is gone, `upgrade` fails
+    /// and the task exits.
+    pub async fn ensure_pump(self: &Arc<Self>, pv_name: &str, rx: mpsc::Receiver<NtPayload>) {
+        let mut pumps = self.pumps.lock().await;
+        if pumps.contains_key(pv_name) {
+            // Existing pump already feeds all subscribers; drop the extra rx.
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let pv = pv_name.to_string();
+        let mut rx = rx;
+        let handle = tokio::spawn(async move {
+            while let Some(payload) = rx.recv().await {
+                let Some(reg) = Weak::upgrade(&weak) else {
+                    break;
+                };
+                reg.notify_monitors(&pv, &payload).await;
+            }
+        });
+        pumps.insert(pv_name.to_string(), handle);
+    }
+
+    /// Abort and drop the pump for `pv_name` if no subscribers remain for it.
+    ///
+    /// Callers must have already removed the relevant subscriptions from
+    /// `monitors` (and released that lock) before calling this.
+    async fn retire_pump_if_idle(&self, pv_name: &str) {
+        let still_active = {
+            let monitors = self.monitors.lock().await;
+            monitors.get(pv_name).is_some_and(|list| !list.is_empty())
+        };
+        if still_active {
+            return;
+        }
+        let mut pumps = self.pumps.lock().await;
+        if let Some(handle) = pumps.remove(pv_name) {
+            handle.abort();
         }
     }
 
@@ -202,23 +260,38 @@ impl MonitorRegistry {
 
     /// Remove a monitor subscription.
     pub async fn remove_monitor_subscription(&self, conn_id: u64, ioid: u32, pv_name: &str) {
-        let mut monitors = self.monitors.lock().await;
-        if let Some(list) = monitors.get_mut(pv_name) {
-            list.retain(|s| s.conn_id != conn_id || s.ioid != ioid);
+        {
+            let mut monitors = self.monitors.lock().await;
+            if let Some(list) = monitors.get_mut(pv_name) {
+                list.retain(|s| s.conn_id != conn_id || s.ioid != ioid);
+            }
         }
+        // Lock released above; retire the pump if this was the PV's last sub.
+        self.retire_pump_if_idle(pv_name).await;
     }
 
     /// Remove all subscriptions and connection entries for a given connection.
     pub async fn cleanup_connection(&self, conn_id: u64) {
-        {
+        // Collect the PVs this connection was subscribed to so their pumps can
+        // be retired after the monitors lock is released.
+        let affected: Vec<String> = {
             let mut monitors = self.monitors.lock().await;
-            for list in monitors.values_mut() {
+            let mut affected = Vec::new();
+            for (pv, list) in monitors.iter_mut() {
+                let before = list.len();
                 list.retain(|s| s.conn_id != conn_id);
+                if list.len() != before {
+                    affected.push(pv.clone());
+                }
             }
-        }
+            affected
+        };
         {
             let mut conns = self.conns.lock().await;
             conns.remove(&conn_id);
+        }
+        for pv in affected {
+            self.retire_pump_if_idle(&pv).await;
         }
     }
 }

@@ -425,6 +425,111 @@ async fn names_reflects_claimed_bindings() {
     assert_eq!(names, vec!["IT:AAA".to_string(), "IT:BBB".to_string()]);
 }
 
+/// End-to-end regression for "monitors don't get updates from gateways": a
+/// real TCP monitor client, connected to a downstream `PvaServer` that
+/// publishes a `GatewaySource`, must receive ongoing updates when the value
+/// changes upstream — not just the initial snapshot.
+///
+/// The earlier `monitor_dedup_and_fanout` test reads `src.subscribe()`
+/// directly and so proves the gateway's own subscribe/upstream-monitor path
+/// works; it never exercises the *server's* TCP monitor delivery. That seam
+/// is where the bug lived: the `cmd=13` monitor handler sent one snapshot at
+/// monitor-start and then relied solely on `notify_monitors`, which fires
+/// only for local PUTs / self-notifying stores. A `GatewaySource` never
+/// self-notifies — its updates arrive only via `Source::subscribe()`, which
+/// the handler never drained — so a downstream monitor client saw the first
+/// value and then silence.
+///
+/// Pre-fix this times out waiting for the second update. Post-fix the server
+/// pumps `Source::subscribe()` into the monitor registry for sources that do
+/// not push their own updates, and the update arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gateway_monitor_delivers_ongoing_updates_to_a_tcp_client() {
+    use std::ops::ControlFlow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc as std_mpsc;
+
+    use spvirit_client::{PvOptions, pvmonitor};
+
+    // Upstream server hosting the PV, plus a gateway source wired to it.
+    let Some((src, pool)) = spawn_gateway(|b| b.ao("GW:MON", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    assert!(src.claim("GW:MON").await.is_some());
+
+    // A downstream PvaServer that publishes the gateway source to TCP clients
+    // — the same wiring `spvirit_gateway::runtime` uses in production.
+    let (Some(down_tcp), Some(down_udp)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("Skipping test: cannot bind a free downstream port");
+        return;
+    };
+    let down = PvaServer::builder()
+        .listen_ip("127.0.0.1".parse().unwrap())
+        .advertise_ip("127.0.0.1".parse().unwrap())
+        .port(down_tcp)
+        .udp_port(down_udp)
+        .source("gateway", 0, Arc::new(src))
+        .build();
+    tokio::spawn(async move {
+        let _ = down.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A real TCP monitor client against the downstream server. Explicit
+    // `server_addr` bypasses UDP search (mirrors `spvirit-ioc`'s
+    // `host_writes.rs`). The callback breaks after two updates: the initial
+    // snapshot plus the out-of-band change below.
+    let (tx, rx) = std_mpsc::channel();
+    let mut opts = PvOptions::new("GW:MON".to_string());
+    opts.server_addr = Some(format!("127.0.0.1:{down_tcp}").parse().expect("loopback addr"));
+    opts.tcp_port = down_tcp;
+    opts.udp_port = down_udp;
+    opts.search_addr = Some("127.0.0.1".parse().unwrap());
+    opts.bind_addr = Some("127.0.0.1".parse().unwrap());
+    opts.timeout = Duration::from_secs(5);
+
+    let count = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(async move {
+        let _ = pvmonitor(&opts, move |update| {
+            let _ = tx.send(format!("{update:?}"));
+            if count.fetch_add(1, Ordering::SeqCst) + 1 >= 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .await;
+    });
+
+    // The initial snapshot must arrive (this part already worked pre-fix).
+    let _initial = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("initial monitor update");
+
+    // Let the downstream pump and the upstream monitor both arm before the
+    // change, so the update is delivered live rather than missed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Change the value out-of-band, directly upstream — exactly what a real
+    // device does. The gateway never sees a local PUT.
+    let upstream = pool.client("it-client").expect("client in pool");
+    upstream
+        .pvput("GW:MON", 42.0f64)
+        .await
+        .expect("direct upstream pvput should succeed");
+
+    // The ongoing update must reach the TCP monitor client. This is the
+    // regression: pre-fix the second update never arrives and this times out.
+    let update = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("an ongoing gateway update must reach a TCP monitor client");
+    assert!(
+        update.contains("42"),
+        "monitor should carry the updated value ~42.0, got: {update}"
+    );
+}
+
 /// RPC forwarding to upstream servers is out of scope for M1: `PvaClient`
 /// exposes no general-purpose RPC call, only an internal `pvlist`-via-RPC
 /// helper. `GatewaySource::rpc` therefore always returns an explicit,

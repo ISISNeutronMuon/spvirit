@@ -549,6 +549,14 @@ fn log_err(method: &str, e: impl std::fmt::Display) {
 }
 
 impl Source for PySourceAdapter {
+    /// Python sources self-notify through `notify_monitors` and expose no
+    /// `subscribe` stream (it returns `None`), so there is nothing for the
+    /// monitor handler to pump. Declared `true` for clarity and to keep the
+    /// gating explicit alongside the other self-notifying sources.
+    fn pushes_own_updates(&self) -> bool {
+        true
+    }
+
     fn claim<'a>(
         &'a self,
         name: &str,

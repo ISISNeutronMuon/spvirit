@@ -1462,6 +1462,18 @@ pub async fn handle_connection(
                                         last_snapshot: None,
                                     });
                             }
+                            // Sources that don't deliver their own updates
+                            // (gateway proxies, group PVs, async backends) only
+                            // expose changes through `subscribe`. Drain that
+                            // stream into the registry so ongoing updates reach
+                            // this monitor; self-notifying sources are skipped
+                            // to avoid double-delivery. One pump per PV, shared
+                            // across subscribers and retired with the last one.
+                            if !state.sources.pushes_own_updates(&pv_name).await
+                                && let Some(rx) = state.sources.subscribe(&pv_name).await
+                            {
+                                state.registry.ensure_pump(&pv_name, rx).await;
+                            }
                             info!(
                                 "Conn {}: monitor init pv='{}' ioid={}",
                                 conn_id, pv_name, ioid

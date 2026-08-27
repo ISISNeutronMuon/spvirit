@@ -386,6 +386,13 @@ impl SimplePvStore {
 }
 
 impl Source for SimplePvStore {
+    /// This store self-notifies: every write both sends to its per-PV
+    /// `subscribers` and calls `registry.notify_monitors`, so the monitor
+    /// handler must not also pump `subscribe` — doing so would double-deliver.
+    fn pushes_own_updates(&self) -> bool {
+        true
+    }
+
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {

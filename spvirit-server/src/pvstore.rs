@@ -81,6 +81,23 @@ pub trait Source: Send + Sync {
         name: &str,
     ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>>;
 
+    /// Whether this source delivers monitor updates on its own, by pushing
+    /// into the server's [`MonitorRegistry`](crate::monitor::MonitorRegistry)
+    /// (via `notify_monitors`, typically wired through
+    /// [`StoreSource::set_monitor_registry`]) rather than only exposing them
+    /// through [`subscribe`](Self::subscribe).
+    ///
+    /// The monitor handler consults this to decide whether it must pump this
+    /// source's [`subscribe`](Self::subscribe) stream into the registry
+    /// itself. Self-notifying sources (in-memory stores, IOC engines) return
+    /// `true` so the handler does *not* pump — pumping a source that also
+    /// self-notifies would deliver every update twice. Subscribe-only sources
+    /// (gateway proxies, group PVs, async backends) keep the default `false`,
+    /// so the handler drains their stream on their behalf.
+    fn pushes_own_updates(&self) -> bool {
+        false
+    }
+
     /// Execute an RPC call on a channel.
     ///
     /// `name` is the channel name, `args` is the decoded request structure.
@@ -299,6 +316,21 @@ impl SourceRegistry {
             }
         }
         None
+    }
+
+    /// Whether the first source that claims `name` delivers its own monitor
+    /// updates (see [`Source::pushes_own_updates`]).
+    ///
+    /// Returns `false` for an unclaimed PV — there is nothing to pump and no
+    /// source to ask, so the caller's decision (pump vs. skip) is moot.
+    pub async fn pushes_own_updates(&self, name: &str) -> bool {
+        let sources = self.sources.read().await;
+        for entry in sources.iter() {
+            if entry.source.claim(name).await.is_some() {
+                return entry.source.pushes_own_updates();
+            }
+        }
+        false
     }
 
     /// Execute an RPC call via the first source that claims the channel.
