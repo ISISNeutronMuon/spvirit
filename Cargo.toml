@@ -7,14 +7,14 @@ resolver = "2"
 # in step: `spvirit-py/pyproject.toml` pins `spvirit-tools` by exact version,
 # and `spvirit-tools/tests/version_pin.rs` fails the build if it drifts.
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 
 # Internal crates are declared once so their version is not repeated across
 # five manifests. Members refer to them with `workspace = true`.
 [workspace.dependencies]
-spvirit-types = { version = "0.3.2", path = "spvirit-types" }
-spvirit-codec = { version = "0.3.2", path = "spvirit-codec" }
-spvirit-client = { version = "0.3.2", path = "spvirit-client" }
-spvirit-server = { version = "0.3.2", path = "spvirit-server" }
-spvirit-ioc = { version = "0.3.2", path = "spvirit-ioc" }
-spvirit-gateway = { version = "0.3.2", path = "spvirit-gateway" }
+spvirit-types = { version = "0.3.3", path = "spvirit-types" }
+spvirit-codec = { version = "0.3.3", path = "spvirit-codec" }
+spvirit-client = { version = "0.3.3", path = "spvirit-client" }
+spvirit-server = { version = "0.3.3", path = "spvirit-server" }
+spvirit-ioc = { version = "0.3.3", path = "spvirit-ioc" }
+spvirit-gateway = { version = "0.3.3", path = "spvirit-gateway" }
