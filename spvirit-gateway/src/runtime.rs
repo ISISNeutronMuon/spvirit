@@ -67,6 +67,7 @@ impl Runtime {
                 .map(|nc| (Duration::from_millis(nc.ttl_ms), nc.capacity.max(1)))
                 .unwrap_or((DEFAULT_NEG_CACHE_TTL, DEFAULT_NEG_CACHE_CAPACITY));
             let neg = Arc::new(NegativeCache::new(ttl, capacity));
+            let access = Arc::new(cfg.build_access_control(server_cfg)?);
 
             let src = GatewaySource::new(
                 pool.clone(),
@@ -74,6 +75,7 @@ impl Runtime {
                 neg,
                 guard,
                 server_cfg.getholdoff,
+                access,
             );
 
             let interface_ip: IpAddr = server_cfg

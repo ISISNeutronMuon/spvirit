@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_gateway::access::AccessControl;
 use spvirit_gateway::cache::negative::NegativeCache;
 use spvirit_gateway::config::GatewayConfig;
 use spvirit_gateway::loopguard::LoopGuard;
@@ -25,6 +26,12 @@ use spvirit_gateway::upstream::UpstreamPool;
 use spvirit_server::PvaServer;
 use spvirit_server::pvstore::Source;
 use spvirit_types::{NtPayload, PvValue, ScalarValue};
+
+/// Shorthand for a decoded `f64` scalar, used by the access-control tests
+/// below that only need *some* value to attempt a `put` with.
+fn decoded_f64(v: f64) -> DecodedValue {
+    DecodedValue::Float64(v)
+}
 
 fn free_tcp_port() -> Option<u16> {
     TcpListener::bind("127.0.0.1:0")
@@ -49,6 +56,39 @@ fn free_udp_port() -> Option<u16> {
 async fn spawn_gateway(
     configure: impl FnOnce(spvirit_server::PvaServerBuilder) -> spvirit_server::PvaServerBuilder,
     getholdoff_ms: u32,
+) -> Option<(GatewaySource, Arc<UpstreamPool>)> {
+    spawn_gateway_with_access(
+        configure,
+        getholdoff_ms,
+        Arc::new(AccessControl::new(false, None, None)),
+    )
+    .await
+}
+
+/// Like [`spawn_gateway`], but with an explicit `AccessControl` (permissive
+/// by default there) gating the returned `GatewaySource`. Serves a single
+/// `ao("IT:PV", ...)` upstream, which is enough for the readOnly/pvlist-deny
+/// tests that only need *some* claimable PV name.
+async fn spawn_gateway_with_ac(access: AccessControl) -> Option<(GatewaySource, Arc<UpstreamPool>)> {
+    spawn_gateway_with_ac_serving(access, "IT:PV").await
+}
+
+/// Like [`spawn_gateway_with_ac`], but serving `serve_name` upstream instead
+/// of the fixed `"IT:PV"` — needed by the alias test, where the downstream
+/// claim name (`PUB:PV`) differs from the upstream name it must resolve to
+/// (`REAL:PV`).
+async fn spawn_gateway_with_ac_serving(
+    access: AccessControl,
+    serve_name: &str,
+) -> Option<(GatewaySource, Arc<UpstreamPool>)> {
+    let serve_name = serve_name.to_string();
+    spawn_gateway_with_access(move |b| b.ao(serve_name, 1.0), 0, Arc::new(access)).await
+}
+
+async fn spawn_gateway_with_access(
+    configure: impl FnOnce(spvirit_server::PvaServerBuilder) -> spvirit_server::PvaServerBuilder,
+    getholdoff_ms: u32,
+    access: Arc<AccessControl>,
 ) -> Option<(GatewaySource, Arc<UpstreamPool>)> {
     let tcp_port = free_tcp_port()?;
     let udp_port = free_udp_port()?;
@@ -91,6 +131,7 @@ async fn spawn_gateway(
         neg,
         guard,
         getholdoff_ms,
+        access,
     );
 
     Some((src, pool))
@@ -163,7 +204,8 @@ async fn claim_resolves_a_real_upstream_pv() {
     let neg = Arc::new(NegativeCache::new(Duration::from_secs(30), 128));
     let guard = Arc::new(LoopGuard::build(&cfg, &cfg.servers[0], std::collections::HashSet::new()));
 
-    let src = GatewaySource::new(pool, vec!["it-client".into()], neg, guard, 0);
+    let access = Arc::new(AccessControl::new(false, None, None));
+    let src = GatewaySource::new(pool, vec!["it-client".into()], neg, guard, 0, access);
 
     assert!(src.claim("IT:TEMP").await.is_some());
     assert!(src.claim("IT:MISSING").await.is_none());
@@ -546,4 +588,138 @@ async fn rpc_is_not_implemented_in_m1() {
 
     let result = src.rpc("IT:AAA", &DecodedValue::Null).await;
     assert!(result.is_err(), "gateway rpc() must return Err in M1");
+}
+
+/// A `readOnly: true` `AccessControl` denies `put` outright even though the
+/// PV was successfully claimed — readOnly overrides everything for
+/// writes/RPCs (`Op::Get` is unaffected, hence the successful `claim` above
+/// it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readonly_rejects_put() {
+    let ac = AccessControl::new(true, None, None);
+    let Some((src, _pool)) = spawn_gateway_with_ac(ac).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    src.claim("IT:PV").await.expect("claim");
+    let err = src
+        .put("IT:PV", &decoded_f64(1.0))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_lowercase().contains("read") || err.to_lowercase().contains("denied"),
+        "expected a readOnly/denied error, got: {err}"
+    );
+}
+
+/// A pvlist `DENY` rule makes the matched PV invisible: `claim` must return
+/// `None` rather than surfacing an upstream-miss-shaped error — the PV is
+/// simply not there as far as this gateway is concerned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pvlist_deny_makes_pv_unclaimable() {
+    let ac = AccessControl::new(
+        false,
+        Some(spvirit_gateway::access::pvlist::parse_pvlist("IT:.* DENY\n.* ALLOW").unwrap()),
+        None,
+    );
+    let Some((src, _pool)) = spawn_gateway_with_ac(ac).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    assert!(src.claim("IT:PV").await.is_none());
+}
+
+/// A pvlist `ALIAS` rule rewrites the *upstream* target while the downstream
+/// key stays the requested name: clients see `PUB:PV`, but the gateway
+/// resolves and reads it against the real upstream `REAL:PV`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alias_claims_upstream_name() {
+    let ac = AccessControl::new(
+        false,
+        Some(
+            spvirit_gateway::access::pvlist::parse_pvlist(
+                "PUB:(.*) ALIAS REAL:\\1\n.* ALLOW",
+            )
+            .unwrap(),
+        ),
+        None,
+    );
+    let Some((src, _pool)) = spawn_gateway_with_ac_serving(ac, "REAL:PV").await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    src.claim("PUB:PV").await.expect("claim should alias to REAL:PV upstream");
+
+    // get routes to REAL:PV upstream (seeded to 1.0 by
+    // `spawn_gateway_with_ac_serving`'s `b.ao(serve_name, 1.0)`) and returns
+    // its value under the downstream name.
+    let payload = src.get("PUB:PV").await.expect("get");
+    let value = extract_f64_value(&payload);
+    assert!((value - 1.0).abs() < 1e-6, "expected ~1.0 from REAL:PV upstream, got {value}");
+}
+
+/// End-to-end HAG coverage: a real TCP client connects over loopback, and an
+/// ACF `HAG` rule keyed on the client's actual peer IP gates whether its
+/// `put` is allowed. This is deliberately the host/HAG half only — the
+/// user/UAG half is already covered at the `AccessControl::decide` unit
+/// level (Task 9's `acf_grants_write_by_uag_and_hag` and friends), since
+/// simulating a decoded `ca` *user* through a real in-crate client would
+/// require driving `PvOptions::authnz_host`/credentials plumbing this test
+/// doesn't otherwise need; the peer IP, on the other hand, is real and free
+/// to assert on over loopback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hag_rule_gates_put_from_a_real_tcp_client() {
+    use spvirit_client::{PvOptions, pvput};
+    use spvirit_gateway::access::acf::parse_acf;
+    use spvirit_gateway::access::pvlist::parse_pvlist;
+
+    // HAG(ctl) deliberately does NOT include 127.0.0.1 -- the loopback
+    // address the real TCP client below connects from -- so the WRITE grant
+    // never applies and the put must be denied.
+    let pvlist = parse_pvlist(".* ALLOW RW 1").unwrap();
+    let acf = parse_acf("HAG(ctl){10.0.0.9}\nASG(RW){ RULE(1, WRITE){ HAG(ctl) } }").unwrap();
+    let access = Arc::new(AccessControl::new(false, Some(pvlist), Some(acf)));
+
+    let Some((src, _pool)) =
+        spawn_gateway_with_access(|b| b.ao("HAG:PV", 1.0), 0, access).await
+    else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    src.claim("HAG:PV").await.expect("claim");
+
+    let (Some(down_tcp), Some(down_udp)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("Skipping test: cannot bind a free downstream port");
+        return;
+    };
+    let down = PvaServer::builder()
+        .listen_ip("127.0.0.1".parse().unwrap())
+        .advertise_ip("127.0.0.1".parse().unwrap())
+        .port(down_tcp)
+        .udp_port(down_udp)
+        .source("gateway", 0, Arc::new(src))
+        .build();
+    tokio::spawn(async move {
+        let _ = down.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut opts = PvOptions::new("HAG:PV".to_string());
+    opts.server_addr = Some(
+        format!("127.0.0.1:{down_tcp}")
+            .parse()
+            .expect("loopback addr"),
+    );
+    opts.tcp_port = down_tcp;
+    opts.udp_port = down_udp;
+    opts.search_addr = Some("127.0.0.1".parse().unwrap());
+    opts.bind_addr = Some("127.0.0.1".parse().unwrap());
+    opts.timeout = Duration::from_secs(5);
+
+    let result = pvput(&opts, 42.0f64).await;
+    assert!(
+        result.is_err(),
+        "put from a peer host outside HAG(ctl) must be denied"
+    );
 }

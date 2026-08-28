@@ -18,12 +18,34 @@ use spvirit_server::pvstore::{PvInfo, Source};
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
 
+use crate::access::{AccessControl, Decision, Identity, Op};
 use crate::bridge::{merge_monitor_delta, nt_payload_from_decoded, nt_payload_from_get};
 use crate::cache::monitor::{MonitorCache, MonitorKey};
 use crate::convert::decoded_to_json;
 use crate::cache::negative::NegativeCache;
 use crate::loopguard::LoopGuard;
 use crate::upstream::UpstreamPool;
+
+/// Snapshots the current downstream connection's identity (peer host, and
+/// decoded `ca` user if any) into an [`Identity`] for [`AccessControl::decide`].
+///
+/// Prefers a resolved host (from `ca` credentials, once wired) over the raw
+/// peer IP string; falls back to the peer IP when no resolved host is set.
+/// Returns a default (all-`None`) `Identity` when called outside a
+/// [`spvirit_server::request_ctx`] scope (e.g. a unit test that calls
+/// `claim`/`put`/`rpc` directly, off any connection task) — a permissive
+/// `AccessControl` still behaves correctly in that case, and a restrictive
+/// one fails closed (no host/user to match against).
+fn current_identity() -> Identity {
+    let rc = spvirit_server::request_ctx::current_request();
+    Identity {
+        host: rc
+            .as_ref()
+            .and_then(|c| c.host.clone())
+            .or_else(|| rc.as_ref().map(|c| c.peer.ip().to_string())),
+        user: rc.and_then(|c| c.user),
+    }
+}
 
 /// Record of which upstream client resolved a downstream PV name, and under
 /// what name it is known upstream.
@@ -64,18 +86,25 @@ pub struct GatewaySource {
     getholdoff_ms: u32,
     bindings: Mutex<HashMap<String, Binding>>,
     monitors: Arc<MonitorCache>,
+    /// The readOnly/pvlist/ACF gate consulted at `claim` (`Op::Get`), `put`
+    /// (`Op::Put`), and `rpc` (`Op::Rpc`). Precedence (readOnly > pvlist >
+    /// ACF) lives entirely inside `AccessControl::decide` — this source only
+    /// calls it and applies the returned `Decision`.
+    access: Arc<AccessControl>,
 }
 
 impl GatewaySource {
     /// Build a source that searches `client_order` (in order) for each
     /// downstream name, backed by `pool`, remembering upstream misses in
-    /// `neg` and refusing to resolve back into our own servers via `guard`.
+    /// `neg`, refusing to resolve back into our own servers via `guard`, and
+    /// gating every claim/put/rpc through `access`.
     pub fn new(
         pool: Arc<UpstreamPool>,
         client_order: Vec<String>,
         neg: Arc<NegativeCache>,
         guard: Arc<LoopGuard>,
         getholdoff_ms: u32,
+        access: Arc<AccessControl>,
     ) -> Self {
         GatewaySource {
             pool,
@@ -85,6 +114,7 @@ impl GatewaySource {
             getholdoff_ms,
             bindings: Mutex::new(HashMap::new()),
             monitors: Arc::new(MonitorCache::new()),
+            access,
         }
     }
 
@@ -105,11 +135,24 @@ impl Source for GatewaySource {
                 return None;
             }
 
+            // Access control gates visibility of the PV itself: a `Deny`
+            // means the downstream name is invisible/unclaimable, and an
+            // `AllowAliased` rewrites the *upstream* target we resolve
+            // against while the binding (and everything downstream — the
+            // registry key, the handler, `MonitorKey`) still keys off the
+            // requested downstream `name`.
+            let id = current_identity();
+            let target = match self.access.decide(Op::Get, &name, &id) {
+                Decision::Deny => return None,
+                Decision::Allow => name.clone(),
+                Decision::AllowAliased(real) => real,
+            };
+
             for client_name in &self.client_order {
                 let Some(client) = self.pool.client(client_name) else {
                     continue;
                 };
-                if let Ok((descriptor, server_addr, guid)) = client.pvinfo_full(&name).await {
+                if let Ok((descriptor, server_addr, guid)) = client.pvinfo_full(&target).await {
                     // Loop / self-connection prevention: if this name resolved
                     // back into one of our own downstream server sockets (or an
                     // `ignoreaddr` host), or the responder's GUID matches one of
@@ -122,7 +165,7 @@ impl Source for GatewaySource {
                         name.clone(),
                         Binding {
                             client_name: client_name.clone(),
-                            real_name: name.clone(),
+                            real_name: target.clone(),
                             struct_id: descriptor.struct_id.clone(),
                             last_get: Mutex::new(None),
                         },
@@ -185,6 +228,10 @@ impl Source for GatewaySource {
         let json = decoded_to_json(value);
         Box::pin(async move {
             let json = json?;
+
+            if let Decision::Deny = self.access.decide(Op::Put, &name, &current_identity()) {
+                return Err("access denied".to_string());
+            }
 
             // Resolve the binding and clone out what's needed before the
             // `.await` below — never hold the bindings-map MutexGuard across
@@ -276,10 +323,14 @@ impl Source for GatewaySource {
     /// until `spvirit-client` grows a general RPC call (spec §14 gap).
     fn rpc(
         &self,
-        _name: &str,
+        name: &str,
         _args: &DecodedValue,
     ) -> Pin<Box<dyn Future<Output = Result<NtPayload, String>> + Send + '_>> {
-        Box::pin(async {
+        let name = name.to_string();
+        Box::pin(async move {
+            if let Decision::Deny = self.access.decide(Op::Rpc, &name, &current_identity()) {
+                return Err("access denied".to_string());
+            }
             Err("gateway RPC forwarding is not implemented in M1".to_string())
         })
     }
@@ -342,7 +393,8 @@ mod tests {
             },
             std::collections::HashSet::new(),
         ));
-        let src = GatewaySource::new(pool, vec![], neg, guard, 0);
+        let access = Arc::new(AccessControl::new(false, None, None));
+        let src = GatewaySource::new(pool, vec![], neg, guard, 0, access);
         assert!(src.claim("ANY:PV").await.is_none());
     }
 }

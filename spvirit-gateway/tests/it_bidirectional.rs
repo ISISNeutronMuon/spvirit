@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use spvirit_client::PvaClient;
 use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_gateway::access::AccessControl;
 use spvirit_gateway::config::GatewayConfig;
 use spvirit_gateway::loopguard::LoopGuard;
 use spvirit_gateway::proxy::GatewaySource;
@@ -311,7 +312,8 @@ async fn autoaddrlist_false_with_explicit_addrlist_still_resolves() {
         &cfg.servers[0],
         std::collections::HashSet::new(),
     ));
-    let src = GatewaySource::new(pool, vec!["uni-client".into()], neg, guard, 0);
+    let access = Arc::new(AccessControl::new(false, None, None));
+    let src = GatewaySource::new(pool, vec!["uni-client".into()], neg, guard, 0, access);
 
     let claimed = tokio::time::timeout(Duration::from_secs(5), src.claim("IT:UNI"))
         .await
@@ -399,6 +401,7 @@ async fn claim_refuses_resolution_into_a_banned_own_server_socket() {
         )),
         control_guard,
         0,
+        Arc::new(AccessControl::new(false, None, None)),
     );
     let control_claim = tokio::time::timeout(Duration::from_secs(5), control_src.claim("IT:LOOP"))
         .await
@@ -442,6 +445,7 @@ async fn claim_refuses_resolution_into_a_banned_own_server_socket() {
         )),
         Arc::new(loop_guard),
         0,
+        Arc::new(AccessControl::new(false, None, None)),
     );
     let loop_claim = tokio::time::timeout(Duration::from_secs(5), loop_src.claim("IT:LOOP"))
         .await
@@ -532,6 +536,7 @@ async fn claim_refuses_resolution_that_carries_our_own_server_guid() {
         )),
         control_guard,
         0,
+        Arc::new(AccessControl::new(false, None, None)),
     );
     let control_claim = tokio::time::timeout(
         Duration::from_secs(5),
@@ -563,6 +568,7 @@ async fn claim_refuses_resolution_that_carries_our_own_server_guid() {
         )),
         guard,
         0,
+        Arc::new(AccessControl::new(false, None, None)),
     );
     let claim = tokio::time::timeout(Duration::from_secs(5), src.claim("IT:LOOPGUID"))
         .await
