@@ -150,9 +150,10 @@ roadmap item 6 in
 ## Gateway (M1): passthrough only
 
 `spgateway` in M1 is a *passthrough* gateway — it resolves, reads, writes, and
-monitors PVs across networks, but the access-control and observability layers
-are not yet wired. The divergences below are deliberate for this milestone and
-are documented in full on the [`spgateway`](../04-tools/spgateway.md) page.
+monitors PVs across networks, with `readOnly`/`pvlist`/ACF access control
+enforced, but the observability layers (metrics, audit, hot reload) are not
+yet wired. The divergences below are deliberate for this milestone and are
+documented in full on the [`spgateway`](../04-tools/spgateway.md) page.
 
 **Representation.** The proxy round-trips through spvirit's decoded value model,
 which does not carry every PVAccess shape losslessly. An array-of-structure
@@ -176,11 +177,13 @@ names this gateway has already claimed, not a true fan-out of each upstream's
 client RPC entry point yet, so an RPC to the gateway returns
 `"gateway RPC forwarding is not implemented in M1"`.
 
-**Access control and ops.** DENY filtering and `readOnly` enforcement (the ACF
-layer) are not applied — every claimed PV is readable and writable. The
-`x-spvirit` metrics, audit, hot-reload, and rate-limit blocks are parsed and
-validated but not consumed. Ctrl-C shutdown is immediate: outstanding requests
-are hard-cancelled rather than drained gracefully.
+**Access control and ops.** `readOnly`, `pvlist`, and `.acf` access control
+*are* enforced (see the [`spgateway`](../04-tools/spgateway.md) page) — this
+is no longer a passthrough-only gap. What remains unwired: the `x-spvirit`
+metrics, audit, hot-reload, and rate-limit blocks are parsed and validated
+but not consumed, and RPC forwarding to upstream servers is not implemented.
+Ctrl-C shutdown is immediate: outstanding requests are hard-cancelled rather
+than drained gracefully.
 
 ## What is *not* on this list
 
