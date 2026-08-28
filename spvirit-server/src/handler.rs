@@ -748,10 +748,42 @@ pub async fn run_udp_search(
 // TCP server
 // ---------------------------------------------------------------------------
 
+/// `EMFILE` — the process hit its own open-file limit (`RLIMIT_NOFILE`).
+/// `ENFILE` — the whole system hit its open-file limit. These are the
+/// Linux/POSIX errno numbers; they are the descriptor-exhaustion cases the
+/// accept loop must recover from rather than die on.
+const EMFILE: i32 = 24;
+const ENFILE: i32 = 23;
+
+/// Decide whether the accept loop should pause before retrying after an
+/// `accept()` error.
+///
+/// Every `accept()` error is transient — a `TcpListener` stays valid across
+/// errors, so a momentary failure must never tear the whole server down (a
+/// single EMFILE previously did exactly that, because the loop used `?`). This
+/// function decides only whether to back off first:
+///
+/// - Descriptor exhaustion (EMFILE/ENFILE) returns a short delay so the loop
+///   does not hot-spin burning CPU while no descriptors are available; the
+///   pause also gives in-flight connections a chance to close and free some.
+/// - Every other error (e.g. a client that reset during the handshake) returns
+///   `None`: retry immediately.
+fn accept_retry_delay(err: &std::io::Error) -> Option<Duration> {
+    match err.raw_os_error() {
+        Some(EMFILE) | Some(ENFILE) => Some(Duration::from_millis(100)),
+        _ => None,
+    }
+}
+
 /// Accept TCP connections and spawn a handler for each.
 ///
 /// Callers must bind the `TcpListener` before spawning any other tasks so that
 /// an `EADDRINUSE` failure is detected eagerly and the beacon is never started.
+///
+/// The accept loop is resilient: a transient `accept()` error (descriptor
+/// exhaustion, or a client aborting mid-handshake) is logged and the loop
+/// continues, so the server keeps serving once the condition clears. See
+/// [`accept_retry_delay`] for the backoff policy.
 pub async fn run_tcp_server(
     state: Arc<ServerState>,
     listener: TcpListener,
@@ -760,7 +792,16 @@ pub async fn run_tcp_server(
     let conn_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                error!("TCP accept error (continuing): {}", e);
+                if let Some(delay) = accept_retry_delay(&e) {
+                    tokio::time::sleep(delay).await;
+                }
+                continue;
+            }
+        };
         let id = conn_id.fetch_add(1, Ordering::SeqCst);
         info!("TCP connection {} from {}", id, peer);
         let state_clone = state.clone();
@@ -1851,6 +1892,29 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket as TokioUdpSocket;
+
+    #[test]
+    fn accept_retry_delay_backs_off_only_on_fd_exhaustion() {
+        use std::io::{Error, ErrorKind};
+
+        // EMFILE (per-process fd limit, errno 24) and ENFILE (system-wide,
+        // errno 23) are transient resource-exhaustion errors: the accept loop
+        // must keep running and pause briefly so it does not hot-spin while
+        // descriptors are scarce.
+        assert!(
+            accept_retry_delay(&Error::from_raw_os_error(24)).is_some(),
+            "EMFILE should back off"
+        );
+        assert!(
+            accept_retry_delay(&Error::from_raw_os_error(23)).is_some(),
+            "ENFILE should back off"
+        );
+
+        // Other transient accept errors (a client that aborted mid-handshake)
+        // are retried immediately, with no backoff.
+        assert!(accept_retry_delay(&Error::from(ErrorKind::ConnectionAborted)).is_none());
+        assert!(accept_retry_delay(&Error::from(ErrorKind::ConnectionReset)).is_none());
+    }
 
     /// A `Source` that records the [`RequestContext`] visible to it (if any)
     /// the last time `claim` was called, so a test can assert on what peer

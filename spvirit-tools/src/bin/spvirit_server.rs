@@ -529,7 +529,21 @@ async fn run_tcp_server(
     let conn_id = Arc::new(AtomicU64::new(1));
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        // A transient accept() error (EMFILE/ENFILE descriptor exhaustion, or a
+        // client that aborted mid-handshake) must not kill the server: the
+        // listener stays valid, so log and keep accepting. Back off briefly on
+        // descriptor exhaustion (errno 24/23) so the loop does not hot-spin
+        // while no descriptors are available.
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                error!("TCP accept error (continuing): {}", e);
+                if matches!(e.raw_os_error(), Some(24) | Some(23)) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                continue;
+            }
+        };
         let id = conn_id.fetch_add(1, Ordering::SeqCst);
         info!("TCP connection {} from {}", id, peer);
         let state_clone = state.clone();
