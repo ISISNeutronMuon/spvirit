@@ -1,0 +1,6 @@
+# Real pvxs/p4p client used to drive downstream load against the gateway
+# (the "Hybrid" choice: spserver backends, real EPICS client).
+FROM python:3.12-slim
+RUN pip install --no-cache-dir p4p
+COPY load.py /load.py
+CMD ["python", "/load.py"]

@@ -1,0 +1,119 @@
+name: spvirit-loadtest
+
+# A small PVA test network for load-testing / reproducing the gateway
+# fd-exhaustion behavior:
+#
+#   loadgen (p4p)  --downstream-->  gateway (spgateway)  --upstream-->  backend1/2 (spserver)
+#
+# The gateway runs with a deliberately low `nofile` ulimit so exhaustion
+# reproduces in seconds. Its open-fd count is sampled to ./out/fd.csv.
+
+networks:
+  pvanet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+
+services:
+  backend1:
+    image: spvirit-loadtest:head
+    networks:
+      pvanet:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - "./:/cfg:ro"
+    command: >
+      spserver --db-file /cfg/pvs.db --listen-addr 0.0.0.0
+      --tcp-port 5075 --udp-port 5076 --advertise-addr 172.30.0.11
+
+  backend2:
+    image: spvirit-loadtest:head
+    networks:
+      pvanet:
+        ipv4_address: 172.30.0.12
+    volumes:
+      - "./:/cfg:ro"
+    command: >
+      spserver --db-file /cfg/pvs.db --listen-addr 0.0.0.0
+      --tcp-port 5075 --udp-port 5076 --advertise-addr 172.30.0.12
+
+  gateway:
+    image: spvirit-loadtest:head
+    depends_on: [backend1, backend2]
+    networks:
+      pvanet:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - "./:/cfg:ro"
+      - "./out:/out"
+    # The whole point: cap the gateway's open files so EMFILE reproduces fast.
+    # Raise this (e.g. 65536) to see how far the load scales before exhaustion.
+    ulimits:
+      nofile:
+        soft: ${GW_NOFILE:-512}
+        hard: ${GW_NOFILE:-512}
+    command: ["sh", "/cfg/gw-entrypoint.sh"]
+
+  loadgen:
+    build:
+      context: .
+      dockerfile: Dockerfile.loadgen
+    depends_on: [gateway]
+    networks:
+      pvanet:
+        ipv4_address: 172.30.0.20
+    environment:
+      # Point p4p at the gateway only (unicast), search on the gateway's port.
+      EPICS_PVA_AUTO_ADDR_LIST: "NO"
+      EPICS_PVA_ADDR_LIST: "172.30.0.10"
+      EPICS_PVA_BROADCAST_PORT: "5076"
+      # Load profile (see load.py / gen_db.py). Keep NUM_PVS/PASSIVE_FRACTION
+      # in sync with how pvs.db was generated.
+      NUM_PVS: "${NUM_PVS:-2000}"
+      PASSIVE_FRACTION: "${PASSIVE_FRACTION:-0.9}"
+      NUM_CLIENTS: "${NUM_CLIENTS:-5}"
+      MONITORS_PER_CLIENT: "${MONITORS_PER_CLIENT:-200}"
+      CHURN_PERIOD: "${CHURN_PERIOD:-5}"
+      RAMP: "${RAMP:-2}"
+      DRIVE_HOT: "${DRIVE_HOT:-0}"
+      # passive = churn quiet PVs (leak); active = churn spsine-driven PVs (control).
+      CHURN_POOL: "${CHURN_POOL:-passive}"
+
+  # --- Optional sine drivers (control case). Enable with:  --profile hot ---
+  # One per backend so whichever backend the gateway picks for a PV is hot.
+  # They make the ACTIVE pool continuously update, so churning monitors on it
+  # (CHURN_POOL=active) plateaus instead of leaking.
+  sine1:
+    image: spvirit-loadtest:head
+    profiles: ["hot"]
+    depends_on: [backend1]
+    networks:
+      pvanet:
+        ipv4_address: 172.30.0.31
+    volumes:
+      - "./:/cfg:ro"
+    environment:
+      SINE_TARGET: "172.30.0.11:5075"
+      NUM_PVS: "${NUM_PVS:-1000}"
+      PASSIVE_FRACTION: "${PASSIVE_FRACTION:-0.9}"
+      SINE_RATE: "${SINE_RATE:-10}"
+      MAX_SINE: "${MAX_SINE:-0}"
+    command: ["sh", "/cfg/sine-driver.sh"]
+
+  sine2:
+    image: spvirit-loadtest:head
+    profiles: ["hot"]
+    depends_on: [backend2]
+    networks:
+      pvanet:
+        ipv4_address: 172.30.0.32
+    volumes:
+      - "./:/cfg:ro"
+    environment:
+      SINE_TARGET: "172.30.0.12:5075"
+      NUM_PVS: "${NUM_PVS:-1000}"
+      PASSIVE_FRACTION: "${PASSIVE_FRACTION:-0.9}"
+      SINE_RATE: "${SINE_RATE:-10}"
+      MAX_SINE: "${MAX_SINE:-0}"
+    command: ["sh", "/cfg/sine-driver.sh"]

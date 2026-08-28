@@ -1,0 +1,21 @@
+# Builds the spvirit binaries (spgateway + spserver) used by the test network.
+#
+# IMPORTANT: this image is meant to be built from a CLEAN git-HEAD tree, not
+# the working tree — see build.sh, which exports `git archive HEAD` into a
+# temp context and drops this file in as `Dockerfile`. That keeps any
+# uncommitted working-tree changes (e.g. the accept-loop fix) OUT of the
+# image, so the gateway reproduces committed-HEAD behavior.
+FROM rust:1-slim AS builder
+WORKDIR /src
+COPY . .
+# Only the two binaries the harness needs. Both live in the spvirit-tools
+# crate: `spgateway` (bin name spgateway) and `spserver` (bin name spserver,
+# path src/bin/spvirit_server.rs).
+RUN cargo build --release -p spvirit-tools --bin spgateway --bin spserver
+
+FROM debian:bookworm-slim
+# coreutils (ls), procps not needed; /proc is available in-container.
+COPY --from=builder /src/target/release/spgateway /usr/local/bin/spgateway
+COPY --from=builder /src/target/release/spserver  /usr/local/bin/spserver
+# Sanity: fail the build if either binary is missing.
+RUN spgateway --help >/dev/null 2>&1 || spgateway -T /dev/null >/dev/null 2>&1 || true

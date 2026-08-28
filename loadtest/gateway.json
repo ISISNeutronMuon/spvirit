@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "clients": [
+    {
+      "name": "backends",
+      "provider": "pva",
+      "autoaddrlist": false,
+      "addrlist": "172.30.0.11 172.30.0.12",
+      "bcastport": 5076,
+      "interface": ["172.30.0.10"]
+    }
+  ],
+  "servers": [
+    {
+      "name": "downstream",
+      "clients": ["backends"],
+      "interface": ["172.30.0.10"],
+      "addrlist": "172.30.255.255",
+      "autoaddrlist": false,
+      "serverport": 5075,
+      "bcastport": 5076,
+      "ignoreaddr": "172.30.0.10"
+    }
+  ],
+  "x-spvirit": {
+    "metrics": { "enabled": true, "listen": "0.0.0.0:9090", "path": "/metrics" }
+  }
+}
