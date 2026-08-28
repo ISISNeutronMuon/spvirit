@@ -144,14 +144,20 @@ as the data plane:
 
 The connecting client supplies its own `user` and `host` identity in the
 PVAccess `ca` connection-validation credentials, and the gateway decodes
-them as-is — nothing about that exchange authenticates the claim. Treat
-`ca` credentials as **advisory, not verified**: a client can assert any
-`user` string, and, if it supplies a `host` string, that is preferred over
-the socket's actual peer-IP address for the purposes of `pvlist FROM`/ACF
-`HAG` matching, falling back to the peer IP only when the client sends no
-`host` credential. Operators who need host-based access control to hold
-against a client that lies about its hostname should keep `HAG`/`FROM`
-entries scoped to values a client cannot forge over an untrusted network
-(e.g. treat this like any other unauthenticated network boundary), since M1
-has no mechanism (TLS client certs, Kerberos, etc.) to bind the declared
-identity to the transport.
+them as-is — nothing about that exchange authenticates the claim.
+
+For `host`, the gateway does **not** trust the client's word: `pvlist
+FROM`/ACF `HAG` matching is always evaluated against the TCP socket's actual
+peer-IP address, never against the client-asserted `host` string in the `ca`
+credentials. That asserted `host` is decoded and available for diagnostics
+(e.g. `asTest`), but it is advisory only and never feeds an access decision
+— trusting it would let a client claim a trusted hostname it isn't actually
+connecting from and bypass host-based rules.
+
+For `user`, the gateway matches p4p/pvagw's long-standing posture: the
+`ca`-asserted user is trusted as-is for `UAG` matching, with no independent
+authentication. `UAG` is therefore authorization, not authentication —
+operators who need real user authentication should treat this like any
+other unauthenticated network boundary, since M1 has no mechanism (TLS
+client certs, Kerberos, etc.) to bind the declared identity to the
+transport.

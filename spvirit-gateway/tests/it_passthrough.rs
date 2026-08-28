@@ -723,3 +723,82 @@ async fn hag_rule_gates_put_from_a_real_tcp_client() {
         "put from a peer host outside HAG(ctl) must be denied"
     );
 }
+
+/// Regression for the trust-boundary bug: a client that spoofs a trusted
+/// hostname via its `ca` connection-validation credentials must NOT be able
+/// to satisfy a HAG rule that the real socket peer IP does not match. HAG
+/// (ctl) here lists `trusted.example.invalid` — a name the real TCP client
+/// below is not connecting from, but *does* assert via
+/// `PvOptions::authnz_host` (which flows into the `ca` credential exchange
+/// per `client.rs`/`search.rs`'s `resolved_authnz_host`, and is decoded
+/// downstream by `handler.rs`'s `ConnectionValidation` handling into
+/// `request_ctx::set_credentials`, exactly the same path a real spoofing
+/// client would use). If `current_identity()` preferred that asserted host
+/// over the real peer IP (the bug), the HAG rule would match and the put
+/// would be wrongly allowed; with peer-IP-authoritative matching (the fix)
+/// the loopback peer never matches `HAG(ctl)` and the put is denied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hag_rule_ignores_a_spoofed_ca_host() {
+    use spvirit_client::{PvOptions, pvput};
+    use spvirit_gateway::access::acf::parse_acf;
+    use spvirit_gateway::access::pvlist::parse_pvlist;
+
+    // HAG(ctl) lists only a hostname the real TCP client below never
+    // connects from -- it connects over 127.0.0.1. The client asserts this
+    // *exact* trusted hostname via its `ca` credentials, so if that
+    // self-asserted host were ever preferred over the real peer IP, this
+    // rule would (wrongly) match and the put would be allowed.
+    let pvlist = parse_pvlist(".* ALLOW RW 1").unwrap();
+    let acf = parse_acf(
+        "HAG(ctl){trusted.example.invalid}\nASG(RW){ RULE(1, WRITE){ HAG(ctl) } }",
+    )
+    .unwrap();
+    let access = Arc::new(AccessControl::new(false, Some(pvlist), Some(acf)));
+
+    let Some((src, _pool)) =
+        spawn_gateway_with_access(|b| b.ao("HAG:SPOOF:PV", 1.0), 0, access).await
+    else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    src.claim("HAG:SPOOF:PV").await.expect("claim");
+
+    let (Some(down_tcp), Some(down_udp)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("Skipping test: cannot bind a free downstream port");
+        return;
+    };
+    let down = PvaServer::builder()
+        .listen_ip("127.0.0.1".parse().unwrap())
+        .advertise_ip("127.0.0.1".parse().unwrap())
+        .port(down_tcp)
+        .udp_port(down_udp)
+        .source("gateway", 0, Arc::new(src))
+        .build();
+    tokio::spawn(async move {
+        let _ = down.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut opts = PvOptions::new("HAG:SPOOF:PV".to_string());
+    opts.server_addr = Some(
+        format!("127.0.0.1:{down_tcp}")
+            .parse()
+            .expect("loopback addr"),
+    );
+    opts.tcp_port = down_tcp;
+    opts.udp_port = down_udp;
+    opts.search_addr = Some("127.0.0.1".parse().unwrap());
+    opts.bind_addr = Some("127.0.0.1".parse().unwrap());
+    opts.timeout = Duration::from_secs(5);
+    // The spoof: assert the exact hostname HAG(ctl) trusts, even though the
+    // TCP connection is really coming from 127.0.0.1.
+    opts.authnz_host = Some("trusted.example.invalid".to_string());
+
+    let result = pvput(&opts, 42.0f64).await;
+    assert!(
+        result.is_err(),
+        "a client asserting a HAG-trusted hostname via ca credentials must \
+         still be denied, because the real peer IP (127.0.0.1) is not in \
+         HAG(ctl) -- the self-asserted host must never satisfy the rule"
+    );
+}

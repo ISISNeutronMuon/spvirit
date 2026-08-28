@@ -26,23 +26,31 @@ use crate::cache::negative::NegativeCache;
 use crate::loopguard::LoopGuard;
 use crate::upstream::UpstreamPool;
 
-/// Snapshots the current downstream connection's identity (peer host, and
-/// decoded `ca` user if any) into an [`Identity`] for [`AccessControl::decide`].
+/// Snapshots the current downstream connection's identity (socket peer host,
+/// and decoded `ca` user if any) into an [`Identity`] for
+/// [`AccessControl::decide`].
 ///
-/// Prefers a resolved host (from `ca` credentials, once wired) over the raw
-/// peer IP string; falls back to the peer IP when no resolved host is set.
+/// `host` is always the socket peer IP — it is the only value trusted for
+/// HAG / pvlist-`FROM` matching (design spec §5.4, §6.3). The client-asserted
+/// `host` string carried in `ca` connection-validation credentials is
+/// advisory only and is deliberately never used for an access decision:
+/// trusting it would let a client claim a trusted hostname it isn't actually
+/// connecting from and bypass host-based rules (a spoofing hole). `user`, by
+/// contrast, *is* the self-asserted `ca` value — spvirit matches p4p's
+/// posture here, where ACF has always trusted the asserted user (UAG is
+/// authorization, not authentication).
+///
 /// Returns a default (all-`None`) `Identity` when called outside a
 /// [`spvirit_server::request_ctx`] scope (e.g. a unit test that calls
 /// `claim`/`put`/`rpc` directly, off any connection task) — a permissive
 /// `AccessControl` still behaves correctly in that case, and a restrictive
-/// one fails closed (no host/user to match against).
+/// one fails closed (no host/user to match against). Whenever a request
+/// scope *is* present, the peer IP is always present too, so `host` is only
+/// `None` in that out-of-scope case.
 fn current_identity() -> Identity {
     let rc = spvirit_server::request_ctx::current_request();
     Identity {
-        host: rc
-            .as_ref()
-            .and_then(|c| c.host.clone())
-            .or_else(|| rc.as_ref().map(|c| c.peer.ip().to_string())),
+        host: rc.as_ref().map(|c| c.peer.ip().to_string()),
         user: rc.and_then(|c| c.user),
     }
 }
