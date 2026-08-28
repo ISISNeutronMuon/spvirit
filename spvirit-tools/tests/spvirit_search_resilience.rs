@@ -103,7 +103,7 @@ async fn search_pv_skips_bad_target_and_succeeds_on_next() {
         .await
         .expect("search should succeed after skipping bad target");
 
-    assert_eq!(search_result.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_eq!(search_result.0.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
 
     let _ = server.kill();
     let _ = server.wait();
