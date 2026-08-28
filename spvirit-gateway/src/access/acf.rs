@@ -365,6 +365,9 @@ impl Parser {
                     let name = self.expect_ident()?;
                     self.expect(&Token::RParen)?;
                     let users = self.parse_brace_ident_list()?;
+                    if acf.uags.contains_key(&name) {
+                        return Err(format!("duplicate UAG({name:?}) definition"));
+                    }
                     acf.uags.insert(name.clone(), Uag { name, users });
                 }
                 "HAG" => {
@@ -372,6 +375,9 @@ impl Parser {
                     let name = self.expect_ident()?;
                     self.expect(&Token::RParen)?;
                     let hosts = self.parse_brace_ident_list()?;
+                    if acf.hags.contains_key(&name) {
+                        return Err(format!("duplicate HAG({name:?}) definition"));
+                    }
                     acf.hags.insert(name.clone(), Hag { name, hosts });
                 }
                 "ASG" => {
@@ -379,6 +385,9 @@ impl Parser {
                     let name = self.expect_ident()?;
                     self.expect(&Token::RParen)?;
                     let rules = self.parse_asg_body()?;
+                    if acf.asgs.contains_key(&name) {
+                        return Err(format!("duplicate ASG({name:?}) definition"));
+                    }
                     acf.asgs.insert(name, rules);
                 }
                 other => return Err(format!("unexpected top-level keyword {other:?}")),
@@ -517,5 +526,26 @@ mod tests {
     #[test]
     fn unknown_top_level_keyword_is_error() {
         assert!(parse_acf("FOO(x) { }").is_err());
+    }
+
+    #[test]
+    fn duplicate_uag_name_is_rejected() {
+        let e = parse_acf("UAG(ops){alice}\nUAG(ops){bob}").unwrap_err();
+        assert!(e.to_lowercase().contains("duplicate"));
+        assert!(e.contains("ops"));
+    }
+
+    #[test]
+    fn duplicate_hag_name_is_rejected() {
+        let e = parse_acf("HAG(ctl){10.0.0.1}\nHAG(ctl){10.0.0.2}").unwrap_err();
+        assert!(e.to_lowercase().contains("duplicate"));
+        assert!(e.contains("ctl"));
+    }
+
+    #[test]
+    fn duplicate_asg_name_is_rejected() {
+        let e = parse_acf("ASG(RW){ RULE(0, READ) }\nASG(RW){ RULE(1, WRITE) }").unwrap_err();
+        assert!(e.to_lowercase().contains("duplicate"));
+        assert!(e.contains("RW"));
     }
 }

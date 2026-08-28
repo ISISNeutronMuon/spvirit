@@ -802,3 +802,98 @@ async fn hag_rule_ignores_a_spoofed_ca_host() {
          HAG(ctl) -- the self-asserted host must never satisfy the rule"
     );
 }
+
+/// End-to-end UAG coverage, mirroring `hag_rule_gates_put_from_a_real_tcp_client`
+/// but gating on the decoded `ca` *user* instead of the peer host. Per spec
+/// §6.3, UAG is authorization, not authentication: the `user` a client
+/// asserts via its `ca` credential exchange is trusted as-is (unlike `host`,
+/// where the real socket peer IP is authoritative -- see
+/// `hag_rule_ignores_a_spoofed_ca_host`). So a real TCP client that sets
+/// `PvOptions::authnz_user` to a UAG-listed name legitimately gains access;
+/// a client asserting an unlisted user is denied. The identity flows through
+/// exactly the same path the HAG tests exercise for host: `client.rs`/
+/// `search.rs`'s `resolved_authnz_user` puts it on the wire via the `ca`
+/// credential exchange, `handler.rs`'s `ConnectionValidation` handling
+/// decodes it into `request_ctx::set_credentials`, and `proxy.rs`'s
+/// `current_identity()` reads it back out as `Identity::user` for
+/// `AccessControl::decide`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uag_rule_gates_put_by_ca_user() {
+    use spvirit_client::{PvOptions, pvput};
+    use spvirit_gateway::access::acf::parse_acf;
+    use spvirit_gateway::access::pvlist::parse_pvlist;
+
+    // UAG(ops) lists only "operator". ASG(RW)'s WRITE rule is gated on
+    // UAG(ops); there is no unconditional fallback rule, so any user other
+    // than "operator" (including no asserted user at all) is denied.
+    let pvlist = parse_pvlist(".* ALLOW RW 1").unwrap();
+    let acf = parse_acf("UAG(ops){operator}\nASG(RW){ RULE(1, WRITE){ UAG(ops) } }").unwrap();
+    let access = Arc::new(AccessControl::new(false, Some(pvlist), Some(acf)));
+
+    let Some((src, _pool)) =
+        spawn_gateway_with_access(|b| b.ao("UAG:PV", 1.0), 0, access).await
+    else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    src.claim("UAG:PV").await.expect("claim");
+
+    let (Some(down_tcp), Some(down_udp)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("Skipping test: cannot bind a free downstream port");
+        return;
+    };
+    let src = Arc::new(src);
+    let down = PvaServer::builder()
+        .listen_ip("127.0.0.1".parse().unwrap())
+        .advertise_ip("127.0.0.1".parse().unwrap())
+        .port(down_tcp)
+        .udp_port(down_udp)
+        .source("gateway", 0, src.clone())
+        .build();
+    tokio::spawn(async move {
+        let _ = down.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    fn base_opts(down_tcp: u16, down_udp: u16) -> PvOptions {
+        let mut opts = PvOptions::new("UAG:PV".to_string());
+        opts.server_addr = Some(
+            format!("127.0.0.1:{down_tcp}")
+                .parse()
+                .expect("loopback addr"),
+        );
+        opts.tcp_port = down_tcp;
+        opts.udp_port = down_udp;
+        opts.search_addr = Some("127.0.0.1".parse().unwrap());
+        opts.bind_addr = Some("127.0.0.1".parse().unwrap());
+        opts.timeout = Duration::from_secs(5);
+        opts
+    }
+
+    // Negative half first: a client asserting no ca user at all is not in
+    // UAG(ops), so the put must be denied.
+    let deny_opts = base_opts(down_tcp, down_udp);
+    let deny_result = pvput(&deny_opts, 7.0f64).await;
+    assert!(
+        deny_result.is_err(),
+        "put from a client asserting no ca user must be denied (not in UAG(ops))"
+    );
+
+    // Positive half: a client asserting the UAG-listed user "operator" via
+    // its ca credentials must have its put succeed.
+    let mut allow_opts = base_opts(down_tcp, down_udp);
+    allow_opts.authnz_user = Some("operator".to_string());
+    let allow_result = pvput(&allow_opts, 42.0f64).await;
+    assert!(
+        allow_result.is_ok(),
+        "put from a client asserting the UAG(ops)-listed user \"operator\" \
+         must succeed, got: {allow_result:?}"
+    );
+
+    let payload = src.get("UAG:PV").await.expect("get should return Some");
+    let value = extract_f64_value(&payload);
+    assert!(
+        (value - 42.0).abs() < 1e-6,
+        "expected the get to reflect the allowed put, got {value}"
+    );
+}
