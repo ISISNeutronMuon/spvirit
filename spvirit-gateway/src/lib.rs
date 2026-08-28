@@ -61,6 +61,7 @@ pub mod convert;
 pub mod loopguard;
 pub mod proxy;
 pub mod runtime;
+pub mod status;
 pub mod upstream;
 #[cfg(test)]
 mod smoke {

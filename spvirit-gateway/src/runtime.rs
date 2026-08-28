@@ -13,6 +13,7 @@ use crate::cache::negative::NegativeCache;
 use crate::config::{ConfigError, GatewayConfig};
 use crate::loopguard::LoopGuard;
 use crate::proxy::GatewaySource;
+use crate::status::{StatusHandles, StatusSource, banner};
 use crate::upstream::UpstreamPool;
 
 /// Default negative-search-cache TTL used when a server has no `x-spvirit
@@ -69,14 +70,14 @@ impl Runtime {
             let neg = Arc::new(NegativeCache::new(ttl, capacity));
             let access = Arc::new(cfg.build_access_control(server_cfg)?);
 
-            let src = GatewaySource::new(
+            let src_arc = Arc::new(GatewaySource::new(
                 pool.clone(),
                 server_cfg.clients.clone(),
                 neg,
                 guard,
                 server_cfg.getholdoff,
-                access,
-            );
+                access.clone(),
+            ));
 
             let interface_ip: IpAddr = server_cfg
                 .interface
@@ -84,14 +85,31 @@ impl Runtime {
                 .and_then(|s| s.parse::<IpAddr>().ok())
                 .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
-            let server = PvaServer::builder()
+            let mut builder = PvaServer::builder()
                 .port(server_cfg.serverport)
                 .udp_port(server_cfg.bcastport)
                 .listen_ip(interface_ip)
                 .advertise_ip(interface_ip)
                 .guid(server_guids[i])
-                .source("gateway", 0, Arc::new(src))
-                .build();
+                .source("gateway", 0, src_arc.clone());
+
+            // Status PVs claim under a lower `.source()` order (-10 <
+            // gateway's 0) so `<statusprefix>*` names always resolve here
+            // first, before the gateway ever gets a chance to shadow them
+            // by forwarding to an upstream PV of the same name.
+            if !server_cfg.statusprefix.is_empty() {
+                let status = Arc::new(StatusSource::new(
+                    server_cfg.statusprefix.clone(),
+                    access.clone(),
+                    StatusHandles::from_gateway(&src_arc, &pool),
+                ));
+                for line in banner::status_pv_lines(&server_cfg.statusprefix) {
+                    tracing::info!("{line}");
+                }
+                builder = builder.source("status", -10, status);
+            }
+
+            let server = builder.build();
 
             servers.push(server);
 
