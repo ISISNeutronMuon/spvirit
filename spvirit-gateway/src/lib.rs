@@ -53,6 +53,7 @@
 //! - **Access control** (DENY filtering, `readOnly` enforcement) and the
 //!   metrics/audit/hot-reload/rate-limit features are parsed but **not**
 //!   enforced in M1 — they land in later milestones.
+pub mod access;
 pub mod bridge;
 pub mod cache;
 pub mod config;
