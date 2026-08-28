@@ -5,4 +5,5 @@
 //! evaluator (`decide`) lands in a later task once both `pvlist` and `acf`
 //! are available.
 
+pub mod acf;
 pub mod pvlist;
