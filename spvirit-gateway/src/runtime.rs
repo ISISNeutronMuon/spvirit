@@ -175,7 +175,15 @@ mod tests {
 
     #[test]
     fn from_config_builds_one_server_per_entry() {
-        let cfg = GatewayConfig::from_json_str(BIDI).unwrap();
+        // BIDI's `pvlist` path (`/etc/pvagw/pvacl.conf`) is illustrative of a
+        // real p4p deployment, not a file present in this checkout; clear it
+        // so this test exercises server construction, not fail-closed file
+        // loading (Task 10's `validate()` now loads it for real).
+        let mut cfg = GatewayConfig::from_json_str(BIDI).unwrap();
+        for s in &mut cfg.servers {
+            s.pvlist.clear();
+            s.access.clear();
+        }
         let n_servers = cfg.servers.len();
         let rt = Runtime::from_config(cfg).expect("valid config builds");
         assert_eq!(rt.servers.len(), n_servers);
