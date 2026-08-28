@@ -109,12 +109,13 @@ impl Source for GatewaySource {
                 let Some(client) = self.pool.client(client_name) else {
                     continue;
                 };
-                if let Ok((descriptor, server_addr, _guid)) = client.pvinfo_full(&name).await {
+                if let Ok((descriptor, server_addr, guid)) = client.pvinfo_full(&name).await {
                     // Loop / self-connection prevention: if this name resolved
                     // back into one of our own downstream server sockets (or an
-                    // `ignoreaddr` host), do NOT bind it — forwarding would loop
-                    // a search into ourselves. Skip to the next client.
-                    if self.guard.is_banned(server_addr) {
+                    // `ignoreaddr` host), or the responder's GUID matches one of
+                    // our own servers' GUIDs, do NOT bind it — forwarding would
+                    // loop a search into ourselves. Skip to the next client.
+                    if self.guard.is_banned(server_addr) || self.guard.is_guid_banned(&guid) {
                         continue;
                     }
                     self.bindings.lock().unwrap().insert(
@@ -322,6 +323,8 @@ mod tests {
         let guard = Arc::new(LoopGuard::build(
             &cfg,
             &crate::config::ServerCfg {
+                // (interface: vec![] below picks up the 0.0.0.0 local-IP
+                // backstop; harmless for this no-clients-configured test.)
                 name: "s".into(),
                 clients: vec![],
                 interface: vec![],
@@ -337,6 +340,7 @@ mod tests {
                 acf_client: None,
                 x_spvirit: None,
             },
+            std::collections::HashSet::new(),
         ));
         let src = GatewaySource::new(pool, vec![], neg, guard, 0);
         assert!(src.claim("ANY:PV").await.is_none());

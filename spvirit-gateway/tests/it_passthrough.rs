@@ -83,7 +83,7 @@ async fn spawn_gateway(
 
     let pool = Arc::new(UpstreamPool::from_config(&cfg));
     let neg = Arc::new(NegativeCache::new(Duration::from_secs(30), 128));
-    let guard = Arc::new(LoopGuard::build(&cfg, &cfg.servers[0]));
+    let guard = Arc::new(LoopGuard::build(&cfg, &cfg.servers[0], std::collections::HashSet::new()));
 
     let src = GatewaySource::new(
         pool.clone(),
@@ -161,7 +161,7 @@ async fn claim_resolves_a_real_upstream_pv() {
 
     let pool = Arc::new(UpstreamPool::from_config(&cfg));
     let neg = Arc::new(NegativeCache::new(Duration::from_secs(30), 128));
-    let guard = Arc::new(LoopGuard::build(&cfg, &cfg.servers[0]));
+    let guard = Arc::new(LoopGuard::build(&cfg, &cfg.servers[0], std::collections::HashSet::new()));
 
     let src = GatewaySource::new(pool, vec!["it-client".into()], neg, guard, 0);
 

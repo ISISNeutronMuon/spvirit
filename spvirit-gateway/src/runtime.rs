@@ -2,11 +2,12 @@
 //! one shared [`UpstreamPool`] plus one [`spvirit_server::PvaServer`] (backed
 //! by a [`GatewaySource`]) per `servers[]` entry.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use spvirit_server::PvaServer;
+use spvirit_server::{PvaServer, rand_guid};
 
 use crate::cache::negative::NegativeCache;
 use crate::config::{ConfigError, GatewayConfig};
@@ -51,8 +52,13 @@ impl Runtime {
         let pool = Arc::new(UpstreamPool::from_config(&cfg));
         let mut servers = Vec::with_capacity(cfg.servers.len());
 
-        for server_cfg in &cfg.servers {
-            let guard = Arc::new(LoopGuard::build(&cfg, server_cfg));
+        // One GUID per server, generated before anything so the ban-set is
+        // complete by the time any server's LoopGuard consults it.
+        let server_guids: Vec<[u8; 12]> = cfg.servers.iter().map(|_| rand_guid()).collect();
+        let all_guids: HashSet<[u8; 12]> = server_guids.iter().copied().collect();
+
+        for (i, server_cfg) in cfg.servers.iter().enumerate() {
+            let guard = Arc::new(LoopGuard::build(&cfg, server_cfg, all_guids.clone()));
 
             let (ttl, capacity) = server_cfg
                 .x_spvirit
@@ -81,6 +87,7 @@ impl Runtime {
                 .udp_port(server_cfg.bcastport)
                 .listen_ip(interface_ip)
                 .advertise_ip(interface_ip)
+                .guid(server_guids[i])
                 .source("gateway", 0, Arc::new(src))
                 .build();
 

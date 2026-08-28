@@ -194,7 +194,7 @@ async fn bidirectional_gateway_bridges_both_nets() {
     // NOT ban the legitimate upstream on the same loopback IP but a different
     // port (127.0.0.1:net_a_tcp), which is exactly why the ban is
     // socket-granular rather than IP-wide.
-    let guard_a = LoopGuard::build(&cfg, &cfg.servers[0]);
+    let guard_a = LoopGuard::build(&cfg, &cfg.servers[0], std::collections::HashSet::new());
     assert!(
         guard_a.is_banned(SocketAddr::new(
             "127.0.0.1".parse::<IpAddr>().unwrap(),
@@ -306,7 +306,11 @@ async fn autoaddrlist_false_with_explicit_addrlist_still_resolves() {
         Duration::from_secs(30),
         128,
     ));
-    let guard = Arc::new(LoopGuard::build(&cfg, &cfg.servers[0]));
+    let guard = Arc::new(LoopGuard::build(
+        &cfg,
+        &cfg.servers[0],
+        std::collections::HashSet::new(),
+    ));
     let src = GatewaySource::new(pool, vec!["uni-client".into()], neg, guard, 0);
 
     let claimed = tokio::time::timeout(Duration::from_secs(5), src.claim("IT:UNI"))
@@ -381,7 +385,11 @@ async fn claim_refuses_resolution_into_a_banned_own_server_socket() {
         }}"#
     ))
     .expect("parse control config");
-    let control_guard = Arc::new(LoopGuard::build(&control_cfg, &control_cfg.servers[0]));
+    let control_guard = Arc::new(LoopGuard::build(
+        &control_cfg,
+        &control_cfg.servers[0],
+        std::collections::HashSet::new(),
+    ));
     let control_src = GatewaySource::new(
         Arc::new(UpstreamPool::from_config(&control_cfg)),
         vec!["loop-client".into()],
@@ -416,7 +424,11 @@ async fn claim_refuses_resolution_into_a_banned_own_server_socket() {
         }}"#
     ))
     .expect("parse loop config");
-    let loop_guard = LoopGuard::build(&loop_cfg, &loop_cfg.servers[0]);
+    let loop_guard = LoopGuard::build(
+        &loop_cfg,
+        &loop_cfg.servers[0],
+        std::collections::HashSet::new(),
+    );
     assert!(
         loop_guard.is_banned(SocketAddr::new("127.0.0.1".parse().unwrap(), tcp_port)),
         "sanity: guard must ban the own-server socket the upstream resolves to"
@@ -437,5 +449,126 @@ async fn claim_refuses_resolution_into_a_banned_own_server_socket() {
     assert!(
         loop_claim.is_none(),
         "claim must refuse to bind a name that resolves into a banned own-server socket"
+    );
+}
+
+/// GUID-based loop / self-connection prevention: an upstream whose search
+/// response carries the gateway's OWN server GUID must be refused by
+/// `claim`, even when the resolved socket itself is not banned (different
+/// port than the gateway's own server) — proving the GUID ban-set, not the
+/// socket ban, is what caught it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claim_refuses_resolution_that_carries_our_own_server_guid() {
+    let Some(tcp_port) = free_tcp_port() else {
+        eprintln!("Skipping test: cannot bind a free TCP port in this environment");
+        return;
+    };
+    let Some(udp_port) = free_udp_port() else {
+        eprintln!("Skipping test: cannot bind a free UDP port in this environment");
+        return;
+    };
+    // Deliberately a DIFFERENT port than the upstream's, so the socket ban
+    // (LoopGuard::is_banned) cannot be what refuses this claim.
+    let Some(gateway_serverport) = free_tcp_port() else {
+        eprintln!("Skipping test: cannot bind a free TCP port in this environment");
+        return;
+    };
+
+    let own_guid = [0x42u8; 12];
+
+    // The "upstream" is standing in for a search response that (somehow --
+    // e.g. via an intermediate relay, or a misconfigured mesh) carries this
+    // gateway's own server GUID, without being bound to this gateway's own
+    // socket.
+    let upstream = PvaServer::builder()
+        .ai("IT:LOOPGUID", 7.0)
+        .listen_ip("127.0.0.1".parse().unwrap())
+        .advertise_ip("127.0.0.1".parse().unwrap())
+        .port(tcp_port)
+        .udp_port(udp_port)
+        .guid(own_guid)
+        .build();
+    tokio::spawn(async move {
+        let _ = upstream.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let client_json = format!(
+        r#"{{
+            "name": "loop-guid-client",
+            "addrlist": "127.0.0.1",
+            "bcastport": {udp_port},
+            "interface": ["127.0.0.1"]
+        }}"#
+    );
+    let cfg = GatewayConfig::from_json_str(&format!(
+        r#"{{
+            "version": 2,
+            "clients": [{client_json}],
+            "servers": [{{
+                "name": "loop-guid-server",
+                "clients": ["loop-guid-client"],
+                "interface": ["127.0.0.1"],
+                "serverport": {gateway_serverport}
+            }}]
+        }}"#
+    ))
+    .expect("parse loop-guid config");
+
+    // Sanity control: with no GUIDs banned, the resolution succeeds (proves
+    // a later `None` is attributable to the GUID ban, not to a resolution
+    // failure or the socket ban).
+    let control_guard = Arc::new(LoopGuard::build(
+        &cfg,
+        &cfg.servers[0],
+        std::collections::HashSet::new(),
+    ));
+    let control_src = GatewaySource::new(
+        Arc::new(UpstreamPool::from_config(&cfg)),
+        vec!["loop-guid-client".into()],
+        Arc::new(spvirit_gateway::cache::negative::NegativeCache::new(
+            Duration::from_secs(30),
+            128,
+        )),
+        control_guard,
+        0,
+    );
+    let control_claim = tokio::time::timeout(
+        Duration::from_secs(5),
+        control_src.claim("IT:LOOPGUID"),
+    )
+    .await
+    .expect("control claim should not time out");
+    assert!(
+        control_claim.is_some(),
+        "control: the upstream must resolve when its GUID is not banned"
+    );
+
+    // Now: the gateway's own server GUID set includes the upstream's GUID
+    // (as it would if the upstream's server WAS one of this gateway's own
+    // servers, resolved via a search-response loop). `claim` must refuse.
+    let mut banned_guids = std::collections::HashSet::new();
+    banned_guids.insert(own_guid);
+    let guard = Arc::new(LoopGuard::build(&cfg, &cfg.servers[0], banned_guids));
+    assert!(
+        guard.is_guid_banned(&own_guid),
+        "sanity: guard must ban the own-server GUID the upstream resolves to"
+    );
+    let src = GatewaySource::new(
+        Arc::new(UpstreamPool::from_config(&cfg)),
+        vec!["loop-guid-client".into()],
+        Arc::new(spvirit_gateway::cache::negative::NegativeCache::new(
+            Duration::from_secs(30),
+            128,
+        )),
+        guard,
+        0,
+    );
+    let claim = tokio::time::timeout(Duration::from_secs(5), src.claim("IT:LOOPGUID"))
+        .await
+        .expect("claim should not time out");
+    assert!(
+        claim.is_none(),
+        "claim must refuse to bind a name whose search response carries a banned own-server GUID"
     );
 }
