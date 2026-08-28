@@ -489,12 +489,21 @@ pub async fn search_pv(
         return Err(PvGetError::Timeout("search response"));
     }
 
-    // Spawn a receiver task per socket that forwards packets into a shared channel.
+    // Spawn a receiver task per socket that forwards packets into a shared
+    // channel. The tasks are held in a JoinSet so that when this function
+    // returns — on success, timeout, or error — the JoinSet is dropped and
+    // every receiver task is aborted. That releases each task's
+    // Arc<UdpSocket> clone, so the ephemeral search socket is closed instead
+    // of leaking. Without this, a task parked in `recv_from().await` on a
+    // quiet target lives forever holding the socket open (one leaked fd per
+    // call, which exhausts the fd table under churn). See the
+    // `search_pv_does_not_leak_udp_sockets` regression test.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+    let mut recv_tasks = tokio::task::JoinSet::new();
     for (sock, _, _) in &socket_info {
         let sock = Arc::clone(sock);
         let tx = tx.clone();
-        tokio::spawn(async move {
+        recv_tasks.spawn(async move {
             loop {
                 let mut buf = vec![0u8; 2048];
                 match sock.recv_from(&mut buf).await {
@@ -970,12 +979,21 @@ pub async fn discover_servers(
         return Err(PvGetError::Search("no search targets"));
     }
 
-    // Spawn a receiver task per socket that forwards packets into a shared channel.
+    // Spawn a receiver task per socket that forwards packets into a shared
+    // channel. The tasks are held in a JoinSet so that when this function
+    // returns — on success, timeout, or error — the JoinSet is dropped and
+    // every receiver task is aborted. That releases each task's
+    // Arc<UdpSocket> clone, so the ephemeral search socket is closed instead
+    // of leaking. Without this, a task parked in `recv_from().await` on a
+    // quiet target lives forever holding the socket open (one leaked fd per
+    // call, which exhausts the fd table under churn). See the
+    // `search_pv_does_not_leak_udp_sockets` regression test.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+    let mut recv_tasks = tokio::task::JoinSet::new();
     for (sock, _, _) in &socket_info {
         let sock = Arc::clone(sock);
         let tx = tx.clone();
-        tokio::spawn(async move {
+        recv_tasks.spawn(async move {
             loop {
                 let mut buf = vec![0u8; 2048];
                 match sock.recv_from(&mut buf).await {
@@ -1103,6 +1121,55 @@ mod tests {
         let (addr, guid) = resolve_pv_server(&opts).await.expect("resolve");
         assert_eq!(guid, g);
         assert!(addr.ip().is_loopback());
+    }
+
+    // Regression test for the UDP search-socket leak: every `search_pv` call
+    // binds an ephemeral UDP socket and spawns a receiver task holding a clone
+    // of it. If the function returns without cancelling that task, the task
+    // stays parked in `recv_from().await` forever and the socket is never
+    // closed — one leaked fd per search, which exhausts the gateway's fd table
+    // under churn (observed in production as EMFILE). The timeout path leaks
+    // identically to the success path, so we drive it with a dead target and
+    // assert the process fd count does not grow across many searches.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn search_pv_does_not_leak_udp_sockets() {
+        fn open_fd_count() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .map(|d| d.count())
+                .unwrap_or(0)
+        }
+
+        // A loopback UDP port nobody listens on: searches get no reply and
+        // fall through to the timeout return path.
+        let dead_port = free_udp_port();
+        let targets = [SearchTarget {
+            target: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        }];
+        let timeout = Duration::from_millis(60);
+
+        // Warm up so runtime/one-time fds are allocated before we baseline.
+        for _ in 0..3 {
+            let _ = search_pv("NOPV", dead_port, timeout, &targets, false).await;
+        }
+
+        let before = open_fd_count();
+        let iters = 40;
+        for _ in 0..iters {
+            let r = search_pv("NOPV", dead_port, timeout, &targets, false).await;
+            assert!(r.is_err(), "search of a dead port must time out, not succeed");
+        }
+        // Let any just-cancelled receiver tasks drop their sockets.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = open_fd_count();
+
+        let growth = after.saturating_sub(before);
+        assert!(
+            growth < 10,
+            "leaked UDP search sockets: fd count grew by {growth} over {iters} \
+             timed-out searches (before={before}, after={after})"
+        );
     }
 
     #[test]
