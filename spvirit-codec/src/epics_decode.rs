@@ -321,40 +321,24 @@ impl PvaPacket {
 }
 
 /// helpers
+///
+/// Thin `Option`-returning wrapper over the shared [`decode_size_prefixed`]
+/// core (the same size-prefix logic used by the pvData value decoder). The
+/// outer epics-protocol framing layer historically reports failure as `None`,
+/// so the richer `DecodeError` is discarded here with `.ok()`.
 pub fn decode_size(raw: &[u8], is_be: bool) -> Option<(usize, usize)> {
-    if raw.is_empty() {
-        return None;
-    }
-
-    match raw[0] {
-        255 => Some((0, 1)),
-        254 => {
-            if raw.len() < 5 {
-                return None;
-            }
-            let size_bytes = &raw[1..5];
-            let size = if is_be {
-                u32::from_be_bytes(size_bytes.try_into().unwrap())
-            } else {
-                u32::from_le_bytes(size_bytes.try_into().unwrap())
-            };
-            Some((size as usize, 5))
-        }
-        short_len => Some((short_len as usize, 1)),
-    }
+    crate::error::decode_size_prefixed(raw, is_be).ok()
 }
 
 // decoding string using the above helper
+//
+// LOSSY UTF-8: this is the outer epics-protocol framing boundary, where the
+// codec is a passive observer of peer traffic and must stay robust to
+// malformed/foreign bytes (contrast the STRICT policy used for structured
+// pvData values in `spvd_decode`). The two policies are deliberately different
+// — do not unify them.
 pub fn decode_string(raw: &[u8], is_be: bool) -> Option<(String, usize)> {
-    let (size, offset) = decode_size(raw, is_be)?;
-    let total_len = offset + size;
-    if raw.len() < total_len {
-        return None;
-    }
-
-    let string_bytes = &raw[offset..total_len];
-    let s = String::from_utf8_lossy(string_bytes).to_string();
-    Some((s, total_len))
+    crate::error::decode_string_prefixed(raw, is_be, crate::error::Utf8Policy::Lossy).ok()
 }
 
 pub fn decode_status(raw: &[u8], is_be: bool) -> (Option<PvaStatus>, usize) {
@@ -1371,15 +1355,19 @@ pub struct PvaOpPayload {
     pub command: u8,
     pub is_server: bool,
     pub status: Option<PvaStatus>,
-    pub pv_names: Vec<String>,
     /// Parsed introspection data (for INIT responses)
     pub introspection: Option<StructureDesc>,
     /// Decoded value (when field_desc is available)
     pub decoded_value: Option<DecodedValue>,
 }
 
-// Heuristic extraction of PV-like names from a PVD body.
-fn extract_pv_names(raw: &[u8]) -> Vec<String> {
+/// Heuristic extraction of PV-like names from a PVD body.
+///
+/// Best-effort fallback for passive-observer display when no field descriptor
+/// is available to decode the value. Computed lazily by [`PvaOpPayload`]'s
+/// `Display` (never stored on the payload) and exposed for external callers
+/// that previously read the removed `pv_names` field.
+pub fn extract_pv_names(raw: &[u8]) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let mut i = 0usize;
     while i < raw.len() {
@@ -1461,11 +1449,9 @@ impl PvaOpPayload {
             (sid, ioid, subcmd, 9)
         };
 
-        let body = if raw.len() > offset {
-            raw[offset..].to_vec()
-        } else {
-            vec![]
-        };
+        // Body slice after the fixed op header (borrowed; we own a single copy
+        // of the post-status payload as `pvd_raw` below — no intermediate Vec).
+        let body: &[u8] = if raw.len() > offset { &raw[offset..] } else { &[] };
 
         // Status is only present in certain subcmd types:
         // Status format (per Lua dissector): first byte = code. If code==0xff (255) -> OK
@@ -1475,25 +1461,22 @@ impl PvaOpPayload {
         // and for non-INIT responses on GET (10), PUT (11), PUT_GET (12).
         // Monitor (13) data updates (non-INIT) do NOT have a status prefix.
         let mut status: Option<PvaStatus> = None;
-        let mut pvd_raw: Vec<u8> = vec![];
-
         let has_status = is_server && ((subcmd & 0x08) != 0 || (command != 13 && command != 14));
 
-        if !body.is_empty() {
-            if has_status {
-                let (parsed, consumed) = decode_status(&body, is_be);
-                status = parsed;
-                pvd_raw = if body.len() > consumed {
-                    body[consumed..].to_vec()
-                } else {
-                    vec![]
-                };
+        // Compute the owned pvData payload exactly once.
+        let pvd_raw: Vec<u8> = if body.is_empty() {
+            Vec::new()
+        } else if has_status {
+            let (parsed, consumed) = decode_status(body, is_be);
+            status = parsed;
+            if body.len() > consumed {
+                body[consumed..].to_vec()
             } else {
-                pvd_raw = body.clone();
+                Vec::new()
             }
-        }
-
-        let pv_names = extract_pv_names(&pvd_raw);
+        } else {
+            body.to_vec()
+        };
 
         // Try to parse introspection from INIT response (subcmd & 0x08 and is_server)
         let introspection = if is_server && (subcmd & 0x08) != 0 && !pvd_raw.is_empty() {
@@ -1503,6 +1486,9 @@ impl PvaOpPayload {
             None
         };
 
+        // NB: pv_names is NOT computed here. The heuristic `extract_pv_names`
+        // scan is deferred to `Display` (only when there is no decoded value),
+        // so it costs nothing on the normal op path.
         let result = Some(Self {
             sid_or_cid,
             ioid,
@@ -1510,8 +1496,7 @@ impl PvaOpPayload {
             body: pvd_raw,
             command,
             is_server,
-            status: status.clone(),
-            pv_names,
+            status,
             introspection,
             decoded_value: None, // Will be set by packet processor with field_desc
         });
@@ -1852,10 +1837,16 @@ impl fmt::Display for PvaOpPayload {
             } else {
                 format!(" [{}]", formatted)
             }
-        } else if !self.pv_names.is_empty() {
-            format!(" data=[{}]", self.pv_names.join(","))
         } else {
-            String::new()
+            // No decoded value: fall back to the heuristic name scan, computed
+            // lazily here (never stored) so it costs nothing on the normal path.
+            // Preserved for all commands (esp. the passive-observer monitor case).
+            let pv_names = extract_pv_names(&self.body);
+            if !pv_names.is_empty() {
+                format!(" data=[{}]", pv_names.join(","))
+            } else {
+                String::new()
+            }
         };
 
         if self.is_server {

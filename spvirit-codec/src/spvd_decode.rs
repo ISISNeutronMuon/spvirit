@@ -6,7 +6,9 @@
 use std::fmt;
 use tracing::debug;
 
-use crate::error::{DecodeError, DecodeResult};
+use crate::error::{
+    DecodeError, DecodeResult, Utf8Policy, decode_size_prefixed, decode_string_prefixed,
+};
 
 /// Re-export the free-standing `decode_string` from `epics_decode` for
 /// discoverability alongside the other decode helpers in this module.
@@ -381,56 +383,20 @@ impl PvdDecoder {
         &self.limits
     }
 
-    /// Decode a size value (PVA variable-length encoding)
+    /// Decode a size value (PVA variable-length encoding).
+    ///
+    /// Delegates to the shared [`decode_size_prefixed`] core.
     pub fn decode_size(&self, data: &[u8]) -> DecodeResult<(usize, usize)> {
-        if data.is_empty() {
-            return Err(DecodeError::Truncated {
-                needed: 1,
-                available: 0,
-            });
-        }
-        let first = data[0];
-        if first == 0xFF {
-            // Special: -1 (null)
-            return Ok((0, 1)); // Treat as 0 for simplicity
-        }
-        if first < 254 {
-            return Ok((first as usize, 1));
-        }
-        if first == 254 {
-            // 4-byte size follows
-            if data.len() < 5 {
-                return Err(DecodeError::Truncated {
-                    needed: 5,
-                    available: data.len(),
-                });
-            }
-            let size = if self.is_be {
-                u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize
-            } else {
-                u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize
-            };
-            return Ok((size, 5));
-        }
-        // first == 255 is null marker, handled above.
-        Err(DecodeError::Malformed("invalid size prefix 255"))
+        decode_size_prefixed(data, self.is_be)
     }
 
-    /// Decode a string
+    /// Decode a string.
+    ///
+    /// STRICT UTF-8: these are structured pvData values, where a non-UTF-8
+    /// value is a genuine protocol error (contrast the LOSSY policy used at the
+    /// outer epics-protocol framing boundary in `epics_decode`).
     pub fn decode_string(&self, data: &[u8]) -> DecodeResult<(String, usize)> {
-        let (size, size_bytes) = self.decode_size(data)?;
-        if size == 0 {
-            return Ok((String::new(), size_bytes));
-        }
-        if data.len() < size_bytes + size {
-            return Err(DecodeError::Truncated {
-                needed: size_bytes + size,
-                available: data.len(),
-            });
-        }
-        let s = std::str::from_utf8(&data[size_bytes..size_bytes + size])
-            .map_err(|_| DecodeError::Malformed("string is not valid UTF-8"))?;
-        Ok((s.to_string(), size_bytes + size))
+        decode_string_prefixed(data, self.is_be, Utf8Policy::Strict)
     }
 
     /// Parse field description from introspection data

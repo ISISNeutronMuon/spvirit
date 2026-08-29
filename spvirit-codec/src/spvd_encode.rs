@@ -9,18 +9,8 @@ use crate::spvd_decode::{FieldDesc, FieldType, StructureDesc, TypeCode};
 use spvirit_types::{
     NdDimension, NtAlarm, NtAttribute, NtDisplay, NtEnum, NtNdArray, NtPayload, NtScalar,
     NtScalarArray, NtTable, NtTableColumn, NtTimeStamp, PvValue, ScalarArrayValue, ScalarValue,
+    STANDARD_FORM_CHOICES,
 };
-
-fn count_structure_fields(desc: &StructureDesc) -> usize {
-    let mut count = 0;
-    for field in &desc.fields {
-        count += 1;
-        if let FieldType::Structure(nested) = &field.field_type {
-            count += count_structure_fields(nested);
-        }
-    }
-    count
-}
 
 pub fn encode_size_pvd(size: usize, is_be: bool) -> Vec<u8> {
     crate::encode_common::encode_size(size, is_be)
@@ -168,16 +158,16 @@ fn encode_bool(value: bool) -> Vec<u8> {
     vec![if value { 1 } else { 0 }]
 }
 
-fn encode_string_array(values: &[String], is_be: bool) -> Vec<u8> {
+fn encode_string_array<S: AsRef<str>>(values: &[S], is_be: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_size_pvd(values.len(), is_be));
     for v in values {
-        out.extend_from_slice(&encode_string_pvd(v, is_be));
+        out.extend_from_slice(&encode_string_pvd(v.as_ref(), is_be));
     }
     out
 }
 
-fn encode_enum(index: i32, choices: &[String], is_be: bool) -> Vec<u8> {
+fn encode_enum<S: AsRef<str>>(index: i32, choices: &[S], is_be: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_i32(index, is_be));
     out.extend_from_slice(&encode_string_array(choices, is_be));
@@ -216,11 +206,22 @@ fn encode_display(nt: &NtScalar, is_be: bool) -> Vec<u8> {
     out.extend_from_slice(&encode_string_pvd(&nt.display_description, is_be));
     out.extend_from_slice(&encode_string_pvd(&nt.units, is_be));
     out.extend_from_slice(&encode_i32(nt.display_precision, is_be));
-    out.extend_from_slice(&encode_enum(
-        nt.display_form_index,
-        &nt.display_form_choices,
-        is_be,
-    ));
+    // Empty `display_form_choices` is the "standard choices" sentinel: fall
+    // back to the 7 standard choices so the wire bytes are identical to an
+    // explicitly-populated NtScalar, without allocating them per value.
+    if nt.display_form_choices.is_empty() {
+        out.extend_from_slice(&encode_enum(
+            nt.display_form_index,
+            &STANDARD_FORM_CHOICES[..],
+            is_be,
+        ));
+    } else {
+        out.extend_from_slice(&encode_enum(
+            nt.display_form_index,
+            &nt.display_form_choices,
+            is_be,
+        ));
+    }
     out
 }
 
@@ -462,7 +463,7 @@ pub fn encode_nt_scalar_full(nt: &NtScalar, is_be: bool) -> Vec<u8> {
 }
 
 fn encode_structure_bitset(desc: &StructureDesc, is_be: bool) -> Vec<u8> {
-    let total_bits = 1 + count_structure_fields(desc);
+    let total_bits = 1 + crate::spvd_decode::count_structure_fields(desc);
     let bitset_size = (total_bits + 7) / 8;
     let mut bitset = vec![0u8; bitset_size];
     for bit in 0..total_bits {
@@ -1763,6 +1764,23 @@ fn dv_string_array(v: &[String]) -> DecodedValue {
     DecodedValue::Array(v.iter().map(|s| DecodedValue::String(s.clone())).collect())
 }
 
+/// `display.form.choices` for the DecodedValue (delta) path. An empty slice is
+/// the "standard choices" sentinel and falls back to `STANDARD_FORM_CHOICES`,
+/// keeping this path byte-identical to `encode_display` (both put the 7 standard
+/// choices on the wire) so the differential test holds.
+fn dv_form_choices(v: &[String]) -> DecodedValue {
+    if v.is_empty() {
+        DecodedValue::Array(
+            STANDARD_FORM_CHOICES
+                .iter()
+                .map(|s| DecodedValue::String((*s).to_string()))
+                .collect(),
+        )
+    } else {
+        dv_string_array(v)
+    }
+}
+
 fn dv_alarm(severity: i32, status: i32, message: &str) -> DecodedValue {
     DecodedValue::Structure(vec![
         ("severity".to_string(), DecodedValue::Int32(severity)),
@@ -1886,7 +1904,7 @@ fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
                             ),
                             (
                                 "choices".to_string(),
-                                dv_string_array(&nt.display_form_choices),
+                                dv_form_choices(&nt.display_form_choices),
                             ),
                         ]),
                     ),
@@ -2219,7 +2237,7 @@ pub fn compute_changed_bits(
     next: &DecodedValue,
     desc: &StructureDesc,
 ) -> Option<Vec<bool>> {
-    let total = 1 + spvd_count_structure_fields(desc);
+    let total = 1 + crate::spvd_decode::count_structure_fields(desc);
     let mut bits = vec![false; total];
     let mut idx = 1usize;
     let any = fill_changed_bits(prev, next, desc, &mut bits, &mut idx);
@@ -2339,17 +2357,6 @@ pub fn encode_nt_payload_delta(
         &mut values,
     );
     Some((bitset, values))
-}
-
-fn spvd_count_structure_fields(desc: &StructureDesc) -> usize {
-    let mut count = 0;
-    for field in &desc.fields {
-        count += 1;
-        if let FieldType::Structure(inner) = &field.field_type {
-            count += spvd_count_structure_fields(inner);
-        }
-    }
-    count
 }
 
 // ---------------------------------------------------------------------------
@@ -2495,6 +2502,68 @@ mod tests {
             .decode_structure(&pvd[1 + desc_bytes.len()..], &parsed_desc)
             .expect("value");
         assert!(consumed > 0);
+    }
+
+    #[test]
+    fn empty_form_choices_sentinel_encodes_standard_choices_on_wire() {
+        // 4f regression: `from_value` now leaves `display_form_choices` empty as
+        // a "standard choices" sentinel instead of allocating the 7 Strings. The
+        // encoder MUST fall back to the 7 standard choices so the wire bytes are
+        // byte-identical to explicitly populating them (an empty array on the
+        // wire would be a protocol change).
+        for is_be in [false, true] {
+            let sentinel = NtScalar::from_value(ScalarValue::F64(1.0));
+            assert!(
+                sentinel.display_form_choices.is_empty(),
+                "from_value must use the empty sentinel"
+            );
+
+            let mut explicit = NtScalar::from_value(ScalarValue::F64(1.0));
+            explicit.display_form_choices = STANDARD_FORM_CHOICES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+            // Byte-identity: sentinel form encoding == explicit-choices encoding.
+            assert_eq!(
+                encode_display(&sentinel, is_be),
+                encode_display(&explicit, is_be),
+                "empty sentinel must encode identically to explicit standard choices (is_be={is_be})"
+            );
+
+            // And the 7 choices genuinely reach the wire (decode round-trip).
+            let decoded = decode_nt_full(&sentinel, is_be);
+            let choices = find_form_choices(&decoded);
+            assert_eq!(
+                choices,
+                STANDARD_FORM_CHOICES.to_vec(),
+                "the 7 standard choices must be present on the wire (is_be={is_be})"
+            );
+        }
+    }
+
+    /// Walk the decoded NtScalar tree and return `display.form.choices`.
+    fn find_form_choices(v: &DecodedValue) -> Vec<String> {
+        fn get<'a>(v: &'a DecodedValue, key: &str) -> Option<&'a DecodedValue> {
+            if let DecodedValue::Structure(fields) = v {
+                fields.iter().find(|(n, _)| n == key).map(|(_, val)| val)
+            } else {
+                None
+            }
+        }
+        let choices = get(v, "display")
+            .and_then(|d| get(d, "form"))
+            .and_then(|f| get(f, "choices"));
+        match choices {
+            Some(DecodedValue::Array(items)) => items
+                .iter()
+                .filter_map(|i| match i {
+                    DecodedValue::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     // --- timeStamp encoding: stored value honored, stable, and distinct -----
