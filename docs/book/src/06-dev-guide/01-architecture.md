@@ -18,11 +18,18 @@ Types (NT) with diagrams. This guide assumes that vocabulary.
                  spvirit-codec        (PVA wire format + PVD codec + state tracker)
                     ┌──┴──────────┐
              spvirit-client   spvirit-server
-                    └──┬──────────┘
-              ┌────────┴────────┐
-        spvirit-tools      spvirit-py
-        (CLI binaries)     (PyO3 bindings)
+                    │              ├──────── spvirit-ioc   (scan/process; server-only)
+                    └──────┬───────┘
+                    ┌──────┴───────┐
+             spvirit-gateway   spvirit-py    (both consume client + server)
+             (proxy engine)    (PyO3 bindings)
+                    │
+             spvirit-tools
+             (CLI binaries; client + server + gateway)
 ```
+
+The authoritative dependency graph, including `spvirit-calc` (which stands
+apart), is the mermaid diagram on the [Crate map](../05-reference/crate-map.md).
 
 - **spvirit-types** — `ScalarValue`, `NtScalar`, `NtPayload`, etc. Everything
   the wire carries, as plain Rust data. Chapter 02.
@@ -35,9 +42,16 @@ Types (NT) with diagrams. This guide assumes that vocabulary.
 - **spvirit-server** — the `Source` provider model, `SimplePvStore` record
   store, protocol runtime (UDP search, TCP handler, beacons, monitors), `.db`
   parser, and the typed `Pv<T>` handle layer. Chapter 03.
-- **spvirit-tools** — 11 CLI binaries (`spget`, `spput`, `spmonitor`,
-  `spexplore`, `spserver`, …) plus the workspace's integration/interop test
-  suite. Chapter 04.
+- **spvirit-ioc** — the higher-level IOC layer built on the server: scan and
+  process infrastructure. Depends on the server (and codec/types), not the
+  client.
+- **spvirit-gateway** — the PVAccess proxy engine behind the `spgateway`
+  binary: it consumes both the client (to reach upstream servers) and the
+  server (to face downstream clients). Chapter 04 (`spgateway`).
+- **spvirit-tools** — 13 CLI binaries (`spget`, `spput`, `spmonitor`,
+  `spexplore`, `spserver`, `spgateway`, …) plus the workspace's
+  integration/interop test suite. Depends on `spvirit-gateway` for the
+  gateway binary. Chapter 04.
 - **spvirit-py** — PyO3 bindings mirroring the handle API in Python,
   plus Python-defined dynamic sources and a low-level channel/codec surface.
   Chapter 05.
@@ -67,10 +81,10 @@ mapping.
                      ┌────────────── PvaServer::run ──────────────┐
  client SEARCH ──► UDP responder          TCP handler ◄── client TCP
                         │                  │       ▲
-                        │            decode PUT    │ frames (writer task)
+                        │            decode PUT    │ frames (ConnWriter)
                         ▼                  ▼       │
                   SourceRegistry ──► SimplePvStore ──► MonitorRegistry
-                  (priority list)    (records, MDEL,     (per-sub delta
+                  (priority list)    (records, MDEL,     (self-contained
                    builtin @0        validators, links,   frames, pipeline
                    record-fields @10 on_put, timestamps)  credits)
                    user sources)           ▲
@@ -84,8 +98,12 @@ link evaluation → `store.set_value`). A third, for sources whose values
 change upstream (gateway, group), is a per-PV pump task that drains
 `Source::subscribe` — started at monitor init for any source that does not
 self-notify (`Source::pushes_own_updates`). All three end at
-`MonitorRegistry::notify_monitors`, which builds full-or-delta frames per
-subscriber and pushes bytes into each connection's writer channel.
+`MonitorRegistry::notify_monitors`, which builds a self-contained,
+fully-filtered frame per subscriber (the stored delta baseline serves only as
+a change detector, never as wire output) and hands the bytes to each
+connection's `ConnWriter` — a two-lane flat-combining writer that coalesces
+monitor frames on a latest-per-ioid lane while control replies take a
+lossless FIFO lane.
 
 ## Two API levels, everywhere
 

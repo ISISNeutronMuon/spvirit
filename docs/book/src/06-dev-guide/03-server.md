@@ -10,21 +10,24 @@ All paths under `spvirit-server/src/`.
 
 | File | ~Lines | Purpose |
 |---|---|---|
-| `pva_server.rs` | 2131 | `PvaServer` + `PvaServerBuilder` (classic API), `ServeBuilder`/`RunningServer` (handle API), shared record-construction helpers `make_scalar_record`/`make_output_record`/`make_array_record` |
-| `handler.rs` | 1818 | **The core.** TCP connection processor (`handle_connection`), UDP search responder (`run_udp_search`), TCP accept loop, `ServerState`, wildcard matching, GUID generation |
-| `simple_store.rs` | 1560 | `SimplePvStore`: in-memory `Source` backed by `RecordInstance`s — value/NT writes, subscribers, MDEL gate, link evaluation, PUT application, NTScalar descriptor builders |
+| `pva_server.rs` | 2335 | `PvaServer` + `PvaServerBuilder` (classic API), `ServeBuilder`/`RunningServer` (handle API), shared record-construction helpers `make_scalar_record`/`make_output_record`/`make_array_record` |
+| `handler.rs` | 2066 | **The core.** TCP connection processor (`handle_connection`), UDP search responder (`run_udp_search`), TCP accept loop, `ServerState`, wildcard matching, GUID generation, `MAX_PIPELINE_WINDOW` |
+| `simple_store.rs` | 1586 | `SimplePvStore`: in-memory `Source` backed by `RecordInstance`s — value/NT writes, subscribers, MDEL gate, link evaluation, PUT application, NTScalar descriptor builders |
 | `pv.rs` | 1498 | Typed handle layer: `Pv<T>`, `PvArray`, `AnyPv`, `PvScalar` trait, pending/bound state machine, builder methods, `attach` |
 | `group.rs` | 1161 | QSRV-style group PVs: `info(Q:group)` JSON parsing → `GroupPvDef`, and `GroupSource` composing members into `NtPayload::Generic` |
-| `types.rs` | 1011 | Record model: `RecordType`, `ScanMode`, `LinkExpr`, `DbCommonState`, `RecordData`, `RecordInstance` + value-mutation methods |
+| `types.rs` | 1104 | Record model: `RecordType`, `ScanMode`, `LinkExpr`, `DbCommonState`, `RecordData`, `RecordInstance` + value-mutation methods |
+| `apply.rs` | 1104 | Pure functions applying a decoded PUT to NT payloads (`apply_value_update`, `apply_table_put`, `apply_ndarray_put`, …) |
+| `db.rs` | 1090 | EPICS `.db` file parser (regex, line-oriented) |
 | `events.rs` | 736 | `Events`: server-wide `on_start` hooks, named `on_event` handlers, the `EventSink` trait, and the single-task dispatcher behind `post_event` |
-| `db.rs` | 717 | EPICS `.db` file parser (regex, line-oriented) |
-| `apply.rs` | 511 | Pure functions applying a decoded PUT to NT payloads (`apply_value_update`, `apply_table_put`, `apply_ndarray_put`, …) |
-| `record_fields.rs` | 467 | QSRV-style field access: serves `<pv>.<FIELD>` and `<pv>.<FIELD>$` as read-only channels; dbCommon defaults table |
-| `monitor.rs` | 311 | `MonitorRegistry`: per-PV subscriber lists, delta/full frame building, pipeline credit accounting |
+| `monitor.rs` | 724 | `MonitorRegistry`: per-PV subscriber lists, the per-connection `ConnWriter` map, `build_monitor_frame` (pure, self-contained frames), pipeline credit accounting, subscribe-only pump management |
+| `record_fields.rs` | 687 | QSRV-style field access: serves `<pv>.<FIELD>` and `<pv>.<FIELD>$` as read-only channels; dbCommon defaults table |
+| `pvstore.rs` | 572 | The **`Source` trait** + `PvInfo` + `SourceRegistry` |
+| `conn_writer.rs` | 484 | `ConnWriter`: the per-connection two-lane flat-combining writer (coalescing monitor lane + FIFO lossless control lane) that replaced the old mpsc-plus-writer-task tail |
+| `field_provider.rs` | 308 | `RecordFieldProvider`: the value-level field-access seam shared by `SimplePvStore` and `spvirit-ioc` (`field_descriptor` resolves type without a read) |
 | `convert.rs` | 276 | `DecodedValue` → `ScalarValue`/`ScalarArrayValue` conversions |
-| `pvstore.rs` | 259 | The **`Source` trait** + `PvInfo` + `SourceRegistry` |
-| `server.rs` | 183 | Orchestration: `run_pva_server_with_registry` binds TCP/UDP/beacon and joins the tasks |
-| `decode.rs` | 128 | PUT-body decoding with fallback strategies + segmented-message reassembly |
+| `server.rs` | 186 | Orchestration: `run_pva_server_with_registry` binds TCP/UDP/beacon and joins the tasks |
+| `request_ctx.rs` | 116 | Task-local per-connection request context (peer address now; `ca` user/host reserved for M2), visible to `Source` impls |
+| `decode.rs` | 110 | PUT-body decoding with fallback strategies + segmented-message reassembly |
 | `beacon.rs` | 67 | Periodic UDP beacon sender |
 | `state.rs` | 37 | Per-connection state: `ConnState`, `MonitorSub`, `MonitorState` |
 
@@ -81,13 +84,16 @@ TCP-accept and beacon tasks and joins them.
   (so a co-located p4p can share the port); answers Search packets whose names
   the registry claims. Response IP: advertise_ip → non-unspecified listen_ip →
   `infer_udp_response_ip` (connect-a-socket trick) → zeros.
-- **TCP connection** (handler.rs:778): per-connection reader plus a dedicated
-  **writer task** draining `mpsc::channel<Vec<u8>>(128)`. Handshake:
+- **TCP connection** (`handle_connection`, handler.rs:838): a per-connection
+  reader whose write half is wrapped in a [`ConnWriter`](#monitor-delivery-the-connwriter)
+  (handler.rs:848) — the flat-combining two-lane writer that replaced the old
+  dedicated writer task draining an `mpsc::channel<Vec<u8>>(128)`. Handshake:
   SET_BYTE_ORDER → CONNECTION_VALIDATION → client's validation →
   CONNECTION_VALIDATED. Then the command dispatch (CreateChannel; Op 10 GET /
   11 PUT / 12 PUT_GET / 13 MONITOR / 20 RPC; DestroyChannel; DestroyRequest;
-  GetField; Echo; AuthNZ silently accepted). Segmented-message reassembly at
-  handler.rs:878–946. Idle timeout enforced per-read.
+  GetField; Echo; AuthNZ silently accepted; CANCEL_REQUEST / ACL_CHANGE /
+  MESSAGE / MULTIPLE_DATA / ORIGIN_TAG and Op 14/16 answered with an error).
+  Idle timeout enforced per-read.
 - **Beacons** (beacon.rs): tick every `beacon_period` (default 15 s, 0
   disables), reading an `AtomicU16` change counter.
 
@@ -98,13 +104,24 @@ TCP-accept and beacon tasks and joins them.
 2. `SimplePvStore::put`: validator → apply under write lock → MDEL gate →
    in-process subscriber sends → returns changed `(name, payload)` list;
    `on_put` spawned; links evaluated (may append more changes).
-3. Handler's `notify_changed_records` (handler.rs:402) bumps the beacon
+3. Handler's `notify_changed_records` (handler.rs:410) bumps the beacon
    counter and calls `registry.notify_monitors` per change.
-4. `MonitorRegistry::notify_monitors` (monitor.rs:102) builds per-subscriber
-   frames — first frame full, later frames sparse delta (filtered subs) or
-   full-or-suppressed (unfiltered, suppressed when unchanged) — respecting
-   pipeline credits, and pushes bytes to each connection's sender.
-5. The connection's writer task writes to the socket.
+4. `MonitorRegistry::notify_monitors` (monitor.rs:221) builds one frame per
+   subscriber via the pure `build_monitor_frame` (monitor.rs:149) — first
+   frame full (possibly field-filtered); a **filtered** subscriber's later
+   frames are self-contained *full filtered* frames (not sparse deltas, so a
+   coalesced drop cannot corrupt the client's value), no-op-suppressed when the
+   filtered view is unchanged; an **unfiltered** subscriber gets full-or-
+   suppressed (suppressed when unchanged). Pipeline credit (`nfree`, capped at
+   `MAX_PIPELINE_WINDOW`) gates delivery. Each frame is then handed to the
+   subscriber's `ConnWriter` on the correct lane (`route_monitor_frame`,
+   monitor.rs:286).
+5. The `ConnWriter` delivers it: a **non-pipelined** monitor goes on the
+   coalescing monitor lane (latest-per-ioid, lossy under load); a **pipelined**
+   monitor goes on the FIFO lossless control lane so no charged credit is ever
+   coalesced away. Whichever task wins the flusher election drains the lanes
+   (control first) to the socket — in the common case inline on the producing
+   task, with no cross-thread wakeup.
 
 **Internal writes** (scan, `Pv::set`, links) enter at step 2 via
 `store.set_value` and notify monitors *from inside the store* (the store holds
@@ -129,13 +146,81 @@ nothing.
 ### Concurrency summary
 
 Tokio tasks: UDP-search loop, TCP-accept loop, beacon loop, one per
-connection + one writer task per connection, one per `.scan()`, detached
-`on_put` tasks, one per group-subscription fan-in, one monitor pump per
-subscribe-only PV under monitor. Locks: store `pvs`
+connection, one per `.scan()`, detached `on_put` tasks, one per
+group-subscription fan-in, one monitor pump per subscribe-only PV under
+monitor. Note there is **no** dedicated per-connection writer task any more:
+the `ConnWriter` flat-combines, so socket writes happen inline on whichever
+task deposited the frame and won the flusher election. Locks: store `pvs`
 (`RwLock`), monitor registry (`Mutex`), source registry (`RwLock`); each
-`Pv` handle's shared state is a **std `Mutex`** held only briefly, never
-across `.await`. Channels: per-connection outbound (128), per-subscriber
-NtPayload (64).
+`ConnWriter` guards its coalescing state with a **std `Mutex`** (never held
+across `.await`) and its socket write half with an async `Mutex`; each `Pv`
+handle's shared state is a **std `Mutex`** held only briefly, never across
+`.await`. Channels: per-subscriber NtPayload (64) — the store's
+`Source::subscribe` stream a monitor pump drains. The old per-connection
+outbound `mpsc(128)` is gone, subsumed by the `ConnWriter`.
+
+## Monitor delivery: the `ConnWriter`
+
+Every connection's write half is owned by a `ConnWriter` (conn_writer.rs),
+stored in `MonitorRegistry::conns` keyed by connection id. It replaced the old
+per-connection `mpsc(128)` plus a dedicated writer task with **flat combining**
+(Hendler, Incze, Shavit & Tzafrir, SPAA 2010): producers deposit complete PVA
+frames and one of them is elected "flusher" to drain them, so the common case
+writes inline on the producing task with no cross-thread wakeup.
+
+Two lanes give the combiner priority scheduling, decided at drain time when it
+holds the whole pending batch:
+
+- **`control`** — a `VecDeque<Vec<u8>>`: FIFO, never coalesced, never dropped.
+  Carries the handshake, GET/PUT/PUT_GET/RPC and monitor-**init** responses,
+  errors, and control frames. **Drained first**, so a monitor's INIT response
+  always precedes that ioid's DATA frames. Also carries every **pipelined**
+  monitor DATA frame (see below).
+- **`monitor`** — a `HashMap<u32, Vec<u8>>` keyed by ioid: latest-frame-per-ioid
+  conflation. A newer frame for an ioid replaces the older one, so intermediate
+  monitor values are dropped under load — exactly like pvxs/pvagw. Carries
+  **non-pipelined** monitor DATA frames only.
+
+`send_control` and `send_monitor` deposit under a std `Mutex` and, if no flusher
+is active, set the `flushing` flag and become the flusher. The drain, the
+empty-check and clearing `flushing` all happen under a single lock acquisition,
+so there is no lost wakeup. Cross-operation reordering is protocol-legal: PVA
+frames are correlated by request id, not stream position. A `dead` flag, set on
+the first socket-write error, makes all further deposits no-ops so a
+dead-but-not-closed peer cannot wedge producers. A `FlushGuard` gives cancel
+safety: if the flusher future is dropped mid-`write_all` (its task cancelled),
+the guard hands the election to a spawned continuation so pending bytes are
+never stranded and no depositor is wedged behind a stale `flushing == true`.
+
+**Frame building is pure.** `MonitorRegistry::build_monitor_frame` (monitor.rs:149)
+takes only a `MonitorSub` and an `NtPayload` and returns `Option<Vec<u8>>`:
+`Some(bytes)` when there is something to send, `None` for a no-op (a duplicate
+under the subscriber's field view). A `None` **does not consume pipeline
+credit** and does not advance the delta baseline. Because the monitor lane may
+drop intermediate frames, every subsequent filtered frame is a *self-contained
+full filtered* frame, not a sparse delta — a dropped self-contained frame is
+harmless, whereas a dropped delta would silently corrupt the client's value.
+
+**Pipelined flow control is lossless.** A `MonitorSub` (state.rs) carries per-sub
+`nfree`, `last_snapshot`, `filtered_desc` and `pipeline_enabled`. Pipelined
+subscribers do credit-based flow control, so every charged frame must arrive;
+`route_monitor_frame` (monitor.rs:286) sends their frames on the lossless
+**control** lane, never the coalescing monitor lane — coalescing one away would
+spend a credit the client never receives and drift its window until it stalls.
+The client-supplied window is capped server-side at `MAX_PIPELINE_WINDOW = 4096`
+(handler.rs:48) at three points: monitor init, ACK refill, and the registry's
+`update_monitor_subscription` gate — so a stalled pipelined client cannot grow
+the lossless lane without bound.
+
+Pump retirement is **cooperative** (a `oneshot` shutdown signal, not `abort`):
+aborting a pump could drop its future mid-`write_all` inside a shared
+`ConnWriter` and wedge that connection's flusher, so `retire_pump_if_idle`
+lets any in-flight `notify_monitors` finish first.
+
+> The standalone [`spserver`](../04-tools/spserver.md) binary is a separate
+> implementation and does **not** use `ConnWriter`; it keeps the older
+> per-connection `mpsc(128)` plus a writer task, borrowing only the pure
+> `build_monitor_frame`. It has no `MAX_PIPELINE_WINDOW` cap.
 
 ## Record model and .db parsing
 

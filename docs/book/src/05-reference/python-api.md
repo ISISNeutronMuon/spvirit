@@ -39,14 +39,19 @@ A compiled PyO3 extension, not a pure-Python package. Wheels ship for the
 usual platforms; building from source needs a Rust toolchain. See
 [Installation](../02-getting-started/install.md).
 
-## The four layers
+## The layers
 
 | Layer | Import | What it gives you |
 |---|---|---|
-| Typed PV handles | `spvirit.ai`, `spvirit.ao`, … | IOC-style records you keep a handle to. The one to start with. |
-| Server + store | `spvirit.Server` | Runs the PVAccess server; `store` reaches records by name. |
+| Typed PV handles (tier 2) | `spvirit.ai`, `spvirit.ao`, … | IOC-style records you keep a handle to. The one to start with. |
+| IOC engine (tier 3) | `spvirit.ioc.ai`, …, `spvirit.Ioc` | A processing IOC built from record specs or `.db` text. Verbatim EPICS field names (`EGU`, `PREC`, …), record graph, `.db` round-trip. |
+| Server + store | `spvirit.Server` | Runs the PVAccess server; `store` reaches records by name. Accepts `pvs=`, `ioc=`, `sources=`, and `.db` via `db_file=`/`db_string=`. |
 | Client | `spvirit.get`, `spvirit.put`, `spvirit.monitor`, `spvirit.Channel` | Reading and writing other people's PVs. |
 | Low level | `spvirit.lowlevel`, `spvirit.codec` | Raw frames and wire encoding, for proxies and analysers. |
+
+Monitor callbacks (`spvirit.monitor`, `Subscription`, `Channel.monitor`)
+receive a `MonitorUpdate` — `.value` plus `.changed`/`.overrun` (dotted field
+paths) and `.has_overrun` — rather than the bare value.
 
 ## Constructors
 
@@ -61,6 +66,13 @@ mbbi  mbbo  waveform  aai  aao  calc  pv  scalar
 than getting it from the constructor name. The full type-coverage table (which
 NT scalar types each constructor accepts) is in the
 [README's *NT scalar type coverage* section](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md#nt-scalar-type-coverage).
+
+The tier-3 IOC layer has its own record constructors under `spvirit.ioc`
+(`ai ao bi bo longin longout`). These take **verbatim EPICS field names** as
+keyword arguments — `spvirit.ioc.ao("SETP", EGU="V", PREC=3)`, not tier 2's
+`units=`/`prec=` — because a tier-3 record round-trips to `.db` text. Pass the
+resulting specs to `spvirit.Ioc(records=[...])` (or build from `db_file=` /
+`db_string=`).
 
 ## Sync and async
 
@@ -81,7 +93,7 @@ because the server object is mutable and the failure is silent. See
 
 ## Examples
 
-`spvirit-py/examples/` holds around thirty runnable scripts — one concept
+`spvirit-py/examples/` holds around forty runnable scripts — one concept
 each. The ones the book's chapters use directly:
 
 | Script | Chapter |

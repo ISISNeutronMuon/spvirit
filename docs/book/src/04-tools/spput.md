@@ -64,7 +64,7 @@ safe in a script.
 
 **A rejected write reaches the server twice.** When the full flow fails,
 `spput` silently falls back to the simple flow
-(`spvirit-tools/src/bin/spvirit_put.rs:214`). A server-side `on_put`
+(`spvirit-tools/src/bin/spvirit_put.rs:236`). A server-side `on_put`
 callback therefore fires once for an accepted write and twice for a
 rejected one. Pass `--no-flow-fallback` to suppress the retry, and write
 `on_put` callbacks to be idempotent either way — see

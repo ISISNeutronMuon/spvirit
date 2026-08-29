@@ -20,11 +20,11 @@ exist on a server, and must be writable.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--freq HZ` | — | sine frequency |
-| `--rate N` | — | writes per second |
-| `--amp A` | — | amplitude |
-| `--offset O` | — | vertical offset |
-| `--phase RAD` | — | phase in radians |
+| `--freq HZ` | 1 | sine frequency |
+| `--rate N` | 10 | writes per second |
+| `--amp A` | 1 | amplitude |
+| `--offset O` | 0 | vertical offset |
+| `--phase RAD` | 0 | phase in radians |
 | `--duration SECS` | 0 | run time; 0 means forever |
 
 The value written is `offset + amp * sin(2π · freq · t + phase)`.

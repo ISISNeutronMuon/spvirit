@@ -46,6 +46,33 @@ DODECA:IMAGE 2026-08-04 10:46:46.086 {ubyteValue=[0, 0, 0, 0, 0, ...]}
 field — the frame is 8-bit greyscale. `spinfo DODECA:IMAGE` prints the
 whole union and the `dimension` list alongside it.
 
+## Controlling the rotation
+
+Alongside the image, the server serves three writable `double` scalar PVs
+that set the spin rate about each axis, in rad/s:
+
+| PV | Default | Axis |
+|---|---|---|
+| `DODECA:SPEED_X` | 0.3 | pitch |
+| `DODECA:SPEED_Y` | 0.5 | yaw |
+| `DODECA:SPEED_Z` | 0.15 | roll |
+
+They share the image PV's prefix — the part before the first `:` — so
+`--pv RIG:CAM` serves `RIG:SPEED_X` and so on, not `DODECA:SPEED_X`. Put
+to one and the rotation changes live; monitor one and you see writes from
+other clients echoed back.
+
+```console
+$ spput DODECA:SPEED_Y 2.0     # spin faster about the vertical axis
+DODECA:SPEED_Y OK
+$ spput DODECA:SPEED_X 0        # stop the pitch entirely
+DODECA:SPEED_X OK
+```
+
+Setting all three to `0` freezes the wireframe — a still test image
+rather than a moving one. The image PV itself is read-only; a PUT to it is
+rejected.
+
 ## What it is for
 
 **Testing an image client.** Area-detector viewers are hard to develop

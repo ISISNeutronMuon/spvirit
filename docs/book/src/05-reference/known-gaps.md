@@ -19,7 +19,7 @@ Nothing here is a plan. These are findings, not commitments.
 `OK`. The record does not change.
 
 **Why.** The `NtEnum` arm of `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:611`) accepts a field literally named
+(`spvirit-server/src/apply.rs:631`) accepts a field literally named
 `value` carrying a scalar integer. A wire PUT of an enum delivers `value` as
 a sub-structure, so no branch matches, `changed` stays false, and the
 operation reports success.
@@ -71,7 +71,7 @@ in the payload's `valueAlarm` structure. Severity stays `NO_ALARM` however
 far the value goes past them.
 
 **Why.** Severity computation is gated on the server-wide `compute_alarms`
-flag, which defaults to `false` (`spvirit-server/src/server.rs:55`). The
+flag, which defaults to `false` (`spvirit-server/src/server.rs:57`). The
 handle-level limits do not turn it on.
 
 **Consequence.** A PV that looks alarmed to a human reading the metadata and
@@ -91,7 +91,7 @@ twice; an accepted write reaches it once.
 
 **Why.** When the full EPICS-Base-style PUT flow fails, `spput` falls back to
 the simple flow without saying so
-(`spvirit-tools/src/bin/spvirit_put.rs:214`).
+(`spvirit-tools/src/bin/spvirit_put.rs:237`).
 
 **Consequence.** Any `on_put` with a side effect — a log line, a counter, a
 hardware poke — doubles up on exactly the writes you were trying to refuse.
@@ -103,7 +103,8 @@ hardware poke — doubles up on exactly the writes you were trying to refuse.
 
 ## 5. `ADEL` is parsed and exposed but not applied
 
-`MDEL` gates monitor posts (`spvirit-server/src/simple_store.rs:545`).
+`MDEL` gates monitor posts (`should_post_update`,
+`spvirit-server/src/simple_store.rs:571`).
 `ADEL` — the archive deadband — is read out of the `.db` file and readable
 as a field, and no posting logic consults it. A `.db` that relies on `ADEL`
 behaves as though it were absent.
@@ -111,7 +112,7 @@ behaves as though it were absent.
 ## 6. Wire PUT is not wired for generic structures
 
 The `Generic` arm of `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:639`) is a no-op — it returns `false` without
+(`spvirit-server/src/apply.rs:659`) is a no-op — it returns `false` without
 looking at the PUT body. `NtTable` and `NtNdArray` are wired (both arms call
 into `apply.rs`'s table/ndarray helpers), so a generic record is now the one
 kind that reports itself writable and silently discards every wire PUT — the
@@ -129,7 +130,7 @@ routes that cannot produce a `longin`. The matrix is on
 
 The server answers PVA command `CANCEL_REQUEST` with
 `"CANCEL_REQUEST command is not supported"`
-(`spvirit-server/src/handler.rs:1773`). `ACL_CHANGE`, `MESSAGE`,
+(`spvirit-server/src/handler.rs:1795`). `ACL_CHANGE`, `MESSAGE`,
 `MULTIPLE_DATA`, `ORIGIN_TAG` and commands 14 and 16 likewise return errors.
 Clients that cancel a request rather than destroying the channel will see the
 error; the common clients do not.
@@ -182,6 +183,8 @@ client RPC entry point yet, so an RPC to the gateway returns
 is no longer a passthrough-only gap. What remains unwired: the `x-spvirit`
 metrics, audit, hot-reload, and rate-limit blocks are parsed and validated
 but not consumed, and RPC forwarding to upstream servers is not implemented.
+The per-client `acf-client` field is likewise parsed and referentially
+validated against the `clients[]` list but never consulted at runtime.
 Ctrl-C shutdown is immediate: outstanding requests are hard-cancelled rather
 than drained gracefully.
 

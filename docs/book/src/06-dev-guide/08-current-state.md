@@ -65,6 +65,22 @@ exists and exercises the full surface: `NtScalar`/`NtScalarArray`
 
 Cross-referenced from the per-crate chapters.
 
+> **Crate audit + remediation, 2026-08-29 (landed on branch
+> `audit-remediation-2026-08-29`, not yet on `main`).** A workspace-wide
+> adversarial audit — one pass per crate — produced fixes across the high and
+> medium tiers, since committed on that branch. Load-bearing landings: the
+> server monitor writer is now the two-lane flat-combining `ConnWriter`
+> (`spvirit-server/src/conn_writer.rs`), which coalesces monitor frames on a
+> latest-per-ioid lane and keeps control replies on a lossless FIFO lane,
+> building self-contained per-subscriber frames (the stored delta serves only
+> as a change detector); client-supplied pipeline windows (`nfree`) are now
+> clamped to `MAX_PIPELINE_WINDOW = 4096` at every assignment from client
+> input (server `handler.rs` and `monitor.rs`, and the `spserver` binary);
+> Python `Notifier.notify` delivers monitor updates in order rather than via
+> fire-and-forget spawns; `spvirit-calc` uses `wrapping_rem` to avoid an
+> `i32::MIN % -1` panic; and the IOC layer prunes dead `field_subs`. Reconcile
+> against `git log` before relying on any of this.
+
 > **Codec-gaps effort, 2026-08-07 (landed).** Three of the protocol/codec
 > entries below are struck through: segmentation reassembly, the heuristic
 > monitor bitset ordering, and silent array truncation. Delivered as a

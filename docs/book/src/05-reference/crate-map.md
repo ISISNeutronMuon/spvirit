@@ -6,9 +6,9 @@
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
 
-Spvirit is seven crates in one workspace. They are published separately, so
-you depend on the layer you need and nothing above it. Six of them form the
-layered stack below; the seventh, `spvirit-calc`, stands apart.
+Spvirit is nine crates in one workspace. They are published separately, so
+you depend on the layer you need and nothing above it. Eight of them form the
+layered stack below; the last, `spvirit-calc`, stands apart.
 
 ## The layering
 
@@ -18,6 +18,8 @@ graph TD
     codec[spvirit-codec]
     client[spvirit-client]
     server[spvirit-server]
+    ioc[spvirit-ioc]
+    gateway[spvirit-gateway]
     tools[spvirit-tools]
     py[spvirit-py]
 
@@ -26,8 +28,16 @@ graph TD
     client --> types
     server --> codec
     server --> types
+    ioc --> server
+    ioc --> codec
+    ioc --> types
+    gateway --> client
+    gateway --> server
+    gateway --> codec
+    gateway --> types
     tools --> client
     tools --> server
+    tools --> gateway
     tools --> codec
     tools --> types
     py --> client
@@ -48,10 +58,12 @@ the codec and the type vocabulary underneath it.
 | `spvirit-codec` | `spvirit-types` | You are encoding or decoding PVAccess frames yourself — a proxy, an analyser, a test harness. | [docs.rs](https://docs.rs/spvirit-codec/latest/spvirit_codec/) |
 | `spvirit-client` | `spvirit-codec` | You are reading, writing, or monitoring PVs from Rust. | [docs.rs](https://docs.rs/spvirit-client/latest/spvirit_client/) |
 | `spvirit-server` | `spvirit-codec` | You are serving PVs: a soft IOC, a simulator, a gateway. | [docs.rs](https://docs.rs/spvirit-server/latest/spvirit_server/) |
-| `spvirit-tools` | client + server | You want the `sp*` command-line programs. Also usable as a library, but it exists mainly to ship binaries. | [docs.rs](https://docs.rs/spvirit-tools/latest/spvirit_tools/) |
+| `spvirit-ioc` | codec + server | You want the higher-level IOC layer built on the server (scan/process infrastructure). | [docs.rs](https://docs.rs/spvirit-ioc/latest/spvirit_ioc/) |
+| `spvirit-gateway` | client + server | You are building a PVAccess gateway — the proxy engine behind `spgateway`. | [docs.rs](https://docs.rs/spvirit-gateway/latest/spvirit_gateway/) |
+| `spvirit-tools` | client + server + gateway | You want the `sp*` command-line programs. Also usable as a library, but it exists mainly to ship binaries. | [docs.rs](https://docs.rs/spvirit-tools/latest/spvirit_tools/) |
 | `spvirit-py` | client + server | The `spvirit` Python module. A PyO3 extension, not a pure-Python package. | [Python API](python-api.md) |
 
-A seventh crate, `spvirit-calc`
+The remaining crate, `spvirit-calc`
 ([docs.rs](https://docs.rs/spvirit-calc/latest/spvirit_calc/)), implements
 the EPICS CALC expression language. It is a workspace member and is published
 alongside the rest, but nothing in the diagram above depends on it — it stands
@@ -74,7 +86,7 @@ Only `spvirit-tools` is feature-gated:
 | Feature | Default | Gates |
 |---|---|---|
 | `client` | yes | `spget`, `spput`, `spmonitor`, `spinfo`, `splist`, `spsine`, `spget_compare` |
-| `server` | yes | `spserver`, `spdodeca` |
+| `server` | yes | `spserver`, `spdodeca`; also required (with `client`) by `spgateway` |
 | `tui` | yes | `spexplore`, `spsearch`; also required (with `server`) by `sptable` |
 
 All three are on by default. A build with `--no-default-features` produces
@@ -82,8 +94,8 @@ All three are on by default. A build with `--no-default-features` produces
 wondering where they went. See
 [Installation](../02-getting-started/install.md).
 
-`spvirit-types`, `spvirit-codec`, `spvirit-client` and `spvirit-server`
-declare no features.
+`spvirit-types`, `spvirit-codec`, `spvirit-client`, `spvirit-server`,
+`spvirit-ioc`, `spvirit-gateway` and `spvirit-calc` declare no features.
 
 ## Where to read further
 

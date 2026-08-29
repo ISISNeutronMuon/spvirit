@@ -28,7 +28,8 @@ the value itself is inside the deadband.
 
 **Alarm transitions always post.** The MDEL deadband gates value changes
 only — a severity change reaches every subscriber regardless of how small
-the value moved (`spvirit-server/src/simple_store.rs:545`).
+the value moved (`should_post_update`,
+`spvirit-server/src/simple_store.rs:571`).
 
 ## Two ways to get a severity
 
@@ -112,7 +113,7 @@ SIM:PRESSURE  95          # no MINOR, despite high = 90
 The cause is two parallel sets of fields. `Pv::alarm_limits` writes
 `nt.value_alarm_*` (`spvirit-server/src/pv.rs:329`), while the evaluator
 `update_alarm_from_value` reads `nt.alarm_low`/`alarm_high`/`alarm_lolo`/
-`alarm_hihi` (`spvirit-types/src/lib.rs:285`) — and only the `.db` loader
+`alarm_hihi` (`spvirit-types/src/lib.rs:271`) — and only the `.db` loader
 populates those (`spvirit-server/src/db.rs:360`).
 
 So today: **computed alarms require a `.db` file.** For handle-built PVs,

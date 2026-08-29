@@ -35,7 +35,7 @@ flowchart TD
 
     NTT --> L["labels + columns"]
     NTNA --> DIM["dimensions + codec + attributes"]
-    NTE --> V3["index: u32 + choices: Vec&lt;String&gt;"]
+    NTE --> V3["index: i32 + choices: Vec&lt;String&gt;"]
     NTE --> A3["alarm"]
 ```
 
@@ -45,7 +45,7 @@ flowchart TD
 |---|---|---|---|
 | NTScalar | `NtScalar` | `ScalarValue` (f64, i32, bool, String, …) | Single-value PVs (`ai`, `ao`, `bi`, `bo`, …) |
 | NTScalarArray | `NtScalarArray` | `ScalarArrayValue` (`Vec<f64>`, `Vec<i32>`, …) | Array PVs (`waveform`, `aai`, `aao`) |
-| NTEnum | `NtEnum` | index (`u32`) + choices (`Vec<String>`) | Multi-bit binary records (`mbbi`, `mbbo`) |
+| NTEnum | `NtEnum` | index (`i32`) + choices (`Vec<String>`) | Multi-bit binary records (`mbbi`, `mbbo`) |
 | NTTable | `NtTable` | Named columns of `ScalarArrayValue` | Tabular data |
 | NTNDArray | `NtNdArray` | `ScalarArrayValue` + dimensions + attributes | Image / detector data (areaDetector) |
 
@@ -62,8 +62,12 @@ The value is the small part. An `NtScalar` also carries:
 - **timeStamp** — seconds past epoch, nanoseconds, and a user tag. The
   server stamps this automatically for IOC-style records.
 - **display** — units (`EGU`), precision (`PREC`), display limits
-  (`HOPR`/`LOPR`), a description, and for binary records the `form.choices`
-  list that carries `ZNAM`/`ONAM`.
+  (`HOPR`/`LOPR`), a description, and a `form` sub-structure whose
+  `choices` list is the seven standard display-format names (`Default`,
+  `String`, `Binary`, `Decimal`, `Hex`, `Exponential`, `Engineering` — the
+  `STANDARD_FORM_CHOICES` static in `spvirit-types`). It does **not** carry
+  `ZNAM`/`ONAM`; those `bi`/`bo` state names are stored on the record, not in
+  the NTScalar payload.
 - **control** — drive limits (`DRVH`/`DRVL`) and a minimum step.
 - **valueAlarm** — the `HIHI`/`HIGH`/`LOW`/`LOLO` thresholds the server uses
   to compute severity.

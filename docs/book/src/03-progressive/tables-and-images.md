@@ -85,7 +85,7 @@ interest.
 ## What to notice
 
 **Both types accept a wire PUT.** `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:609`) dispatches `NtTable` and `NtNdArray` PUTs
+(`spvirit-server/src/apply.rs:629`) dispatches `NtTable` and `NtNdArray` PUTs
 to `apply_table_put`/`apply_ndarray_put`, so a client write updates the
 record and restamps it like any other. The examples above still use
 `store.put_nt(...)` because that is the natural way to drive a

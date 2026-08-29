@@ -16,6 +16,7 @@ PVAccess traffic between an upstream "client" network and a downstream
 spgateway <config.json>
 spgateway -T <config.json>
 spgateway --test-config <config.json>
+spgateway -v <config.json>
 ```
 
 Requires the `client` and `server` features.
@@ -23,6 +24,10 @@ Requires the `client` and `server` features.
 | Flag | Meaning |
 |---|---|
 | `-T`, `--test-config` | Parse and validate the configuration, print `OK` or the error, and exit (0 on success, 1 on error). Does not start the gateway. |
+| `-v`, `--verbose` | Raise the log level from the default `INFO` to `DEBUG`. Ignored under `-T`. |
+
+Flags may appear in any position relative to the config path; the first
+non-flag argument is taken as the config file.
 
 ## Validating a configuration
 
@@ -49,6 +54,12 @@ receives Ctrl-C. Each server resolves names across its configured `clients`
 fans out monitors — proxying between the upstream "client" network and the
 downstream "server" network. Requires the `client` and `server` features.
 
+A normal start is not silent: the gateway installs a tracing subscriber at
+`INFO` and logs a one-line-per-server startup banner (which port each server
+listens on and which upstreams it proxies), plus one `Status PV: …` line per
+status PV when a `statusprefix` is set, plus any warnings/errors. `-v` adds
+per-module `DEBUG` detail.
+
 ## Status
 
 M1 is a **passthrough** gateway with access control enforced: it resolves,
@@ -61,7 +72,9 @@ the `x-spvirit` metrics / audit / hot-reload / rate-limit blocks, RPC
 forwarding to upstream servers (the local `asTest` status RPC below is
 answered by the gateway itself, not proxied), and a true upstream `pvlist`
 fan-out for downstream `splist` (`names()` reports only PVs this gateway has
-already claimed). Ctrl-C shutdown is immediate rather than a graceful drain.
+already claimed), and the per-server `acf-client` field (parsed and
+referentially validated against `clients[]`, but not yet consulted at
+runtime). Ctrl-C shutdown is immediate rather than a graceful drain.
 These and the representation limits (array-of-structure, `union`/`any`,
 non-finite floats, multi-token `addrlist`) are collected on the
 [Known gaps](../05-reference/known-gaps.md) page.
@@ -87,6 +100,12 @@ fail-closed design, matching p4p/pvagw.
 parse; `CALC` guard expressions in a `RULE` are a hard parse error rather than
 being silently ignored, so a config that depends on `CALC` fails `-T`
 validation instead of serving with a weaker rule than the operator intended.
+A duplicate `UAG`, `HAG`, or `ASG` name is also a hard parse error, so a
+second definition can never silently shadow the first. `READ`/`GET`,
+`WRITE`/`PUT`, and `RPC` are the recognised `RULE` operations; any other
+op keyword is rejected. Referenced but undefined `UAG`/`HAG` names, and an
+`ASG` absent from the file, fail closed (they grant nothing) rather than
+erroring.
 
 ### Fail-closed configuration loading
 

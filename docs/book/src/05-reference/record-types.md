@@ -43,7 +43,8 @@ If you are not sure whether you want a record at all, read
 ² `RecordType::from_db_name` maps twelve `.db` spellings, including `mbbi`
 (also spelled `ntenum`) and `mbbo`. Those two then reach an arm in
 `spvirit-server/src/db.rs:550` that prints *"is not a standard EPICS Base
-record type and cannot be loaded from .db files"* and drops the record.
+record type and cannot be loaded from .db files"* (message at db.rs:558) and
+drops the record.
 `mbbi` and `mbbo` **are** standard EPICS Base record types; the message is
 wrong. See [Known gaps](known-gaps.md).
 
@@ -52,7 +53,7 @@ an enum index is currently dropped — see [Known gaps](known-gaps.md).
 
 ⁴ Writable via a client PUT as well as `store.put_nt()`. The `NtTable`/
 `NtNdArray` arms of `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:609`) apply the wire fields and restamp the
+(`spvirit-server/src/apply.rs:629`) apply the wire fields and restamp the
 record.
 
 ## Reading the columns

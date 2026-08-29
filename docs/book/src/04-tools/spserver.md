@@ -25,9 +25,9 @@ Requires the `server` feature.
 | `--udp-port PORT` | 5076 | PVA search port |
 | `--reload-interval SECS` | 2 | how often to re-read the `.db` file |
 | `--advertise-addr ADDR` | — | address to put in search responses |
-| `--beacon-period SECS` | — | beacon interval |
-| `--beacon-addr IP:PORT` | — | beacon target |
-| `--conn-timeout SECS` | — | idle connection timeout |
+| `--beacon-period SECS` | 15 | beacon interval; `0` disables beacons |
+| `--beacon-addr IP:PORT` | `224.0.0.128:5076` | beacon target (auto-switches to `[ff02::42:1]:5076` when `--listen-addr` is IPv6) |
+| `--conn-timeout SECS` | 64000 (~17.8 h) | idle connection timeout; overridable via the `EPICS_PVA_CONN_TMO` env var |
 | `--compute-alarms` | off | derive severity from `LOW`/`HIGH`/`LOLO`/`HIHI` |
 | `--pvlist-mode MODE` | `list` | `off`, `discover`, or `list` |
 | `--pvlist-max N` | 1024 | cap on names returned by a listing |

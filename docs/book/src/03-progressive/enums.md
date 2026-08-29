@@ -61,8 +61,9 @@ and cannot be loaded from .db files
 ```
 
 The message is misleading — `mbbi` *is* a standard EPICS Base record type;
-it is spvirit's `.db` loader that does not build it
-(`spvirit-server/src/db.rs:550`). Build enum records in code.
+it is spvirit's `.db` loader that does not build it — the `mbbi`/`mbbo` arm
+at `spvirit-server/src/db.rs:550` (message at db.rs:558). Build enum records
+in code.
 
 **Writing to an `mbbo` from a client does not work today.** The record is
 advertised writable and the PUT is accepted on the wire — `spput` prints
@@ -77,10 +78,12 @@ $ spget SIM:MODE
 SIM:MODE {index=0, choices=["Standby", "Acquire", "Calibrate"]}
 ```
 
-The store's enum PUT branch (`spvirit-server/src/simple_store.rs:616`)
-matches only a bare integer under `value`, but the NTEnum wire format nests
-the index one level deeper as `value.index`, so the update is dropped
-silently. **Drive enum records server-side with `pv.set(index)`** and treat
+The enum PUT branch (`RecordInstance::apply_put` →
+`RecordData::NtEnum`, `spvirit-server/src/apply.rs:631`) matches only a bare
+integer under `value` (`DecodedValue::Int32`/`Int64`/…), but the NTEnum wire
+format nests the index one level deeper as `value.index` — a sub-structure no
+arm matches, so the update is left alone. The code comment there flags this as
+Known gap #1. **Drive enum records server-side with `pv.set(index)`** and treat
 them as read-only from the client until this is fixed.
 
 **Out-of-range indices are rejected, not clamped.** The store checks

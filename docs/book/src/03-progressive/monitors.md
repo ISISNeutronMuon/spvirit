@@ -58,9 +58,18 @@ dead subscription looks exactly like a quiet PV.
 Every update carries two bitsets: **changed**, the fields this delta actually
 contains, and **overrun**, the fields for which the server dropped at least
 one earlier update before sending this one. An overrun means you are seeing
-the latest value but not every value — the server's monitor queue for your
-subscription filled up. Raising the queue depth with
-`MonitorOptions::pipelined(q)`, or doing less work in the callback, is the fix.
+the latest value but not every value. Raising the queue depth with
+`MonitorOptions::pipelined(q)`, or doing less work in the callback, is the fix:
+a pipelined subscription is delivered losslessly, so it is never conflated.
+
+> **spvirit's own server does not populate the overrun bitset.** Under load it
+> conflates a non-pipelined subscriber's queued updates down to the latest value
+> per subscription — dropping the intermediate ones — and still sends an *empty*
+> overrun bitset, so `has_overrun()` stays `false` even when frames were
+> silently dropped. The bits remain meaningful against servers that do set them
+> (a real EPICS IOC, or pvxs), and pipelining a spvirit subscription avoids the
+> drops entirely. So treat the overrun API as "believe it when it fires," not as
+> a promise that a quiet stream lost nothing.
 
 In Rust, `update.changed` and `update.overrun` are the raw bitset bytes;
 `changed_paths()` and `overrun_paths()` resolve them to dotted field names,
@@ -96,11 +105,12 @@ reporting the whole value rather than naming individual fields.
 $ spmonitor SIM:TEMPERATURE
 ```
 
-`spmonitor` prints overruns to stderr, one line per affected update, so they
-never contaminate the value stream on stdout:
+When the server reports overruns — a real EPICS IOC or pvxs, not spvirit's own
+server (see the note above) — `spmonitor` prints them to stderr, one line per
+affected update, so they never contaminate the value stream on stdout:
 
 ```console
-SIM:TEMPERATURE: overrun on value, alarm.severity
+SOME:IOC:PV: overrun on value, alarm.severity
 ```
 
 ## What to notice

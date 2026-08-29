@@ -2,25 +2,25 @@
 
 ## spvirit-client
 
-Library-only crate (~4,900 LOC). Deps: `spvirit-types`, `spvirit-codec`,
+Library-only crate (~5,300 LOC). Deps: `spvirit-types`, `spvirit-codec`,
 `tokio`, `serde_json`, `dns-lookup`, `get_if_addrs`, `socket2`, `chrono`.
 **No TLS crate — TLS is the biggest known gap.**
 
 | File | ~LOC | Purpose |
 |---|---|---|
-| `pva_client.rs` | 970 | High-level API: `PvaClient`, `PvaClientBuilder`, `PvaChannel` (streaming PUT), monitor loop, pvinfo |
-| `search.rs` | 1233 | UDP broadcast/multicast search + discovery, TCP name-server search, `resolve_pv_server`, EPICS env vars |
-| `pvlist.rs` | 766 | PV-name listing with 4 fallback strategies (`__pvlist`, GET_FIELD, server RPC, server GET) |
-| `put_encode.rs` | 673 | JSON→PVD PUT payload encoder (bitset partial encoding, scalars/arrays/unions/variants) |
-| `client.rs` | 311 | Low-level channel lifecycle: `establish_channel`, `pvget`/`pvget_fields` |
+| `pva_client.rs` | 1091 | High-level API: `PvaClient`, `PvaClientBuilder`, `PvaChannel` (streaming PUT), monitor loop, pvinfo |
+| `search.rs` | 1290 | UDP broadcast/multicast search + discovery, TCP name-server search, `resolve_pv_server`, EPICS env vars |
+| `pvlist.rs` | 771 | PV-name listing with 4 fallback strategies (`__pvlist`, GET_FIELD, server RPC, server GET) |
+| `put_encode.rs` | 633 | JSON→PVD PUT payload encoder (bitset partial encoding, scalars/arrays/unions/variants) |
+| `client.rs` | 358 | Low-level channel lifecycle: `establish_channel`, `pvget`/`pvget_fields` |
 | `format.rs` | 521 | Output rendering (text/JSON), NT metadata extraction, NTTable formatting |
-| `types.rs` | 88 | `PvOptions`, `PvGetResult`, `PvMonitorEvent`, `PvGetError` |
-| `transport.rs` | 61 | `read_packet` / `read_until` framed-packet readers |
+| `types.rs` | 97 | `PvOptions`, `PvGetResult`, `PvMonitorEvent`, `PvGetError` |
+| `transport.rs` | 532 | Framed-packet readers: `read_frame` (blocks through mid-frame stalls), `read_frame_resumable` (persistent `FrameBuf`, deadline-bounded, resumes after a dropped read), `read_until`, `read_packet` |
 | `auth.rs` | 25 | AuthNZ user/host resolution (options → env → "unknown") |
 
 ### Discovery and search (`search.rs`)
 
-`resolve_pv_server` (search.rs:749) is the entry point: an explicit
+`resolve_pv_server` (search.rs:872) is the entry point: an explicit
 `server_addr` short-circuits; otherwise all strategies run concurrently in a
 `JoinSet` (one TCP name-server search per configured server + one UDP search),
 first success wins, rest aborted.
@@ -30,15 +30,15 @@ first success wins, rest aborted.
   directed broadcast + IPv4 multicast `224.0.0.128` + IPv6 `ff02::42:1` —
   multicast added because Docker overlay networks may block broadcast).
 - Retransmit schedule: 100/500/1000/2000 ms within the overall timeout.
-- **Ephemeral source port is intentional** (search.rs:376): binding the client
+- **Ephemeral source port is intentional** (search.rs:400): binding the client
   to 5076 with SO_REUSEPORT loops packets back to the sender on Linux. Do not
   "fix" this.
-- **SO_REUSEADDR is Unix-only** (search.rs:321): deliberately skipped on
+- **SO_REUSEADDR is Unix-only** (search.rs:323): deliberately skipped on
   Windows where the semantics are unsafe. Also do not "fix".
 
 ### Operations
 
-- **Channel setup** (`establish_channel`, client.rs:56): TCP connect → learn
+- **Channel setup** (`establish_channel`, client.rs:121): TCP connect → learn
   version + byte order from the first packets → client validation (authnz
   "ca") → wait for ConnectionValidated → CREATE_CHANNEL (**cid hardcoded to
   1** — fine for one-shot connections, a hazard if you ever multiplex).
@@ -54,12 +54,17 @@ first success wins, rest aborted.
   introspection, echo keepalive after 10 s idle, background reader aborted on
   Drop).
 - **MONITOR**: INIT → START = `0x44` (START|GET). Callback
-  `FnMut(&DecodedValue) -> ControlFlow<()>`; `Break` sends best-effort
-  DESTROY. Read timeouts are non-fatal (`continue`); 10 s echo keepalive.
-  Pipelining (`MonitorOptions::pipelined(n)`) encodes
+  `FnMut(&MonitorUpdate) -> ControlFlow<()>`; `Break` sends best-effort
+  DESTROY. Read timeouts are non-fatal (`continue`); 10 s echo keepalive. The
+  loop reads with `read_frame_resumable` over a persistent `FrameBuf`: the
+  echo-keepalive `select!` branch drops the in-flight read every ~10 s, and the
+  `FrameBuf` keeps any mid-frame bytes so the next read resumes instead of
+  desyncing the TCP framing. Pipelining (`MonitorOptions::pipelined(n)`) encodes
   `pipeline=true,queueSize=N` in the pvRequest *and* appends queueSize to the
-  INIT body *and* sets bit 0x80 on the INIT subcmd; ACKs at queueSize/2.
-  **Critical invariant** (pva_client.rs:548–552): never set 0x80 on the START
+  INIT body *and* sets bit 0x80 on the INIT subcmd; ACKs at queueSize/2, and the
+  ACK-credit accounting runs on *every* consumed update (decode success or
+  failure) so a decode error can never leak a credit and stall the stream.
+  **Critical invariant** (pva_client.rs:553–556): never set 0x80 on the START
   message — on non-INIT monitor messages 0x80 means "ACK with u32 body", and
   getting this wrong makes pvxs/Java drop the TCP connection.
 - **INFO**: GET_FIELD (cmd 0x11) → `StructureDesc`.
@@ -104,17 +109,17 @@ the `argparse` crate, and `block_on` a manually built tokio runtime.
 | Binary | LOC | What it is / what it exercises |
 |---|---|---|
 | `spget` | 56 | One-shot GET; `format_output`, `--raw` hex dumps |
-| `spput` | 316 | PUT; default "EPICS-base-style" full flow (GET → PUT INIT → get-put probe → PUT → DESTROY_REQUEST → GET), auto-fallback to simple flow; `PV=VALUE` syntax for negative numbers |
-| `spmonitor` | 278 | Multi-PV monitor (JoinSet); `--raw`, `--json`, `--pipeline N` |
-| `spinfo` | 192 | Introspection with the 3-level fallback chain |
+| `spput` | 338 | PUT; default "EPICS-base-style" full flow (GET → PUT INIT → get-put probe → PUT → DESTROY_REQUEST → GET), auto-fallback to simple flow; `PV=VALUE` syntax for negative numbers |
+| `spmonitor` | 289 | Multi-PV monitor (JoinSet); `--raw`, `--json`, `--pipeline N` |
+| `spinfo` | 193 | Introspection with the 3-level fallback chain |
 | `splist` | 112 | Server discovery (GUID + addr) or PV listing via `pvlist_with_fallback` |
 | `spsine` | 102 | Streaming-PUT sine generator (`open_put_channel` showcase) |
 | `spget_compare` | 324 | Offline diagnostic: byte-compares captured frames against local encoder output; no network |
 | `spexplore` | 1414 | ratatui TUI: servers→PVs→details panes, chart view, background worker thread over `std::sync::mpsc` |
 | `spsearch` | 1094 | ratatui TUI: **passive** search-traffic sniffer; decodes frames directly with `PvaPacket` |
-| `spserver` | 4185 | Full PVA server binary: `.db` loading, hot-reload, beacons, MDEL, `__pvlist`/discovery modes; record logic comes from the spvirit-server crate |
-| `spdodeca` | 1179 | Self-contained single-PV server streaming a rotating dodecahedron as NTNDArray (does *not* use spvirit-server) |
-| `sptable` | ~1200 | ratatui TUI spreadsheet IOC. Rows are dynamically added PVs: 12 scalar types, arrays, **NTEnum**, **NTTable**. Modal `a` wizard **plus a vim-style `:` command line** (`:add/:set/:del/:mv/:ro/:rw/:anim/:stop/:source`, shorthands, `:help`). Bash-style **pattern expansion** (`RING:BPM{01..99}`, products) for bulk ops. **Animation** generators (sine/ramp/triangle/square/noise/walk/count, enum `cycle`) driven by a server-side tick (`--rate`, default 10 Hz). |
+| `spserver` | 3490 | Full PVA server binary: `.db` loading, hot-reload, beacons, MDEL, `__pvlist`/discovery modes; record logic comes from the spvirit-server crate |
+| `spdodeca` | 1165 | Self-contained single-PV server streaming a rotating dodecahedron as NTNDArray (does *not* use spvirit-server) |
+| `sptable` | ~1300 | ratatui TUI spreadsheet IOC. Rows are dynamically added PVs: 12 scalar types, arrays, **NTEnum**, **NTTable**. Modal `a` wizard **plus a vim-style `:` command line** (`:add/:set/:del/:mv/:ro/:rw/:anim/:stop/:source`, shorthands, `:help`). Bash-style **pattern expansion** (`RING:BPM{01..99}`, products) for bulk ops. **Animation** generators (sine/ramp/triangle/square/noise/walk/count, enum `cycle`) driven by a server-side tick (`--rate`, default 10 Hz). |
 
 #### sptable command reference
 
