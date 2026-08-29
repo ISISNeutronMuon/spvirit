@@ -33,10 +33,12 @@ use tokio::sync::mpsc;
 pub type MonitorKey = (String, String);
 
 /// Bounded channel capacity for each downstream subscriber's `mpsc` pair.
-/// Small and fixed: subscribers that fall behind get updates dropped
-/// (`try_send` failure) rather than backpressuring the single upstream
-/// monitor task, and a slow/dead subscriber's sender is pruned on the next
-/// delivery attempt (see `MonitorEntry::dispatch`).
+/// Small and fixed: subscribers that fall behind have *this* update dropped
+/// (a `TrySendError::Full` from `try_send`) rather than backpressuring the
+/// single upstream monitor task — but the subscriber itself is KEPT, so a
+/// momentarily-slow client recovers on the next delivery instead of being
+/// silently unsubscribed. Only a genuinely dead subscriber (its receiver
+/// dropped, `TrySendError::Closed`) is pruned. See `MonitorEntry::dispatch`.
 const CHANNEL_CAPACITY: usize = 16;
 
 /// Shared state for one upstream monitor: its most recent payload (for
@@ -56,15 +58,33 @@ impl MonitorEntry {
     }
 
     /// Stores `payload` as the latest value and fans it out to every live
-    /// subscriber, pruning any sender whose receiver has been dropped or
-    /// whose channel is full. Returns `true` if at least one subscriber is
-    /// still live after dispatch (the upstream task should keep running),
-    /// `false` if the subscriber list is now empty (the upstream task
-    /// should end its monitor loop).
+    /// subscriber. A subscriber whose channel is momentarily `Full` (a slow
+    /// but still-live client) is KEPT — only *this* update is dropped for it,
+    /// and it recovers on the next delivery. A subscriber whose receiver has
+    /// been dropped (`Closed`) is pruned. Returns `true` if at least one
+    /// subscriber remains after dispatch (the upstream task should keep
+    /// running), `false` only if the subscriber list is now empty (the
+    /// upstream task should end its monitor loop).
+    ///
+    /// INTENTIONAL DIVERGENCE from the crate-wide "prune on `Full`"
+    /// convention: elsewhere a Full downstream buffer is treated as a dead
+    /// peer and pruned, but here pruning the last subscriber uniquely trips
+    /// `dispatch_or_retire` into tearing down the shared upstream monitor for
+    /// the whole PV. A single slow client — or a burst that momentarily fills
+    /// *every* subscriber's buffer — must never be able to do that. Dropping
+    /// an intermediate update is safe specifically because `subscribe`
+    /// re-accumulates a full snapshot each tick, so a subscriber that misses
+    /// one Full update is not left with a torn/partial view.
     pub fn dispatch(&self, payload: NtPayload) -> bool {
         *self.latest.lock().unwrap() = Some(payload.clone());
         let mut subs = self.subs.lock().unwrap();
-        subs.retain(|tx| tx.try_send(payload.clone()).is_ok());
+        subs.retain(|tx| match tx.try_send(payload.clone()) {
+            Ok(()) => true,
+            // Slow but live: keep the subscriber, drop only this update.
+            Err(mpsc::error::TrySendError::Full(_)) => true,
+            // Receiver gone: prune the dead subscriber.
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
         !subs.is_empty()
     }
 }
@@ -250,6 +270,91 @@ mod tests {
         let entry = captured_entry.expect("spawn_upstream captured the entry");
         let still_live = entry.dispatch(payload(1.0));
         assert!(!still_live, "no live subscribers left after drop");
+    }
+
+    /// Proves the gateway-G1 fix: when EVERY subscriber's buffer is Full,
+    /// dispatch must NOT prune anyone and must NOT report the entry empty.
+    /// The old `retain(|tx| try_send(..).is_ok())` dropped Full senders just
+    /// like Closed ones, so an all-Full burst emptied `subs`, made dispatch
+    /// return `false`, and let `dispatch_or_retire` tear down the whole
+    /// upstream monitor for a PV whose subscribers were merely slow.
+    #[test]
+    fn full_buffers_do_not_prune_subscribers_or_retire_upstream() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let mut captured_entry = None;
+        // Two slow-but-live subscribers whose receivers are never drained.
+        let _rx_a = cache.subscribe(key.clone(), |entry| captured_entry = Some(entry));
+        let _rx_b = cache.subscribe(key.clone(), |_| {});
+        let entry = captured_entry.expect("spawn_upstream captured the entry");
+
+        // Fill BOTH subscribers' buffers right up to capacity.
+        for i in 0..CHANNEL_CAPACITY {
+            assert!(
+                entry.dispatch(payload(i as f64)),
+                "filling buffers must keep the entry live"
+            );
+        }
+
+        // Every subscriber's buffer is now Full. A further update must be
+        // dropped for those subscribers WITHOUT pruning them and WITHOUT
+        // retiring the entry.
+        let still_live = entry.dispatch(payload(1000.0));
+        assert!(
+            still_live,
+            "an all-Full burst must not report the entry empty (no upstream teardown)"
+        );
+        assert_eq!(
+            entry.subs.lock().unwrap().len(),
+            2,
+            "Full subscribers must be kept, not pruned"
+        );
+
+        // And through the full retire path: the upstream must survive.
+        let should_continue = cache.dispatch_or_retire(&key, &entry, payload(1001.0));
+        assert!(
+            should_continue,
+            "dispatch_or_retire must not tear down the upstream on an all-Full burst"
+        );
+        assert_eq!(
+            cache.upstream_count(),
+            1,
+            "the upstream monitor must still be tracked after an all-Full burst"
+        );
+    }
+
+    /// A Full (slow-but-live) subscriber is kept while a Closed (receiver
+    /// dropped) subscriber is pruned — the two `TrySendError` arms behave
+    /// differently, which is the whole point of the fix.
+    #[test]
+    fn full_subscriber_survives_while_closed_subscriber_is_pruned() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let mut captured_entry = None;
+        // Slow-but-live subscriber: never drained.
+        let _rx_slow = cache.subscribe(key.clone(), |entry| captured_entry = Some(entry));
+        // Closed subscriber: receiver dropped.
+        let rx_closed = cache.subscribe(key.clone(), |_| {});
+        drop(rx_closed);
+
+        let entry = captured_entry.expect("spawn_upstream captured the entry");
+
+        // Fill the slow subscriber's buffer to capacity.
+        for i in 0..CHANNEL_CAPACITY {
+            entry.dispatch(payload(i as f64));
+        }
+
+        // Slow sub is now Full (kept), closed sub is Closed (pruned).
+        let still_live = entry.dispatch(payload(1000.0));
+        assert!(
+            still_live,
+            "the slow-but-live subscriber must keep the upstream alive"
+        );
+        assert_eq!(
+            entry.subs.lock().unwrap().len(),
+            1,
+            "the Full subscriber is kept; only the Closed one is pruned"
+        );
     }
 
     /// Proves the FIX-1 invariant across the "retire wins" interleave: the
