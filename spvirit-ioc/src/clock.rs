@@ -3,6 +3,7 @@
 //! Every scan mechanism reads time through a `Clock`, so tests advance a
 //! `ManualClock` explicitly and never call `thread::sleep`.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,12 @@ pub trait Clock: Send + Sync {
     fn sleep_until(&self, deadline: Instant);
     /// Wall-clock nanoseconds since the UNIX epoch, for record timestamps.
     fn unix_nanos(&self) -> u64;
+    /// Wake every thread currently parked in `sleep_until`, regardless of
+    /// whether their deadline has passed. Used by shutdown paths to unpark a
+    /// thread deterministically without waiting for a real timeout. A no-op
+    /// on clocks with nothing to notify (e.g. `SystemClock`, which parks via
+    /// `thread::sleep` rather than a shared condvar).
+    fn wake_all(&self);
 }
 
 /// Wall-clock nanoseconds since the UNIX epoch, from the real OS clock.
@@ -42,6 +49,10 @@ impl Clock for SystemClock {
     fn unix_nanos(&self) -> u64 {
         real_unix_nanos()
     }
+    fn wake_all(&self) {
+        // Nothing to wake: sleep_until parks via thread::sleep, not a
+        // condvar this clock owns.
+    }
 }
 
 /// A clock that only advances when told to. Deterministic for tests.
@@ -62,6 +73,13 @@ struct Inner {
     epoch_base: u64,
     accumulated: Mutex<Duration>,
     cvar: Condvar,
+    /// Bumped only by `wake_all`, never by `advance`. `sleep_until` snapshots
+    /// this on entry and folds "has it changed" into its wait condition, so
+    /// a `wake_all` unparks a sleeper immediately regardless of whether the
+    /// deadline has actually passed — distinct from `advance`, whose notify
+    /// must NOT release a sleeper short of its deadline (a partial advance
+    /// re-checks the same unchanged generation and goes back to sleep).
+    wake_gen: std::sync::atomic::AtomicU64,
 }
 
 impl ManualClock {
@@ -72,6 +90,7 @@ impl ManualClock {
                 epoch_base: real_unix_nanos(),
                 accumulated: Mutex::new(Duration::ZERO),
                 cvar: Condvar::new(),
+                wake_gen: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -100,13 +119,26 @@ impl Clock for ManualClock {
         self.inner.anchor + *self.inner.accumulated.lock().unwrap()
     }
     fn sleep_until(&self, deadline: Instant) {
+        let gen_at_entry = self.inner.wake_gen.load(Ordering::SeqCst);
         let mut acc = self.inner.accumulated.lock().unwrap();
-        while self.inner.anchor + *acc < deadline {
+        while self.inner.anchor + *acc < deadline
+            && self.inner.wake_gen.load(Ordering::SeqCst) == gen_at_entry
+        {
             acc = self.inner.cvar.wait(acc).unwrap();
         }
     }
     fn unix_nanos(&self) -> u64 {
         self.inner.epoch_base + self.inner.accumulated.lock().unwrap().as_nanos() as u64
+    }
+    fn wake_all(&self) {
+        // Locking `accumulated` here (even though we don't touch it) gives
+        // this call a full memory barrier with `sleep_until`'s own lock/
+        // unlock, so a flag a caller set just before calling `wake_all`
+        // (e.g. Scanner's `stop`) is guaranteed visible to the woken thread
+        // once it re-acquires the lock inside `sleep_until`.
+        let _acc = self.inner.accumulated.lock().unwrap();
+        self.inner.wake_gen.fetch_add(1, Ordering::SeqCst);
+        self.inner.cvar.notify_all();
     }
 }
 
