@@ -251,16 +251,33 @@ impl PyNotifier {
         let payload = py_to_nt_payload(nt)?;
         let registry = self.registry.clone();
         py.allow_threads(|| {
-            // If we're already inside the runtime, fire-and-forget spawn;
-            // otherwise use the shared runtime's block_on.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    registry.notify_monitors(&pv_name, &payload).await;
-                });
+            let deliver = async move {
+                registry.notify_monitors(&pv_name, &payload).await;
+            };
+            // Deliver SYNCHRONOUSLY and IN-ORDER regardless of caller context.
+            //
+            // The in-runtime branch used to `handle.spawn(...)` this future
+            // fire-and-forget. Tokio gives no ordering guarantee across
+            // independent spawned tasks, so notify(v2) could be delivered
+            // before notify(v1): `notify_monitors` would then compute v2's
+            // changed-bit delta against the wrong `last_snapshot`, latching
+            // clients on a stale value. The spawn also silently dropped any
+            // delivery panic. Instead, block on delivery here so each call
+            // returns only once its update has been applied — mirroring the
+            // re-entrancy handling in `runtime::block_on_py`.
+            //
+            // `notify_monitors` only touches its own registry locks and the
+            // per-connection writer channels, so blocking the current worker
+            // here cannot deadlock against anything this call holds.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Already on a runtime worker (e.g. a Python source callback
+                // invoked while a PUT is being processed): a plain
+                // `RUNTIME.block_on` would panic, so hand off with
+                // `block_in_place` and drive the delivery to completion.
+                tokio::task::block_in_place(|| RUNTIME.block_on(deliver));
             } else {
-                RUNTIME.block_on(async move {
-                    registry.notify_monitors(&pv_name, &payload).await;
-                });
+                // Plain Python thread (already correct, left unchanged).
+                RUNTIME.block_on(deliver);
             }
         });
         Ok(())
@@ -1092,5 +1109,117 @@ mod asyncio_loop_race_tests {
             1,
             "losing_candidates_are_stopped_and_do_not_leak_their_thread",
         );
+    }
+}
+
+#[cfg(all(test, feature = "test-embed"))]
+mod notify_ordering_tests {
+    //! Ordered/synchronous monitor-update delivery for `PyNotifier::notify`
+    //! (finding PY-1). Needs a real embedded interpreter, so — like the
+    //! asyncio-bridge race tests above — it only builds under `test-embed`:
+    //!   cargo test -p spvirit-py --no-default-features --features test-embed
+    use super::*;
+    use spvirit_server::monitor::MonitorRegistry;
+    use spvirit_server::state::MonitorSub;
+    use spvirit_types::{NtPayload, NtScalar, ScalarValue};
+
+    /// Build the Python `NtScalar` wrapper for a `double` value, going through
+    /// the same `nt_payload_to_py` path production uses so `notify`'s
+    /// `py_to_nt_payload` round-trips it back to `NtPayload::Scalar`.
+    fn scalar_nt(py: Python<'_>, v: f64) -> PyObject {
+        nt_payload_to_py(py, NtPayload::Scalar(NtScalar::from_value(ScalarValue::F64(v))))
+    }
+
+    /// Snapshot the (single) subscriber's `last_snapshot` value for `pv`
+    /// without yielding: `try_lock` never blocks and, since nothing else holds
+    /// the registry lock at this instant, always succeeds. Using a blocking
+    /// `lock().await` here would hand control back to the runtime and let a
+    /// stray fire-and-forget task (the old buggy behaviour) sneak in before
+    /// the read, masking the very race under test.
+    fn current_value(registry: &MonitorRegistry, pv: &str) -> Option<ScalarValue> {
+        let monitors = registry.monitors.try_lock().expect("registry lock uncontended");
+        let sub = &monitors.get(pv).expect("pv has a subscriber list")[0];
+        match sub.last_snapshot.as_ref() {
+            Some(NtPayload::Scalar(s)) => Some(s.value.clone()),
+            Some(other) => panic!("unexpected payload variant: {other:?}"),
+            None => None,
+        }
+    }
+
+    fn running_sub(conn_id: u64, ioid: u32) -> MonitorSub {
+        MonitorSub {
+            conn_id,
+            ioid,
+            version: 2,
+            is_be: false,
+            running: true,
+            pipeline_enabled: false,
+            nfree: 0,
+            filtered_desc: None,
+            last_snapshot: None,
+        }
+    }
+
+    /// In-runtime `notify` must deliver each update SYNCHRONOUSLY and IN
+    /// ORDER, so a client can never end latched on a stale value.
+    ///
+    /// This exercises the branch that used to `handle.spawn(...)`
+    /// fire-and-forget: `notify` is called from inside a spawned Tokio task
+    /// (so `Handle::try_current()` is `Ok`), exactly as a Python source
+    /// callback running on a runtime worker would.
+    ///
+    /// Against the OLD code every `notify` returned before its spawned
+    /// `notify_monitors` had run, so the `current_value` read taken the
+    /// instant `notify(v1)` returns saw `None` (nothing delivered yet) and the
+    /// first assertion failed — and, worse, the two independent spawns had no
+    /// ordering guarantee at all. With synchronous delivery the subscriber is
+    /// deterministically on v1 after the first call and on v2 after the
+    /// second.
+    #[test]
+    fn in_runtime_notify_delivers_synchronously_and_in_order() {
+        pyo3::prepare_freethreaded_python();
+
+        let registry = Arc::new(MonitorRegistry::new());
+        RUNTIME.block_on(async {
+            registry
+                .monitors
+                .lock()
+                .await
+                .insert("pv1".to_string(), vec![running_sub(1, 1)]);
+        });
+
+        let notifier = PyNotifier::new(registry.clone());
+        let reg_for_task = registry.clone();
+
+        RUNTIME.block_on(async move {
+            tokio::spawn(async move {
+                // On a runtime worker now: Handle::try_current() is Ok, so
+                // this drives `notify`'s in-runtime (block_in_place) branch.
+                Python::with_gil(|py| {
+                    let v1 = scalar_nt(py, 1.0);
+                    let v2 = scalar_nt(py, 2.0);
+
+                    notifier
+                        .notify(py, "pv1".to_string(), v1.bind(py))
+                        .expect("notify v1");
+                    assert_eq!(
+                        current_value(&reg_for_task, "pv1"),
+                        Some(ScalarValue::F64(1.0)),
+                        "notify(v1) must deliver synchronously before it returns"
+                    );
+
+                    notifier
+                        .notify(py, "pv1".to_string(), v2.bind(py))
+                        .expect("notify v2");
+                    assert_eq!(
+                        current_value(&reg_for_task, "pv1"),
+                        Some(ScalarValue::F64(2.0)),
+                        "after notify(v2) the subscriber must be on v2, not latched on v1"
+                    );
+                });
+            })
+            .await
+            .expect("notify task must not panic");
+        });
     }
 }
