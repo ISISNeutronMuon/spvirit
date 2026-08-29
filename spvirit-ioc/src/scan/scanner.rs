@@ -210,7 +210,19 @@ impl Scanner {
         self.stop.store(true, Ordering::Relaxed);
         self.clock.wake_all();
         let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.threads.lock().unwrap());
+        // If the last strong `Arc<Scanner>` happens to be dropped from inside
+        // one of our own periodic threads (e.g. mid-pass, after `weak.upgrade()`
+        // -- see `periodic_loop`), `Scanner::drop` -> `shutdown()` runs ON that
+        // thread, and its own `JoinHandle` is one of `handles`. Joining your own
+        // thread from itself never returns (`JoinHandle::join` blocks forever
+        // rather than erroring), so we must skip it: that thread is already in
+        // the process of exiting on its own, so simply detaching its handle is
+        // correct and leaks nothing (the OS thread still runs to completion).
+        let self_id = std::thread::current().id();
         for handle in handles {
+            if handle.thread().id() == self_id {
+                continue;
+            }
             let _ = handle.join();
         }
     }
@@ -676,5 +688,64 @@ mod tests {
             "no thread should be spawned for a period with nothing registered"
         );
         scanner.shutdown();
+    }
+
+    #[test]
+    fn shutdown_skips_self_join_when_its_own_thread_triggers_it() {
+        // Reproduces the deadlock Fix 1 (Weak-based Drop reclaim) introduced:
+        // a periodic thread upgrades `weak` to a strong `this: Arc<Scanner>`
+        // and holds it across `process_ids` (see `periodic_loop`). If the
+        // owner has already dropped its own external `Arc<Scanner>` down to
+        // strong-count 1 while that thread holds `this` (count 2), then when
+        // `this` drops at the end of that thread's loop iteration, the count
+        // goes 1 -> 0 *on that thread*, so `Scanner::drop` -> `shutdown()`
+        // runs there. `shutdown()`'s `handles` then contains that very
+        // thread's own `JoinHandle` (pushed by `start()`), and joining your
+        // own thread from itself blocks forever -- a silent thread leak with
+        // no panic and no test failure, unless something bounds the wait.
+        //
+        // Driving this end-to-end through the real weak-upgrade/refcount race
+        // (ManualClock advance + a helper thread racing to drop the last
+        // external Arc mid-pass) is not reliably deterministic: whichever
+        // thread's decrement happens to observe the count hitting zero is a
+        // genuine data race, so a test built that way could pass even on
+        // unfixed code simply because the owner's drop -- not the periodic
+        // thread's -- won the race that particular run.
+        //
+        // Instead, this constructs the exact precondition the race produces
+        // -- a thread's own `JoinHandle` present in `threads` when that same
+        // thread calls `shutdown()` -- deterministically, via a rendezvous
+        // channel that guarantees the handle is pushed into `threads` before
+        // `shutdown()` is invoked. This exercises the identical code path in
+        // `shutdown()` (including the real `self_id` guard) without any
+        // timing dependency.
+        //
+        // Without the `self_id` skip: `handle.join()` on itself never
+        // returns, `done_tx.send(())` is never reached, and `recv_timeout`
+        // below times out and this test fails. With the fix: `shutdown()`
+        // returns promptly and the test passes.
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let clock = Arc::new(ManualClock::new());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db, clock, sink));
+
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let scanner_for_thread = scanner.clone();
+        let handle = std::thread::spawn(move || {
+            // Wait until our own JoinHandle is in `threads` before calling
+            // shutdown() on ourselves -- otherwise we might race ahead and
+            // call it while `threads` is still empty, which would trivially
+            // "pass" without ever exercising the self-join path.
+            go_rx.recv().unwrap();
+            scanner_for_thread.shutdown();
+            let _ = done_tx.send(());
+        });
+        scanner.threads.lock().unwrap().push(handle);
+        go_tx.send(()).unwrap();
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown() did not return within 5s: self-join likely deadlocked");
     }
 }
