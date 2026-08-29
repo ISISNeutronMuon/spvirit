@@ -30,6 +30,7 @@
 
 pub mod apply;
 pub mod beacon;
+pub mod conn_writer;
 pub mod convert;
 pub mod db;
 pub mod decode;

@@ -1776,8 +1776,12 @@ mod tests {
         // `update_monitor_subscription` -- but without needing a live
         // socket for this test.
         let registry = server.monitor_registry();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        registry.conns.lock().await.insert(1, tx);
+        let (mut client, server_side) = tokio::io::duplex(4096);
+        registry
+            .conns
+            .lock()
+            .await
+            .insert(1, crate::conn_writer::ConnWriter::new(server_side));
         registry.monitors.lock().await.insert(
             "T:SP".to_string(),
             vec![MonitorSub {
@@ -1795,11 +1799,13 @@ mod tests {
 
         server.run_start_hooks().await.expect("hooks must succeed");
 
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), client.read(&mut buf))
             .await
             .expect("monitor update did not arrive within 5s -- on_start hook's write did not reach the registry")
-            .expect("monitor channel closed unexpectedly");
-        assert!(!msg.is_empty(), "monitor update message must not be empty");
+            .expect("read from duplex failed");
+        assert!(n > 0, "monitor update message must not be empty");
     }
 
     #[tokio::test]

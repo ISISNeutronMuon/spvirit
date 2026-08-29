@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::debug;
 
 use spvirit_codec::spvirit_encode::{
@@ -14,20 +14,32 @@ use spvirit_codec::spvirit_encode::{
 };
 use spvirit_types::NtPayload;
 
+use crate::conn_writer::ConnWriter;
 use crate::state::MonitorSub;
 
 /// Active connection channels and monitor subscriptions managed by the server.
 pub struct MonitorRegistry {
     /// PV name → list of active monitor subscriptions.
     pub monitors: Mutex<HashMap<String, Vec<MonitorSub>>>,
-    /// Connection id → message sender.
-    pub conns: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    /// Connection id → its flat-combining writer.
+    pub conns: Mutex<HashMap<u64, Arc<ConnWriter>>>,
     /// PV name → the task draining a subscribe-only source's update stream
     /// into `notify_monitors`. One pump per PV, shared by every subscriber of
     /// that PV; retired once the last subscriber goes away. Sources that
     /// deliver their own updates ([`Source::pushes_own_updates`]) never get a
     /// pump entry — pumping them would double-deliver.
-    pumps: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    pumps: Mutex<HashMap<String, PumpHandle>>,
+}
+
+/// A pump task plus its cooperative-shutdown signal.
+///
+/// Retirement signals `shutdown` rather than aborting the task: an abort could
+/// drop the pump future mid-`write_all` inside a shared [`ConnWriter`], wedging
+/// that connection's flusher. Cooperative shutdown lets any in-flight
+/// `notify_monitors` (and its socket write) finish before the task exits.
+struct PumpHandle {
+    shutdown: oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 impl MonitorRegistry {
@@ -60,21 +72,35 @@ impl MonitorRegistry {
         let weak = Arc::downgrade(self);
         let pv = pv_name.to_string();
         let mut rx = rx;
+        let (shutdown, mut shutdown_rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
-            while let Some(payload) = rx.recv().await {
-                let Some(reg) = Weak::upgrade(&weak) else {
-                    break;
-                };
-                reg.notify_monitors(&pv, &payload).await;
+            loop {
+                tokio::select! {
+                    // Cooperative shutdown: retirement fires this. Cancellation
+                    // can only take effect here at the top of the loop, never
+                    // inside an in-flight `notify_monitors` — so a socket write
+                    // is never dropped mid-frame.
+                    _ = &mut shutdown_rx => break,
+                    maybe = rx.recv() => {
+                        let Some(payload) = maybe else { break };
+                        let Some(reg) = Weak::upgrade(&weak) else { break };
+                        reg.notify_monitors(&pv, &payload).await;
+                    }
+                }
             }
         });
-        pumps.insert(pv_name.to_string(), handle);
+        pumps.insert(pv_name.to_string(), PumpHandle { shutdown, handle });
     }
 
-    /// Abort and drop the pump for `pv_name` if no subscribers remain for it.
+    /// Retire the pump for `pv_name` if no subscribers remain for it.
     ///
     /// Callers must have already removed the relevant subscriptions from
     /// `monitors` (and released that lock) before calling this.
+    ///
+    /// Shutdown is cooperative (signal, not abort): the pump finishes any
+    /// in-flight `notify_monitors` — including its socket write — before
+    /// exiting, so a flush is never dropped mid-write to wedge the shared
+    /// [`ConnWriter`].
     async fn retire_pump_if_idle(&self, pv_name: &str) {
         let still_active = {
             let monitors = self.monitors.lock().await;
@@ -84,16 +110,25 @@ impl MonitorRegistry {
             return;
         }
         let mut pumps = self.pumps.lock().await;
-        if let Some(handle) = pumps.remove(pv_name) {
-            handle.abort();
+        if let Some(PumpHandle { shutdown, handle }) = pumps.remove(pv_name) {
+            // Signal cooperative shutdown; the task exits at its next loop turn.
+            let _ = shutdown.send(());
+            // Detach: the task stops on its own. Do NOT abort (would risk
+            // dropping a flush mid-write).
+            drop(handle);
         }
     }
 
-    /// Send a raw message to a connection.
+    /// Look up a connection's flat-combining writer.
+    async fn conn_writer(&self, conn_id: u64) -> Option<Arc<ConnWriter>> {
+        self.conns.lock().await.get(&conn_id).cloned()
+    }
+
+    /// Send a raw control/one-shot frame to a connection (priority lane,
+    /// never coalesced).
     pub async fn send_msg(&self, conn_id: u64, msg: Vec<u8>) {
-        let conns = self.conns.lock().await;
-        if let Some(tx) = conns.get(&conn_id) {
-            let _ = tx.send(msg).await;
+        if let Some(cw) = self.conn_writer(conn_id).await {
+            cw.send_control(msg).await;
         }
     }
 
@@ -130,8 +165,19 @@ impl MonitorRegistry {
         };
         // Subsequent frames.
         if let Some(ref desc) = sub.filtered_desc {
-            // Filtered subscribers get a true sparse delta (may be None if the
-            // filtered view is unchanged).
+            // The monitor lane coalesces (latest-wins) and may drop intermediate
+            // frames under load, so every frame must be self-contained. Emit a
+            // full filtered frame (safe to drop — the next one fully
+            // reconstructs the filtered view), NOT a sparse delta: a dropped
+            // delta would silently corrupt the client's value.
+            //
+            // Still suppress no-op updates (filtered view unchanged) to preserve
+            // bandwidth and pipeline credit — the delta encoder returning `None`
+            // is the change detector here.
+            //
+            // PERF follow-up (codec audit): this detects change by building and
+            // discarding a delta frame; a lighter filtered-projection equality
+            // check would avoid the redundant encode.
             encode_monitor_data_response_delta(
                 sub.ioid,
                 subcmd,
@@ -140,7 +186,15 @@ impl MonitorRegistry {
                 desc,
                 sub.version,
                 sub.is_be,
-            )
+            )?;
+            Some(encode_monitor_data_response_filtered(
+                sub.ioid,
+                subcmd,
+                payload,
+                desc,
+                sub.version,
+                sub.is_be,
+            ))
         } else if prev == payload {
             // Unfiltered subscriber, unchanged payload: suppress.
             None
@@ -158,7 +212,7 @@ impl MonitorRegistry {
 
     /// Broadcast a monitor update for `pv_name` to all running subscribers.
     pub async fn notify_monitors(&self, pv_name: &str, payload: &NtPayload) {
-        let mut to_send: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut to_send: Vec<(u64, u32, Vec<u8>, bool)> = Vec::new();
         {
             let mut monitors = self.monitors.lock().await;
             if let Some(list) = monitors.get_mut(pv_name) {
@@ -177,14 +231,39 @@ impl MonitorRegistry {
                         sub.nfree -= 1;
                     }
                     sub.last_snapshot = Some(payload.clone());
-                    to_send.push((sub.conn_id, msg));
+                    to_send.push((sub.conn_id, sub.ioid, msg, sub.pipeline_enabled));
                 }
             }
         }
 
-        for (conn_id, msg) in to_send {
-            self.send_msg(conn_id, msg).await;
+        for (conn_id, ioid, msg, pipelined) in to_send {
+            if let Some(cw) = self.conn_writer(conn_id).await {
+                self.route_monitor_frame(&cw, ioid, msg, pipelined).await;
+            }
             debug!("Monitor update pv='{}' conn={}", pv_name, conn_id);
+        }
+    }
+
+    /// Deliver a built monitor frame on the correct lane.
+    ///
+    /// Non-pipelined subscribers use the coalescing monitor lane (latest-wins
+    /// conflation under load). Pipelined subscribers do explicit credit-based
+    /// flow control, so every charged frame must be delivered losslessly —
+    /// coalescing one away would leak the credit the client already spent and
+    /// drift its window until it stalls. They therefore use the FIFO control
+    /// lane, which is lossless and, for a pipelined subscriber, bounded by the
+    /// credit window (the sender stops at `nfree == 0`).
+    async fn route_monitor_frame(
+        &self,
+        cw: &Arc<ConnWriter>,
+        ioid: u32,
+        msg: Vec<u8>,
+        pipelined: bool,
+    ) {
+        if pipelined {
+            cw.send_control(msg).await;
+        } else {
+            cw.send_monitor(ioid, msg).await;
         }
     }
 
@@ -196,7 +275,7 @@ impl MonitorRegistry {
         ioid: u32,
         payload: &NtPayload,
     ) {
-        let mut to_send: Option<(u64, Vec<u8>)> = None;
+        let mut to_send: Option<(u64, Vec<u8>, bool)> = None;
         {
             let mut monitors = self.monitors.lock().await;
             if let Some(list) = monitors.get_mut(pv_name) {
@@ -217,13 +296,15 @@ impl MonitorRegistry {
                         sub.nfree -= 1;
                     }
                     sub.last_snapshot = Some(payload.clone());
-                    to_send = Some((sub.conn_id, msg));
+                    to_send = Some((sub.conn_id, msg, sub.pipeline_enabled));
                 }
             }
         }
 
-        if let Some((conn_id, msg)) = to_send {
-            self.send_msg(conn_id, msg).await;
+        if let Some((conn_id, msg, pipelined)) = to_send {
+            if let Some(cw) = self.conn_writer(conn_id).await {
+                self.route_monitor_frame(&cw, ioid, msg, pipelined).await;
+            }
         }
     }
 
@@ -366,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_delta_emitted_when_selected_field_changes() {
+    fn filtered_frame_emitted_when_selected_field_changes() {
         let p1 = nt_payload(1.0, 0);
         let full_desc = nt_payload_desc(&p1);
         let filt = filter_structure_desc(&full_desc, &["alarm.severity".to_string()]);
@@ -375,10 +456,161 @@ mod tests {
         let _ = MonitorRegistry::build_monitor_frame(&sub, &p1).expect("first");
         sub.last_snapshot = Some(p1.clone());
 
-        // Severity changes: delta must be emitted.
+        // Severity changes: a frame must be emitted.
         let p2 = nt_payload(1.0, 2);
-        let delta = MonitorRegistry::build_monitor_frame(&sub, &p2)
-            .expect("delta required when selected field changes");
-        assert!(!delta.is_empty());
+        let frame = MonitorRegistry::build_monitor_frame(&sub, &p2)
+            .expect("frame required when selected field changes");
+        assert!(!frame.is_empty());
+    }
+
+    #[test]
+    fn filtered_subsequent_frame_is_self_contained_not_delta() {
+        // The monitor lane coalesces (latest-wins) and drops intermediate
+        // frames under load. A filtered subscriber's subsequent frame must
+        // therefore be a self-contained full filtered frame (safe to drop),
+        // NOT a sparse delta relative to `last_snapshot` — a dropped delta
+        // would silently corrupt the client's value.
+        let p1 = nt_payload(1.0, 0);
+        let full_desc = nt_payload_desc(&p1);
+        let filt = filter_structure_desc(&full_desc, &["value".to_string()]);
+        let mut sub = make_sub(Some(filt.clone()));
+
+        let _ = MonitorRegistry::build_monitor_frame(&sub, &p1).expect("first");
+        sub.last_snapshot = Some(p1.clone());
+
+        // `value` changes -> a frame is emitted; it must equal a fresh full
+        // filtered encode of the new payload (self-contained), not a delta.
+        let p2 = nt_payload(2.0, 0);
+        let frame =
+            MonitorRegistry::build_monitor_frame(&sub, &p2).expect("frame on change");
+        let expected = encode_monitor_data_response_filtered(
+            sub.ioid,
+            0x00,
+            &p2,
+            &filt,
+            sub.version,
+            sub.is_be,
+        );
+        assert_eq!(
+            frame, expected,
+            "subsequent filtered frame must be a self-contained full filtered \
+             frame (coalesce-safe), not a sparse delta"
+        );
+    }
+
+    /// Gated recording sink: writes park until the test grants permits, so a
+    /// flusher can be pinned mid-write while more frames are deposited.
+    #[derive(Clone)]
+    struct TestGate {
+        writes: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        inner: Arc<std::sync::Mutex<TestGateInner>>,
+    }
+    struct TestGateInner {
+        permits: usize,
+        waker: Option<std::task::Waker>,
+    }
+    impl TestGate {
+        fn new() -> Self {
+            Self {
+                writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+                inner: Arc::new(std::sync::Mutex::new(TestGateInner {
+                    permits: 0,
+                    waker: None,
+                })),
+            }
+        }
+        fn release(&self, n: usize) {
+            let mut g = self.inner.lock().unwrap();
+            g.permits += n;
+            if let Some(w) = g.waker.take() {
+                w.wake();
+            }
+        }
+        fn parked(&self) -> bool {
+            self.inner.lock().unwrap().waker.is_some()
+        }
+    }
+    impl tokio::io::AsyncWrite for TestGate {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut g = self.inner.lock().unwrap();
+            if g.permits == 0 {
+                g.waker = Some(cx.waker().clone());
+                return std::task::Poll::Pending;
+            }
+            g.permits -= 1;
+            drop(g);
+            self.writes.lock().unwrap().push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipelined_monitor_frames_are_not_coalesced() {
+        // Pipelined monitors do credit-based flow control: every charged frame
+        // must be delivered losslessly. Coalescing would drop a frame the
+        // client already spent a credit on, drifting the window until it stalls.
+        let reg = Arc::new(MonitorRegistry::new());
+        let sink = TestGate::new();
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(sink.clone()));
+        }
+        {
+            let mut mons = reg.monitors.lock().await;
+            let mut sub = make_sub(None);
+            sub.conn_id = 1;
+            sub.ioid = 42;
+            sub.pipeline_enabled = true;
+            sub.nfree = 100;
+            mons.insert("pv".to_string(), vec![sub]);
+        }
+
+        let p1 = nt_payload(1.0, 0);
+        let p2 = nt_payload(2.0, 0);
+        let p3 = nt_payload(3.0, 0);
+
+        // Park the flusher on the first frame.
+        let r = reg.clone();
+        let p1c = p1.clone();
+        let t = tokio::spawn(async move { r.notify_monitors("pv", &p1c).await });
+        while !sink.parked() {
+            tokio::task::yield_now().await;
+        }
+
+        // Two more distinct frames for the same ioid, deposited while parked.
+        reg.notify_monitors("pv", &p2).await;
+        reg.notify_monitors("pv", &p3).await;
+
+        for _ in 0..40 {
+            sink.release(4);
+            if sink.writes.lock().unwrap().len() >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        t.await.unwrap();
+
+        let writes = sink.writes.lock().unwrap().clone();
+        assert_eq!(
+            writes.len(),
+            3,
+            "pipelined monitor frames must be delivered losslessly, not coalesced; got {writes:?}"
+        );
     }
 }

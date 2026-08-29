@@ -9,9 +9,8 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use regex::Regex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use spvirit_codec::epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand};
@@ -36,6 +35,7 @@ use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
 use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue, ScalarValue};
 
+use crate::conn_writer::ConnWriter;
 use crate::decode::decode_put_body;
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::SourceRegistry;
@@ -633,11 +633,18 @@ pub async fn run_udp_search(
     loop {
         let (len, peer) = socket.recv_from(&mut buf).await?;
         let data = &buf[..len];
-        let header = PvaHeader::new(data);
+        // Untrusted UDP ingress: a datagram shorter than the 8-byte PVA header
+        // must be skipped, not allowed to panic the search task.
+        let Some(header) = PvaHeader::try_new(data) else {
+            debug!("UDP search: dropping short datagram ({} bytes) from {}", len, peer);
+            continue;
+        };
         if header.flags.is_control || header.command != 3 {
             continue;
         }
-        let mut pkt = PvaPacket::new(data);
+        let Some(mut pkt) = PvaPacket::try_new(data) else {
+            continue;
+        };
         let Some(cmd) = pkt.decode_payload() else {
             continue;
         };
@@ -828,21 +835,12 @@ pub async fn handle_connection(
     conn_id: u64,
     conn_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(128);
+    let (mut reader, writer) = stream.into_split();
 
     {
         let mut conns = state.registry.conns.lock().await;
-        conns.insert(conn_id, tx);
+        conns.insert(conn_id, ConnWriter::new(writer));
     }
-
-    let writer_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if writer.write_all(&msg).await.is_err() {
-                break;
-            }
-        }
-    });
 
     let mut conn_state = ConnState::default();
 
@@ -1871,7 +1869,6 @@ pub async fn handle_connection(
     }
 
     state.registry.cleanup_connection(conn_id).await;
-    let _ = writer_task.await;
     Ok(())
 }
 
@@ -1952,7 +1949,8 @@ mod tests {
         fn subscribe(
             &self,
             _name: &str,
-        ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Option<tokio::sync::mpsc::Receiver<NtPayload>>> + Send + '_>>
+        {
             Box::pin(async { None })
         }
 
