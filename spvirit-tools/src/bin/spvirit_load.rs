@@ -202,6 +202,101 @@ async fn run_watch(
     Ok(())
 }
 
+pub(crate) fn puts_due(rate_hz: f64, elapsed: Duration) -> u64 {
+    (rate_hz * elapsed.as_secs_f64()).floor().max(0.0) as u64
+}
+
+pub(crate) fn target_pv(seq: u64, npvs: usize) -> usize {
+    (seq % npvs.max(1) as u64) as usize
+}
+
+async fn run_drive(
+    base_opts: spvirit_client::PvGetOptions,
+    prefix: String,
+    npvs: usize,
+    rate_hz: f64,
+    duration: Duration,
+    stamp: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = client_from_opts(&base_opts);
+    // One persistent PUT channel per PV (keeps its reader task alive across puts).
+    let mut channels: Vec<spvirit_client::PvaChannel> = Vec::with_capacity(npvs);
+    for p in 0..npvs {
+        channels.push(client.open_put_channel(&pv_name(&prefix, p)).await?);
+    }
+
+    let start = std::time::Instant::now();
+    let mut issued: u64 = 0;
+    // Pace by "catch up to puts_due": sleep a small tick, then issue whatever is owed.
+    let tick = Duration::from_millis(1);
+    while start.elapsed() < duration {
+        let due = puts_due(rate_hz, start.elapsed());
+        while issued < due {
+            let p = target_pv(issued, npvs);
+            let value: f64 = if stamp {
+                now_ms().saturating_sub(STAMP_EPOCH_MS) as f64
+            } else {
+                // per-PV monotonic counter = issued / npvs (each PV gets a clean 0,1,2,... sequence)
+                (issued / npvs.max(1) as u64) as f64
+            };
+            channels[p].put(value).await?;
+            issued += 1;
+        }
+        tokio::time::sleep(tick).await;
+    }
+    eprintln!(
+        "spload drive: issued {issued} puts over {:.1}s (target {:.0}/s)",
+        duration.as_secs_f64(),
+        rate_hz
+    );
+    Ok(())
+}
+
+async fn run_drive_cli(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    use spvirit_tools::spvirit_client::cli::CommonClientArgs;
+    let mut prefix = "LOAD".to_string();
+    let mut npvs: usize = 1;
+    let mut rate_hz: f64 = 1000.0;
+    let mut duration_s: f64 = 12.0;
+    let mut stamp = false;
+    let mut common = CommonClientArgs::new();
+    {
+        let mut ap = ArgumentParser::new();
+        ap.set_description(
+            "spload drive: PUT a monotonic counter (or timestamp) to M PVs at an aggregate rate",
+        );
+        ap.refer(&mut prefix)
+            .add_option(&["--prefix"], Store, "PV name prefix (default LOAD)");
+        ap.refer(&mut npvs)
+            .add_option(&["--pvs"], Store, "number of distinct PVs M (default 1)");
+        ap.refer(&mut rate_hz)
+            .add_option(&["--rate"], Store, "aggregate PUT rate Hz (default 1000)");
+        ap.refer(&mut duration_s)
+            .add_option(&["--duration"], Store, "drive duration seconds (default 12)");
+        ap.refer(&mut stamp).add_option(
+            &["--stamp"],
+            StoreTrue,
+            "latency mode: PUT ms timestamp instead of counter",
+        );
+        common.add_to_parser(&mut ap);
+        match ap.parse(argv, &mut std::io::stdout(), &mut std::io::stderr()) {
+            Ok(()) => {}
+            Err(code) => std::process::exit(code),
+        }
+    }
+    common.init_tracing();
+    let base_opts = common.into_pv_get_options(pv_name(&prefix, 0))?;
+    run_drive(
+        base_opts,
+        prefix,
+        npvs,
+        rate_hz,
+        Duration::from_secs_f64(duration_s),
+        stamp,
+    )
+    .await
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 {
@@ -212,10 +307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = Runtime::new()?;
     match mode.as_str() {
         "watch" => rt.block_on(run_watch_cli(argv)),
-        "drive" => {
-            eprintln!("spload drive: not yet implemented");
-            std::process::exit(2);
-        }
+        "drive" => rt.block_on(run_drive_cli(argv)),
         other => {
             eprintln!("spload: unknown mode {other:?} (expected drive|watch)");
             std::process::exit(2);
@@ -303,5 +395,21 @@ mod tests {
     fn pv_name_matches_gen_db_format() {
         assert_eq!(pv_name("LOAD", 0), "LOAD:PV00000");
         assert_eq!(pv_name("LOAD", 1800), "LOAD:PV01800");
+    }
+
+    #[test]
+    fn puts_due_is_floor_rate_times_elapsed() {
+        assert_eq!(puts_due(100.0, std::time::Duration::from_millis(2500)), 250);
+        assert_eq!(puts_due(1000.0, std::time::Duration::from_secs(1)), 1000);
+        assert_eq!(puts_due(0.0, std::time::Duration::from_secs(5)), 0);
+    }
+
+    #[test]
+    fn target_pv_round_robins() {
+        assert_eq!(target_pv(0, 3), 0);
+        assert_eq!(target_pv(1, 3), 1);
+        assert_eq!(target_pv(2, 3), 2);
+        assert_eq!(target_pv(3, 3), 0);
+        assert_eq!(target_pv(7, 1), 0);
     }
 }
