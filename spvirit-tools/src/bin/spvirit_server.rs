@@ -1129,6 +1129,8 @@ async fn handle_connection(
                                     ])
                                 };
                             }
+                            // Cap client-supplied pipeline window (see MAX_PIPELINE_WINDOW).
+                            let nfree = nfree.min(MAX_PIPELINE_WINDOW);
                             let resp = encode_op_init_response_desc(
                                 payload.command,
                                 ioid,
@@ -1198,7 +1200,7 @@ async fn handle_connection(
                                         payload.body[3],
                                     ])
                                 };
-                                nfree = Some(v);
+                                nfree = Some(v.min(MAX_PIPELINE_WINDOW));
                             }
                             let running = if start {
                                 true
@@ -1228,9 +1230,10 @@ async fn handle_connection(
                                 }
                                 if let Some(v) = nfree {
                                     if pipeline_ack {
-                                        mon.nfree = mon.nfree.saturating_add(v);
+                                        mon.nfree =
+                                            mon.nfree.saturating_add(v).min(MAX_PIPELINE_WINDOW);
                                     } else {
-                                        mon.nfree = v;
+                                        mon.nfree = v.min(MAX_PIPELINE_WINDOW);
                                     }
                                 }
                             }
@@ -1696,6 +1699,13 @@ async fn send_monitor_update_for(
     }
 }
 
+/// Ceiling on a client-supplied pipeline window (`nfree`), mirroring the
+/// library's `spvirit_server::handler::MAX_PIPELINE_WINDOW`. A client could
+/// otherwise request an unbounded window and force the server to buffer an
+/// arbitrary number of monitor frames. Applied at every point where `nfree`
+/// is set from client input: subscription init, ACK refill, and here.
+const MAX_PIPELINE_WINDOW: u32 = 4096;
+
 async fn update_monitor_subscription(
     state: &Arc<ServerState>,
     conn_id: u64,
@@ -1713,7 +1723,7 @@ async fn update_monitor_subscription(
         {
             sub.running = running;
             if let Some(v) = nfree {
-                sub.nfree = v;
+                sub.nfree = v.min(MAX_PIPELINE_WINDOW);
             }
             if let Some(enabled) = pipeline_enabled {
                 if enabled {
@@ -3379,6 +3389,51 @@ mod tests {
         assert!(
             sub.last_snapshot.is_some(),
             "delta baseline must advance after a delivered frame"
+        );
+    }
+
+    // A client must not be able to request an unbounded pipeline window: every
+    // path that sets `nfree` from client input clamps it to MAX_PIPELINE_WINDOW.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_pipeline_window_is_clamped_to_ceiling() {
+        let record = mdel_ai_record("test_pv", 1.0, "0");
+        let state = test_state(record);
+        {
+            let mut monitors = state.monitors.lock().await;
+            monitors.insert(
+                "test_pv".to_string(),
+                vec![MonitorSub {
+                    conn_id: 1,
+                    ioid: 10,
+                    version: 2,
+                    is_be: false,
+                    running: true,
+                    pipeline_enabled: true,
+                    nfree: 0,
+                    filtered_desc: None,
+                    last_snapshot: None,
+                }],
+            );
+        }
+
+        // Client asks for a wildly oversized window.
+        let ok = update_monitor_subscription(
+            &state,
+            1,
+            10,
+            "test_pv",
+            true,
+            Some(u32::MAX),
+            Some(true),
+        )
+        .await;
+        assert!(ok, "subscription should be found and updated");
+
+        let monitors = state.monitors.lock().await;
+        let sub = &monitors.get("test_pv").unwrap()[0];
+        assert_eq!(
+            sub.nfree, MAX_PIPELINE_WINDOW,
+            "client-supplied nfree must be capped at MAX_PIPELINE_WINDOW"
         );
     }
 
