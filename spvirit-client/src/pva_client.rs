@@ -32,7 +32,7 @@ use spvirit_codec::spvirit_encode::{
 use crate::client::{ChannelConn, ensure_status_ok, establish_channel, pvget as low_level_pvget};
 use crate::put_encode::encode_put_payload;
 use crate::search::resolve_pv_server;
-use crate::transport::{read_frame, read_packet, read_until};
+use crate::transport::{FrameBuf, read_frame, read_frame_resumable, read_until};
 use crate::types::{PvGetError, PvGetResult, PvOptions};
 
 /// PVA protocol version used in headers.
@@ -568,6 +568,12 @@ impl PvaClient {
         let mut echo_interval = interval(Duration::from_secs(10));
         let mut echo_token: u32 = 1;
 
+        // Persistent partial-read state: the echo branch below drops the read
+        // future whenever it wins the `select!`. `read_frame_resumable` keeps
+        // any in-progress frame's bytes here so the next read resumes instead
+        // of losing them and desyncing the TCP framing.
+        let mut frame_buf = FrameBuf::new();
+
         loop {
             tokio::select! {
                 _ = echo_interval.tick() => {
@@ -575,7 +581,7 @@ impl PvaClient {
                     echo_token = echo_token.wrapping_add(1);
                     let _ = stream.write_all(&msg).await;
                 }
-                res = read_packet(&mut stream, self.timeout, &mut reassembler) => {
+                res = read_frame_resumable(&mut stream, self.timeout, &mut reassembler, &mut frame_buf) => {
                     let bytes = match res {
                         Ok(b) => b,
                         Err(PvGetError::Timeout(_)) => continue,
