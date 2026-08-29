@@ -275,6 +275,14 @@ impl MonitorRegistry {
     /// drift its window until it stalls. They therefore use the FIFO control
     /// lane, which is lossless and, for a pipelined subscriber, bounded by the
     /// credit window (the sender stops at `nfree == 0`).
+    ///
+    /// Invariant (R1-L1): a task depositing a *pipelined* (control-lane) frame
+    /// here must never be `abort`ed mid-deposit. Pipeline credit (`nfree`) is
+    /// decremented at build time in `notify_monitors`, before the frame reaches
+    /// the wire, so an aborted deposit would spend a credit the client never
+    /// receives — drifting its window until it stalls. Pumps today are shut
+    /// down cooperatively (not aborted), so this holds; it is a guard against
+    /// future changes that might introduce abort-based shutdown.
     async fn route_monitor_frame(
         &self,
         cw: &Arc<ConnWriter>,
@@ -348,7 +356,11 @@ impl MonitorRegistry {
             {
                 sub.running = running;
                 if let Some(v) = nfree {
-                    sub.nfree = v;
+                    // Clamp to the server ceiling: this `nfree` is the credit
+                    // copy that gates `notify_monitors`, so a client-supplied
+                    // window above the cap must not reach the control lane
+                    // unbounded (R1-H1).
+                    sub.nfree = v.min(crate::handler::MAX_PIPELINE_WINDOW);
                 }
                 if let Some(enabled) = pipeline_enabled {
                     if enabled {
@@ -425,6 +437,44 @@ mod tests {
         nt.alarm_severity = severity;
         NtPayload::Scalar(nt)
     }
+
+    #[tokio::test]
+    async fn update_monitor_subscription_clamps_client_window_to_ceiling() {
+        // R1-H1: `sub.nfree` here is the credit copy that gates
+        // `notify_monitors`. A client-supplied window above the server ceiling
+        // must be clamped so the lossless control lane cannot grow without
+        // bound for a stalled pipelined subscriber.
+        let reg = MonitorRegistry::new();
+        {
+            let mut monitors = reg.monitors.lock().await;
+            let mut sub = make_sub(None);
+            sub.pipeline_enabled = true;
+            monitors.entry("pv:x".to_string()).or_default().push(sub);
+        }
+
+        // A u32::MAX window clamps to the ceiling.
+        let ok = reg
+            .update_monitor_subscription(1, 42, "pv:x", true, Some(u32::MAX), Some(true))
+            .await;
+        assert!(ok, "expected the sub to be found");
+        {
+            let monitors = reg.monitors.lock().await;
+            let sub = &monitors.get("pv:x").unwrap()[0];
+            assert_eq!(sub.nfree, crate::handler::MAX_PIPELINE_WINDOW);
+            assert!(sub.nfree <= crate::handler::MAX_PIPELINE_WINDOW);
+        }
+
+        // A window below the cap is preserved unchanged.
+        reg.update_monitor_subscription(1, 42, "pv:x", true, Some(8), Some(true))
+            .await;
+        {
+            let monitors = reg.monitors.lock().await;
+            assert_eq!(monitors.get("pv:x").unwrap()[0].nfree, 8);
+        }
+    }
+
+    // Signature order note: update_monitor_subscription(conn_id, ioid, pv_name,
+    // running, nfree, pipeline_enabled). make_sub uses conn_id=1, ioid=42.
 
     #[test]
     fn unfiltered_first_frame_full_then_suppress_duplicate_then_resend_on_change() {

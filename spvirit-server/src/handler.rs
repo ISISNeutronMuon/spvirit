@@ -41,6 +41,12 @@ use crate::monitor::MonitorRegistry;
 use crate::pvstore::SourceRegistry;
 use crate::state::{ConnState, MonitorState, MonitorSub};
 
+/// Hard server-side ceiling on a pipelined monitor's outstanding-frame credit,
+/// regardless of the window a client requests or ACKs. Bounds worst-case memory
+/// on the (lossless) control lane so a stalled pipelined client cannot OOM the
+/// server (crate-audit review R1-H1).
+pub const MAX_PIPELINE_WINDOW: u32 = 4096;
+
 // ---------------------------------------------------------------------------
 // PvListMode — controls virtual PV listing behaviour
 // ---------------------------------------------------------------------------
@@ -1471,6 +1477,11 @@ pub async fn handle_connection(
                                         payload.body[start + 3],
                                     ])
                                 };
+                                // Clamp the client-requested window to the
+                                // server ceiling so a huge (up to u32::MAX)
+                                // request cannot make the lossless control lane
+                                // grow without bound (R1-H1).
+                                nfree = nfree.min(MAX_PIPELINE_WINDOW);
                             }
                             let resp = encode_op_init_response_desc(
                                 payload.command,
@@ -1591,9 +1602,13 @@ pub async fn handle_connection(
                                 }
                                 if let Some(v) = nfree {
                                     if pipeline_ack {
-                                        mon.nfree = mon.nfree.saturating_add(v);
+                                        // Clamp after the add so repeated ACKs
+                                        // cannot push credit past the server
+                                        // ceiling (R1-H1).
+                                        mon.nfree =
+                                            mon.nfree.saturating_add(v).min(MAX_PIPELINE_WINDOW);
                                     } else {
-                                        mon.nfree = v;
+                                        mon.nfree = v.min(MAX_PIPELINE_WINDOW);
                                     }
                                 }
                             }
@@ -1889,6 +1904,37 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket as TokioUdpSocket;
+
+    #[test]
+    fn pipeline_window_is_clamped_at_init_and_across_acks() {
+        // R1-H1: the subscription-init and pipeline-ACK sites read the
+        // outstanding-credit window from client-controlled bytes. These clamps
+        // mirror the exact expressions used at those sites; a huge requested
+        // window (or an accumulation of ACKs) must never exceed the ceiling,
+        // which is what bounds the lossless control lane's memory.
+
+        // Init: a window far above the cap (u32::MAX) clamps to the ceiling.
+        let requested = u32::MAX;
+        let nfree_init = requested.min(MAX_PIPELINE_WINDOW);
+        assert_eq!(nfree_init, MAX_PIPELINE_WINDOW);
+        assert!(nfree_init <= MAX_PIPELINE_WINDOW);
+
+        // A modest request below the cap is preserved unchanged.
+        let small = 16u32;
+        assert_eq!(small.min(MAX_PIPELINE_WINDOW), small);
+
+        // ACK: repeated large credit ACKs (saturating_add then clamp) can never
+        // push the window above the ceiling, even at u32::MAX per ACK.
+        let mut nfree = nfree_init;
+        for _ in 0..8 {
+            nfree = nfree.saturating_add(u32::MAX).min(MAX_PIPELINE_WINDOW);
+            assert!(
+                nfree <= MAX_PIPELINE_WINDOW,
+                "ACK-accumulated window {nfree} exceeded cap {MAX_PIPELINE_WINDOW}"
+            );
+        }
+        assert_eq!(nfree, MAX_PIPELINE_WINDOW);
+    }
 
     #[test]
     fn accept_retry_delay_backs_off_only_on_fd_exhaustion() {
