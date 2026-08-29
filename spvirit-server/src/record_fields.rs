@@ -379,7 +379,14 @@ impl Source for RecordFieldSource {
             let initial = resolve_field_payload(self.provider.as_ref(), &name).await?;
             let (tx, rx) = mpsc::channel(4);
             let _ = tx.try_send(initial);
-            self.open_subs.lock().await.push(tx);
+            // Prune senders whose receivers have been dropped before pushing a
+            // new one, so a churn of subscribe/disconnect cannot grow this Vec
+            // unboundedly. Exactly as tier-3's `IocSource::field_subs` fix (ioc
+            // 3a) — but this is a tokio `Mutex`, so the guard is awaited, not
+            // `.lock().unwrap()`.
+            let mut subs = self.open_subs.lock().await;
+            subs.retain(|tx| !tx.is_closed());
+            subs.push(tx);
             Some(rx)
         })
     }

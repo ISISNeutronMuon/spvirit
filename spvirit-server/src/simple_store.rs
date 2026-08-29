@@ -223,7 +223,7 @@ impl SimplePvStore {
             let payload = entry.record.to_ntpayload();
             entry
                 .subscribers
-                .retain(|tx| tx.try_send(payload.clone()).is_ok());
+                .retain(|tx| deliver_or_keep(tx, &payload));
             payload
         };
 
@@ -252,7 +252,7 @@ impl SimplePvStore {
                     let payload = entry.record.to_ntpayload();
                     entry
                         .subscribers
-                        .retain(|tx| tx.try_send(payload.clone()).is_ok());
+                        .retain(|tx| deliver_or_keep(tx, &payload));
                     Some(payload)
                 } else {
                     None
@@ -285,7 +285,7 @@ impl SimplePvStore {
                     let payload = entry.record.to_ntpayload();
                     entry
                         .subscribers
-                        .retain(|tx| tx.try_send(payload.clone()).is_ok());
+                        .retain(|tx| deliver_or_keep(tx, &payload));
                     Some(payload)
                 } else {
                     None
@@ -318,7 +318,7 @@ impl SimplePvStore {
                     let payload = entry.record.to_ntpayload();
                     entry
                         .subscribers
-                        .retain(|tx| tx.try_send(payload.clone()).is_ok());
+                        .retain(|tx| deliver_or_keep(tx, &payload));
                     Some(payload)
                 } else {
                     None
@@ -463,7 +463,7 @@ impl Source for SimplePvStore {
                     let payload = entry.record.to_ntpayload();
                     entry
                         .subscribers
-                        .retain(|tx| tx.try_send(payload.clone()).is_ok());
+                        .retain(|tx| deliver_or_keep(tx, &payload));
                     (Some((name.clone(), payload)), outcome)
                 } else {
                     (None, outcome)
@@ -514,6 +514,25 @@ impl Source for SimplePvStore {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+/// Try to deliver `payload` to one subscriber, returning whether the sender
+/// should be retained.
+///
+/// Distinguishes a *full* channel from a *closed* one — the crate-wide
+/// prune-on-Full convention (same shape as the committed gateway `dispatch`
+/// fix, item 0a): `Full` keeps the subscriber and drops only this update (a
+/// slow-but-live receiver must not be silently unsubscribed), `Closed` removes
+/// it. The bare `try_send(..).is_ok()` this replaces dropped both cases,
+/// which for any future subscriber that could actually fill the buffer would be
+/// a latent unsubscribe-on-a-single-slow-tick trap. (Unreachable via the server
+/// path today, where `pushes_own_updates()==true`.)
+fn deliver_or_keep(tx: &mpsc::Sender<NtPayload>, payload: &NtPayload) -> bool {
+    match tx.try_send(payload.clone()) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
 
 /// Numeric view of a scalar value, for deadband arithmetic.
 fn scalar_as_f64(v: &ScalarValue) -> Option<f64> {

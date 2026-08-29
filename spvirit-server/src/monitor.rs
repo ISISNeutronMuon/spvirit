@@ -139,7 +139,14 @@ impl MonitorRegistry {
     /// pipeline credit accounting. Returns `None` when the update is a no-op
     /// (duplicate of the last snapshot under the subscriber's field view) —
     /// in that case the caller must NOT decrement `nfree`.
-    fn build_monitor_frame(sub: &MonitorSub, payload: &NtPayload) -> Option<Vec<u8>> {
+    ///
+    /// This is a **pure** function (inputs → frame bytes; it reads only its two
+    /// arguments and touches no `self`/registry state), which is why it is `pub`:
+    /// the server *bin* calls it directly so its monitor-delivery tail can be a
+    /// byte-for-byte match of this canonical builder instead of a hand-copied
+    /// duplicate (crate audit item 2a). The S1 coalescing fix (0b) lives here,
+    /// so centralizing on this copy is what keeps every caller correct.
+    pub fn build_monitor_frame(sub: &MonitorSub, payload: &NtPayload) -> Option<Vec<u8>> {
         let subcmd = 0x00;
         // First frame: send the whole (possibly filtered) payload with bit 0 set.
         let Some(prev) = sub.last_snapshot.as_ref() else {
@@ -236,10 +243,25 @@ impl MonitorRegistry {
             }
         }
 
-        for (conn_id, ioid, msg, pipelined) in to_send {
-            if let Some(cw) = self.conn_writer(conn_id).await {
-                self.route_monitor_frame(&cw, ioid, msg, pipelined).await;
-            }
+        // Resolve every connection's writer with a SINGLE `conns` lock rather
+        // than re-locking per subscriber. The `monitors` lock is already
+        // released (its block ended above), so this does NOT nest `conns`
+        // inside `monitors` — preserving the lock ordering the pump relies on.
+        let resolved: Vec<(u64, Arc<ConnWriter>, u32, Vec<u8>, bool)> = {
+            let conns = self.conns.lock().await;
+            to_send
+                .into_iter()
+                .filter_map(|(conn_id, ioid, msg, pipelined)| {
+                    conns
+                        .get(&conn_id)
+                        .cloned()
+                        .map(|cw| (conn_id, cw, ioid, msg, pipelined))
+                })
+                .collect()
+        };
+
+        for (conn_id, cw, ioid, msg, pipelined) in resolved {
+            self.route_monitor_frame(&cw, ioid, msg, pipelined).await;
             debug!("Monitor update pv='{}' conn={}", pv_name, conn_id);
         }
     }
@@ -424,6 +446,42 @@ mod tests {
         let p2 = nt_payload(2.0, 0);
         let f2 = MonitorRegistry::build_monitor_frame(&sub, &p2).expect("full on change");
         assert!(!f2.is_empty());
+    }
+
+    #[test]
+    fn build_monitor_frame_first_frame_matches_reference_full_encode() {
+        // Reference frame for item 2a: the (now `pub`) canonical builder's
+        // output is what the server bin's copy must reproduce byte-for-byte.
+        // Pin the representative unfiltered first-frame to a fresh full encode.
+        //
+        // The payload MUST carry an explicit timeStamp: with `time_stamp == None`
+        // the encoder falls back to `SystemTime::now()` at encode time, so the two
+        // independent encodes below (taken microseconds apart) would stamp
+        // different timeStamps and never match. Pinning it makes the encode
+        // deterministic — which is exactly the property the byte-for-byte
+        // reference guarantee relies on.
+        let sub = make_sub(None);
+        let mut p1 = nt_payload(1.0, 0);
+        if let NtPayload::Scalar(ref mut nt) = p1 {
+            nt.time_stamp = Some(spvirit_types::NtTimeStamp {
+                seconds_past_epoch: 1_700_000_000,
+                nanoseconds: 123_456_789,
+                user_tag: 0,
+            });
+        }
+        let frame =
+            MonitorRegistry::build_monitor_frame(&sub, &p1).expect("first frame");
+        let expected = encode_monitor_data_response_payload(
+            sub.ioid,
+            0x00,
+            &p1,
+            sub.version,
+            sub.is_be,
+        );
+        assert_eq!(
+            frame, expected,
+            "canonical build_monitor_frame first frame must equal a full payload encode"
+        );
     }
 
     #[test]
