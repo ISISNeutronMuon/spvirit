@@ -4,7 +4,7 @@
 //! `ManualClock` explicitly and never call `thread::sleep`.
 
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A source of monotonic time the engine can wait against.
 pub trait Clock: Send + Sync {
@@ -12,6 +12,17 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> Instant;
     /// Block the calling thread until `now() >= deadline`.
     fn sleep_until(&self, deadline: Instant);
+    /// Wall-clock nanoseconds since the UNIX epoch, for record timestamps.
+    fn unix_nanos(&self) -> u64;
+}
+
+/// Wall-clock nanoseconds since the UNIX epoch, from the real OS clock.
+fn real_unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        // A clock before the epoch is not worth failing a process pass over.
+        .unwrap_or(1)
 }
 
 /// The real OS clock. Used in production.
@@ -28,6 +39,9 @@ impl Clock for SystemClock {
             std::thread::sleep(deadline - now);
         }
     }
+    fn unix_nanos(&self) -> u64 {
+        real_unix_nanos()
+    }
 }
 
 /// A clock that only advances when told to. Deterministic for tests.
@@ -43,6 +57,9 @@ pub struct ManualClock {
 
 struct Inner {
     anchor: Instant,
+    /// Real epoch nanos captured at construction, so `unix_nanos` yields a
+    /// plausible wall-clock stamp that still advances only on `advance`.
+    epoch_base: u64,
     accumulated: Mutex<Duration>,
     cvar: Condvar,
 }
@@ -52,6 +69,7 @@ impl ManualClock {
         Self {
             inner: Arc::new(Inner {
                 anchor: Instant::now(),
+                epoch_base: real_unix_nanos(),
                 accumulated: Mutex::new(Duration::ZERO),
                 cvar: Condvar::new(),
             }),
@@ -63,6 +81,11 @@ impl ManualClock {
         let mut acc = self.inner.accumulated.lock().unwrap();
         *acc += by;
         self.inner.cvar.notify_all();
+    }
+
+    /// The current wall-clock stamp this clock would hand a record, for tests.
+    pub fn now_unix_nanos(&self) -> u64 {
+        self.unix_nanos()
     }
 }
 
@@ -81,6 +104,9 @@ impl Clock for ManualClock {
         while self.inner.anchor + *acc < deadline {
             acc = self.inner.cvar.wait(acc).unwrap();
         }
+    }
+    fn unix_nanos(&self) -> u64 {
+        self.inner.epoch_base + self.inner.accumulated.lock().unwrap().as_nanos() as u64
     }
 }
 

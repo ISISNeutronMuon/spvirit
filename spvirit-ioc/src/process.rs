@@ -12,18 +12,6 @@ use crate::ctx::{ProcCtx, ProcError};
 use crate::lockset::{LockSetData, RecordId};
 use crate::model::{Field, Kind, Limits, Link, Omsl, Record, Target, Value};
 
-/// Wall-clock nanoseconds since the epoch, for the record's timestamp.
-///
-/// Sub-project B replaces this with a TSE-aware time provider; A stamps at
-/// process time, which is what `TSE = 0` means.
-fn now_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        // A clock before the epoch is not worth failing a process pass over.
-        .unwrap_or(1)
-}
-
 /// Process one record.
 ///
 /// The numbered steps are `dbProcess`'s, kept in the same order so the
@@ -406,7 +394,7 @@ pub(crate) fn record_body(
         set.get_mut(id).common.pact = false;
         return Err(err);
     }
-    set.get_mut(id).time_ns = now_ns();
+    set.get_mut(id).time_ns = ctx.clock().unix_nanos();
     if is_analogue(kind) {
         check_limits(set, id);
     } else {
@@ -661,6 +649,37 @@ mod tests {
 
     fn event_names(ctx: &mut ProcCtx) -> Vec<String> {
         ctx.take_events().into_iter().map(|(n, _)| n).collect()
+    }
+
+    #[test]
+    fn record_timestamp_comes_from_the_injected_clock() {
+        use crate::clock::ManualClock;
+        use std::time::Duration;
+        let clock = ManualClock::new();
+        clock.advance(Duration::from_secs(1_700_000_000)); // a fixed, known offset
+        let expected_ns = clock.now_unix_nanos(); // helper added below
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"1\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let mut ctx = ProcCtx::with_clock(&clock);
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            assert_eq!(
+                set.get(id).time_ns,
+                expected_ns,
+                "timestamp must come from the injected clock, not SystemTime::now"
+            );
+            // An independent lower bound so this asserts the clock's arithmetic,
+            // not just that both sides share a (possibly broken) unix_nanos.
+            // The advance alone is 1.7e18 ns; a real epoch base only adds to it,
+            // so the stamp must clear the advance. A `+`->`-` or drop-to-zero
+            // mutation of `ManualClock::unix_nanos` falls below this and dies.
+            assert!(
+                set.get(id).time_ns >= 1_700_000_000_000_000_000,
+                "the stamp must reflect the advanced clock, not a zeroed or \
+                 subtracted epoch: got {}",
+                set.get(id).time_ns
+            );
+        });
     }
 
     #[test]
