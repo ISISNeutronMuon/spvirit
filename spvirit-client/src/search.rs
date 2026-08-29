@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use crate::auth::{default_authnz_host, default_authnz_user};
 use crate::transport::read_packet;
 use crate::types::{PvGetError, PvGetOptions};
 use spvirit_codec::SegmentReassembler;
-use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand, PvaSearchResponsePayload};
 use spvirit_codec::spvirit_encode::{
     encode_client_connection_validation, encode_search_request, ip_to_bytes,
     socket_addr_from_pva_bytes,
@@ -339,25 +340,47 @@ fn bind_udp_reuse(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     Ok(sock.into())
 }
 
-pub async fn search_pv(
-    pv_name: &str,
+/// UDP sockets opened for one search/discovery operation, plus the shared
+/// channel their receiver tasks forward inbound packets into.
+///
+/// `recv_tasks` MUST be held for the whole receive loop and dropped only when
+/// the operation ends: dropping this struct aborts the receiver tasks, which
+/// releases their `Arc<UdpSocket>` clones and closes the ephemeral sockets.
+/// This is the fd-leak fix — a receiver parked in `recv_from().await` on a
+/// quiet target otherwise lives forever holding the socket open (one leaked fd
+/// per call, exhausting the fd table under churn). See the
+/// `search_pv_does_not_leak_udp_sockets` regression test.
+struct SearchSockets {
+    /// Per bind group: (socket, encoded request, destinations) for retransmit.
+    socket_info: Vec<(Arc<UdpSocket>, Vec<u8>, Vec<SocketAddr>)>,
+    /// Receiver tasks; held only for their `Drop` — dropping the set aborts
+    /// the tasks and closes the sockets (the fd-leak fix), so the field is
+    /// never read directly.
+    #[allow(dead_code)]
+    recv_tasks: tokio::task::JoinSet<()>,
+    /// Inbound (packet, source) stream merged from every socket.
+    rx: tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+}
+
+/// Shared UDP setup for [`search_pv`] and [`discover_servers`]: group targets
+/// by bind address, open one ephemeral socket per bind, send the request built
+/// by `build_msg(reply_port, reply_addr)` to every target, and spawn a
+/// receiver task per socket forwarding packets into a shared channel.
+///
+/// Returns `Err(last_io_error)` when no socket could be opened, so the caller
+/// can pick the error kind appropriate to its operation (`None` = no I/O error
+/// occurred, the caller had no viable targets/binds).
+async fn open_search_sockets<F>(
     udp_port: u16,
-    timeout_dur: Duration,
     targets: &[SearchTarget],
     debug_enabled: bool,
-) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
-    if targets.is_empty() {
-        return Err(PvGetError::Search("no search targets"));
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let seq = (now.as_nanos() as u32).wrapping_add(std::process::id());
-    let cid = seq ^ 0x9E37_79B9;
-
+    op: &str,
+    mut build_msg: F,
+) -> Result<SearchSockets, Option<std::io::Error>>
+where
+    F: FnMut(u16, [u8; 16]) -> Vec<u8>,
+{
     let mut last_io_error: Option<std::io::Error> = None;
-    let deadline = tokio::time::Instant::now() + timeout_dur;
 
     // Group targets by bind address so we can share a socket per bind.
     let mut bind_groups: Vec<(IpAddr, Vec<IpAddr>)> = Vec::new();
@@ -374,11 +397,10 @@ pub async fn search_pv(
     let mut socket_info: Vec<(Arc<UdpSocket>, Vec<u8>, Vec<SocketAddr>)> = Vec::new();
 
     for (bind_ip, group_targets) in &bind_groups {
-        // Always use an ephemeral port for the search client socket.
-        // We only receive unicast replies, so sharing the server's search
-        // port is unnecessary — and on Linux with SO_REUSEPORT the kernel
-        // would route our own outbound packet back to us instead of the
-        // server.
+        // Always use an ephemeral port for the client socket. We only receive
+        // unicast replies, so sharing the server's search port is unnecessary
+        // — and on Linux with SO_REUSEPORT the kernel would route our own
+        // outbound packet back to us instead of the server.
         let bind_addr = SocketAddr::new(*bind_ip, 0);
         let (std_sock, actual_bind_addr) = match bind_udp_reuse(bind_addr) {
             Ok(sock) => {
@@ -388,7 +410,7 @@ pub async fn search_pv(
             Err(err) => {
                 if debug_enabled {
                     debug!(
-                        "pva search skipping bind={} step=bind kind={:?} err={}",
+                        "pva {op} skipping bind={} step=bind kind={:?} err={}",
                         bind_addr,
                         err.kind(),
                         err
@@ -401,7 +423,7 @@ pub async fn search_pv(
         if let Err(err) = std_sock.set_broadcast(true) {
             if debug_enabled {
                 debug!(
-                    "pva search skipping bind={} step=set_broadcast kind={:?} err={}",
+                    "pva {op} skipping bind={} step=set_broadcast kind={:?} err={}",
                     bind_addr,
                     err.kind(),
                     err
@@ -419,7 +441,7 @@ pub async fn search_pv(
             Err(err) => {
                 if debug_enabled {
                     debug!(
-                        "pva search skipping bind={} step=local_addr kind={:?} err={}",
+                        "pva {op} skipping bind={} step=local_addr kind={:?} err={}",
                         bind_addr,
                         err.kind(),
                         err
@@ -429,15 +451,14 @@ pub async fn search_pv(
                 continue;
             }
         };
-        let requests = [(cid, pv_name)];
-        let msg = encode_search_request(seq, 0x81, reply_port, reply_addr, &requests, 2, false);
+        let msg = build_msg(reply_port, reply_addr);
 
         let socket = match UdpSocket::from_std(std_sock) {
             Ok(socket) => socket,
             Err(err) => {
                 if debug_enabled {
                     debug!(
-                        "pva search skipping bind={} step=from_std kind={:?} err={}",
+                        "pva {op} skipping bind={} step=from_std kind={:?} err={}",
                         bind_addr,
                         err.kind(),
                         err
@@ -457,19 +478,18 @@ pub async fn search_pv(
         for dest in &dests {
             if debug_enabled {
                 debug!(
-                    "pva search bind={} target={} server_port={} reply_port={}",
+                    "pva {op} bind={} target={} server_port={} reply_port={}",
                     actual_bind_addr,
                     dest.ip(),
                     udp_port,
                     reply_port
                 );
-                debug!("pva search seq={} cid={}", seq, cid);
-                debug!("pva search send {} bytes to {}", msg.len(), dest);
+                debug!("pva {op} send {} bytes to {}", msg.len(), dest);
             }
             if let Err(err) = socket.send_to(&msg, dest).await {
                 if debug_enabled {
                     debug!(
-                        "pva search send_to target={} kind={:?} err={}",
+                        "pva {op} send_to target={} kind={:?} err={}",
                         dest,
                         err.kind(),
                         err
@@ -483,22 +503,15 @@ pub async fn search_pv(
     }
 
     if socket_info.is_empty() {
-        if let Some(err) = last_io_error {
-            return Err(PvGetError::Io(err));
-        }
-        return Err(PvGetError::Timeout("search response"));
+        return Err(last_io_error);
     }
 
     // Spawn a receiver task per socket that forwards packets into a shared
-    // channel. The tasks are held in a JoinSet so that when this function
-    // returns — on success, timeout, or error — the JoinSet is dropped and
-    // every receiver task is aborted. That releases each task's
-    // Arc<UdpSocket> clone, so the ephemeral search socket is closed instead
-    // of leaking. Without this, a task parked in `recv_from().await` on a
-    // quiet target lives forever holding the socket open (one leaked fd per
-    // call, which exhausts the fd table under churn). See the
-    // `search_pv_does_not_leak_udp_sockets` regression test.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
+    // channel. The tasks are held in a JoinSet so that when the operation ends
+    // — on success, timeout, or error — the JoinSet is dropped and every
+    // receiver task is aborted, closing the ephemeral socket instead of
+    // leaking it (see the `SearchSockets` doc and the fd-leak regression test).
+    let (tx, rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
     let mut recv_tasks = tokio::task::JoinSet::new();
     for (sock, _, _) in &socket_info {
         let sock = Arc::clone(sock);
@@ -520,6 +533,43 @@ pub async fn search_pv(
     }
     drop(tx); // Only spawned tasks hold senders; channel closes when they exit.
 
+    Ok(SearchSockets {
+        socket_info,
+        recv_tasks,
+        rx,
+    })
+}
+
+/// Shared receive loop for [`search_pv`] and [`discover_servers`].
+///
+/// Drives the retransmit schedule against `deadline`, decodes each inbound
+/// packet, applies the filtering common to both callers (matching `seq`; TCP
+/// protocol only), and hands every accepted [`PvaSearchResponsePayload`] to
+/// `on_response`. The handler returns [`ControlFlow::Break`] to stop early and
+/// return its value (first-match, as `search_pv` does) or
+/// [`ControlFlow::Continue`] to keep collecting (as `discover_servers` does).
+///
+/// `fail_on_decode_error` selects the decode-failure policy: `true` returns a
+/// [`PvGetError::Search`] (search_pv), `false` skips the packet (discover).
+/// Returns `Ok(None)` when the deadline elapses or every socket closed without
+/// an early return.
+async fn run_search_recv_loop<H, T>(
+    sockets: &mut SearchSockets,
+    seq: u32,
+    deadline: tokio::time::Instant,
+    debug_enabled: bool,
+    op: &str,
+    fail_on_decode_error: bool,
+    mut on_response: H,
+) -> Result<Option<T>, PvGetError>
+where
+    H: FnMut(PvaSearchResponsePayload, SocketAddr) -> ControlFlow<T>,
+{
+    // Bind the two accessed fields as disjoint borrows up front so the
+    // `select!` below cannot be read as borrowing all of `*sockets`.
+    let rx = &mut sockets.rx;
+    let socket_info = &sockets.socket_info;
+
     // Retransmit schedule: exponential backoff from start.
     let retransmit_offsets = [100u64, 500, 1000, 2000];
     let start = tokio::time::Instant::now();
@@ -538,13 +588,19 @@ pub async fn search_pv(
             recv = rx.recv() => {
                 let Some((buf, src)) = recv else { break };
                 let mut pkt = PvaPacket::new(&buf);
-                let cmd = pkt
-                    .decode_payload()
-                    .ok_or(PvGetError::Search("failed to decode search response"))?;
+                let cmd = match pkt.decode_payload() {
+                    Some(cmd) => cmd,
+                    None => {
+                        if fail_on_decode_error {
+                            return Err(PvGetError::Search("failed to decode search response"));
+                        }
+                        continue;
+                    }
+                };
                 if let PvaPacketCommand::SearchResponse(payload) = cmd {
                     if debug_enabled {
                         debug!(
-                            "pva search response found={} cids={:?} addr={:?} port={}",
+                            "pva {op} response found={} cids={:?} addr={:?} port={}",
                             payload.found, payload.cids, payload.addr, payload.port
                         );
                     }
@@ -554,18 +610,9 @@ pub async fn search_pv(
                     if !payload.protocol.is_empty() && !payload.protocol.eq_ignore_ascii_case("tcp") {
                         continue;
                     }
-                    if !payload.found {
-                        continue;
+                    if let ControlFlow::Break(value) = on_response(payload, src) {
+                        return Ok(Some(value));
                     }
-                    if !payload.cids.is_empty() && !payload.cids.contains(&cid) {
-                        continue;
-                    }
-
-                    let addr = decode_search_response_addr(payload.addr, payload.port, src);
-                    if debug_enabled {
-                        debug!("pva search response from {}", addr);
-                    }
-                    return Ok((addr, payload.guid));
                 }
             }
             _ = tokio::time::sleep_until(wake_at) => {
@@ -575,9 +622,9 @@ pub async fn search_pv(
                 // Retransmit to all targets on all sockets.
                 if next_retransmit < retransmit_offsets.len() {
                     if debug_enabled {
-                        debug!("pva search retransmit round {}", next_retransmit + 1);
+                        debug!("pva {op} retransmit round {}", next_retransmit + 1);
                     }
-                    for (sock, msg, dests) in &socket_info {
+                    for (sock, msg, dests) in socket_info {
                         for dest in dests {
                             let _ = sock.send_to(msg, dest).await;
                         }
@@ -588,7 +635,70 @@ pub async fn search_pv(
         }
     }
 
-    Err(PvGetError::Timeout("search response"))
+    Ok(None)
+}
+
+pub async fn search_pv(
+    pv_name: &str,
+    udp_port: u16,
+    timeout_dur: Duration,
+    targets: &[SearchTarget],
+    debug_enabled: bool,
+) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
+    if targets.is_empty() {
+        return Err(PvGetError::Search("no search targets"));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seq = (now.as_nanos() as u32).wrapping_add(std::process::id());
+    let cid = seq ^ 0x9E37_79B9;
+
+    let deadline = tokio::time::Instant::now() + timeout_dur;
+
+    let mut sockets = match open_search_sockets(
+        udp_port,
+        targets,
+        debug_enabled,
+        "search",
+        |reply_port, reply_addr| {
+            let requests = [(cid, pv_name)];
+            encode_search_request(seq, 0x81, reply_port, reply_addr, &requests, 2, false)
+        },
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(Some(err)) => return Err(PvGetError::Io(err)),
+        Err(None) => return Err(PvGetError::Timeout("search response")),
+    };
+
+    let found = run_search_recv_loop(
+        &mut sockets,
+        seq,
+        deadline,
+        debug_enabled,
+        "search",
+        // search_pv treats an undecodable response as a hard error.
+        true,
+        |payload, src| {
+            if !payload.found {
+                return ControlFlow::Continue(());
+            }
+            if !payload.cids.is_empty() && !payload.cids.contains(&cid) {
+                return ControlFlow::Continue(());
+            }
+            let addr = decode_search_response_addr(payload.addr, payload.port, src);
+            if debug_enabled {
+                debug!("pva search response from {}", addr);
+            }
+            ControlFlow::Break((addr, payload.guid))
+        },
+    )
+    .await?;
+
+    found.ok_or(PvGetError::Timeout("search response"))
 }
 
 pub fn default_bind_ip() -> Option<IpAddr> {
@@ -848,222 +958,46 @@ pub async fn discover_servers(
     let seq = (now.as_nanos() as u32).wrapping_add(std::process::id());
 
     let mut found: Vec<DiscoveredServer> = Vec::new();
-    let mut last_io_error: Option<std::io::Error> = None;
     let deadline = tokio::time::Instant::now() + timeout_dur;
 
-    // Group targets by bind address so we can share a socket per bind.
-    let mut bind_groups: Vec<(IpAddr, Vec<IpAddr>)> = Vec::new();
-    for t in targets {
-        if let Some(group) = bind_groups.iter_mut().find(|(b, _)| *b == t.bind) {
-            group.1.push(t.target);
-        } else {
-            bind_groups.push((t.bind, vec![t.target]));
-        }
-    }
+    let mut sockets = match open_search_sockets(
+        udp_port,
+        targets,
+        debug_enabled,
+        "discover",
+        // Server discovery sends an empty pv-request list (no cids).
+        |reply_port, reply_addr| {
+            encode_search_request(seq, 0x81, reply_port, reply_addr, &[], 2, false)
+        },
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(Some(err)) => return Err(PvGetError::Io(err)),
+        // Discovery reports "no targets" rather than a timeout when no socket
+        // could be opened.
+        Err(None) => return Err(PvGetError::Search("no search targets")),
+    };
 
-    // Open sockets and send to all targets first, then collect responses.
-    // Store (socket, message, destinations) for retransmission.
-    let mut socket_info: Vec<(Arc<UdpSocket>, Vec<u8>, Vec<SocketAddr>)> = Vec::new();
-
-    for (bind_ip, group_targets) in &bind_groups {
-        // Always use an ephemeral port for the discovery client socket.
-        // We only receive unicast replies, so sharing the server's search
-        // port is unnecessary — and on Linux with SO_REUSEPORT the kernel
-        // would route our own outbound packet back to us instead of the
-        // server.
-        let bind_addr = SocketAddr::new(*bind_ip, 0);
-        let (std_sock, actual_bind_addr) = match bind_udp_reuse(bind_addr) {
-            Ok(sock) => {
-                let actual = sock.local_addr().unwrap_or(bind_addr);
-                (sock, actual)
-            }
-            Err(err) => {
-                if debug_enabled {
-                    debug!(
-                        "pva discover skipping bind={} step=bind kind={:?} err={}",
-                        bind_addr,
-                        err.kind(),
-                        err
-                    );
-                }
-                last_io_error = Some(err);
-                continue;
-            }
-        };
-        if let Err(err) = std_sock.set_broadcast(true) {
-            if debug_enabled {
-                debug!(
-                    "pva discover skipping bind={} step=set_broadcast kind={:?} err={}",
-                    bind_addr,
-                    err.kind(),
-                    err
-                );
-            }
-            last_io_error = Some(err);
-            continue;
-        }
-
-        join_multicast_any(&std_sock, *bind_ip);
-
-        let reply_addr = ip_to_bytes(*bind_ip);
-        let reply_port = match std_sock.local_addr() {
-            Ok(addr) => addr.port(),
-            Err(err) => {
-                if debug_enabled {
-                    debug!(
-                        "pva discover skipping bind={} step=local_addr kind={:?} err={}",
-                        bind_addr,
-                        err.kind(),
-                        err
-                    );
-                }
-                last_io_error = Some(err);
-                continue;
-            }
-        };
-        let msg = encode_search_request(seq, 0x81, reply_port, reply_addr, &[], 2, false);
-
-        let socket = match UdpSocket::from_std(std_sock) {
-            Ok(socket) => socket,
-            Err(err) => {
-                if debug_enabled {
-                    debug!(
-                        "pva discover skipping bind={} step=from_std kind={:?} err={}",
-                        bind_addr,
-                        err.kind(),
-                        err
-                    );
-                }
-                last_io_error = Some(err);
-                continue;
-            }
-        };
-
-        let dests: Vec<SocketAddr> = group_targets
-            .iter()
-            .map(|ip| SocketAddr::new(*ip, udp_port))
-            .collect();
-
-        // Send to every target in this bind group immediately.
-        for dest in &dests {
-            if debug_enabled {
-                debug!(
-                    "pva discover bind={} target={} server_port={} reply_port={} seq={}",
-                    actual_bind_addr,
-                    dest.ip(),
-                    udp_port,
-                    reply_port,
-                    seq
-                );
-            }
-            if let Err(err) = socket.send_to(&msg, dest).await {
-                if debug_enabled {
-                    debug!(
-                        "pva discover send_to target={} kind={:?} err={}",
-                        dest,
-                        err.kind(),
-                        err
-                    );
-                }
-                last_io_error = Some(err);
-            }
-        }
-
-        socket_info.push((Arc::new(socket), msg, dests));
-    }
-
-    if socket_info.is_empty() {
-        if let Some(err) = last_io_error {
-            return Err(PvGetError::Io(err));
-        }
-        return Err(PvGetError::Search("no search targets"));
-    }
-
-    // Spawn a receiver task per socket that forwards packets into a shared
-    // channel. The tasks are held in a JoinSet so that when this function
-    // returns — on success, timeout, or error — the JoinSet is dropped and
-    // every receiver task is aborted. That releases each task's
-    // Arc<UdpSocket> clone, so the ephemeral search socket is closed instead
-    // of leaking. Without this, a task parked in `recv_from().await` on a
-    // quiet target lives forever holding the socket open (one leaked fd per
-    // call, which exhausts the fd table under churn). See the
-    // `search_pv_does_not_leak_udp_sockets` regression test.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
-    let mut recv_tasks = tokio::task::JoinSet::new();
-    for (sock, _, _) in &socket_info {
-        let sock = Arc::clone(sock);
-        let tx = tx.clone();
-        recv_tasks.spawn(async move {
-            loop {
-                let mut buf = vec![0u8; 2048];
-                match sock.recv_from(&mut buf).await {
-                    Ok((len, src)) => {
-                        buf.truncate(len);
-                        if tx.send((buf, src)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-    drop(tx); // Only spawned tasks hold senders; channel closes when they exit.
-
-    // Retransmit schedule: exponential backoff from start.
-    let retransmit_offsets = [100u64, 500, 1000, 2000];
-    let start = tokio::time::Instant::now();
-    let mut next_retransmit = 0usize;
-
-    loop {
-        // Compute the next wake-up: either the next retransmit or the deadline.
-        let next_retransmit_at = if next_retransmit < retransmit_offsets.len() {
-            start + Duration::from_millis(retransmit_offsets[next_retransmit])
-        } else {
-            deadline
-        };
-        let wake_at = next_retransmit_at.min(deadline);
-
-        tokio::select! {
-            recv = rx.recv() => {
-                let Some((buf, src)) = recv else { break };
-                let mut pkt = PvaPacket::new(&buf);
-                let Some(cmd) = pkt.decode_payload() else {
-                    continue;
-                };
-                if let PvaPacketCommand::SearchResponse(payload) = cmd {
-                    if payload.seq != seq {
-                        continue;
-                    }
-                    if !payload.protocol.is_empty() && !payload.protocol.eq_ignore_ascii_case("tcp") {
-                        continue;
-                    }
-                    let tcp_addr = decode_search_response_addr(payload.addr, payload.port, src);
-                    found.push(DiscoveredServer {
-                        guid: payload.guid,
-                        tcp_addr,
-                    });
-                }
-            }
-            _ = tokio::time::sleep_until(wake_at) => {
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                // Retransmit to all targets on all sockets.
-                if next_retransmit < retransmit_offsets.len() {
-                    if debug_enabled {
-                        debug!("pva discover retransmit round {}", next_retransmit + 1);
-                    }
-                    for (sock, msg, dests) in &socket_info {
-                        for dest in dests {
-                            let _ = sock.send_to(msg, dest).await;
-                        }
-                    }
-                    next_retransmit += 1;
-                }
-            }
-        }
-    }
+    // Collect every responder until the deadline; discovery never stops early
+    // and (unlike search_pv) skips undecodable packets rather than erroring.
+    run_search_recv_loop(
+        &mut sockets,
+        seq,
+        deadline,
+        debug_enabled,
+        "discover",
+        false,
+        |payload, src| -> ControlFlow<()> {
+            let tcp_addr = decode_search_response_addr(payload.addr, payload.port, src);
+            found.push(DiscoveredServer {
+                guid: payload.guid,
+                tcp_addr,
+            });
+            ControlFlow::Continue(())
+        },
+    )
+    .await?;
 
     Ok(normalize_discovered_servers(found))
 }

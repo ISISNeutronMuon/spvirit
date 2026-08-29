@@ -66,24 +66,29 @@ pub struct ChannelConn {
     pub reassembler: SegmentReassembler,
 }
 
-pub async fn establish_channel(
-    target: std::net::SocketAddr,
-    guid: [u8; 12],
+/// Perform the PVA connection-validation handshake on an already-connected
+/// TCP stream.
+///
+/// Reads the server's opening frames (SET_BYTE_ORDER control + the server's
+/// `ConnectionValidation`) to learn the protocol version and byte order, sends
+/// this client's `ConnectionValidation`, then waits for `ConnectionValidated`.
+/// Returns the negotiated `(version, is_be)`.
+///
+/// `reassembler` must be the one owned by this connection so pending segments
+/// survive the handshake into the caller's subsequent reads.
+///
+/// Shared by [`establish_channel`] and `pvlist::list_pvs_via_get_field`, which
+/// previously carried byte-identical copies of this exchange.
+pub async fn pva_handshake(
+    stream: &mut TcpStream,
     opts: &PvGetOptions,
-) -> Result<ChannelConn, PvGetError> {
-    let mut stream = timeout(opts.timeout, TcpStream::connect(target))
-        .await
-        .map_err(|_| PvGetError::Timeout("connect"))??;
-
-    // One reassembler for the lifetime of this connection; it is handed to
-    // the caller in `ChannelConn` so pending segments survive the handshake.
-    let mut reassembler = SegmentReassembler::new();
-
+    reassembler: &mut SegmentReassembler,
+) -> Result<(u8, bool), PvGetError> {
     let mut version = 2u8;
     let mut is_be = false;
 
     for _ in 0..2 {
-        if let Ok(bytes) = read_packet(&mut stream, opts.timeout, &mut reassembler).await {
+        if let Ok(bytes) = read_packet(stream, opts.timeout, reassembler).await {
             let mut pkt = PvaPacket::new(&bytes);
             if let Some(cmd) = pkt.decode_payload() {
                 match cmd {
@@ -105,10 +110,28 @@ pub async fn establish_channel(
     let validation = build_client_validation(opts, version, is_be);
     stream.write_all(&validation).await?;
 
-    let _ = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
+    let _ = read_until(stream, opts.timeout, reassembler, |cmd| {
         matches!(cmd, PvaPacketCommand::ConnectionValidated(_))
     })
     .await?;
+
+    Ok((version, is_be))
+}
+
+pub async fn establish_channel(
+    target: std::net::SocketAddr,
+    guid: [u8; 12],
+    opts: &PvGetOptions,
+) -> Result<ChannelConn, PvGetError> {
+    let mut stream = timeout(opts.timeout, TcpStream::connect(target))
+        .await
+        .map_err(|_| PvGetError::Timeout("connect"))??;
+
+    // One reassembler for the lifetime of this connection; it is handed to
+    // the caller in `ChannelConn` so pending segments survive the handshake.
+    let mut reassembler = SegmentReassembler::new();
+
+    let (version, is_be) = pva_handshake(&mut stream, opts, &mut reassembler).await?;
 
     let cid = 1u32;
     let create = encode_create_channel_request(cid, &opts.pv_name, version, is_be);

@@ -592,35 +592,37 @@ impl PvaClient {
                         if op.command == 13 && op.ioid == ioid && op.subcmd == 0x00 {
                             let payload = &bytes[8..]; // skip header
                             let pos = 5; // skip ioid(4) + subcmd(1)
-                            if let Ok(update) =
-                                decoder.decode_monitor_update(&payload[pos..], &field_desc)
-                            {
-                                let flow = callback(&update);
+                            // Decode the update, but do NOT gate credit
+                            // accounting on a successful decode. Under
+                            // pipelining the server charges exactly one credit
+                            // for this MONITOR data message whether or not the
+                            // client can decode it, so the ACK (credit return)
+                            // must run on *every* consume path — decode success
+                            // and decode failure alike. Gating the ACK on a
+                            // successful decode (as this once did) leaks one
+                            // credit per decode failure; once the queue window
+                            // drains the server stops sending and the monitor
+                            // stalls forever. Only the callback / break
+                            // handling is gated on a successful decode.
+                            let decoded =
+                                decoder.decode_monitor_update(&payload[pos..], &field_desc);
 
-                                if pipeline_queue.is_some() {
-                                    consumed_since_ack = consumed_since_ack.saturating_add(1);
-                                    if consumed_since_ack >= ack_threshold {
-                                        let ack_bytes = if is_be {
-                                            consumed_since_ack.to_be_bytes()
-                                        } else {
-                                            consumed_since_ack.to_le_bytes()
-                                        };
-                                        let ack = encode_monitor_request(
-                                            sid,
-                                            ioid,
-                                            0x80,
-                                            &ack_bytes,
-                                            PVA_VERSION,
-                                            is_be,
-                                        );
-                                        if stream.write_all(&ack).await.is_err() {
-                                            return Ok(());
-                                        }
-                                        consumed_since_ack = 0;
+                            if pipeline_queue.is_some() {
+                                if let Some(ack) = pipeline_ack_on_consume(
+                                    &mut consumed_since_ack,
+                                    ack_threshold,
+                                    sid,
+                                    ioid,
+                                    is_be,
+                                ) {
+                                    if stream.write_all(&ack).await.is_err() {
+                                        return Ok(());
                                     }
                                 }
+                            }
 
-                                if flow.is_break() {
+                            if let Ok(update) = decoded {
+                                if callback(&update).is_break() {
                                     // Best-effort DESTROY so the server releases
                                     // its per-subscription state promptly.
                                     let destroy = encode_monitor_request(
@@ -910,9 +912,116 @@ pub fn decode_init_introspection(raw: &[u8], label: &str) -> Result<StructureDes
     }
 }
 
+/// Pipeline ACK-credit accounting for one consumed MONITOR data message.
+///
+/// Increments the count of updates consumed since the last ACK and, once that
+/// count reaches `ack_threshold`, returns the encoded ACK message to send
+/// (returning the accumulated credit to the server) and resets the counter.
+/// Returns `None` when no ACK is due yet.
+///
+/// This MUST be called once for *every* consumed server MONITOR data message —
+/// including updates that fail to decode — so a decode failure can never leak a
+/// pipeline credit and permanently stall the subscription. Keeping the
+/// accounting in one place (rather than inline inside the decode-success guard)
+/// makes that invariant hard to break; see the
+/// `pipeline_ack_returns_credit_even_when_updates_fail_to_decode` test.
+///
+/// Callers only invoke this when pipelining is enabled, so `ack_threshold` is
+/// always `>= 1` (it is `(queueSize / 2).max(1)`); an ACK is therefore never
+/// emitted for a zero consume count.
+fn pipeline_ack_on_consume(
+    consumed_since_ack: &mut u32,
+    ack_threshold: u32,
+    sid: u32,
+    ioid: u32,
+    is_be: bool,
+) -> Option<Vec<u8>> {
+    *consumed_since_ack = consumed_since_ack.saturating_add(1);
+    if *consumed_since_ack >= ack_threshold {
+        let n = *consumed_since_ack;
+        let ack_bytes = if is_be {
+            n.to_be_bytes()
+        } else {
+            n.to_le_bytes()
+        };
+        let ack = encode_monitor_request(sid, ioid, 0x80, &ack_bytes, PVA_VERSION, is_be);
+        *consumed_since_ack = 0;
+        Some(ack)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the pipelined-monitor ACK-credit leak.
+    ///
+    /// Under monitor pipelining the server grants a bounded window of credits
+    /// and stops sending once the window drains, resuming only when the client
+    /// ACKs the updates it consumed. The bug: credit accounting used to live
+    /// *inside* the `if let Ok(update)` decode-success guard, so any update
+    /// that failed to decode consumed a server credit but never returned it —
+    /// after `queueSize` decode failures the window is empty, no ACK has been
+    /// sent, and the monitor stalls forever.
+    ///
+    /// [`pipeline_ack_on_consume`] is now called on every consume path,
+    /// decode success or failure. This test drives many more "consumed but
+    /// undecodable" updates than the credit window and asserts that credit
+    /// keeps being returned to the wire (ACKs are emitted and the total credit
+    /// returned equals the number consumed), so the stream never stalls. With
+    /// the old decode-gated accounting this loop would emit zero ACKs.
+    #[test]
+    fn pipeline_ack_returns_credit_even_when_updates_fail_to_decode() {
+        let queue_size: u32 = 8;
+        // Mirror the client's threshold: half the window, at least 1.
+        let ack_threshold: u32 = (queue_size / 2).max(1);
+        let sid = 7u32;
+        let ioid = 42u32;
+        let is_be = false;
+
+        // Decode `queue_size` full windows' worth of updates, all of which
+        // "fail to decode" (we never call a callback — we only account the
+        // consume, exactly as the monitor loop does on a decode error).
+        let total_consumed = queue_size * 4;
+        let mut consumed_since_ack: u32 = 0;
+        let mut acks_sent = 0u32;
+        let mut credit_returned: u32 = 0;
+
+        for _ in 0..total_consumed {
+            if let Some(ack) =
+                pipeline_ack_on_consume(&mut consumed_since_ack, ack_threshold, sid, ioid, is_be)
+            {
+                acks_sent += 1;
+                // The ACK body is a u32 credit count at the tail of the
+                // op-request payload: 8-byte header + sid(4) + ioid(4) +
+                // subcmd(1), then the 4-byte count.
+                let count_off = 8 + 4 + 4 + 1;
+                let count = u32::from_le_bytes(
+                    ack[count_off..count_off + 4].try_into().expect("ack u32"),
+                );
+                credit_returned += count;
+            }
+        }
+
+        // Credit must keep flowing: at least one ACK per window consumed.
+        assert!(
+            acks_sent >= total_consumed / ack_threshold,
+            "expected at least {} ACKs, got {acks_sent}",
+            total_consumed / ack_threshold
+        );
+        // Every consumed credit that reached a threshold boundary is returned;
+        // only the sub-threshold remainder stays unacked (and is < threshold,
+        // so it never starves a window >= 2*threshold).
+        let remainder = consumed_since_ack;
+        assert!(remainder < ack_threshold, "remainder must be below threshold");
+        assert_eq!(
+            credit_returned + remainder,
+            total_consumed,
+            "all consumed credit is either returned or below the ACK threshold"
+        );
+    }
 
     #[test]
     fn builder_defaults() {

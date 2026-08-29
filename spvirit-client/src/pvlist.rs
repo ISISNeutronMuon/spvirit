@@ -22,10 +22,10 @@ use spvirit_codec::spvd_encode::{encode_string_pvd, encode_structure_desc};
 use spvirit_codec::spvirit_encode::encode_rpc_request;
 
 use crate::client::{
-    ChannelConn, build_client_validation, encode_get_field_request, encode_get_request,
-    establish_channel, pvget,
+    ChannelConn, encode_get_field_request, encode_get_request, establish_channel, pva_handshake,
+    pvget,
 };
-use crate::transport::{read_packet, read_until};
+use crate::transport::read_until;
 use crate::types::{PvGetError, PvOptions};
 use spvirit_codec::SegmentReassembler;
 
@@ -227,36 +227,7 @@ pub async fn list_pvs_via_get_field(
     // One reassembler for this connection, shared by every read below.
     let mut reassembler = SegmentReassembler::new();
 
-    let mut version = 2u8;
-    let mut is_be = false;
-
-    for _ in 0..2 {
-        if let Ok(bytes) = read_packet(&mut stream, opts.timeout, &mut reassembler).await {
-            let mut pkt = PvaPacket::new(&bytes);
-            if let Some(cmd) = pkt.decode_payload() {
-                match cmd {
-                    PvaPacketCommand::Control(payload) => {
-                        if payload.command == 2 {
-                            is_be = pkt.header.flags.is_msb;
-                        }
-                    }
-                    PvaPacketCommand::ConnectionValidation(_) => {
-                        version = pkt.header.version;
-                        is_be = pkt.header.flags.is_msb;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    let validation = build_client_validation(opts, version, is_be);
-    stream.write_all(&validation).await?;
-
-    let _ = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
-        matches!(cmd, PvaPacketCommand::ConnectionValidated(_))
-    })
-    .await?;
+    let (version, is_be) = pva_handshake(&mut stream, opts, &mut reassembler).await?;
 
     let get_field = encode_get_field_request(0, 0, field_pattern, version, is_be);
     stream.write_all(&get_field).await?;
@@ -518,7 +489,9 @@ pub async fn list_pvs_via_server_get(
         }
 
         let mut names = Vec::new();
-        names.extend(op.pv_names.clone());
+        // pv_names was removed from PvaOpPayload (codec 4c: now computed lazily);
+        // recompute it here from the op body — behaviorally identical to the old field.
+        names.extend(spvirit_codec::epics_decode::extract_pv_names(&op.body));
         extract_ascii_candidates(&op.body, &mut names);
         if let Some(desc) = &init_desc {
             for field in &desc.fields {

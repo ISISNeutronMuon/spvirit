@@ -544,76 +544,36 @@ fn ensure_range_u64(value: u64, min: u64, max: u64, field_name: &str) -> Result<
     }
 }
 
-fn push_i16(data: &mut Vec<u8>, v: i16, is_be: bool) {
-    let bytes = if is_be {
-        v.to_be_bytes()
-    } else {
-        v.to_le_bytes()
+/// Generate the little/big-endian scalar push helpers.
+///
+/// Each `push_<ty>(data, v, is_be)` appends `v`'s wire bytes to `data` in the
+/// requested byte order. `to_le_bytes`/`to_be_bytes` are inherent methods on
+/// every primitive numeric type (not a shared trait), so a declarative macro
+/// removes the copy-paste while keeping the wire output byte-identical.
+macro_rules! push_endian {
+    ($($name:ident => $ty:ty),+ $(,)?) => {
+        $(
+            fn $name(data: &mut Vec<u8>, v: $ty, is_be: bool) {
+                let bytes = if is_be {
+                    v.to_be_bytes()
+                } else {
+                    v.to_le_bytes()
+                };
+                data.extend_from_slice(&bytes);
+            }
+        )+
     };
-    data.extend_from_slice(&bytes);
 }
 
-fn push_i32(data: &mut Vec<u8>, v: i32, is_be: bool) {
-    let bytes = if is_be {
-        v.to_be_bytes()
-    } else {
-        v.to_le_bytes()
-    };
-    data.extend_from_slice(&bytes);
-}
-
-fn push_i64(data: &mut Vec<u8>, v: i64, is_be: bool) {
-    let bytes = if is_be {
-        v.to_be_bytes()
-    } else {
-        v.to_le_bytes()
-    };
-    data.extend_from_slice(&bytes);
-}
-
-fn push_u16(data: &mut Vec<u8>, v: u16, is_be: bool) {
-    let bytes = if is_be {
-        v.to_be_bytes()
-    } else {
-        v.to_le_bytes()
-    };
-    data.extend_from_slice(&bytes);
-}
-
-fn push_u32(data: &mut Vec<u8>, v: u32, is_be: bool) {
-    let bytes = if is_be {
-        v.to_be_bytes()
-    } else {
-        v.to_le_bytes()
-    };
-    data.extend_from_slice(&bytes);
-}
-
-fn push_u64(data: &mut Vec<u8>, v: u64, is_be: bool) {
-    let bytes = if is_be {
-        v.to_be_bytes()
-    } else {
-        v.to_le_bytes()
-    };
-    data.extend_from_slice(&bytes);
-}
-
-fn push_f32(data: &mut Vec<u8>, v: f32, is_be: bool) {
-    let bytes = if is_be {
-        v.to_be_bytes()
-    } else {
-        v.to_le_bytes()
-    };
-    data.extend_from_slice(&bytes);
-}
-
-fn push_f64(data: &mut Vec<u8>, v: f64, is_be: bool) {
-    let bytes = if is_be {
-        v.to_be_bytes()
-    } else {
-        v.to_le_bytes()
-    };
-    data.extend_from_slice(&bytes);
+push_endian! {
+    push_i16 => i16,
+    push_i32 => i32,
+    push_i64 => i64,
+    push_u16 => u16,
+    push_u32 => u32,
+    push_u64 => u64,
+    push_f32 => f32,
+    push_f64 => f64,
 }
 
 #[cfg(test)]
