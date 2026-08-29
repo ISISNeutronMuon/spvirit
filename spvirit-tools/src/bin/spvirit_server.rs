@@ -411,13 +411,17 @@ async fn run_udp_search(
     loop {
         let (len, peer) = socket.recv_from(&mut buf).await?;
         let data = &buf[..len];
-        let header = PvaHeader::new(data);
+        let Some(header) = PvaHeader::try_new(data) else {
+            continue;
+        };
         // UDP endpoint only handles SEARCH (cmd=3) data messages.
         // Ignore other traffic early to avoid noisy "unknown command" decode logs.
         if header.flags.is_control || header.command != 3 {
             continue;
         }
-        let mut pkt = PvaPacket::new(data);
+        let Some(mut pkt) = PvaPacket::try_new(data) else {
+            continue;
+        };
         let Some(cmd) = pkt.decode_payload() else {
             continue;
         };
@@ -1740,7 +1744,17 @@ async fn remove_monitor_subscription(
 async fn send_msg(state: &Arc<ServerState>, conn_id: u64, msg: Vec<u8>) {
     let conns = state.conns.lock().await;
     if let Some(tx) = conns.get(&conn_id) {
-        let _ = tx.send(msg).await;
+        // Non-blocking send: if this client's bounded queue is full, drop this
+        // update for THIS client only rather than stalling monitor delivery to
+        // every later client and the global DB-reload / PUT paths that drive
+        // the fan-out loop. Delivery stays lossless & in-order per client whose
+        // queue is keeping up; a slow client just loses its own updates.
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg) {
+            warn!(
+                "Dropping monitor update for conn={}: send queue full (slow client)",
+                conn_id
+            );
+        }
     }
 }
 
@@ -3209,6 +3223,83 @@ mod tests {
             },
             raw_fields,
         }
+    }
+
+    // Regression test for finding tools-T1 (cross-client head-of-line
+    // blocking): a slow client whose bounded 128-deep queue is full must NOT
+    // stall monitor fan-out to other, healthy clients. The fan-out loop sends
+    // to conns in registration order, so the full client (conn 1) is visited
+    // before the healthy one (conn 2). With a blocking `tx.send().await` this
+    // hangs forever on conn 1 and conn 2 never receives its update; with the
+    // non-blocking `try_send` the frame for conn 1 is dropped and conn 2 still
+    // gets its frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_client_does_not_block_fanout_to_healthy_client() {
+        let record = mdel_ai_record("test_pv", 1.0, "0");
+        let payload = record.to_ntpayload();
+        let state = test_state(record);
+
+        // conn 1: a slow client. Fill its 128-deep queue to capacity so any
+        // further send would block. Keep _rx1 alive so the channel stays open
+        // (Full, not Closed).
+        let (tx1, _rx1) = mpsc::channel::<Vec<u8>>(128);
+        for _ in 0..128 {
+            tx1.try_send(Vec::new()).expect("prefill slow client queue");
+        }
+        // conn 2: a healthy client with an empty queue.
+        let (tx2, mut rx2) = mpsc::channel::<Vec<u8>>(128);
+
+        {
+            let mut conns = state.conns.lock().await;
+            conns.insert(1, tx1);
+            conns.insert(2, tx2);
+        }
+        {
+            let mut monitors = state.monitors.lock().await;
+            monitors.insert(
+                "test_pv".to_string(),
+                vec![
+                    MonitorSub {
+                        conn_id: 1,
+                        ioid: 10,
+                        version: 2,
+                        is_be: false,
+                        running: true,
+                        pipeline_enabled: false,
+                        nfree: 0,
+                        filtered_desc: None,
+                        last_snapshot: None,
+                    },
+                    MonitorSub {
+                        conn_id: 2,
+                        ioid: 20,
+                        version: 2,
+                        is_be: false,
+                        running: true,
+                        pipeline_enabled: false,
+                        nfree: 0,
+                        filtered_desc: None,
+                        last_snapshot: None,
+                    },
+                ],
+            );
+        }
+
+        // Must complete promptly. With the blocking send this future never
+        // resolves (conn 1's queue is full), so the timeout fires and the test
+        // fails.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            notify_monitors(&state, "test_pv", &payload),
+        )
+        .await
+        .expect("notify_monitors must not block on a full slow-client queue");
+
+        // The healthy client must have received its monitor frame.
+        let got = rx2
+            .try_recv()
+            .expect("healthy client should receive its monitor update");
+        assert!(!got.is_empty(), "healthy client frame should be non-empty");
     }
 
     fn ts_field(seconds: i64, nanos: i32) -> DecodedValue {

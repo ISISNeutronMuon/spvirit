@@ -405,11 +405,15 @@ async fn run_udp_search(
     loop {
         let (len, peer) = socket.recv_from(&mut buf).await?;
         let data = &buf[..len];
-        let header = PvaHeader::new(data);
+        let Some(header) = PvaHeader::try_new(data) else {
+            continue;
+        };
         if header.flags.is_control || header.command != 3 {
             continue;
         }
-        let mut pkt = PvaPacket::new(data);
+        let Some(mut pkt) = PvaPacket::try_new(data) else {
+            continue;
+        };
         let Some(cmd) = pkt.decode_payload() else {
             continue;
         };
