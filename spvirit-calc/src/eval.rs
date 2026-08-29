@@ -295,7 +295,7 @@ impl Expression {
                     stack.push(if ib == 0 {
                         f64::NAN
                     } else {
-                        ((a as i32) % ib) as f64
+                        ((a as i32).wrapping_rem(ib)) as f64
                     });
                 }
                 // calcPerform.c:170-173 `case POWER`: `pow(*ptop, top)`.
@@ -777,6 +777,18 @@ mod tests {
     fn modulo_with_negative_divisor() {
         // C truncated division: 7 % -3 == 1 (sign follows the dividend).
         assert_eq!(ev("A%B", &[7.0, -3.0]), 1.0);
+    }
+
+    // `i32::MIN % -1` overflows (the mathematical result `2147483648` is out
+    // of `i32` range) and PANICS under Rust's `%` in debug builds - the same
+    // no-panic-invariant hazard as the unmasked shift counts above. C's `%`
+    // is likewise UB here, but Base never traps; the crate's documented
+    // no-panic invariant requires we don't either. `wrapping_rem` matches the
+    // `wrapping_shl`/`wrapping_shr` treatment and yields `0`, the wrapped
+    // result. The zero-divisor NaN guard must remain untouched.
+    #[test]
+    fn modulo_i32_min_by_negative_one_wraps_and_never_panics() {
+        assert_eq!(ev("A%B", &[i32::MIN as f64, -1.0]), 0.0);
     }
 
     #[test]
