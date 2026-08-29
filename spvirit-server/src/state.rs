@@ -23,9 +23,11 @@ pub struct MonitorSub {
     pub nfree: u32,
     /// When set, only encode these fields in monitor data responses.
     pub filtered_desc: Option<StructureDesc>,
-    /// Last payload sent to this subscriber. Used to produce sparse deltas on
-    /// subsequent updates (see `spvirit-server/src/monitor.rs`). `None` means
-    /// the next update is the initial full snapshot.
+    /// Last payload sent to this subscriber. Used purely as a change detector:
+    /// each monitor frame is a self-contained, fully-filtered snapshot (see
+    /// `spvirit-server/src/monitor.rs`), and this baseline decides whether a
+    /// new update differs enough to post — it is never emitted as a sparse
+    /// delta on the wire. `None` means the next update is the initial snapshot.
     pub last_snapshot: Option<NtPayload>,
 }
 
