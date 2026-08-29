@@ -23,6 +23,7 @@ pub mod graph;
 pub mod lockset;
 pub mod model;
 pub mod process;
+pub mod scan;
 pub mod source;
 pub mod spec;
 #[cfg(test)]
