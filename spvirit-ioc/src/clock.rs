@@ -87,7 +87,6 @@ impl Clock for ManualClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -118,22 +117,27 @@ mod tests {
     fn manual_clock_sleep_until_actually_blocks_before_deadline() {
         let c = Arc::new(ManualClock::new());
         let deadline = c.now() + Duration::from_millis(200);
-        let done = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let c2 = c.clone();
-        let done2 = done.clone();
         let waiter = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
             c2.sleep_until(deadline);
-            done2.store(true, Ordering::SeqCst);
+            done_tx.send(()).unwrap();
         });
-        // Give the waiter thread time to actually park in sleep_until.
-        std::thread::sleep(Duration::from_millis(50));
+        // Deterministic rendezvous: wait for the waiter to signal that it is
+        // about to call sleep_until. No real sleep, no timing tolerance.
+        ready_rx.recv().expect("waiter signals before calling sleep_until");
+        // A partial advance must not release the waiter.
+        c.advance(Duration::from_millis(100));
         assert!(
-            !done.load(Ordering::SeqCst),
+            done_rx.try_recv().is_err(),
             "must still be blocked before the deadline is crossed"
         );
-        c.advance(Duration::from_millis(200));
+        // Cross the deadline: the waiter must wake and signal completion.
+        c.advance(Duration::from_millis(100));
+        done_rx.recv().expect("waiter signals after crossing deadline");
         waiter.join().expect("waiter thread wakes and exits");
-        assert!(done.load(Ordering::SeqCst));
     }
 
     #[test]
