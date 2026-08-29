@@ -216,11 +216,16 @@ impl RecordDb {
 
     /// Run `f` with the lock set held. If a previous `process()` panicked
     /// mid-pass the lock is poisoned; we recover the guard via `into_inner`
-    /// rather than propagating. A permanently poisoned lock would kill all
-    /// future scanning of this set — far worse than the alternative: the
-    /// engine re-establishes each record's invariants at the top of the next
-    /// `process()` pass, so a transiently half-updated record is recomputed,
-    /// not observed by clients.
+    /// rather than propagating. Recovery is strictly better than propagation:
+    /// a permanently poisoned lock would kill all future scanning of the whole
+    /// set, whereas recovery strands at most the one record that panicked.
+    ///
+    /// NOTE: recovery does not by itself heal a half-updated record. A panic
+    /// between PACT being set and cleared leaves that record with PACT set
+    /// (`record_body` clears PACT only on an `Err` return, not on unwind), so
+    /// the next pass hits the PACT brake and silently skips it. No engine
+    /// panic path is reachable today; whoever introduces one (async processing
+    /// in sub-project B) must reset PACT on unwind. See ruling R-T6-PACT.
     pub fn with_set<T>(&self, set: usize, f: impl FnOnce(&mut LockSetData) -> T) -> T {
         let mut guard = match self.lock_sets[set].lock() {
             Ok(g) => g,
