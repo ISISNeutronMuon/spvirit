@@ -1662,8 +1662,7 @@ pub fn encode_nt_payload_values_for_desc(
         // Fast path: no narrowing.
         return encode_nt_payload_full(payload, is_be);
     }
-    let decoded = decode_payload_to_structure(payload, is_be)
-        .unwrap_or_else(|| DecodedValue::Structure(Vec::new()));
+    let decoded = nt_payload_to_decoded(payload, is_be);
     encode_decoded_projected(&decoded, desc, is_be)
 }
 
@@ -1700,11 +1699,418 @@ fn field_type_equal(a: &FieldType, b: &FieldType) -> bool {
 
 /// Round-trip an NtPayload through its full descriptor to obtain a
 /// `DecodedValue::Structure` we can project against a narrowed descriptor.
+///
+/// This is the reference implementation retained for the differential
+/// byte-identity tests; the production delta path uses the direct
+/// [`nt_payload_to_decoded`] projection below, which produces a byte-identical
+/// tree without the wire encode+decode round-trip (see finding codec-C1).
+#[cfg(test)]
 fn decode_payload_to_structure(payload: &NtPayload, is_be: bool) -> Option<DecodedValue> {
     let desc = nt_payload_desc(payload);
     let bytes = encode_nt_payload_full(payload, is_be);
     let decoder = crate::spvd_decode::PvdDecoder::new(is_be);
     decoder.decode_structure(&bytes, &desc).ok().map(|(v, _)| v)
+}
+
+// ---------------------------------------------------------------------------
+// Direct NtPayload -> DecodedValue projection (codec-C1)
+//
+// Mirrors `encode_nt_payload_full` composed with
+// `PvdDecoder::decode_structure` EXACTLY, but builds the in-memory tree with no
+// wire round-trip. This must stay byte-identical to the round-trip path: field
+// order and names come from `nt_payload_desc`, and the `DecodedValue` variant
+// chosen for each leaf must match what `decode_scalar`/`decode_value` yields
+// for the corresponding wire bytes. The `direct_projection_matches_roundtrip_*`
+// differential tests assert this over every NtPayload variant.
+// ---------------------------------------------------------------------------
+
+fn dv_scalar(v: &ScalarValue) -> DecodedValue {
+    match v {
+        ScalarValue::Bool(x) => DecodedValue::Boolean(*x),
+        ScalarValue::I8(x) => DecodedValue::Int8(*x),
+        ScalarValue::I16(x) => DecodedValue::Int16(*x),
+        ScalarValue::I32(x) => DecodedValue::Int32(*x),
+        ScalarValue::I64(x) => DecodedValue::Int64(*x),
+        ScalarValue::U8(x) => DecodedValue::UInt8(*x),
+        ScalarValue::U16(x) => DecodedValue::UInt16(*x),
+        ScalarValue::U32(x) => DecodedValue::UInt32(*x),
+        ScalarValue::U64(x) => DecodedValue::UInt64(*x),
+        ScalarValue::F32(x) => DecodedValue::Float32(*x),
+        ScalarValue::F64(x) => DecodedValue::Float64(*x),
+        ScalarValue::Str(x) => DecodedValue::String(x.clone()),
+    }
+}
+
+fn dv_scalar_array(v: &ScalarArrayValue) -> DecodedValue {
+    let items: Vec<DecodedValue> = match v {
+        ScalarArrayValue::Bool(a) => a.iter().map(|x| DecodedValue::Boolean(*x)).collect(),
+        ScalarArrayValue::I8(a) => a.iter().map(|x| DecodedValue::Int8(*x)).collect(),
+        ScalarArrayValue::I16(a) => a.iter().map(|x| DecodedValue::Int16(*x)).collect(),
+        ScalarArrayValue::I32(a) => a.iter().map(|x| DecodedValue::Int32(*x)).collect(),
+        ScalarArrayValue::I64(a) => a.iter().map(|x| DecodedValue::Int64(*x)).collect(),
+        ScalarArrayValue::U8(a) => a.iter().map(|x| DecodedValue::UInt8(*x)).collect(),
+        ScalarArrayValue::U16(a) => a.iter().map(|x| DecodedValue::UInt16(*x)).collect(),
+        ScalarArrayValue::U32(a) => a.iter().map(|x| DecodedValue::UInt32(*x)).collect(),
+        ScalarArrayValue::U64(a) => a.iter().map(|x| DecodedValue::UInt64(*x)).collect(),
+        ScalarArrayValue::F32(a) => a.iter().map(|x| DecodedValue::Float32(*x)).collect(),
+        ScalarArrayValue::F64(a) => a.iter().map(|x| DecodedValue::Float64(*x)).collect(),
+        ScalarArrayValue::Str(a) => a.iter().map(|x| DecodedValue::String(x.clone())).collect(),
+    };
+    DecodedValue::Array(items)
+}
+
+fn dv_string_array(v: &[String]) -> DecodedValue {
+    DecodedValue::Array(v.iter().map(|s| DecodedValue::String(s.clone())).collect())
+}
+
+fn dv_alarm(severity: i32, status: i32, message: &str) -> DecodedValue {
+    DecodedValue::Structure(vec![
+        ("severity".to_string(), DecodedValue::Int32(severity)),
+        ("status".to_string(), DecodedValue::Int32(status)),
+        ("message".to_string(), DecodedValue::String(message.to_string())),
+    ])
+}
+
+fn dv_timestamp(secs: i64, nanos: i32, user_tag: i32) -> DecodedValue {
+    DecodedValue::Structure(vec![
+        ("secondsPastEpoch".to_string(), DecodedValue::Int64(secs)),
+        ("nanoseconds".to_string(), DecodedValue::Int32(nanos)),
+        ("userTag".to_string(), DecodedValue::Int32(user_tag)),
+    ])
+}
+
+fn dv_nt_timestamp(ts: &NtTimeStamp) -> DecodedValue {
+    dv_timestamp(ts.seconds_past_epoch, ts.nanoseconds, ts.user_tag)
+}
+
+/// Mirror `encode_timestamp`'s stored-value-or-`now()` fallback for NtScalar.
+fn dv_scalar_timestamp(nt: &NtScalar) -> DecodedValue {
+    let (secs, nanos, user_tag) = match &nt.time_stamp {
+        Some(ts) => (ts.seconds_past_epoch, ts.nanoseconds, ts.user_tag),
+        None => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            (now.as_secs() as i64, now.subsec_nanos() as i32, 0)
+        }
+    };
+    dv_timestamp(secs, nanos, user_tag)
+}
+
+/// display_t with the 5 common fields (used by NTScalarArray / NTNDArray).
+fn dv_display5(d: &NtDisplay) -> DecodedValue {
+    DecodedValue::Structure(vec![
+        ("limitLow".to_string(), DecodedValue::Float64(d.limit_low)),
+        ("limitHigh".to_string(), DecodedValue::Float64(d.limit_high)),
+        (
+            "description".to_string(),
+            DecodedValue::String(d.description.clone()),
+        ),
+        ("units".to_string(), DecodedValue::String(d.units.clone())),
+        ("precision".to_string(), DecodedValue::Int32(d.precision)),
+    ])
+}
+
+fn dv_pv_value(v: &PvValue) -> DecodedValue {
+    match v {
+        PvValue::Scalar(sv) => dv_scalar(sv),
+        PvValue::ScalarArray(sa) => dv_scalar_array(sa),
+        PvValue::Structure { fields, .. } => DecodedValue::Structure(
+            fields
+                .iter()
+                .map(|(n, val)| (n.clone(), dv_pv_value(val)))
+                .collect(),
+        ),
+    }
+}
+
+/// The NTNDArray union member name selected for a given array element type,
+/// matching `nt_ndarray_value_union_fields` order and `ndarray_union_index`.
+fn ndarray_union_field_name(v: &ScalarArrayValue) -> &'static str {
+    match v {
+        ScalarArrayValue::Bool(_) => "booleanValue",
+        ScalarArrayValue::I8(_) => "byteValue",
+        ScalarArrayValue::I16(_) => "shortValue",
+        ScalarArrayValue::I32(_) => "intValue",
+        ScalarArrayValue::I64(_) => "longValue",
+        ScalarArrayValue::U8(_) => "ubyteValue",
+        ScalarArrayValue::U16(_) => "ushortValue",
+        ScalarArrayValue::U32(_) => "uintValue",
+        ScalarArrayValue::U64(_) => "ulongValue",
+        ScalarArrayValue::F32(_) => "floatValue",
+        ScalarArrayValue::F64(_) => "doubleValue",
+        ScalarArrayValue::Str(_) => "stringValue",
+    }
+}
+
+/// Direct, allocation-only projection of an [`NtPayload`] into the
+/// `DecodedValue::Structure` tree that the encode→decode round-trip would
+/// yield. Byte-identity with [`decode_payload_to_structure`] is enforced by the
+/// differential tests; the two callers on the monitor delta hot path use this
+/// to avoid the redundant wire serialization (finding codec-C1).
+fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
+    // `is_be` is irrelevant to the in-memory tree (endianness only affects the
+    // wire bytes, which we skip); kept for signature parity with the round-trip.
+    let _ = is_be;
+    match payload {
+        NtPayload::Scalar(nt) => DecodedValue::Structure(vec![
+            ("value".to_string(), dv_scalar(&nt.value)),
+            (
+                "alarm".to_string(),
+                dv_alarm(nt.alarm_severity, nt.alarm_status, &nt.alarm_message),
+            ),
+            ("timeStamp".to_string(), dv_scalar_timestamp(nt)),
+            (
+                "display".to_string(),
+                DecodedValue::Structure(vec![
+                    ("limitLow".to_string(), DecodedValue::Float64(nt.display_low)),
+                    (
+                        "limitHigh".to_string(),
+                        DecodedValue::Float64(nt.display_high),
+                    ),
+                    (
+                        "description".to_string(),
+                        DecodedValue::String(nt.display_description.clone()),
+                    ),
+                    ("units".to_string(), DecodedValue::String(nt.units.clone())),
+                    (
+                        "precision".to_string(),
+                        DecodedValue::Int32(nt.display_precision),
+                    ),
+                    (
+                        "form".to_string(),
+                        DecodedValue::Structure(vec![
+                            (
+                                "index".to_string(),
+                                DecodedValue::Int32(nt.display_form_index),
+                            ),
+                            (
+                                "choices".to_string(),
+                                dv_string_array(&nt.display_form_choices),
+                            ),
+                        ]),
+                    ),
+                ]),
+            ),
+            (
+                "control".to_string(),
+                DecodedValue::Structure(vec![
+                    ("limitLow".to_string(), DecodedValue::Float64(nt.control_low)),
+                    (
+                        "limitHigh".to_string(),
+                        DecodedValue::Float64(nt.control_high),
+                    ),
+                    (
+                        "minStep".to_string(),
+                        DecodedValue::Float64(nt.control_min_step),
+                    ),
+                ]),
+            ),
+            (
+                "valueAlarm".to_string(),
+                DecodedValue::Structure(vec![
+                    (
+                        "active".to_string(),
+                        DecodedValue::Boolean(nt.value_alarm_active),
+                    ),
+                    (
+                        "lowAlarmLimit".to_string(),
+                        DecodedValue::Float64(nt.value_alarm_low_alarm_limit),
+                    ),
+                    (
+                        "lowWarningLimit".to_string(),
+                        DecodedValue::Float64(nt.value_alarm_low_warning_limit),
+                    ),
+                    (
+                        "highWarningLimit".to_string(),
+                        DecodedValue::Float64(nt.value_alarm_high_warning_limit),
+                    ),
+                    (
+                        "highAlarmLimit".to_string(),
+                        DecodedValue::Float64(nt.value_alarm_high_alarm_limit),
+                    ),
+                    (
+                        "lowAlarmSeverity".to_string(),
+                        DecodedValue::Int32(nt.value_alarm_low_alarm_severity),
+                    ),
+                    (
+                        "lowWarningSeverity".to_string(),
+                        DecodedValue::Int32(nt.value_alarm_low_warning_severity),
+                    ),
+                    (
+                        "highWarningSeverity".to_string(),
+                        DecodedValue::Int32(nt.value_alarm_high_warning_severity),
+                    ),
+                    (
+                        "highAlarmSeverity".to_string(),
+                        DecodedValue::Int32(nt.value_alarm_high_alarm_severity),
+                    ),
+                    (
+                        "hysteresis".to_string(),
+                        DecodedValue::UInt8(nt.value_alarm_hysteresis),
+                    ),
+                ]),
+            ),
+        ]),
+        NtPayload::ScalarArray(nt) => DecodedValue::Structure(vec![
+            ("value".to_string(), dv_scalar_array(&nt.value)),
+            (
+                "alarm".to_string(),
+                dv_alarm(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
+            ),
+            ("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)),
+            ("display".to_string(), dv_display5(&nt.display)),
+            (
+                "control".to_string(),
+                DecodedValue::Structure(vec![
+                    (
+                        "limitLow".to_string(),
+                        DecodedValue::Float64(nt.control.limit_low),
+                    ),
+                    (
+                        "limitHigh".to_string(),
+                        DecodedValue::Float64(nt.control.limit_high),
+                    ),
+                    (
+                        "minStep".to_string(),
+                        DecodedValue::Float64(nt.control.min_step),
+                    ),
+                ]),
+            ),
+        ]),
+        NtPayload::Table(nt) => {
+            let value_fields: Vec<(String, DecodedValue)> = nt
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), dv_scalar_array(&c.values)))
+                .collect();
+            let alarm = nt.alarm.clone().unwrap_or_default();
+            let ts = nt.time_stamp.clone().unwrap_or_default();
+            DecodedValue::Structure(vec![
+                ("labels".to_string(), dv_string_array(&nt.labels)),
+                ("value".to_string(), DecodedValue::Structure(value_fields)),
+                (
+                    "descriptor".to_string(),
+                    DecodedValue::String(nt.descriptor.clone().unwrap_or_default()),
+                ),
+                (
+                    "alarm".to_string(),
+                    dv_alarm(alarm.severity, alarm.status, &alarm.message),
+                ),
+                ("timeStamp".to_string(), dv_nt_timestamp(&ts)),
+            ])
+        }
+        NtPayload::NdArray(nt) => {
+            // value — union member selected by element type
+            let value = DecodedValue::Structure(vec![(
+                ndarray_union_field_name(&nt.value).to_string(),
+                dv_scalar_array(&nt.value),
+            )]);
+            // codec.parameters — Variant: empty -> Null, else Structure of
+            // string key/value pairs (HashMap iteration order matches encode).
+            let codec_parameters = if nt.codec.parameters.is_empty() {
+                DecodedValue::Null
+            } else {
+                DecodedValue::Structure(
+                    nt.codec
+                        .parameters
+                        .iter()
+                        .map(|(k, v)| (k.clone(), DecodedValue::String(v.clone())))
+                        .collect(),
+                )
+            };
+            let codec = DecodedValue::Structure(vec![
+                (
+                    "name".to_string(),
+                    DecodedValue::String(nt.codec.name.clone()),
+                ),
+                ("parameters".to_string(), codec_parameters),
+            ]);
+            let dimension = DecodedValue::Array(
+                nt.dimension
+                    .iter()
+                    .map(|d| {
+                        DecodedValue::Structure(vec![
+                            ("size".to_string(), DecodedValue::Int32(d.size)),
+                            ("offset".to_string(), DecodedValue::Int32(d.offset)),
+                            ("fullSize".to_string(), DecodedValue::Int32(d.full_size)),
+                            ("binning".to_string(), DecodedValue::Int32(d.binning)),
+                            ("reverse".to_string(), DecodedValue::Boolean(d.reverse)),
+                        ])
+                    })
+                    .collect(),
+            );
+            let attribute = DecodedValue::Array(
+                nt.attribute
+                    .iter()
+                    .map(|a| {
+                        DecodedValue::Structure(vec![
+                            ("name".to_string(), DecodedValue::String(a.name.clone())),
+                            ("value".to_string(), dv_scalar(&a.value)),
+                            (
+                                "descriptor".to_string(),
+                                DecodedValue::String(a.descriptor.clone()),
+                            ),
+                            ("sourceType".to_string(), DecodedValue::Int32(a.source_type)),
+                            ("source".to_string(), DecodedValue::String(a.source.clone())),
+                        ])
+                    })
+                    .collect(),
+            );
+            let alarm = nt.alarm.clone().unwrap_or_default();
+            let ts = nt.time_stamp.clone().unwrap_or_default();
+            let display = nt.display.clone().unwrap_or_default();
+            DecodedValue::Structure(vec![
+                ("value".to_string(), value),
+                ("codec".to_string(), codec),
+                (
+                    "compressedSize".to_string(),
+                    DecodedValue::Int64(nt.compressed_size),
+                ),
+                (
+                    "uncompressedSize".to_string(),
+                    DecodedValue::Int64(nt.uncompressed_size),
+                ),
+                ("dimension".to_string(), dimension),
+                ("uniqueId".to_string(), DecodedValue::Int32(nt.unique_id)),
+                (
+                    "dataTimeStamp".to_string(),
+                    dv_nt_timestamp(&nt.data_time_stamp),
+                ),
+                ("attribute".to_string(), attribute),
+                (
+                    "descriptor".to_string(),
+                    DecodedValue::String(nt.descriptor.clone().unwrap_or_default()),
+                ),
+                (
+                    "alarm".to_string(),
+                    dv_alarm(alarm.severity, alarm.status, &alarm.message),
+                ),
+                ("timeStamp".to_string(), dv_nt_timestamp(&ts)),
+                ("display".to_string(), dv_display5(&display)),
+            ])
+        }
+        NtPayload::Enum(nt) => DecodedValue::Structure(vec![
+            (
+                "value".to_string(),
+                DecodedValue::Structure(vec![
+                    ("index".to_string(), DecodedValue::Int32(nt.index)),
+                    ("choices".to_string(), dv_string_array(&nt.choices)),
+                ]),
+            ),
+            (
+                "alarm".to_string(),
+                dv_alarm(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
+            ),
+            ("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)),
+        ]),
+        NtPayload::Generic { fields, .. } => DecodedValue::Structure(
+            fields
+                .iter()
+                .map(|(n, v)| (n.clone(), dv_pv_value(v)))
+                .collect(),
+        ),
+    }
 }
 
 /// Re-encode a `DecodedValue::Structure` against a (possibly narrowed)
@@ -1743,8 +2149,7 @@ pub fn encode_decoded_projected(
 /// that contains only the fields represented in `desc`. Missing descriptor
 /// fields are silently dropped.
 fn project_payload_on_desc(payload: &NtPayload, desc: &StructureDesc, is_be: bool) -> DecodedValue {
-    let decoded = decode_payload_to_structure(payload, is_be)
-        .unwrap_or_else(|| DecodedValue::Structure(Vec::new()));
+    let decoded = nt_payload_to_decoded(payload, is_be);
     project_decoded(&decoded, desc)
 }
 
@@ -2567,5 +2972,432 @@ mod tests {
             &DecodedValue::Float64(1.0),
             &DecodedValue::Float64(2.0)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // codec-C1: differential byte-identity of the direct NtPayload projection
+    //
+    // The production monitor delta path replaced the encode→decode wire
+    // round-trip (`decode_payload_to_structure`) with the direct in-memory
+    // projection (`nt_payload_to_decoded`). These tests assert the two produce
+    // BYTE-IDENTICAL delta output for every NtPayload variant. If the direct
+    // mapping diverged from what `decode_structure` yields, deltas would be
+    // silently corrupted on the wire — so byte-identity is the whole ballgame.
+    // -----------------------------------------------------------------------
+
+    use spvirit_types::{NdCodec, NtControl};
+    use std::collections::HashMap;
+
+    fn scalar_sample(v: ScalarValue) -> NtScalar {
+        let mut nt = NtScalar::from_value(v).with_timestamp(1_700_000_000, 7);
+        nt.time_stamp = Some(NtTimeStamp {
+            seconds_past_epoch: 1_700_000_000,
+            nanoseconds: 7,
+            user_tag: 9,
+        });
+        nt.alarm_severity = 1;
+        nt.alarm_status = 2;
+        nt.alarm_message = "warn".into();
+        nt.display_low = -1.5;
+        nt.display_high = 5.25;
+        nt.display_description = "desc".into();
+        nt.units = "V".into();
+        nt.display_precision = 3;
+        nt.display_form_index = 2;
+        nt.control_low = -2.0;
+        nt.control_high = 6.0;
+        nt.control_min_step = 0.5;
+        nt.value_alarm_active = true;
+        nt.value_alarm_low_alarm_limit = -3.0;
+        nt.value_alarm_low_warning_limit = -2.5;
+        nt.value_alarm_high_warning_limit = 4.5;
+        nt.value_alarm_high_alarm_limit = 5.0;
+        nt.value_alarm_low_alarm_severity = 2;
+        nt.value_alarm_low_warning_severity = 1;
+        nt.value_alarm_high_warning_severity = 1;
+        nt.value_alarm_high_alarm_severity = 2;
+        nt.value_alarm_hysteresis = 4;
+        nt
+    }
+
+    fn scalar_array_sample(v: ScalarArrayValue) -> NtScalarArray {
+        NtScalarArray {
+            value: v,
+            alarm: NtAlarm {
+                severity: 1,
+                status: 2,
+                message: "arr".into(),
+            },
+            time_stamp: NtTimeStamp {
+                seconds_past_epoch: 1_700_000_100,
+                nanoseconds: 11,
+                user_tag: 3,
+            },
+            display: NtDisplay {
+                limit_low: -10.0,
+                limit_high: 10.0,
+                description: "d".into(),
+                units: "A".into(),
+                precision: 2,
+            },
+            control: NtControl {
+                limit_low: -9.0,
+                limit_high: 9.0,
+                min_step: 0.25,
+            },
+        }
+    }
+
+    /// Every NtPayload variant, with non-trivial data in each field.
+    fn all_payload_samples() -> Vec<NtPayload> {
+        let scalar_values = vec![
+            ScalarValue::Bool(true),
+            ScalarValue::I8(-5),
+            ScalarValue::I16(-300),
+            ScalarValue::I32(-70_000),
+            ScalarValue::I64(-5_000_000_000),
+            ScalarValue::U8(250),
+            ScalarValue::U16(60_000),
+            ScalarValue::U32(4_000_000_000),
+            ScalarValue::U64(18_000_000_000_000_000_000),
+            ScalarValue::F32(1.5),
+            ScalarValue::F64(2.5),
+            ScalarValue::Str("hello".into()),
+        ];
+        let array_values = vec![
+            ScalarArrayValue::Bool(vec![true, false, true]),
+            ScalarArrayValue::I8(vec![-1, 2, -3]),
+            ScalarArrayValue::I16(vec![-1, 300, -300]),
+            ScalarArrayValue::I32(vec![-1, 70_000]),
+            ScalarArrayValue::I64(vec![-1, 5_000_000_000]),
+            ScalarArrayValue::U8(vec![1, 2, 250]),
+            ScalarArrayValue::U16(vec![1, 60_000]),
+            ScalarArrayValue::U32(vec![1, 4_000_000_000]),
+            ScalarArrayValue::U64(vec![1, 18_000_000_000_000_000_000]),
+            ScalarArrayValue::F32(vec![1.5, -2.5]),
+            ScalarArrayValue::F64(vec![1.5, -2.5, 3.5]),
+            ScalarArrayValue::Str(vec!["a".into(), "bb".into()]),
+        ];
+
+        let mut out: Vec<NtPayload> = Vec::new();
+        for v in scalar_values {
+            out.push(NtPayload::Scalar(scalar_sample(v)));
+        }
+        for v in array_values {
+            out.push(NtPayload::ScalarArray(scalar_array_sample(v)));
+        }
+
+        // Table with mixed-type columns and metadata (alarm Some / None both).
+        out.push(NtPayload::Table(NtTable {
+            labels: vec!["x".into(), "y".into(), "s".into()],
+            columns: vec![
+                NtTableColumn {
+                    name: "x".into(),
+                    values: ScalarArrayValue::I32(vec![1, 2, 3]),
+                },
+                NtTableColumn {
+                    name: "y".into(),
+                    values: ScalarArrayValue::F64(vec![1.0, 2.0, 3.0]),
+                },
+                NtTableColumn {
+                    name: "s".into(),
+                    values: ScalarArrayValue::Str(vec!["p".into(), "q".into(), "r".into()]),
+                },
+            ],
+            descriptor: Some("table".into()),
+            alarm: Some(NtAlarm {
+                severity: 1,
+                status: 1,
+                message: "t".into(),
+            }),
+            time_stamp: Some(NtTimeStamp {
+                seconds_past_epoch: 1_700_000_200,
+                nanoseconds: 5,
+                user_tag: 0,
+            }),
+        }));
+        out.push(NtPayload::Table(NtTable {
+            labels: vec!["only".into()],
+            columns: vec![NtTableColumn {
+                name: "only".into(),
+                values: ScalarArrayValue::U16(vec![7, 8]),
+            }],
+            descriptor: None,
+            alarm: None,
+            time_stamp: None,
+        }));
+
+        // NdArray: numeric value, non-empty codec params, dimensions and
+        // attributes with mixed variant types, display Some.
+        let mut params = HashMap::new();
+        params.insert("level".to_string(), "6".to_string());
+        params.insert("mode".to_string(), "fast".to_string());
+        out.push(NtPayload::NdArray(NtNdArray {
+            value: ScalarArrayValue::U8(vec![1, 2, 3, 4, 5, 6]),
+            codec: NdCodec {
+                name: "zlib".into(),
+                parameters: params,
+            },
+            compressed_size: 6,
+            uncompressed_size: 6,
+            dimension: vec![
+                NdDimension {
+                    size: 2,
+                    offset: 0,
+                    full_size: 2,
+                    binning: 1,
+                    reverse: false,
+                },
+                NdDimension {
+                    size: 3,
+                    offset: 1,
+                    full_size: 3,
+                    binning: 1,
+                    reverse: true,
+                },
+            ],
+            unique_id: 42,
+            data_time_stamp: NtTimeStamp {
+                seconds_past_epoch: 1_700_000_300,
+                nanoseconds: 1,
+                user_tag: 0,
+            },
+            attribute: vec![
+                NtAttribute {
+                    name: "ColorMode".into(),
+                    value: ScalarValue::Str("Mono".into()),
+                    descriptor: "cm".into(),
+                    source_type: 0,
+                    source: "src".into(),
+                },
+                NtAttribute {
+                    name: "Gain".into(),
+                    value: ScalarValue::F64(1.25),
+                    descriptor: "g".into(),
+                    source_type: 1,
+                    source: "cam".into(),
+                },
+            ],
+            descriptor: Some("nd".into()),
+            alarm: Some(NtAlarm {
+                severity: 0,
+                status: 0,
+                message: String::new(),
+            }),
+            time_stamp: Some(NtTimeStamp {
+                seconds_past_epoch: 1_700_000_301,
+                nanoseconds: 2,
+                user_tag: 0,
+            }),
+            display: Some(NtDisplay {
+                limit_low: 0.0,
+                limit_high: 255.0,
+                description: "px".into(),
+                units: "cnt".into(),
+                precision: 0,
+            }),
+        }));
+        // NdArray: string-valued union member, empty codec params (Variant Null),
+        // no dimensions/attributes, all trailing metadata defaulted.
+        out.push(NtPayload::NdArray(NtNdArray {
+            value: ScalarArrayValue::Str(vec!["a".into(), "b".into()]),
+            codec: NdCodec {
+                name: String::new(),
+                parameters: HashMap::new(),
+            },
+            compressed_size: 0,
+            uncompressed_size: 0,
+            dimension: vec![],
+            unique_id: 0,
+            data_time_stamp: NtTimeStamp::default(),
+            attribute: vec![],
+            descriptor: None,
+            alarm: None,
+            time_stamp: None,
+            display: None,
+        }));
+
+        // Enum.
+        out.push(NtPayload::Enum(NtEnum {
+            index: 1,
+            choices: vec!["OFF".into(), "ON".into(), "TRIP".into()],
+            alarm: NtAlarm {
+                severity: 1,
+                status: 3,
+                message: "e".into(),
+            },
+            time_stamp: NtTimeStamp {
+                seconds_past_epoch: 1_700_000_400,
+                nanoseconds: 9,
+                user_tag: 0,
+            },
+        }));
+
+        // Generic recursive structure with scalars, arrays, string arrays and
+        // a nested sub-structure.
+        out.push(NtPayload::Generic {
+            struct_id: "custom_t".into(),
+            fields: vec![
+                ("i".into(), PvValue::Scalar(ScalarValue::I32(-7))),
+                ("u".into(), PvValue::Scalar(ScalarValue::U64(99))),
+                ("s".into(), PvValue::Scalar(ScalarValue::Str("txt".into()))),
+                (
+                    "arr".into(),
+                    PvValue::ScalarArray(ScalarArrayValue::F64(vec![1.0, 2.0])),
+                ),
+                (
+                    "strs".into(),
+                    PvValue::ScalarArray(ScalarArrayValue::Str(vec!["m".into(), "n".into()])),
+                ),
+                (
+                    "nested".into(),
+                    PvValue::Structure {
+                        struct_id: "inner_t".into(),
+                        fields: vec![
+                            ("b".into(), PvValue::Scalar(ScalarValue::Bool(true))),
+                            ("f".into(), PvValue::Scalar(ScalarValue::F32(0.5))),
+                        ],
+                    },
+                ),
+            ],
+        });
+
+        out
+    }
+
+    /// Reference delta computed via the OLD encode→decode round-trip
+    /// projection. The production `encode_nt_payload_delta` now uses the direct
+    /// projection; this reproduces the pre-C1 behavior for differential
+    /// comparison.
+    fn reference_delta(
+        prev: &NtPayload,
+        next: &NtPayload,
+        desc: &StructureDesc,
+        is_be: bool,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let empty = || DecodedValue::Structure(Vec::new());
+        let prev_proj = project_decoded(
+            &decode_payload_to_structure(prev, is_be).unwrap_or_else(empty),
+            desc,
+        );
+        let next_proj = project_decoded(
+            &decode_payload_to_structure(next, is_be).unwrap_or_else(empty),
+            desc,
+        );
+        let bits = compute_changed_bits(&prev_proj, &next_proj, desc)?;
+        let bitset = encode_bitset_from_flags(&bits, is_be);
+        let mut values = Vec::new();
+        let mut idx = 1usize;
+        encode_values_for_bits(&next_proj, desc, &bits, &mut idx, is_be, &mut values);
+        Some((bitset, values))
+    }
+
+    #[test]
+    fn direct_projection_matches_roundtrip_all_variants() {
+        for payload in all_payload_samples() {
+            for is_be in [false, true] {
+                let direct = nt_payload_to_decoded(&payload, is_be);
+                let roundtrip = decode_payload_to_structure(&payload, is_be)
+                    .expect("round-trip decode must succeed for a full encode");
+                // 1. Structural + type-variant identity (names, order, variants).
+                assert!(
+                    decoded_values_equal(&direct, &roundtrip),
+                    "direct projection differs structurally from round-trip\n  \
+                     variant tag: {payload:?}\n  direct:    {direct:?}\n  roundtrip: {roundtrip:?}"
+                );
+                // 2. Byte-identity of a full re-encode (catches width differences
+                //    that structural equality alone might miss).
+                assert_eq!(
+                    encode_decoded_value(&direct, is_be),
+                    encode_decoded_value(&roundtrip, is_be),
+                    "direct vs round-trip re-encode bytes differ (is_be={is_be})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_delta_output_byte_identical_all_variants() {
+        // For each variant, build a "next" that differs from "prev" (mutating a
+        // representative leaf) and assert the full sparse-delta output
+        // (bitset + values) from the production direct path is byte-identical
+        // to the reference round-trip path — over both endiannesses, and for
+        // both the full descriptor and a narrowed descriptor.
+        for payload in all_payload_samples() {
+            let next = mutate_payload(&payload);
+            for is_be in [false, true] {
+                let full_desc = nt_payload_desc(&payload);
+
+                // Full descriptor.
+                let prod = encode_nt_payload_delta(&payload, &next, &full_desc, is_be);
+                let refr = reference_delta(&payload, &next, &full_desc, is_be);
+                assert_eq!(
+                    prod, refr,
+                    "delta bytes differ (full desc, is_be={is_be}) for {payload:?}"
+                );
+
+                // Narrowed descriptor: keep only the first top-level field
+                // (usually `value`) to exercise projection/pruning too.
+                if let Some(first) = full_desc.fields.first() {
+                    let narrowed = filter_structure_desc(&full_desc, &[first.name.clone()]);
+                    let prod_n = encode_nt_payload_delta(&payload, &next, &narrowed, is_be);
+                    let refr_n = reference_delta(&payload, &next, &narrowed, is_be);
+                    assert_eq!(
+                        prod_n, refr_n,
+                        "delta bytes differ (narrowed desc, is_be={is_be}) for {payload:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Produce a modified copy of `payload` that differs in at least one leaf,
+    /// so the delta path emits a non-empty frame.
+    fn mutate_payload(payload: &NtPayload) -> NtPayload {
+        match payload {
+            NtPayload::Scalar(nt) => {
+                let mut n = nt.clone();
+                n.alarm_severity += 1;
+                n.time_stamp = Some(NtTimeStamp {
+                    seconds_past_epoch: 1_700_000_999,
+                    nanoseconds: 123,
+                    user_tag: 0,
+                });
+                NtPayload::Scalar(n)
+            }
+            NtPayload::ScalarArray(nt) => {
+                let mut n = nt.clone();
+                n.alarm.severity += 1;
+                n.time_stamp.seconds_past_epoch += 1;
+                NtPayload::ScalarArray(n)
+            }
+            NtPayload::Table(nt) => {
+                let mut n = nt.clone();
+                n.descriptor = Some(format!("{}!", n.descriptor.clone().unwrap_or_default()));
+                NtPayload::Table(n)
+            }
+            NtPayload::NdArray(nt) => {
+                let mut n = nt.clone();
+                n.unique_id += 1;
+                NtPayload::NdArray(n)
+            }
+            NtPayload::Enum(nt) => {
+                let mut n = nt.clone();
+                n.index += 1;
+                NtPayload::Enum(n)
+            }
+            NtPayload::Generic { struct_id, fields } => {
+                let mut fields = fields.clone();
+                if let Some((_, PvValue::Scalar(ScalarValue::I32(v)))) =
+                    fields.iter_mut().find(|(n, _)| n == "i")
+                {
+                    *v += 1;
+                }
+                NtPayload::Generic {
+                    struct_id: struct_id.clone(),
+                    fields,
+                }
+            }
+        }
     }
 }
