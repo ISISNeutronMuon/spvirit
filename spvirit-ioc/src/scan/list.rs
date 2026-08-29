@@ -97,4 +97,14 @@ mod tests {
         assert_eq!(l.snapshot(), vec![rid(1), rid(2)]);
         assert_eq!(l.len(), 2);
     }
+
+    #[test]
+    fn is_empty_tracks_membership() {
+        let mut l = ScanList::new();
+        assert!(l.is_empty());
+        l.insert(rid(1), 0);
+        assert!(!l.is_empty());
+        l.remove(rid(1));
+        assert!(l.is_empty());
+    }
 }
