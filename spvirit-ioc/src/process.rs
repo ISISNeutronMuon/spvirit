@@ -29,7 +29,6 @@ fn now_ns() -> u64 {
 /// The numbered steps are `dbProcess`'s, kept in the same order so the
 /// divergences from Base are visible rather than emergent.
 pub fn process(set: &mut LockSetData, id: RecordId, ctx: &mut ProcCtx) -> Result<(), ProcError> {
-    let name = set.get(id).name.clone();
     let tpro = set.get(id).common.tpro;
 
     // 1. PACT is the recursion brake. A record already being processed —
@@ -37,26 +36,32 @@ pub fn process(set: &mut LockSetData, id: RecordId, ctx: &mut ProcCtx) -> Result
     //    completion — returns immediately.
     if set.get(id).common.pact {
         if tpro {
-            ctx.trace_line(format!("{name}: PACT already set, returning"));
+            let n = &set.get(id).name;
+            ctx.trace_line(format!("{n}: PACT already set, returning"));
         }
         return Ok(());
     }
 
-    ctx.push_depth(&name)?;
-    let result = process_inner(set, id, ctx, &name, tpro);
+    ctx.push_depth(&set.get(id).name)?;
+    let result = process_inner(set, id, ctx, tpro);
     ctx.pop_depth();
     result
 }
 
+// The record's name is re-read lazily at each `if tpro` trace site rather than
+// threaded in as a `&str`: an owned `name` param forced the caller to clone,
+// because a live `&set.get(id).name` borrow cannot coexist with the `&mut
+// LockSetData` this function needs. A fresh, short-lived `&set.get(id).name`
+// per trace site ends before any `set.get_mut`, so the clone is gone.
 fn process_inner(
     set: &mut LockSetData,
     id: RecordId,
     ctx: &mut ProcCtx,
-    name: &str,
     tpro: bool,
 ) -> Result<(), ProcError> {
     if tpro {
-        ctx.trace_line(format!("{name}: process entered"));
+        let n = &set.get(id).name;
+        ctx.trace_line(format!("{n}: process entered"));
     }
 
     // 2. Disable check. SDIS, if it is a link, supplies DISA; the record is
@@ -74,7 +79,8 @@ fn process_inner(
     if record.common.disa == record.common.disv {
         let diss = record.common.diss;
         if tpro {
-            ctx.trace_line(format!("{name}: disabled (DISA == DISV)"));
+            let n = &set.get(id).name;
+            ctx.trace_line(format!("{n}: disabled (DISA == DISV)"));
         }
         // A disabled record still publishes its disabled state, but only if
         // DISS actually raises the severity. `recGblSetSevr` is raise-only:
@@ -105,7 +111,8 @@ fn process_inner(
     //    reaching that point, simply leaves PACT set; `complete_async` is
     //    the only other path that clears it.
     if tpro {
-        ctx.trace_line(format!("{name}: process complete"));
+        let n = &set.get(id).name;
+        ctx.trace_line(format!("{n}: process complete"));
     }
     body
 }
@@ -448,7 +455,6 @@ pub(crate) fn post_monitors(
     }
 
     let payload = record.to_payload();
-    let name = record.name.clone();
     // MLST and ALST each advance only when their own deadband was crossed,
     // evaluated independently — mirroring aiRecord::monitor in Base, where
     // the MDEL and ADEL checks are two separate `if` statements, neither
@@ -473,7 +479,9 @@ pub(crate) fn post_monitors(
     r.prev_sevr = r.common.sevr;
     r.prev_stat = r.common.stat;
 
-    ctx.post(&name, payload);
+    // The `&mut` borrow via `r` above has ended, so the name can be re-read
+    // straight from the record without cloning it earlier.
+    ctx.post(&set.get(id).name, payload);
 }
 
 /// `recGblFwdLink`: process the forward link target.
@@ -638,8 +646,7 @@ pub fn complete_async(
     if !set.get(id).common.pact {
         return Ok(());
     }
-    let name = set.get(id).name.clone();
-    ctx.push_depth(&name)?;
+    ctx.push_depth(&set.get(id).name)?;
     let result = record_body(set, id, ctx);
     ctx.pop_depth();
     result

@@ -52,7 +52,9 @@ pub struct IocSource {
     /// one-shot snapshot in A2 — live field monitors arrive with the field
     /// writes in sub-project B — so these are retained only to keep the
     /// channels open, exactly as `RecordFieldSource::open_subs` does for
-    /// tier 2 (`SimplePvStore`).
+    /// tier 2 (`SimplePvStore`). Each subscribe first prunes senders whose
+    /// receiver has been dropped (`is_closed()`), so the Vec stays bounded
+    /// under subscribe/disconnect churn rather than growing forever.
     field_subs: Mutex<Vec<mpsc::Sender<NtPayload>>>,
     /// The server's monitor registry, handed over by
     /// `PvaServer::serve_after_start_hooks` before serving begins.
@@ -406,10 +408,18 @@ impl Source for IocSource {
                 let initial = resolve_field_payload(self, &name).await?;
                 let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
                 let _ = tx.try_send(initial);
-                self.field_subs
+                let mut field_subs = self
+                    .field_subs
                     .lock()
-                    .expect("field subscriber list poisoned")
-                    .push(tx);
+                    .expect("field subscriber list poisoned");
+                // Prune senders whose receiver has been dropped before pushing
+                // the new one, so subscribe/disconnect churn cannot grow this
+                // Vec without bound. `is_closed()` is the right test: the
+                // channel only ever carries the single one-shot snapshot, so a
+                // closed channel means the subscriber is gone — never merely
+                // backpressured — and a `try_send` probe would be spurious.
+                field_subs.retain(|tx| !tx.is_closed());
+                field_subs.push(tx);
                 return Some(rx);
             }
             let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE);
@@ -528,5 +538,35 @@ mod tests {
         ])
         .expect("must build");
         assert_eq!(source.record_names_sorted(), vec!["A:PV".to_string(), "Z:PV".to_string()]);
+    }
+
+    /// Item 3a: repeated subscribe/disconnect churn on a field PV must keep the
+    /// `field_subs` Vec bounded. The Vec used to be append-only — one entry per
+    /// subscribe, never pruned — so churn grew it without limit. Pruning senders
+    /// whose receiver has been dropped (`is_closed()`) on each subscribe holds
+    /// it at the count of *live* subscriptions, which here is one at a time.
+    #[tokio::test]
+    async fn field_subscription_churn_keeps_field_subs_bounded() {
+        let source = IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")])
+            .expect("must build");
+        for _ in 0..100 {
+            let rx = source
+                .subscribe("PV:A.EGU")
+                .await
+                .expect("a field PV is subscribable");
+            // Dropping the receiver closes the channel; the next subscribe must
+            // prune this now-dead sender rather than accumulate it.
+            drop(rx);
+        }
+        let len = source
+            .field_subs
+            .lock()
+            .expect("field subscriber list poisoned")
+            .len();
+        assert!(
+            len <= 1,
+            "field_subs must stay bounded under churn (an append-only Vec would \
+             hold 100 here), got {len}"
+        );
     }
 }
