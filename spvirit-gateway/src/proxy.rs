@@ -392,6 +392,7 @@ mod tests {
                 autoaddrlist: true,
                 serverport: 5075,
                 bcastport: 5076,
+                discovery_parity: true,
                 getholdoff: 0,
                 statusprefix: String::new(),
                 access: String::new(),

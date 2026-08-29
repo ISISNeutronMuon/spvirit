@@ -74,6 +74,7 @@ pub struct PvaServerBuilder {
     event_handlers: Vec<(String, crate::events::EventHandler)>,
     event_sinks: Vec<Arc<dyn crate::events::EventSink>>,
     guid: Option<[u8; 12]>,
+    discovery_parity: bool,
 }
 
 impl PvaServerBuilder {
@@ -99,6 +100,7 @@ impl PvaServerBuilder {
             event_handlers: Vec::new(),
             event_sinks: Vec::new(),
             guid: None,
+            discovery_parity: true,
         }
     }
 
@@ -609,6 +611,13 @@ impl PvaServerBuilder {
         self
     }
 
+    /// Bind the UDP search socket broadly (0.0.0.0) and join the PVA multicast
+    /// group so broadcast/multicast searches are heard (p4p parity). Default true.
+    pub fn discovery_parity(mut self, on: bool) -> Self {
+        self.discovery_parity = on;
+        self
+    }
+
     /// Override the server's GUID instead of minting a random one.
     pub fn guid(mut self, guid: [u8; 12]) -> Self {
         self.guid = Some(guid);
@@ -728,6 +737,7 @@ impl PvaServerBuilder {
         config.pvlist_max = self.pvlist_max;
         config.pvlist_allow_pattern = self.pvlist_allow_pattern;
         config.guid = self.guid;
+        config.discovery_parity = self.discovery_parity;
 
         let events = Arc::new(crate::events::Events::new());
         for (name, handler) in self.event_handlers {
@@ -1108,6 +1118,11 @@ impl ServeBuilder {
     }
     pub fn advertise_ip(mut self, ip: IpAddr) -> Self {
         self.inner = self.inner.advertise_ip(ip);
+        self
+    }
+    /// See [`PvaServerBuilder::discovery_parity`].
+    pub fn discovery_parity(mut self, on: bool) -> Self {
+        self.inner = self.inner.discovery_parity(on);
         self
     }
     pub fn compute_alarms(mut self, enabled: bool) -> Self {
@@ -2101,6 +2116,13 @@ mod tests {
         assert_eq!(server.config.tcp_port, 5075);
         assert_eq!(server.config.udp_port, 5076);
         assert!(!server.config.compute_alarms);
+        assert!(server.config.discovery_parity);
+    }
+
+    #[test]
+    fn builder_discovery_parity_override() {
+        let server = PvaServer::builder().discovery_parity(false).build();
+        assert!(!server.config.discovery_parity);
     }
 
     #[test]

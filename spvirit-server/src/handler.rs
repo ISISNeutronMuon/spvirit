@@ -631,9 +631,19 @@ pub async fn run_udp_search(
     tcp_port: u16,
     guid: [u8; 12],
     advertise_ip: Option<IpAddr>,
+    multicast_iface: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let socket = bind_udp_search_socket(addr)?;
     socket.set_broadcast(true)?;
+    if let Some(iface) = multicast_iface {
+        const PVA_MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
+        if let Err(e) = socket.join_multicast_v4(PVA_MULTICAST, iface) {
+            // Non-fatal: unicast/broadcast search still works without the join.
+            tracing::warn!("UDP search: multicast join {PVA_MULTICAST} on {iface} failed: {e}");
+        } else {
+            tracing::info!("UDP search: joined multicast {PVA_MULTICAST} on {iface}");
+        }
+    }
     let mut buf = vec![0u8; 4096];
 
     loop {
@@ -2042,7 +2052,7 @@ mod tests {
         let server_port = free_udp_port().await;
         let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
         tokio::spawn(async move {
-            let _ = run_udp_search(state, server_addr, 5075, rand_guid(), None).await;
+            let _ = run_udp_search(state, server_addr, 5075, rand_guid(), None, None).await;
         });
 
         let client = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();

@@ -75,6 +75,12 @@ pub struct ServerCfg {
     pub serverport: u16,
     #[serde(default = "default_bcastport")]
     pub bcastport: u16,
+    /// When true (default), the server's UDP search socket binds `0.0.0.0` and
+    /// joins the PVA multicast group (224.0.0.128) so broadcast/multicast
+    /// searches are heard (p4p parity). When false, it binds only the
+    /// configured `interface` IP and does not join multicast.
+    #[serde(default = "default_true")]
+    pub discovery_parity: bool,
     #[serde(default = "default_getholdoff")]
     pub getholdoff: u32,
     #[serde(default)]
@@ -384,6 +390,21 @@ mod tests {
             { "name":"s","clients":[], "x-spvirit": { "negativeCahe": {} } }
         ]}"#;
         assert!(GatewayConfig::from_json_str(typo).is_err()); // deny_unknown_fields inside x-spvirit
+    }
+
+    #[test]
+    fn discovery_parity_defaults_true_and_parses_explicit_false() {
+        let default = r#"{ "version":2, "clients":[], "servers":[
+            { "name":"s","clients":[] }
+        ]}"#;
+        let cfg = GatewayConfig::from_json_str(default).unwrap();
+        assert!(cfg.servers[0].discovery_parity);
+
+        let off = r#"{ "version":2, "clients":[], "servers":[
+            { "name":"s","clients":[], "discovery_parity": false }
+        ]}"#;
+        let cfg = GatewayConfig::from_json_str(off).unwrap();
+        assert!(!cfg.servers[0].discovery_parity);
     }
 
     #[test]

@@ -90,6 +90,7 @@ impl Runtime {
                 .udp_port(server_cfg.bcastport)
                 .listen_ip(interface_ip)
                 .advertise_ip(interface_ip)
+                .discovery_parity(server_cfg.discovery_parity)
                 .guid(server_guids[i])
                 .source("gateway", 0, src_arc.clone());
 

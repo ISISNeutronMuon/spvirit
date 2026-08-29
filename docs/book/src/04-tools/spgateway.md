@@ -25,6 +25,7 @@ Requires the `client` and `server` features.
 |---|---|
 | `-T`, `--test-config` | Parse and validate the configuration, print `OK` or the error, and exit (0 on success, 1 on error). Does not start the gateway. |
 | `-v`, `--verbose` | Raise the log level from the default `INFO` to `DEBUG`. Ignored under `-T`. |
+| `--discovery-parity` / `--no-discovery-parity` | Force the per-server `discovery_parity` field on / off for **every** server, overriding whatever the JSON says. Passing both is an error. The override also applies under `-T`, so `-T` validates the effective config. |
 
 Flags may appear in any position relative to the config path; the first
 non-flag argument is taken as the config file.
@@ -59,6 +60,51 @@ A normal start is not silent: the gateway installs a tracing subscriber at
 listens on and which upstreams it proxies), plus one `Status PV: …` line per
 status PV when a `statusprefix` is set, plus any warnings/errors. `-v` adds
 per-module `DEBUG` detail.
+
+## Discovery parity (`discovery_parity`)
+
+By default each `servers[]` entry binds its downstream UDP search-receive
+socket broadly so that **broadcast and multicast** PVAccess searches are heard,
+matching p4p/pvagw. This is controlled by a per-server boolean field,
+`discovery_parity`, placed at the top level of a `server` block (a sibling of
+`interface`, `serverport`, `bcastport`), defaulting to `true`:
+
+```json
+{
+  "version": 2,
+  "servers": [
+    { "name": "downstream", "clients": ["upstream"],
+      "interface": ["10.0.0.5"],
+      "discovery_parity": true }
+  ]
+}
+```
+
+| Value | UDP search socket | Multicast |
+|---|---|---|
+| `true` (default) | Binds `0.0.0.0:<bcastport>` (all interfaces) | Joins the PVA multicast group `224.0.0.128` |
+| `false` | Binds only the configured `interface` IP | Does not join multicast |
+
+A socket bound to a specific unicast IP does not receive broadcast or
+multicast datagrams at the OS level (notably on Windows), so with parity
+**off** and an `interface` pinned, only unicast searches (a client pointed
+directly at the host) ever reach the server. Parity **on** binds `0.0.0.0`
+and joins `224.0.0.128`, so a plain broadcast search from the local machine
+discovers the gateway's PVs the same way it discovers a p4p gateway. A p4p
+config that has no such key therefore gets p4p-equivalent discovery, because
+the field defaults to `true`. The multicast join is best-effort: if it fails
+the server logs a warning and continues serving unicast/broadcast searches.
+
+Only the UDP search socket is affected. The TCP listener still binds the
+configured `interface` IP, and the address advertised in search responses
+remains the `interface` IP — parity changes *which searches are heard*, not
+where connections are made or what address is handed back.
+
+The `--discovery-parity` / `--no-discovery-parity` CLI flags override this
+field for **every** server, taking precedence over the JSON value. This is
+convenient for toggling the behavior across a whole config without editing it
+(for example, `--no-discovery-parity` to restore interface-pinned binding on
+all servers).
 
 ## Status
 
