@@ -28,6 +28,13 @@ use std::sync::{Arc, Mutex};
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
 
+// NOTE (item 4d): a write-only `latest: Mutex<Option<NtPayload>>` field used to
+// live here to cache the most recent payload for a hypothetical "late-subscriber
+// replay". It was written on every `dispatch` (an extra `payload.clone()` plus a
+// lock per update — doubling per-update work for a single-subscriber PV) but read
+// nowhere, since replay is not implemented in M1. Dropped; reintroduce lazily
+// when replay actually lands.
+
 /// Identifies one upstream monitor: which client to reach it through, and
 /// its name as known to that client.
 pub type MonitorKey = (String, String);
@@ -41,18 +48,14 @@ pub type MonitorKey = (String, String);
 /// dropped, `TrySendError::Closed`) is pruned. See `MonitorEntry::dispatch`.
 const CHANNEL_CAPACITY: usize = 16;
 
-/// Shared state for one upstream monitor: its most recent payload (for
-/// future late-subscriber replay, unused by M1's `subscribe` but kept for
-/// forward compatibility) and the live downstream fan-out list.
+/// Shared state for one upstream monitor: the live downstream fan-out list.
 pub struct MonitorEntry {
-    pub latest: Mutex<Option<NtPayload>>,
     subs: Mutex<Vec<mpsc::Sender<NtPayload>>>,
 }
 
 impl MonitorEntry {
     fn new() -> Self {
         MonitorEntry {
-            latest: Mutex::new(None),
             subs: Mutex::new(Vec::new()),
         }
     }
@@ -76,7 +79,6 @@ impl MonitorEntry {
     /// re-accumulates a full snapshot each tick, so a subscriber that misses
     /// one Full update is not left with a torn/partial view.
     pub fn dispatch(&self, payload: NtPayload) -> bool {
-        *self.latest.lock().unwrap() = Some(payload.clone());
         let mut subs = self.subs.lock().unwrap();
         subs.retain(|tx| match tx.try_send(payload.clone()) {
             Ok(()) => true,

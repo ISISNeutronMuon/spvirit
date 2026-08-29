@@ -34,6 +34,29 @@ use crate::upstream::UpstreamPool;
 /// How often the `subscribe` ticker refreshes a live PV's value.
 const TICK_PERIOD: Duration = Duration::from_secs(1);
 
+/// Snapshots the current downstream connection's identity (socket peer host,
+/// and decoded `ca` user if any) into an [`Identity`] for
+/// [`AccessControl::decide`].
+///
+/// This deliberately mirrors `proxy::current_identity` (which is private to
+/// that module and cannot be reused) rather than reaching across a crate
+/// boundary: the peer IP is authoritative for `host` (the self-asserted `ca`
+/// host is advisory only and never used for a decision), while `user` is the
+/// self-asserted `ca` value, matching p4p's posture. Returns a default
+/// (all-`None`) [`Identity`] when called outside a
+/// [`spvirit_server::request_ctx`] scope (e.g. a unit test that calls
+/// `put`/`get` directly): a permissive `AccessControl` still behaves
+/// correctly, and a restrictive one fails closed. In particular, for a pure
+/// `readOnly` config `decide` short-circuits before any host/user match, so
+/// enforcement holds even with a default `Identity`.
+fn current_identity() -> Identity {
+    let rc = spvirit_server::request_ctx::current_request();
+    Identity {
+        host: rc.as_ref().map(|c| c.peer.ip().to_string()),
+        user: rc.and_then(|c| c.user),
+    }
+}
+
 /// The live PVs, in the stable order `names()`/the banner report them.
 /// `poke` is included here (it is readable — its value is an internal
 /// generation counter — as well as the only writable status PV).
@@ -209,6 +232,12 @@ impl Source for StatusSource {
             if !served_suffixes().any(|s| s == suffix) {
                 return None;
             }
+            // Hardening: a pvlist DENY hides the status PV entirely (claim
+            // fails, so it is never registered for this identity). readOnly
+            // does not affect Get, so this only bites on an explicit DENY.
+            if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
+                return None;
+            }
             let payload = if RPC_NAMES.contains(&suffix) {
                 Self::astest_response("", &Decision::Deny, &Decision::Deny, &Decision::Deny)
             } else {
@@ -226,6 +255,9 @@ impl Source for StatusSource {
         Box::pin(async move {
             let suffix = self.suffix(&name)?;
             if RPC_NAMES.contains(&suffix) {
+                return None;
+            }
+            if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
                 return None;
             }
             let v = if LIVE.contains(&suffix) {
@@ -252,6 +284,14 @@ impl Source for StatusSource {
             if suffix != "poke" {
                 return Err(format!("status PV {name:?} is read-only"));
             }
+            // Gate the write through the same AccessControl the data-plane
+            // GatewaySource uses, BEFORE mutating the generation counter.
+            // For a pure `readOnly` config, `decide` short-circuits at step 1
+            // (before any host/pvlist match), so even a default `Identity`
+            // — as seen when called outside a request scope — enforces it.
+            if let Decision::Deny = self.access.decide(Op::Put, &name, &current_identity()) {
+                return Err("access denied".to_string());
+            }
             self.generation.fetch_add(1, Ordering::Relaxed);
             Ok(vec![])
         })
@@ -265,6 +305,9 @@ impl Source for StatusSource {
         Box::pin(async move {
             let suffix = self.suffix(&name)?.to_string();
             if RPC_NAMES.contains(&suffix.as_str()) {
+                return None;
+            }
+            if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
                 return None;
             }
             let (tx, rx) = mpsc::channel(4);
@@ -326,5 +369,77 @@ impl Source for StatusSource {
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
         let prefix = self.prefix.clone();
         Box::pin(async move { served_suffixes().map(|s| format!("{prefix}{s}")).collect() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PREFIX: &str = "GW:STATUS:";
+
+    fn source(read_only: bool) -> StatusSource {
+        let access = Arc::new(AccessControl::new(read_only, None, None));
+        StatusSource::new(PREFIX.to_string(), access, StatusHandles::test())
+    }
+
+    /// Item 1g: `poke` is the only writable status PV, but under a `readOnly`
+    /// config a downstream `put` to it must be DENIED and must NOT advance the
+    /// generation counter. Before the fix `put` mutated the counter without
+    /// ever consulting `AccessControl` — a real `readOnly` bypass. `decide`
+    /// short-circuits at step 1 for `readOnly`, so even the default `Identity`
+    /// this off-connection unit test produces enforces the deny.
+    #[tokio::test]
+    async fn read_only_denies_poke_write() {
+        let src = source(true);
+        let name = format!("{PREFIX}poke");
+        let value = DecodedValue::Structure(vec![]);
+
+        let before = src.generation.load(Ordering::Relaxed);
+        let res = src.put(&name, &value).await;
+
+        assert!(res.is_err(), "readOnly must deny the poke write");
+        assert_eq!(res.unwrap_err(), "access denied");
+        assert_eq!(
+            src.generation.load(Ordering::Relaxed),
+            before,
+            "a denied write must NOT advance the generation counter"
+        );
+    }
+
+    /// Control: without `readOnly` the same `poke` write is allowed and bumps
+    /// the generation counter — proving the gate denies only what it should.
+    #[tokio::test]
+    async fn writable_config_allows_poke_write() {
+        let src = source(false);
+        let name = format!("{PREFIX}poke");
+        let value = DecodedValue::Structure(vec![]);
+
+        let before = src.generation.load(Ordering::Relaxed);
+        let res = src.put(&name, &value).await;
+
+        assert!(res.is_ok(), "a writable config must allow the poke write");
+        assert_eq!(
+            src.generation.load(Ordering::Relaxed),
+            before + 1,
+            "an allowed write must advance the generation counter"
+        );
+    }
+
+    /// A non-`poke` status PV stays read-only regardless of access config: the
+    /// gate is reached only after the read-only-suffix check, so the error is
+    /// the "read-only" one, not "access denied".
+    #[tokio::test]
+    async fn non_poke_status_pv_is_read_only() {
+        let src = source(false);
+        let name = format!("{PREFIX}clients");
+        let value = DecodedValue::Structure(vec![]);
+
+        let res = src.put(&name, &value).await;
+        assert!(res.is_err());
+        assert!(
+            res.unwrap_err().contains("read-only"),
+            "non-poke status PVs are rejected as read-only before the access gate"
+        );
     }
 }
