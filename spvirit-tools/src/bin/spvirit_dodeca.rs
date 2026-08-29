@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use argparse::{ArgumentParser, Store, StoreTrue};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info};
 
 use spvirit_codec::epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand};
@@ -23,8 +23,10 @@ use spvirit_codec::spvirit_encode::{
     encode_control_message, encode_create_channel_error, encode_create_channel_response,
     encode_destroy_channel_response, encode_monitor_data_response_payload, encode_op_error,
     encode_op_get_data_response_payload, encode_op_init_response_desc, encode_op_put_response,
-    encode_search_response, ip_from_bytes, ip_to_bytes,
+    encode_search_response, ip_to_bytes,
 };
+use spvirit_server::conn_writer::ConnWriter;
+use spvirit_server::handler::{rand_guid, search_reply_target};
 use spvirit_types::{
     NdCodec, NdDimension, NtAlarm, NtNdArray, NtPayload, NtScalar, NtTimeStamp, ScalarArrayValue,
     ScalarValue,
@@ -294,7 +296,7 @@ struct ServerState {
     speed_y: RwLock<f64>,
     speed_z: RwLock<f64>,
     monitors: Mutex<Vec<MonitorSub>>,
-    conns: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    conns: Mutex<HashMap<u64, Arc<ConnWriter>>>,
     sid_counter: AtomicU32,
     conn_counter: AtomicU64,
     beacon_change: AtomicU16,
@@ -379,9 +381,12 @@ impl ServerState {
     }
 
     async fn send_msg(&self, conn_id: u64, msg: Vec<u8>) {
-        let conns = self.conns.lock().await;
-        if let Some(tx) = conns.get(&conn_id) {
-            let _ = tx.send(msg).await;
+        let cw = {
+            let conns = self.conns.lock().await;
+            conns.get(&conn_id).cloned()
+        };
+        if let Some(cw) = cw {
+            cw.send_control(msg).await;
         }
     }
 }
@@ -465,14 +470,6 @@ async fn run_udp_search(
     }
 }
 
-fn search_reply_target(addr: &[u8; 16], port: u16, peer: SocketAddr) -> SocketAddr {
-    let target_port = if port != 0 { port } else { peer.port() };
-    let target_ip = ip_from_bytes(addr)
-        .filter(|ip| !ip.is_unspecified())
-        .unwrap_or_else(|| peer.ip());
-    SocketAddr::new(target_ip, target_port)
-}
-
 fn infer_response_ip(listen: IpAddr, peer: SocketAddr) -> IpAddr {
     if !listen.is_unspecified() {
         return listen;
@@ -504,21 +501,12 @@ async fn handle_connection(
     conn_id: u64,
     conn_timeout: Duration,
 ) {
-    let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(512);
+    let (mut reader, writer) = stream.into_split();
 
     {
         let mut conns = state.conns.lock().await;
-        conns.insert(conn_id, tx);
+        conns.insert(conn_id, ConnWriter::new(writer));
     }
-
-    let writer_task = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if writer.write_all(&msg).await.is_err() {
-                break;
-            }
-        }
-    });
 
     // PVA handshake: SET_BYTE_ORDER then CONNECTION_VALIDATION.
     let set_byte_order = encode_control_message(true, false, 2, 2, 0);
@@ -818,7 +806,6 @@ async fn handle_connection(
         let mut conns = state.conns.lock().await;
         conns.remove(&conn_id);
     }
-    writer_task.abort();
     info!("Conn {} closed", conn_id);
 }
 
@@ -972,40 +959,24 @@ async fn run_image_updater(state: Arc<ServerState>, width: usize, height: usize,
             let current = state.current.read().await;
             NtPayload::NdArray(current.clone())
         };
-        // Pre-encode once per distinct (version, is_be) combination.
-        // In practice all clients use the same settings.
-        let mut encoded_cache: Vec<(u8, bool, Vec<u8>)> = Vec::new();
-        for sub in &subs {
-            let encoded = if let Some((_, _, cached)) = encoded_cache
-                .iter()
-                .find(|(v, be, _)| *v == sub.version && *be == sub.is_be)
-            {
-                // Rewrite the ioid in the cached copy
-                let mut copy = cached.clone();
-                let ioid_bytes = if sub.is_be {
-                    sub.ioid.to_be_bytes()
-                } else {
-                    sub.ioid.to_le_bytes()
-                };
-                copy[8..12].copy_from_slice(&ioid_bytes);
-                copy
-            } else {
-                let resp = encode_monitor_data_response_payload(
-                    sub.ioid,
-                    0x00,
-                    &payload,
-                    sub.version,
-                    sub.is_be,
-                );
-                encoded_cache.push((sub.version, sub.is_be, resp.clone()));
-                resp
-            };
-            // Non-blocking send: drop frame for slow clients instead of
-            // stalling the entire update loop.
+        // Resolve the ConnWriter for each subscriber under a single lock,
+        // then hand each its encoded frame. ConnWriter's monitor lane
+        // coalesces latest-per-ioid and drops on dead sockets, so slow
+        // clients never stall the update loop.
+        let targets: Vec<(Arc<ConnWriter>, u32, u8, bool)> = {
             let conns = state.conns.lock().await;
-            if let Some(tx) = conns.get(&sub.conn_id) {
-                let _ = tx.try_send(encoded);
-            }
+            subs.iter()
+                .filter_map(|sub| {
+                    conns
+                        .get(&sub.conn_id)
+                        .cloned()
+                        .map(|cw| (cw, sub.ioid, sub.version, sub.is_be))
+                })
+                .collect()
+        };
+        for (cw, ioid, version, is_be) in targets {
+            let resp = encode_monitor_data_response_payload(ioid, 0x00, &payload, version, is_be);
+            cw.send_monitor(ioid, resp).await;
         }
     }
 }
@@ -1049,16 +1020,6 @@ async fn run_beacon(
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-
-fn rand_guid() -> [u8; 12] {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let mut guid = [0u8; 12];
-    let bytes = now.as_nanos().to_le_bytes();
-    guid.copy_from_slice(&bytes[0..12]);
-    guid
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pv_name = "DODECA:IMAGE".to_string();

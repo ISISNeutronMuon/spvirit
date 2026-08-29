@@ -36,11 +36,12 @@ use spvirit_codec::spvirit_encode::{
     encode_op_rpc_data_response_payload, encode_op_status_error_response,
     encode_op_status_response, encode_search_response, ip_from_bytes, ip_to_bytes,
 };
-use spvirit_codec::spvirit_encode::{
-    encode_monitor_data_response_delta, encode_monitor_data_response_filtered,
-};
-
 use spvirit_codec::{SegmentOutcome, SegmentReassembler};
+
+use spvirit_server::handler::{
+    infer_udp_response_ip, is_pattern_query, rand_guid, search_reply_target, wildcard_match,
+};
+use spvirit_server::monitor::MonitorRegistry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PvListMode {
@@ -1603,7 +1604,7 @@ async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPa
                 if sub.pipeline_enabled && sub.nfree == 0 {
                     continue;
                 }
-                let Some(msg) = build_monitor_frame(sub, payload) else {
+                let Some(msg) = MonitorRegistry::build_monitor_frame(sub, payload) else {
                     continue;
                 };
                 if sub.pipeline_enabled && sub.nfree > 0 {
@@ -1618,46 +1619,6 @@ async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPa
     for (conn_id, msg) in to_send {
         send_msg(state, conn_id, msg).await;
         debug!("Monitor update pv='{}' conn={} ", pv_name, conn_id);
-    }
-}
-
-fn build_monitor_frame(sub: &MonitorSub, payload: &NtPayload) -> Option<Vec<u8>> {
-    let subcmd = 0x00;
-    let Some(prev) = sub.last_snapshot.as_ref() else {
-        let bytes = if let Some(ref desc) = sub.filtered_desc {
-            encode_monitor_data_response_filtered(
-                sub.ioid,
-                subcmd,
-                payload,
-                desc,
-                sub.version,
-                sub.is_be,
-            )
-        } else {
-            encode_monitor_data_response_payload(sub.ioid, subcmd, payload, sub.version, sub.is_be)
-        };
-        return Some(bytes);
-    };
-    if let Some(ref desc) = sub.filtered_desc {
-        encode_monitor_data_response_delta(
-            sub.ioid,
-            subcmd,
-            prev,
-            payload,
-            desc,
-            sub.version,
-            sub.is_be,
-        )
-    } else if prev == payload {
-        None
-    } else {
-        Some(encode_monitor_data_response_payload(
-            sub.ioid,
-            subcmd,
-            payload,
-            sub.version,
-            sub.is_be,
-        ))
     }
 }
 
@@ -1682,7 +1643,7 @@ async fn send_monitor_update_for(
                 if sub.pipeline_enabled && sub.nfree == 0 {
                     return;
                 }
-                let Some(msg) = build_monitor_frame(sub, payload) else {
+                let Some(msg) = MonitorRegistry::build_monitor_frame(sub, payload) else {
                     return;
                 };
                 if sub.pipeline_enabled && sub.nfree > 0 {
@@ -1768,41 +1729,6 @@ fn is_server_rpc_pv(pv_name: &str) -> bool {
 
 fn is_virtual_event_pv(pv_name: &str) -> bool {
     pv_name.starts_with("__event:")
-}
-
-fn is_pattern_query(raw: &str) -> bool {
-    raw.contains('*') || raw.contains('?')
-}
-
-fn wildcard_match(pattern: &str, text: &str) -> bool {
-    let p = pattern.as_bytes();
-    let t = text.as_bytes();
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut star: Option<usize> = None;
-    let mut match_j = 0usize;
-
-    while j < t.len() {
-        if i < p.len() && (p[i] == b'?' || p[i] == t[j]) {
-            i += 1;
-            j += 1;
-        } else if i < p.len() && p[i] == b'*' {
-            star = Some(i);
-            i += 1;
-            match_j = j;
-        } else if let Some(star_idx) = star {
-            i = star_idx + 1;
-            match_j += 1;
-            j = match_j;
-        } else {
-            return false;
-        }
-    }
-
-    while i < p.len() && p[i] == b'*' {
-        i += 1;
-    }
-    i == p.len()
 }
 
 fn collect_visible_pv_names_from_store(
@@ -3359,43 +3285,6 @@ mod tests {
 
 fn file_mtime(path: &str) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-fn search_reply_target(addr: &[u8; 16], port: u16, peer: SocketAddr) -> SocketAddr {
-    let target_port = if port != 0 { port } else { peer.port() };
-    let target_ip = ip_from_bytes(addr)
-        .filter(|ip| !ip.is_unspecified())
-        .unwrap_or_else(|| peer.ip());
-    SocketAddr::new(target_ip, target_port)
-}
-
-fn infer_udp_response_ip(peer: SocketAddr) -> Option<IpAddr> {
-    let bind_addr = if peer.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    };
-    let sock = std::net::UdpSocket::bind(bind_addr).ok()?;
-    sock.connect(peer).ok()?;
-    let local = sock.local_addr().ok()?;
-    if local.ip().is_unspecified() {
-        None
-    } else {
-        Some(local.ip())
-    }
-}
-
-fn rand_guid() -> [u8; 12] {
-    let pid = std::process::id().to_le_bytes();
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .to_le_bytes();
-    let mut guid = [0u8; 12];
-    guid[..4].copy_from_slice(&pid);
-    guid[4..12].copy_from_slice(&nanos[..8]);
-    guid
 }
 
 fn validate_encoded_packet(conn_id: u64, label: &str, bytes: &[u8]) {
