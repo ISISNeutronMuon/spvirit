@@ -72,7 +72,11 @@ impl ScalarArrayValue {
             Self::U64(_) => 8,
             Self::F32(_) => 4,
             Self::F64(_) => 8,
-            Self::Str(v) => v.iter().map(|s| s.len()).sum(),
+            // Strings are variable-length: there is no meaningful fixed
+            // per-element byte size. Return a nominal 0 (per-element, like the
+            // other arms); the `.max(1)` guards at every call site neutralise
+            // it, and byte-size validation is skipped for string arrays.
+            Self::Str(_) => 0,
         }
     }
 
@@ -108,7 +112,7 @@ pub struct NtTimeStamp {
     pub user_tag: i32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NtDisplay {
     pub limit_low: f64,
     pub limit_high: f64,
@@ -117,33 +121,11 @@ pub struct NtDisplay {
     pub precision: i32,
 }
 
-impl Default for NtDisplay {
-    fn default() -> Self {
-        Self {
-            limit_low: 0.0,
-            limit_high: 0.0,
-            description: String::new(),
-            units: String::new(),
-            precision: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NtControl {
     pub limit_low: f64,
     pub limit_high: f64,
     pub min_step: f64,
-}
-
-impl Default for NtControl {
-    fn default() -> Self {
-        Self {
-            limit_low: 0.0,
-            limit_high: 0.0,
-            min_step: 0.0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,7 +183,11 @@ impl NtScalar {
             display_description: String::new(),
             display_precision: 0,
             display_form_index: 0,
-            display_form_choices: default_form_choices(),
+            // Empty = "use the standard form choices". The encoder falls back
+            // to `STANDARD_FORM_CHOICES` when this is empty, so a normally
+            // constructed NtScalar is allocation-free here yet still puts the
+            // 7 standard choices on the wire. See `STANDARD_FORM_CHOICES`.
+            display_form_choices: Vec::new(),
             control_low: 0.0,
             control_high: 0.0,
             control_min_step: 0.0,
@@ -479,6 +465,10 @@ impl NtNdArray {
         {
             return Err("ntndarray attribute descriptor must be set".to_string());
         }
+        // String arrays are variable-length, so `element_size_bytes()` has no
+        // meaningful fixed value for them; skip the dimension*element_size
+        // consistency check entirely rather than assert against a nominal size.
+        let is_string_array = matches!(self.value, ScalarArrayValue::Str(_));
         let element_size = self.value.element_size_bytes().max(1) as i64;
         let logical_elements = self
             .dimension
@@ -487,7 +477,10 @@ impl NtNdArray {
             .product::<i64>()
             .max(0);
         let expected_uncompressed = logical_elements.saturating_mul(element_size);
-        if self.uncompressed_size > 0 && self.uncompressed_size != expected_uncompressed {
+        if !is_string_array
+            && self.uncompressed_size > 0
+            && self.uncompressed_size != expected_uncompressed
+        {
             return Err(format!(
                 "uncompressed_size {} does not match dimension*element_size {}",
                 self.uncompressed_size, expected_uncompressed
@@ -580,17 +573,20 @@ pub enum NtPayload {
     },
 }
 
-pub(crate) fn default_form_choices() -> Vec<String> {
-    vec![
-        "Default".to_string(),
-        "String".to_string(),
-        "Binary".to_string(),
-        "Decimal".to_string(),
-        "Hex".to_string(),
-        "Exponential".to_string(),
-        "Engineering".to_string(),
-    ]
-}
+/// The 7 standard `display.form.choices` strings, defined once as the single
+/// source of truth. An empty `NtScalar::display_form_choices` means "use these"
+/// — the encoder (`spvirit-codec`) falls back to this static and still puts the
+/// 7 choices on the wire, so no per-value allocation is needed for the common
+/// case while the wire bytes stay identical to explicitly populating them.
+pub static STANDARD_FORM_CHOICES: [&str; 7] = [
+    "Default",
+    "String",
+    "Binary",
+    "Decimal",
+    "Hex",
+    "Exponential",
+    "Engineering",
+];
 
 #[cfg(test)]
 mod tests {
@@ -600,6 +596,47 @@ mod tests {
     fn from_value_has_no_timestamp_by_default() {
         let nt = NtScalar::from_value(ScalarValue::F64(1.0));
         assert_eq!(nt.time_stamp, None);
+    }
+
+    #[test]
+    fn string_ndarray_validate_ignores_variable_byte_size() {
+        // Regression: `element_size_bytes()` used to return the SUMMED byte
+        // length of the whole string vector for the `Str` arm, so `validate()`
+        // computed a nonsensical `count * total_bytes` and would spuriously
+        // accept or reject string NTNDArrays. Strings are variable-length, so
+        // the byte-size consistency check must be skipped for them.
+        let mut nd = NtNdArray::empty();
+        nd.value = ScalarArrayValue::Str(vec!["hello".to_string(), "worldwide".to_string()]);
+        nd.dimension = vec![NdDimension {
+            size: 2,
+            offset: 0,
+            full_size: 2,
+            binning: 1,
+            reverse: false,
+        }];
+        // An arbitrary nonzero uncompressed_size. Under the old summed-length
+        // bug element_size was 14 (5 + 9), so expected = 2*14 = 28 and this
+        // would be rejected; now the string arm skips the check → Ok.
+        nd.uncompressed_size = 999;
+        assert!(
+            nd.validate().is_ok(),
+            "string NTNDArray must not be rejected by the byte-size check"
+        );
+    }
+
+    #[test]
+    fn str_element_size_is_nominal_per_element() {
+        // Per-element nominal size for strings is 0 (the `.max(1)` guards at the
+        // call sites neutralise it); it must NOT be the summed vector length.
+        let sa = ScalarArrayValue::Str(vec!["abc".to_string(), "de".to_string()]);
+        assert_eq!(sa.element_size_bytes(), 0);
+    }
+
+    #[test]
+    fn from_value_uses_empty_form_choices_sentinel() {
+        // Empty sentinel means "standard choices" and is allocation-free.
+        let nt = NtScalar::from_value(ScalarValue::F64(1.0));
+        assert!(nt.display_form_choices.is_empty());
     }
 
     #[test]
