@@ -89,7 +89,14 @@ impl ProcCtx {
     }
 
     /// Leave one level of recursion.
+    ///
+    /// Every `push_depth` that returned `Ok` must be matched by exactly one
+    /// `pop_depth`. An unmatched pop is a control-flow bug (a missing pop on
+    /// an early-return path, or a double pop): it fails loudly in debug and
+    /// still saturates in release so a shipped binary degrades rather than
+    /// panics.
     pub fn pop_depth(&mut self) {
+        debug_assert!(self.depth > 0, "pop_depth underflow: push/pop imbalance");
         self.depth = self.depth.saturating_sub(1);
     }
 
@@ -157,5 +164,12 @@ mod tests {
                 record: "PV:DEEP".to_string()
             }
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "pop_depth underflow")]
+    fn pop_without_push_panics_in_debug() {
+        let mut ctx = ProcCtx::new();
+        ctx.pop_depth(); // depth is 0 — an unmatched pop is a bug
     }
 }
