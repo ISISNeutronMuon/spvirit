@@ -974,8 +974,29 @@ async fn run_image_updater(state: Arc<ServerState>, width: usize, height: usize,
                 })
                 .collect()
         };
+        // Encode the full NdArray frame ONCE per distinct (version, is_be)
+        // combination (at most a handful: LE/BE times protocol versions in
+        // use), then give each subscriber its own frame by cloning the cached
+        // encoding and patching in that subscriber's ioid. The frame is
+        // byte-identical across subscribers except for the ioid, which is the
+        // first field of the message payload: encode_header emits an 8-byte
+        // header, then encode_monitor_data_response_payload writes the ioid as
+        // the first 4 payload bytes in the chosen endianness. So the ioid lives
+        // at bytes [8..12] and nothing else (including the payload_length) is
+        // ioid-dependent.
+        const IOID_OFFSET: usize = 8;
+        let mut encode_cache: HashMap<(u8, bool), Vec<u8>> = HashMap::new();
         for (cw, ioid, version, is_be) in targets {
-            let resp = encode_monitor_data_response_payload(ioid, 0x00, &payload, version, is_be);
+            let template = encode_cache.entry((version, is_be)).or_insert_with(|| {
+                encode_monitor_data_response_payload(ioid, 0x00, &payload, version, is_be)
+            });
+            let mut resp = template.clone();
+            let ioid_bytes = if is_be {
+                ioid.to_be_bytes()
+            } else {
+                ioid.to_le_bytes()
+            };
+            resp[IOID_OFFSET..IOID_OFFSET + 4].copy_from_slice(&ioid_bytes);
             cw.send_monitor(ioid, resp).await;
         }
     }

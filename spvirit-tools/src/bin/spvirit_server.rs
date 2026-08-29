@@ -1593,7 +1593,13 @@ async fn run_beacon(
 }
 
 async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPayload) {
-    let mut to_send: Vec<(u64, Vec<u8>)> = Vec::new();
+    // Phase 1: build frames under the monitors lock, but DO NOT commit per-sub
+    // state (`nfree` / `last_snapshot`) yet. A frame that gets dropped by a full
+    // client queue in phase 2 must not consume a pipeline credit (would leak →
+    // permanent stall) nor advance the delta baseline (would latch a filtered
+    // client on a value it never received). Commit happens in phase 3, only for
+    // frames actually enqueued (crate-audit review R2-H1).
+    let mut to_send: Vec<(u64, u32, Vec<u8>)> = Vec::new();
     {
         let mut monitors = state.monitors.lock().await;
         if let Some(list) = monitors.get_mut(pv_name) {
@@ -1607,18 +1613,36 @@ async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPa
                 let Some(msg) = MonitorRegistry::build_monitor_frame(sub, payload) else {
                     continue;
                 };
-                if sub.pipeline_enabled && sub.nfree > 0 {
-                    sub.nfree -= 1;
-                }
-                sub.last_snapshot = Some(payload.clone());
-                to_send.push((sub.conn_id, msg));
+                to_send.push((sub.conn_id, sub.ioid, msg));
             }
         }
     }
 
-    for (conn_id, msg) in to_send {
-        send_msg(state, conn_id, msg).await;
-        debug!("Monitor update pv='{}' conn={} ", pv_name, conn_id);
+    // Phase 2: enqueue outside the lock; remember which subs actually took delivery.
+    let mut delivered: Vec<(u64, u32)> = Vec::new();
+    for (conn_id, ioid, msg) in to_send {
+        if send_msg(state, conn_id, msg).await {
+            delivered.push((conn_id, ioid));
+            debug!("Monitor update pv='{}' conn={} ", pv_name, conn_id);
+        }
+    }
+
+    // Phase 3: commit delta baseline + pipeline credit ONLY for delivered frames.
+    if !delivered.is_empty() {
+        let mut monitors = state.monitors.lock().await;
+        if let Some(list) = monitors.get_mut(pv_name) {
+            for sub in list.iter_mut() {
+                if delivered
+                    .iter()
+                    .any(|&(c, i)| c == sub.conn_id && i == sub.ioid)
+                {
+                    if sub.pipeline_enabled && sub.nfree > 0 {
+                        sub.nfree -= 1;
+                    }
+                    sub.last_snapshot = Some(payload.clone());
+                }
+            }
+        }
     }
 }
 
@@ -1629,34 +1653,46 @@ async fn send_monitor_update_for(
     ioid: u32,
     payload: &NtPayload,
 ) {
-    let mut to_send: Option<(u64, Vec<u8>)> = None;
-    {
+    // Build under the lock WITHOUT committing `nfree` / `last_snapshot` — see
+    // notify_monitors: a dropped frame must not spend credit or advance the
+    // delta baseline (crate-audit review R2-H1).
+    let msg = {
+        let mut monitors = state.monitors.lock().await;
+        let Some(list) = monitors.get_mut(pv_name) else {
+            return;
+        };
+        let Some(sub) = list
+            .iter_mut()
+            .find(|s| s.conn_id == conn_id && s.ioid == ioid)
+        else {
+            return;
+        };
+        if !sub.running {
+            return;
+        }
+        if sub.pipeline_enabled && sub.nfree == 0 {
+            return;
+        }
+        match MonitorRegistry::build_monitor_frame(sub, payload) {
+            Some(m) => m,
+            None => return,
+        }
+    };
+
+    // Enqueue outside the lock; commit baseline + credit only on delivery.
+    if send_msg(state, conn_id, msg).await {
         let mut monitors = state.monitors.lock().await;
         if let Some(list) = monitors.get_mut(pv_name) {
             if let Some(sub) = list
                 .iter_mut()
                 .find(|s| s.conn_id == conn_id && s.ioid == ioid)
             {
-                if !sub.running {
-                    return;
-                }
-                if sub.pipeline_enabled && sub.nfree == 0 {
-                    return;
-                }
-                let Some(msg) = MonitorRegistry::build_monitor_frame(sub, payload) else {
-                    return;
-                };
                 if sub.pipeline_enabled && sub.nfree > 0 {
                     sub.nfree -= 1;
                 }
                 sub.last_snapshot = Some(payload.clone());
-                to_send = Some((sub.conn_id, msg));
             }
         }
-    }
-
-    if let Some((conn_id, msg)) = to_send {
-        send_msg(state, conn_id, msg).await;
     }
 }
 
@@ -1702,20 +1738,37 @@ async fn remove_monitor_subscription(
     }
 }
 
-async fn send_msg(state: &Arc<ServerState>, conn_id: u64, msg: Vec<u8>) {
+/// Enqueue one already-built frame for a connection. Returns `true` iff the
+/// frame was actually accepted into the client's queue.
+///
+/// Non-blocking send: if this client's bounded queue is full, drop this update
+/// for THIS client only rather than stalling monitor delivery to every later
+/// client and the global DB-reload / PUT paths that drive the fan-out loop.
+/// Delivery stays lossless & in-order per client whose queue is keeping up; a
+/// slow client just loses its own updates.
+///
+/// The returned delivered/dropped signal is load-bearing: monitor callers must
+/// commit pipeline credit (`nfree`) and the delta baseline (`last_snapshot`)
+/// ONLY when this returns `true`. Committing on a dropped frame would (a) leak a
+/// pipeline credit → permanent stall of a pipelined client, and (b) advance the
+/// delta baseline past a value the client never received → a filtered client
+/// latched on stale data (crate-audit review R2-H1).
+async fn send_msg(state: &Arc<ServerState>, conn_id: u64, msg: Vec<u8>) -> bool {
     let conns = state.conns.lock().await;
     if let Some(tx) = conns.get(&conn_id) {
-        // Non-blocking send: if this client's bounded queue is full, drop this
-        // update for THIS client only rather than stalling monitor delivery to
-        // every later client and the global DB-reload / PUT paths that drive
-        // the fan-out loop. Delivery stays lossless & in-order per client whose
-        // queue is keeping up; a slow client just loses its own updates.
-        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg) {
-            warn!(
-                "Dropping monitor update for conn={}: send queue full (slow client)",
-                conn_id
-            );
+        match tx.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "Dropping monitor update for conn={}: send queue full (slow client)",
+                    conn_id
+                );
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
+    } else {
+        false
     }
 }
 
@@ -3226,6 +3279,107 @@ mod tests {
             .try_recv()
             .expect("healthy client should receive its monitor update");
         assert!(!got.is_empty(), "healthy client frame should be non-empty");
+    }
+
+    // Regression test for finding R2-H1 (premature commit): when a pipelined
+    // subscriber's frame is DROPPED because its bounded queue is full, the
+    // fan-out must NOT consume a pipeline credit and must NOT advance the delta
+    // baseline. The old code committed both under the monitors lock *before* the
+    // lossy `try_send`, so a dropped frame leaked a credit (→ permanent stall,
+    // since the client never ACKs a frame it never got) and latched the delta
+    // baseline on an un-delivered value. This test uses a *pipelined* sub with a
+    // full queue — the exact configuration the tools-T1 test could not exercise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_pipelined_frame_does_not_consume_credit_or_advance_baseline() {
+        let record = mdel_ai_record("test_pv", 1.0, "0");
+        let payload = record.to_ntpayload();
+        let state = test_state(record);
+
+        // A slow pipelined client: fill its 128-deep queue so any send drops.
+        let (tx1, _rx1) = mpsc::channel::<Vec<u8>>(128);
+        for _ in 0..128 {
+            tx1.try_send(Vec::new()).expect("prefill slow client queue");
+        }
+        {
+            let mut conns = state.conns.lock().await;
+            conns.insert(1, tx1);
+        }
+        {
+            let mut monitors = state.monitors.lock().await;
+            monitors.insert(
+                "test_pv".to_string(),
+                vec![MonitorSub {
+                    conn_id: 1,
+                    ioid: 10,
+                    version: 2,
+                    is_be: false,
+                    running: true,
+                    pipeline_enabled: true,
+                    nfree: 1,
+                    filtered_desc: None,
+                    last_snapshot: None,
+                }],
+            );
+        }
+
+        notify_monitors(&state, "test_pv", &payload).await;
+
+        let monitors = state.monitors.lock().await;
+        let sub = &monitors.get("test_pv").unwrap()[0];
+        assert_eq!(
+            sub.nfree, 1,
+            "credit must NOT be consumed for a dropped frame (would leak → stall)"
+        );
+        assert!(
+            sub.last_snapshot.is_none(),
+            "delta baseline must NOT advance past a value the client never received"
+        );
+    }
+
+    // Positive counterpart: a healthy pipelined client whose frame is actually
+    // enqueued MUST have its credit decremented and its delta baseline advanced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivered_pipelined_frame_consumes_credit_and_advances_baseline() {
+        let record = mdel_ai_record("test_pv", 1.0, "0");
+        let payload = record.to_ntpayload();
+        let state = test_state(record);
+
+        let (tx1, mut rx1) = mpsc::channel::<Vec<u8>>(128);
+        {
+            let mut conns = state.conns.lock().await;
+            conns.insert(1, tx1);
+        }
+        {
+            let mut monitors = state.monitors.lock().await;
+            monitors.insert(
+                "test_pv".to_string(),
+                vec![MonitorSub {
+                    conn_id: 1,
+                    ioid: 10,
+                    version: 2,
+                    is_be: false,
+                    running: true,
+                    pipeline_enabled: true,
+                    nfree: 1,
+                    filtered_desc: None,
+                    last_snapshot: None,
+                }],
+            );
+        }
+
+        notify_monitors(&state, "test_pv", &payload).await;
+
+        assert!(
+            rx1.try_recv().is_ok(),
+            "healthy client should receive its frame"
+        );
+        let monitors = state.monitors.lock().await;
+        let sub = &monitors.get("test_pv").unwrap()[0];
+        assert_eq!(sub.nfree, 0, "credit must be consumed for a delivered frame");
+        assert!(
+            sub.last_snapshot.is_some(),
+            "delta baseline must advance after a delivered frame"
+        );
     }
 
     fn ts_field(seconds: i64, nanos: i32) -> DecodedValue {
