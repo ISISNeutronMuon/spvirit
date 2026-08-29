@@ -70,20 +70,31 @@ enum Fill {
 /// the bytes taken off the socket. Dropping this future mid-fill therefore
 /// loses no data.
 ///
-/// The deadline can only produce `TimedOut` when `allow_timeout` is set *and*
-/// no byte has been read into `buf` yet (`*filled == 0`): that is the only
-/// clean boundary. Once any byte has been read — or when `allow_timeout` is
-/// false (the payload phase, whose header is already spent) — we are committed
-/// to finishing the buffer and block on cancellation-safe `read()`, never
-/// abandoning a partially-read buffer. This is what keeps the two
-/// `Err(Timeout) => continue` call sites from ever seeing a mid-frame timeout,
-/// and prevents a busy-loop when the deadline has already elapsed mid-frame.
+/// A clean-boundary `TimedOut` (no byte read yet, `*filled == 0`) is produced
+/// only when `allow_timeout` is set — that is the frame boundary the idle-poll
+/// call sites expect.
+///
+/// The committed portion (once any byte has been read, or the payload phase
+/// whose header is already spent) is governed by `bound_committed`:
+/// - `false` — block on cancellation-safe `read()` with no deadline, never
+///   abandoning a partially-read buffer. A fresh-buffer caller that loops on
+///   `Err(Timeout) => continue` (e.g. the PUT reader) relies on this to emulate
+///   an indefinitely-blocking read without ever desyncing on a mid-frame stall.
+/// - `true` — bound every committed read by the deadline too and surface
+///   `TimedOut`. Callers that either abort the connection (`read_until`) or hold
+///   a persistent `fb` that resumes (`read_frame_resumable`) opt in, so a peer
+///   that stalls mid-frame can no longer hang them forever (review R2-M1).
+///
+/// In all cases `read()` (unlike `read_exact`) consumes nothing when its future
+/// is dropped, so `*filled` always reflects exactly the bytes taken off the
+/// socket and dropping this future mid-fill loses no data.
 async fn fill<R>(
     reader: &mut R,
     buf: &mut [u8],
     filled: &mut usize,
     deadline: Instant,
     allow_timeout: bool,
+    bound_committed: bool,
 ) -> Result<Fill, PvGetError>
 where
     R: AsyncRead + Unpin,
@@ -100,6 +111,26 @@ where
                     return Err(PvGetError::Io(io::Error::new(
                         ErrorKind::UnexpectedEof,
                         "eof before frame",
+                    )));
+                }
+                Ok(Ok(n)) => *filled += n,
+                Ok(Err(e)) => return Err(PvGetError::Io(e)),
+                Err(_elapsed) => return Ok(Fill::TimedOut),
+            }
+        } else if bound_committed {
+            // Committed but deadline-bounded: surface TimedOut so the caller can
+            // abort (read_until) or resume from a persistent buffer
+            // (read_frame_resumable) instead of hanging on a peer that stops
+            // mid-frame. Still cancellation-safe.
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(d) if !d.is_zero() => d,
+                _ => return Ok(Fill::TimedOut),
+            };
+            match timeout(remaining, reader.read(&mut buf[*filled..])).await {
+                Ok(Ok(0)) => {
+                    return Err(PvGetError::Io(io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "eof mid-frame",
                     )));
                 }
                 Ok(Ok(n)) => *filled += n,
@@ -133,6 +164,7 @@ async fn read_frame_into<R>(
     timeout_dur: Duration,
     reassembler: &mut SegmentReassembler,
     fb: &mut FrameBuf,
+    bound_committed: bool,
 ) -> Result<Vec<u8>, PvGetError>
 where
     R: AsyncRead + Unpin,
@@ -140,9 +172,20 @@ where
     let deadline = Instant::now() + timeout_dur;
     loop {
         // Phase 1: header (8 bytes). A timeout with no header byte yet read is
-        // a clean frame boundary and is surfaced to the caller.
+        // a clean frame boundary and is surfaced to the caller. When
+        // `bound_committed` is set, a stall after a *partial* header also times
+        // out rather than hanging.
         if !fb.header_done {
-            match fill(reader, &mut fb.header, &mut fb.header_filled, deadline, true).await? {
+            match fill(
+                reader,
+                &mut fb.header,
+                &mut fb.header_filled,
+                deadline,
+                true,
+                bound_committed,
+            )
+            .await?
+            {
                 Fill::TimedOut => return Err(PvGetError::Timeout("read header")),
                 Fill::Done => {}
             }
@@ -159,8 +202,10 @@ where
         }
 
         // Phase 2: payload. The header is already consumed, so this is never a
-        // clean boundary: `fill` (allow_timeout = false) blocks through to
-        // completion and never returns `TimedOut`.
+        // clean boundary (`allow_timeout = false`). With `bound_committed` unset
+        // `fill` blocks through to completion and never returns `TimedOut`; with
+        // it set a mid-payload stall times out and is surfaced as a payload
+        // timeout (the caller either aborts or resumes from its persistent fb).
         if fb.payload_filled < fb.payload_need {
             match fill(
                 reader,
@@ -168,10 +213,11 @@ where
                 &mut fb.payload_filled,
                 deadline,
                 false,
+                bound_committed,
             )
             .await?
             {
-                Fill::TimedOut => unreachable!("payload fill never times out"),
+                Fill::TimedOut => return Err(PvGetError::Timeout("read payload")),
                 Fill::Done => {}
             }
         }
@@ -195,9 +241,11 @@ where
 ///
 /// The per-call buffer is fresh, so this returns [`PvGetError::Timeout`] only
 /// at a clean frame boundary (before any byte of the next frame is consumed):
-/// a mid-frame stall is read to completion rather than abandoned. Callers that
-/// drop this future mid-frame (e.g. from a `select!` branch) must instead use
-/// [`read_frame_resumable`], which persists the partial read.
+/// a mid-frame stall is read to completion rather than abandoned (block-forever
+/// committed reads). This keeps a fresh-buffer caller that loops on
+/// `Err(Timeout) => continue` from ever desyncing on a partially-read frame.
+/// Callers that must bound a mid-frame stall need a persistent buffer — use
+/// [`read_frame_resumable`], which both persists the partial read and bounds it.
 pub async fn read_frame<R>(
     reader: &mut R,
     timeout_dur: Duration,
@@ -207,7 +255,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut fb = FrameBuf::new();
-    read_frame_into(reader, timeout_dur, reassembler, &mut fb).await
+    read_frame_into(reader, timeout_dur, reassembler, &mut fb, false).await
 }
 
 /// Like [`read_frame`], but resumes from partial state held in `fb`.
@@ -217,6 +265,11 @@ where
 /// outlives any single call, the bytes already pulled off the socket for an
 /// in-progress frame survive the drop and the next call continues from there,
 /// keeping the TCP framing in sync.
+///
+/// Committed reads are deadline-bounded (`bound_committed = true`): a peer that
+/// stalls mid-frame yields `Err(Timeout)` instead of hanging the reader, and
+/// because `fb` persists, the next call resumes the same frame with no desync
+/// (review R2-M1). The monitor loop already treats `Err(Timeout) => continue`.
 pub async fn read_frame_resumable<R>(
     reader: &mut R,
     timeout_dur: Duration,
@@ -226,7 +279,7 @@ pub async fn read_frame_resumable<R>(
 where
     R: AsyncRead + Unpin,
 {
-    read_frame_into(reader, timeout_dur, reassembler, fb).await
+    read_frame_into(reader, timeout_dur, reassembler, fb, true).await
 }
 
 /// Read one complete PVA message from a TCP stream.
@@ -242,6 +295,14 @@ pub async fn read_packet(
 }
 
 /// Read complete PVA messages until `predicate` accepts one.
+///
+/// Committed reads are deadline-bounded, so a peer that sends a partial frame
+/// and then stalls yields `Err(Timeout)` rather than hanging the resolve /
+/// handshake / RPC paths forever (review R2-M1). This is desync-safe because a
+/// mid-frame timeout aborts the whole call (`?`) and every caller then abandons
+/// the connection — the partial bytes in the local `fb` are never reused. The
+/// `fb` is persisted across the loop only so successive complete frames share
+/// one buffer.
 pub async fn read_until<F>(
     stream: &mut TcpStream,
     timeout_dur: Duration,
@@ -252,13 +313,14 @@ where
     F: FnMut(&PvaPacketCommand) -> bool,
 {
     let deadline = tokio::time::Instant::now() + timeout_dur;
+    let mut fb = FrameBuf::new();
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return Err(PvGetError::Timeout("read_until"));
         }
         let remaining = deadline - now;
-        let bytes = read_packet(stream, remaining, reassembler).await?;
+        let bytes = read_frame_into(stream, remaining, reassembler, &mut fb, true).await?;
         let mut pkt = PvaPacket::new(&bytes);
         if let Some(cmd) = pkt.decode_payload() {
             if predicate(&cmd) {
@@ -397,5 +459,74 @@ mod tests {
             .await
             .expect("control frame read");
         assert_eq!(got, expected);
+    }
+
+    /// R2-M1: a peer that delivers a partial frame and then stalls mid-payload
+    /// must make a `bound_committed` reader (`read_frame_resumable`, and by the
+    /// same path `read_until`) time out instead of hanging forever. Because the
+    /// caller-owned `fb` persists, the timed-out partial read is resumed on the
+    /// next call and the frame is reassembled intact — no desync.
+    #[tokio::test]
+    async fn mid_payload_stall_times_out_then_resumes_without_desync() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let frame = sample_frame(); // 8-byte header + 5-byte payload
+        let expected = frame.clone();
+
+        // Deliver the full header plus the first 2 payload bytes, then stall.
+        server.write_all(&frame[..10]).await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut reass = SegmentReassembler::new();
+        let mut fb = FrameBuf::new();
+
+        // The committed (payload) read must surface a timeout rather than block.
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame_resumable(&mut client, Duration::from_millis(30), &mut reass, &mut fb),
+        )
+        .await
+        .expect("committed read must time out, not hang");
+        assert!(
+            matches!(err, Err(PvGetError::Timeout(_))),
+            "mid-payload stall must yield Timeout, got {err:?}"
+        );
+        // Partial state survives for the resume.
+        assert!(fb.header_done, "header must be retained across the timeout");
+        assert_eq!(fb.payload_filled, 2, "partial payload must be retained");
+
+        // Deliver the rest; the resumed read returns the intact frame.
+        server.write_all(&frame[10..]).await.unwrap();
+        server.flush().await.unwrap();
+        let got = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame_resumable(&mut client, Duration::from_secs(5), &mut reass, &mut fb),
+        )
+        .await
+        .expect("resumed read timed out")
+        .expect("resumed read failed");
+        assert_eq!(got, expected, "resumed frame must be intact (no desync)");
+    }
+
+    /// The block-forever committed read that [`read_frame`] uses (the PUT reader
+    /// loop relies on it to emulate an indefinitely-blocking read with a fresh
+    /// buffer) must NOT time out mid-frame: a partial frame leaves the read
+    /// pending regardless of `timeout_dur`, so a `select!` timer wins instead.
+    #[tokio::test]
+    async fn read_frame_does_not_time_out_mid_frame() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let frame = sample_frame();
+        server.write_all(&frame[..10]).await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut reass = SegmentReassembler::new();
+        let timed_out = tokio::select! {
+            r = read_frame(&mut client, Duration::from_millis(30), &mut reass) => {
+                panic!("read_frame must not resolve on a mid-frame stall, got {r:?}");
+            }
+            _ = sleep(Duration::from_millis(150)) => true,
+        };
+        assert!(timed_out, "committed read stayed pending as expected");
+        // Keep `server` alive until here so the stall is a stall, not an EOF.
+        drop(server);
     }
 }
