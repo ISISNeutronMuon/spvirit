@@ -2,10 +2,16 @@
 //! record engine, never holding a scan-list lock across a process() call.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// Bound on the `scan_once` request queue (mirrors the event dispatcher's
+/// `DISPATCH_QUEUE_CAPACITY`). At module scope so the drop-count test can
+/// reference it as `super::SCAN_ONCE_CAPACITY`.
+pub(crate) const SCAN_ONCE_CAPACITY: usize = 1024;
 
 use crate::clock::Clock;
 use crate::ctx::ProcCtx;
@@ -31,10 +37,25 @@ pub struct Scanner {
     periodic: Mutex<HashMap<PeriodKey, ScanList>>,
     stop: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Sender end of the bounded `scan_once` queue. `None` once `shutdown()`
+    /// has closed it (dropping the sender is what makes the drain thread's
+    /// blocked `recv()` return `Err` and exit).
+    scan_once_tx: Mutex<Option<SyncSender<RecordId>>>,
+    /// Receiver end, parked here until `start()` moves it into the drain
+    /// thread. Kept alive (not dropped) until then so `try_send` on a full
+    /// queue reports `Full`, not `Disconnected`.
+    scan_once_rx: Mutex<Option<Receiver<RecordId>>>,
+    /// Count of `scan_once` requests dropped because the queue was full.
+    scan_once_dropped: AtomicU64,
+    /// The `scan_once` drain/callback thread's handle. Kept out of `threads`
+    /// (which stays the periodic-thread set several tests assert on), but
+    /// joined by the SAME self-join-guarded loop in `shutdown()`.
+    drain_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Scanner {
     pub fn new(db: Arc<RecordDb>, clock: Arc<dyn Clock>, sink: Arc<dyn ProcSink>) -> Self {
+        let (tx, rx) = sync_channel(SCAN_ONCE_CAPACITY);
         Self {
             db,
             clock,
@@ -42,7 +63,40 @@ impl Scanner {
             periodic: Mutex::new(HashMap::new()),
             stop: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
+            scan_once_tx: Mutex::new(Some(tx)),
+            scan_once_rx: Mutex::new(Some(rx)),
+            scan_once_dropped: AtomicU64::new(0),
+            drain_thread: Mutex::new(None),
         }
+    }
+
+    /// Enqueue a single-record process request onto the bounded `scan_once`
+    /// queue. Non-blocking (uses `try_send`) and safe to call from inside a
+    /// process pass: it only enqueues, never processes. When the queue is
+    /// full the request is dropped, [`Self::scan_once_dropped`] is
+    /// incremented, and a power-of-two rate-limited warning is emitted
+    /// (mirroring the event dispatcher's overflow handling).
+    pub fn scan_once(&self, id: RecordId) {
+        let guard = self.scan_once_tx.lock().unwrap();
+        // `None` after shutdown: the queue is closed, so silently drop --
+        // there is no drain thread left to process the request.
+        let Some(tx) = guard.as_ref() else { return };
+        if tx.try_send(id).is_err() {
+            let n = self.scan_once_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    "scan_once queue full; dropped scan request for {:?} ({} dropped so far)",
+                    id,
+                    n
+                );
+            }
+        }
+    }
+
+    /// Number of `scan_once` requests dropped so far because the queue was
+    /// full.
+    pub fn scan_once_dropped(&self) -> u64 {
+        self.scan_once_dropped.load(Ordering::Relaxed)
     }
 
     /// Sweep every record whose `PINI` field is true, in ascending `PHAS`
@@ -159,6 +213,27 @@ impl Scanner {
                 Self::periodic_loop(weak, clock, stop, key, period, anchor)
             }));
         }
+        // The `scan_once` drain/callback thread: drains the bounded queue and
+        // processes each request via `process_ids`. Like the periodic threads
+        // it holds only a `Weak<Self>` and upgrades it fresh per drained
+        // request -- never holding a strong `Arc<Scanner>` across the blocking
+        // `recv()` -- so an owner's `drop()` can still reclaim it. `recv()`
+        // returns `Err` (and the loop exits) once `shutdown()` drops the
+        // sender. `rx` is `take()`n so a second `start()` spawns no second
+        // drain thread.
+        if let Some(rx) = self.scan_once_rx.lock().unwrap().take() {
+            let weak = Arc::downgrade(self);
+            *self.drain_thread.lock().unwrap() = Some(std::thread::spawn(move || {
+                while let Ok(id) = rx.recv() {
+                    // `Scanner` may already be gone (owner dropped their last
+                    // handle without calling `shutdown()`): exit exactly as a
+                    // closed sender would. The strong ref is dropped at the end
+                    // of each iteration, before the next blocking `recv()`.
+                    let Some(this) = weak.upgrade() else { break };
+                    this.process_ids(&[id]);
+                }
+            }));
+        }
     }
 
     /// `n`th tick's offset from the thread's start instant, in nanoseconds.
@@ -252,7 +327,19 @@ impl Scanner {
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
         self.clock.wake_all();
-        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.threads.lock().unwrap());
+        // Close the `scan_once` queue BEFORE joining: the drain thread is
+        // blocked in `recv()` (a channel wait, not a clock sleep, so
+        // `wake_all()` cannot release it). Dropping the sender makes that
+        // `recv()` return `Err(RecvError)` and the thread exits; joining it
+        // before this drop would hang forever. Idempotent: `None` on the
+        // second call. The drain thread's handle sits in the same `threads`
+        // vec below, so the self-join guard covers it too.
+        *self.scan_once_tx.lock().unwrap() = None;
+        let mut handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.threads.lock().unwrap());
+        // Join the drain thread through the SAME loop (and its self-join
+        // guard) as the periodic threads. Taken so a second `shutdown()` sees
+        // `None` and stays a no-op.
+        handles.extend(self.drain_thread.lock().unwrap().take());
         // If the last strong `Arc<Scanner>` happens to be dropped from inside
         // one of our own periodic threads (e.g. mid-pass, after `weak.upgrade()`
         // -- see `periodic_loop`), `Scanner::drop` -> `shutdown()` runs ON that
@@ -783,6 +870,51 @@ mod tests {
             "no periodic list was registered, so no thread should be spawned"
         );
         scanner.shutdown();
+    }
+
+    #[test]
+    fn scan_once_processes_the_record_on_the_callback_thread() {
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        scanner.start();
+        let a = db.lookup("PV:A").unwrap();
+        scanner.scan_once(a);
+        wait_until(|| sink.count("PV:A") == 1);
+        assert_eq!(sink.count("PV:A"), 1);
+        scanner.shutdown();
+    }
+
+    #[test]
+    fn scan_once_dropped_starts_at_zero_and_stays_zero_without_drops() {
+        // A fresh Scanner has dropped nothing; and a single enqueued+drained
+        // request (queue never full) must not increment the drop counter.
+        // Pins `scan_once_dropped()` to the real counter rather than a
+        // constant (kills a mutant that hard-codes its return value).
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        assert_eq!(scanner.scan_once_dropped(), 0);
+        scanner.start();
+        let a = db.lookup("PV:A").unwrap();
+        scanner.scan_once(a);
+        wait_until(|| sink.count("PV:A") == 1);
+        assert_eq!(scanner.scan_once_dropped(), 0);
+        scanner.shutdown();
+    }
+
+    #[test]
+    fn scan_once_drops_and_counts_when_the_queue_is_full() {
+        // Do NOT start the callback thread, so nothing drains: fill past capacity
+        // from the caller side and assert scan_once_dropped() > 0.
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Scanner::new(db.clone(), clock, sink);
+        let a = db.lookup("PV:A").unwrap();
+        for _ in 0..(super::SCAN_ONCE_CAPACITY + 50) {
+            scanner.scan_once(a);
+        }
+        assert!(scanner.scan_once_dropped() > 0);
     }
 
     #[test]
