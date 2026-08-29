@@ -16,6 +16,7 @@
 
 pub mod alarm;
 pub mod build;
+pub mod clock;
 pub mod ctx;
 pub mod fields;
 pub mod graph;
