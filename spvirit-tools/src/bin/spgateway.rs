@@ -48,6 +48,18 @@ fn parse_discovery_override(args: &[String]) -> Result<Option<bool>, String> {
     }
 }
 
+/// Apply a `discovery_parity` CLI override to every server in `cfg`. A `None`
+/// override leaves the config untouched (each server keeps its JSON value);
+/// `Some(v)` sets every server's `discovery_parity` to `v` (CLI overrides JSON
+/// for all servers).
+fn apply_discovery_override(cfg: &mut GatewayConfig, override_val: Option<bool>) {
+    if let Some(v) = override_val {
+        for s in &mut cfg.servers {
+            s.discovery_parity = v;
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -89,11 +101,7 @@ fn main() -> ExitCode {
 
     if test_config {
         let result = GatewayConfig::from_json_str(&contents).and_then(|mut cfg| {
-            if let Some(v) = discovery_override {
-                for s in &mut cfg.servers {
-                    s.discovery_parity = v;
-                }
-            }
+            apply_discovery_override(&mut cfg, discovery_override);
             cfg.validate()
         });
         return match result {
@@ -124,11 +132,7 @@ fn main() -> ExitCode {
     };
 
     // CLI overrides JSON for all servers.
-    if let Some(v) = discovery_override {
-        for s in &mut cfg.servers {
-            s.discovery_parity = v;
-        }
-    }
+    apply_discovery_override(&mut cfg, discovery_override);
 
     let runtime = match Runtime::from_config(cfg) {
         Ok(rt) => rt,
@@ -157,7 +161,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_discovery_override;
+    use super::{apply_discovery_override, parse_discovery_override};
     use spvirit_gateway::config::GatewayConfig;
 
     fn args(items: &[&str]) -> Vec<String> {
@@ -202,11 +206,7 @@ mod tests {
         let mut cfg = GatewayConfig::from_json_str(json).unwrap();
         let override_val = parse_discovery_override(&args(&["--no-discovery-parity", "cfg.json"]))
             .unwrap();
-        if let Some(v) = override_val {
-            for s in &mut cfg.servers {
-                s.discovery_parity = v;
-            }
-        }
+        apply_discovery_override(&mut cfg, override_val);
         assert!(cfg.servers.iter().all(|s| !s.discovery_parity));
     }
 }
