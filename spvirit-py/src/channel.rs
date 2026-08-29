@@ -38,7 +38,7 @@ const QOS_INIT: u8 = 0x08;
 /// delegate to [`encode_pv_request`] (which supports dotted nested paths).
 fn build_pv_request(fields: &[String], is_be: bool) -> Vec<u8> {
     if fields.is_empty() {
-        vec![0xfd, 0x02, 0x00, 0x80, 0x00, 0x00]
+        crate::codec::ALL_FIELDS_PV_REQUEST.to_vec()
     } else {
         let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
         encode_pv_request(&refs, is_be)
@@ -135,11 +135,7 @@ async fn run_get(
     let version = conn.version;
     let sid = conn.sid;
 
-    let pv_request = if fields.is_empty() {
-        vec![0xfd, 0x02, 0x00, 0x80, 0x00, 0x00]
-    } else {
-        build_pv_request(&fields, is_be)
-    };
+    let pv_request = build_pv_request(&fields, is_be);
 
     let get_init = encode_get_request(sid, ioid, QOS_INIT, &pv_request, version, is_be);
     conn.stream.write_all(&get_init).await?;
@@ -223,7 +219,7 @@ async fn run_introspect(
     let version = conn.version;
     let sid = conn.sid;
 
-    let pv_request = vec![0xfd, 0x02, 0x00, 0x80, 0x00, 0x00];
+    let pv_request = build_pv_request(&[], is_be);
     let init = encode_get_request(sid, ioid, QOS_INIT, &pv_request, version, is_be);
     conn.stream.write_all(&init).await?;
     let init_resp = read_until(&mut conn.stream, timeout, &mut conn.reassembler, |cmd| {
@@ -288,20 +284,15 @@ async fn run_monitor(
                         if let Ok(update) =
                             decoder.decode_monitor_update(&payload[pos..], &field_desc)
                         {
-                            let keep_going = Python::with_gil(|py| {
-                                let v = crate::monitor_update::PyMonitorUpdate::from_update(
-                                    py, &update,
-                                );
-                                match callback.call1(py, (v,)) {
-                                    Ok(ret) => ret.extract::<bool>(py).unwrap_or(true),
-                                    Err(e) => {
-                                        *cb_err = Some(e);
-                                        false
-                                    }
+                            match crate::monitor_update::dispatch_monitor_update(
+                                &callback, &update,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => return Ok(()),
+                                Err(e) => {
+                                    *cb_err = Some(e);
+                                    return Ok(());
                                 }
-                            });
-                            if !keep_going {
-                                return Ok(());
                             }
                         }
                     }

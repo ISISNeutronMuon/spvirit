@@ -31,7 +31,11 @@ pub(crate) enum PvKind {
     Bool(Pv<bool>),
     I32(Pv<i32>),
     Str(Pv<String>),
-    Array(PvArray),
+    /// Array handle plus its element `TypeCode`, captured at construction.
+    /// A record's element type is fixed when the record is created and never
+    /// changes, so carrying it here lets `set`/`set_async` coerce Python
+    /// values strictly without a GET round-trip to re-learn the type.
+    Array(PvArray, TypeCode),
     /// Dynamically typed scalar — covers all twelve NTScalar wire types.
     /// The TypeCode is the record's wire type; Python values are strictly
     /// coerced against it at the boundary.
@@ -53,7 +57,7 @@ impl PyPv {
             PvKind::Bool(p) => AnyPv::from(p.clone()),
             PvKind::I32(p) => AnyPv::from(p.clone()),
             PvKind::Str(p) => AnyPv::from(p.clone()),
-            PvKind::Array(a) => AnyPv::from(a.clone()),
+            PvKind::Array(a, _) => AnyPv::from(a.clone()),
             PvKind::Typed(p, _) => AnyPv::from(p.clone()),
         }
     }
@@ -69,7 +73,7 @@ impl PyPv {
             PvKind::Bool(p) => p.name(),
             PvKind::I32(p) => p.name(),
             PvKind::Str(p) => p.name(),
-            PvKind::Array(p) => p.name(),
+            PvKind::Array(p, _) => p.name(),
             PvKind::Typed(p, _) => p.name(),
         }
     }
@@ -80,7 +84,7 @@ impl PyPv {
             PvKind::Bool(_) => "bool".into(),
             PvKind::I32(_) => "int".into(),
             PvKind::Str(_) => "str".into(),
-            PvKind::Array(_) => "array".into(),
+            PvKind::Array(..) => "array".into(),
             PvKind::Typed(_, code) => wire_type_name(*code).into(),
         };
         format!("<spvirit.Pv '{}' ({ty})>", self.name())
@@ -105,17 +109,11 @@ impl PyPv {
                 let v: String = value.extract()?;
                 block_on_py(py, p.set(v)).map_err(pv_err)
             }
-            PvKind::Array(p) => {
-                // Bound handles coerce strictly to the record's current element type
-                // (the record is the authority); unbound handles fall back to
-                // inference — set() on them raises Unbound in p.set() anyway.
-                let v = match block_on_py(py, async { p.get().await }) {
-                    Ok(cur) => crate::convert::py_to_scalar_array_typed(
-                        value,
-                        crate::convert::scalar_array_type_code(&cur),
-                    )?,
-                    Err(_) => py_to_scalar_array(value)?,
-                };
+            PvKind::Array(p, code) => {
+                // Coerce strictly to the record's element type, captured at
+                // construction. No GET round-trip: the element type is fixed
+                // when the record is created and cannot change.
+                let v = crate::convert::py_to_scalar_array_typed(value, *code)?;
                 block_on_py(py, p.set(v)).map_err(pv_err)
             }
             PvKind::Typed(p, code) => {
@@ -144,7 +142,7 @@ impl PyPv {
                 let v = block_on_py(py, p.get()).map_err(pv_err)?;
                 v.into_py_any(py)
             }
-            PvKind::Array(p) => {
+            PvKind::Array(p, _) => {
                 let v = block_on_py(py, p.get()).map_err(pv_err)?;
                 Ok(scalar_array_to_py(py, &v))
             }
@@ -194,14 +192,9 @@ impl PyPv {
                     Python::with_gil(|py| py.None().into_py_any(py))
                 })
             }
-            PvKind::Array(p) => {
-                let v = match block_on_py(py, async { p.get().await }) {
-                    Ok(cur) => crate::convert::py_to_scalar_array_typed(
-                        value,
-                        crate::convert::scalar_array_type_code(&cur),
-                    )?,
-                    Err(_) => py_to_scalar_array(value)?,
-                };
+            PvKind::Array(p, code) => {
+                // Coerce against the construction-time element type — no GET.
+                let v = crate::convert::py_to_scalar_array_typed(value, *code)?;
                 let handle = p.clone();
                 future_into_py(py, async move {
                     handle.set(v).await.map_err(pv_err)?;
@@ -250,7 +243,7 @@ impl PyPv {
                     Python::with_gil(|py| v.into_py_any(py))
                 })
             }
-            PvKind::Array(p) => {
+            PvKind::Array(p, _) => {
                 let handle = p.clone();
                 future_into_py(py, async move {
                     let v = handle.get().await.map_err(pv_err)?;
@@ -284,7 +277,7 @@ impl PyPv {
             PvKind::Str(p) => {
                 block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
             }
-            PvKind::Array(p) => {
+            PvKind::Array(p, _) => {
                 block_on_py(py, p.set_alarm(severity, status, message)).map_err(pv_err)
             }
             PvKind::Typed(p, _) => {
@@ -302,7 +295,7 @@ impl PyPv {
     /// (decorator protocol), so it works both as a plain method call and as
     /// `@pv.on_put`.
     fn on_put(&self, py: Python<'_>, callback: PyObject) -> PyResult<PyObject> {
-        if matches!(&self.kind, PvKind::Array(_)) {
+        if matches!(&self.kind, PvKind::Array(..)) {
             return Err(PyTypeError::new_err(
                 "on_put/scan not supported on array PVs",
             ));
@@ -344,7 +337,7 @@ impl PyPv {
                     py_on_put(&cb, PvKind::Typed(handle.clone(), c), PutVal::Scalar(v))
                 });
             }
-            PvKind::Array(_) => unreachable!("Array on_put rejected above"),
+            PvKind::Array(..) => unreachable!("Array on_put rejected above"),
         }
         Ok(callback)
     }
@@ -360,7 +353,7 @@ impl PyPv {
     /// afterwards is a silent no-op (core logs a warning).
     #[pyo3(signature = (period, callback=None))]
     fn scan(&self, py: Python<'_>, period: f64, callback: Option<PyObject>) -> PyResult<PyObject> {
-        if matches!(&self.kind, PvKind::Array(_)) {
+        if matches!(&self.kind, PvKind::Array(..)) {
             return Err(PyTypeError::new_err(
                 "on_put/scan not supported on array PVs",
             ));
@@ -431,7 +424,7 @@ fn register_scan(pv: &PyPv, period_secs: f64, cb: PyObject) {
                 .clone()
                 .scan(dur, move |h| scan_bridge_typed(&cb, &cache, h, c));
         }
-        PvKind::Array(_) => unreachable!("Array scan rejected in PyPv::scan"),
+        PvKind::Array(..) => unreachable!("Array scan rejected in PyPv::scan"),
     }
 }
 
@@ -720,8 +713,9 @@ pub fn mbbo(name: String, choices: Vec<String>, initial: i32, desc: Option<Strin
 #[pyo3(signature = (name, data, *, r#type=None))]
 pub fn waveform(name: String, data: &Bound<'_, PyAny>, r#type: Option<String>) -> PyResult<PyPv> {
     let arr = crate::convert::py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
+    let code = crate::convert::scalar_array_type_code(&arr);
     Ok(PyPv {
-        kind: PvKind::Array(PvArray::waveform(name, arr)),
+        kind: PvKind::Array(PvArray::waveform(name, arr), code),
     })
 }
 
@@ -732,8 +726,9 @@ pub fn waveform(name: String, data: &Bound<'_, PyAny>, r#type: Option<String>) -
 #[pyo3(signature = (name, data, *, r#type=None))]
 pub fn aai(name: String, data: &Bound<'_, PyAny>, r#type: Option<String>) -> PyResult<PyPv> {
     let arr = crate::convert::py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
+    let code = crate::convert::scalar_array_type_code(&arr);
     Ok(PyPv {
-        kind: PvKind::Array(PvArray::aai(name, arr)),
+        kind: PvKind::Array(PvArray::aai(name, arr), code),
     })
 }
 
@@ -744,8 +739,9 @@ pub fn aai(name: String, data: &Bound<'_, PyAny>, r#type: Option<String>) -> PyR
 #[pyo3(signature = (name, data, *, r#type=None))]
 pub fn aao(name: String, data: &Bound<'_, PyAny>, r#type: Option<String>) -> PyResult<PyPv> {
     let arr = crate::convert::py_to_scalar_array_maybe_typed(data, r#type.as_deref())?;
+    let code = crate::convert::scalar_array_type_code(&arr);
     Ok(PyPv {
-        kind: PvKind::Array(PvArray::aao(name, arr)),
+        kind: PvKind::Array(PvArray::aao(name, arr), code),
     })
 }
 
@@ -843,8 +839,9 @@ pub fn pv(
                 ));
             }
             let arr = crate::convert::py_to_scalar_array_typed(initial, code)?;
+            let elem_code = crate::convert::scalar_array_type_code(&arr);
             return Ok(PyPv {
-                kind: PvKind::Array(PvArray::waveform(name, arr)),
+                kind: PvKind::Array(PvArray::waveform(name, arr), elem_code),
             });
         }
         let sv = py_to_scalar_typed(initial, code)?;
@@ -917,7 +914,8 @@ pub fn pv(
             ));
         }
         let arr = py_to_scalar_array(initial)?;
-        PvKind::Array(PvArray::waveform(name, arr))
+        let code = crate::convert::scalar_array_type_code(&arr);
+        PvKind::Array(PvArray::waveform(name, arr), code)
     } else if initial.is_instance_of::<PyFloat>() {
         PvKind::F64(apply_opts(
             Pv::ao(name, initial.extract::<f64>()?),

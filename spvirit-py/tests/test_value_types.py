@@ -313,6 +313,23 @@ def test_store_put_nt_coerces_payload_value():
             lambda: store.put_nt("VST:U8", spvirit.NtScalar(300)))
 
 
+def test_server_pv_array_handle_coerces_to_element_type():
+    # server.pv() on an array record returns an array handle carrying the
+    # record's element type (captured at construction). Writes through it
+    # coerce strictly to that element type (ushort here) with no GET
+    # round-trip to re-learn it.
+    wf = spvirit.waveform("VTA:SPWF", [0] * 4, type="ushort")
+    server = spvirit.Server(pvs=[wf], port=16082, udp_port=16083,
+                            listen_ip="127.0.0.1")
+    h = server.pv("VTA:SPWF")
+    assert "(array)" in repr(h)
+    h.set([1, 2, 3])                        # plain int list must stay ushort
+    assert h.get() == [1, 2, 3]
+    assert wf.get() == [1, 2, 3]
+    _expect(OverflowError, lambda: h.set([70000]))
+    _expect(TypeError, lambda: h.set(["x"]))
+
+
 def main():
     for fn in sorted(k for k in globals() if k.startswith("test_")):
         globals()[fn]()

@@ -64,92 +64,60 @@ pub fn scalar_to_py(py: Python<'_>, v: &ScalarValue) -> PyObject {
 pub fn scalar_array_to_py(py: Python<'_>, v: &ScalarArrayValue) -> PyObject {
     match v {
         ScalarArrayValue::U8(a) => PyBytes::new(py, a).into_any().unbind(),
-        ScalarArrayValue::Bool(a) => {
-            let items: Vec<PyObject> = a
-                .iter()
-                .map(|x| PyBool::new(py, *x).to_owned().into_any().unbind())
-                .collect();
-            PyList::new(py, &items).expect("list").into_any().unbind()
-        }
-        ScalarArrayValue::I8(a) => int_list_i8(py, a),
-        ScalarArrayValue::I16(a) => int_list_i16(py, a),
-        ScalarArrayValue::I32(a) => int_list_i32(py, a),
-        ScalarArrayValue::I64(a) => int_list_i64(py, a),
-        ScalarArrayValue::U16(a) => int_list_u16(py, a),
-        ScalarArrayValue::U32(a) => int_list_u32(py, a),
-        ScalarArrayValue::U64(a) => int_list_u64(py, a),
-        ScalarArrayValue::F32(a) => {
-            let items: Vec<PyObject> = a
-                .iter()
-                .map(|x| PyFloat::new(py, *x as f64).into_any().unbind())
-                .collect();
-            PyList::new(py, &items).expect("list").into_any().unbind()
-        }
-        ScalarArrayValue::F64(a) => {
-            let items: Vec<PyObject> = a
-                .iter()
-                .map(|x| PyFloat::new(py, *x).into_any().unbind())
-                .collect();
-            PyList::new(py, &items).expect("list").into_any().unbind()
-        }
-        ScalarArrayValue::Str(a) => {
-            let items: Vec<PyObject> = a
-                .iter()
-                .map(|x| PyString::new(py, x).into_any().unbind())
-                .collect();
-            PyList::new(py, &items).expect("list").into_any().unbind()
-        }
+        ScalarArrayValue::Bool(a) => PyList::new(
+            py,
+            a.iter().map(|x| PyBool::new(py, *x).to_owned().into_any().unbind()),
+        )
+        .expect("list")
+        .into_any()
+        .unbind(),
+        ScalarArrayValue::I8(a) => int_list(py, a),
+        ScalarArrayValue::I16(a) => int_list(py, a),
+        ScalarArrayValue::I32(a) => int_list(py, a),
+        ScalarArrayValue::I64(a) => int_list(py, a),
+        ScalarArrayValue::U16(a) => int_list(py, a),
+        ScalarArrayValue::U32(a) => int_list(py, a),
+        ScalarArrayValue::U64(a) => int_list(py, a),
+        ScalarArrayValue::F32(a) => PyList::new(
+            py,
+            a.iter().map(|x| PyFloat::new(py, *x as f64).into_any().unbind()),
+        )
+        .expect("list")
+        .into_any()
+        .unbind(),
+        ScalarArrayValue::F64(a) => PyList::new(
+            py,
+            a.iter().map(|x| PyFloat::new(py, *x).into_any().unbind()),
+        )
+        .expect("list")
+        .into_any()
+        .unbind(),
+        ScalarArrayValue::Str(a) => PyList::new(
+            py,
+            a.iter().map(|x| PyString::new(py, x).into_any().unbind()),
+        )
+        .expect("list")
+        .into_any()
+        .unbind(),
     }
 }
 
-fn int_list_i8(py: Python<'_>, a: &[i8]) -> PyObject {
-    let items: Vec<PyObject> = a
-        .iter()
-        .map(|x| x.into_pyobject(py).expect("i8").into_any().unbind())
-        .collect();
-    PyList::new(py, &items).expect("list").into_any().unbind()
-}
-fn int_list_i16(py: Python<'_>, a: &[i16]) -> PyObject {
-    let items: Vec<PyObject> = a
-        .iter()
-        .map(|x| x.into_pyobject(py).expect("i16").into_any().unbind())
-        .collect();
-    PyList::new(py, &items).expect("list").into_any().unbind()
-}
-fn int_list_i32(py: Python<'_>, a: &[i32]) -> PyObject {
-    let items: Vec<PyObject> = a
-        .iter()
-        .map(|x| x.into_pyobject(py).expect("i32").into_any().unbind())
-        .collect();
-    PyList::new(py, &items).expect("list").into_any().unbind()
-}
-fn int_list_i64(py: Python<'_>, a: &[i64]) -> PyObject {
-    let items: Vec<PyObject> = a
-        .iter()
-        .map(|x| x.into_pyobject(py).expect("i64").into_any().unbind())
-        .collect();
-    PyList::new(py, &items).expect("list").into_any().unbind()
-}
-fn int_list_u16(py: Python<'_>, a: &[u16]) -> PyObject {
-    let items: Vec<PyObject> = a
-        .iter()
-        .map(|x| x.into_pyobject(py).expect("u16").into_any().unbind())
-        .collect();
-    PyList::new(py, &items).expect("list").into_any().unbind()
-}
-fn int_list_u32(py: Python<'_>, a: &[u32]) -> PyObject {
-    let items: Vec<PyObject> = a
-        .iter()
-        .map(|x| x.into_pyobject(py).expect("u32").into_any().unbind())
-        .collect();
-    PyList::new(py, &items).expect("list").into_any().unbind()
-}
-fn int_list_u64(py: Python<'_>, a: &[u64]) -> PyObject {
-    let items: Vec<PyObject> = a
-        .iter()
-        .map(|x| x.into_pyobject(py).expect("u64").into_any().unbind())
-        .collect();
-    PyList::new(py, &items).expect("list").into_any().unbind()
+/// Build a Python `list` from a slice of `Copy` integers.
+///
+/// One generic replaces the seven near-identical `int_list_*` helpers
+/// (`i8/i16/i32/i64/u16/u32/u64`). The mapped iterator is handed straight to
+/// `PyList::new` — which accepts any `ExactSizeIterator` of `IntoPyObject` —
+/// so there is no intermediate `Vec<PyObject>` allocation. `bool`, `f32`
+/// (needs `as f64` widening), and string arrays keep their own arms above
+/// because their per-element conversion differs.
+fn int_list<T>(py: Python<'_>, a: &[T]) -> PyObject
+where
+    T: Copy + for<'py> IntoPyObject<'py>,
+{
+    PyList::new(py, a.iter().copied())
+        .expect("list")
+        .into_any()
+        .unbind()
 }
 
 // ─── Python → serde_json::Value ──────────────────────────────────────────────

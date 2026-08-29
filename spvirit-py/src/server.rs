@@ -21,6 +21,50 @@ use crate::nt::{nt_payload_to_py, py_to_nt_payload};
 use crate::runtime::{RUNTIME, block_on_py};
 use crate::source::{PyNotifier, PySourceAdapter};
 
+/// Build the deferred `on_start` hook for a Python source.
+///
+/// `PyServerBuilder::add_source` and `PyServer::new` register the identical
+/// hook: at server start it looks up the notifier in the shared `cell` and
+/// invokes the source's `on_start`, panicking (to abort startup, naming the
+/// source) if it raises, or logging loudly if the cell was somehow never
+/// filled. The notifier does not exist at registration time, so the hook
+/// reads it lazily from the cell that `build()` fills. Extracted here so the
+/// two registration sites cannot drift apart.
+fn make_source_on_start_hook(
+    adapter: Arc<PySourceAdapter>,
+    cell: Arc<std::sync::OnceLock<PyNotifier>>,
+    label: String,
+) -> impl Fn(Arc<SimplePvStore>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
++ Send
++ Sync
++ 'static {
+    move |_store| {
+        let adapter = adapter.clone();
+        let cell = cell.clone();
+        let label = label.clone();
+        Box::pin(async move {
+            if let Some(notifier) = cell.get() {
+                if let Err(e) = adapter.invoke_on_start(notifier.clone()) {
+                    // Propagate as a panic so run_start_hooks aborts startup,
+                    // naming the hook — the same rule that holds for a raising
+                    // @builder.on_start. A raising source on_start is not a
+                    // lesser citizen: letting startup silently proceed after it
+                    // failed was the exact bug this hook exists to fix.
+                    panic!("on_start hook for source '{label}' raised: {e}");
+                }
+            } else {
+                // Should be unreachable: `build()` always fills the cell before
+                // any hook can fire. If it ever happens, the source's on_start
+                // silently never runs, so log loudly.
+                tracing::error!(
+                    "on_start hook for source '{label}' fired before the notifier \
+                     cell was filled; on_start was NOT invoked"
+                );
+            }
+        })
+    }
+}
+
 // ─── ServerBuilder ───────────────────────────────────────────────────────────
 
 /// Fluent builder for a PVAccess server. Chain record definitions and
@@ -564,32 +608,9 @@ impl PyServerBuilder {
         // does not exist yet at add_source time; the hook reads it lazily
         // from the cell that `build()` fills.
         let cell = slf.notifier_cell.clone();
-        slf.builder = Some(b.on_start(move |_store| {
-            let adapter = adapter.clone();
-            let cell = cell.clone();
-            let label = label_for_hook.clone();
-            Box::pin(async move {
-                if let Some(notifier) = cell.get() {
-                    if let Err(e) = adapter.invoke_on_start(notifier.clone()) {
-                        // Propagate as a panic so run_start_hooks aborts
-                        // startup, naming the hook — the same rule that
-                        // holds for a raising @builder.on_start. A raising
-                        // source on_start is not a lesser citizen: letting
-                        // startup silently proceed after it failed was the
-                        // exact bug this hook exists to fix.
-                        panic!("on_start hook for source '{label}' raised: {e}");
-                    }
-                } else {
-                    // Should be unreachable: `build()` always fills the cell
-                    // before any hook can fire. If it ever happens, the
-                    // source's on_start silently never runs, so log loudly.
-                    tracing::error!(
-                        "on_start hook for source '{label}' fired before the notifier \
-                         cell was filled; on_start was NOT invoked"
-                    );
-                }
-            })
-        }));
+        slf.builder = Some(
+            b.on_start(make_source_on_start_hook(adapter, cell, label_for_hook)),
+        );
         Ok(slf)
     }
 
@@ -747,25 +768,7 @@ impl PyServer {
             // Same deferred hook as PyServerBuilder::add_source: fires at
             // server start, not here, and interleaves on the shared list.
             let cell = notifier_cell.clone();
-            sb = sb.on_start(move |_store| {
-                let adapter = adapter.clone();
-                let cell = cell.clone();
-                let label = label_for_hook.clone();
-                Box::pin(async move {
-                    if let Some(notifier) = cell.get() {
-                        if let Err(e) = adapter.invoke_on_start(notifier.clone()) {
-                            panic!("on_start hook for source '{label}' raised: {e}");
-                        }
-                    } else {
-                        // Should be unreachable: filled right after
-                        // `sb.build()` below, before any hook can fire.
-                        tracing::error!(
-                            "on_start hook for source '{label}' fired before the notifier \
-                             cell was filled; on_start was NOT invoked"
-                        );
-                    }
-                })
-            });
+            sb = sb.on_start(make_source_on_start_hook(adapter, cell, label_for_hook));
         }
         let mut server = py.allow_threads(|| RUNTIME.block_on(sb.build()));
         let store = server.store().clone();
@@ -845,9 +848,12 @@ impl PyServer {
                 let h = block_on_py(py, server.pv::<i32>(&name)).map_err(pv_err)?;
                 PvKind::I32(h)
             }
-            Some(NtPayload::ScalarArray(_)) => {
+            Some(NtPayload::ScalarArray(nt)) => {
+                // Capture the element type from the served record's current
+                // value so the array handle can coerce writes without a GET.
+                let code = scalar_array_type_code(&nt.value);
                 let h = block_on_py(py, server.array_pv(&name)).map_err(pv_err)?;
-                PvKind::Array(h)
+                PvKind::Array(h, code)
             }
             Some(other) => {
                 return Err(pyo3::exceptions::PyKeyError::new_err(format!(

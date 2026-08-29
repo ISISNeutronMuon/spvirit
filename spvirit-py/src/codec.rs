@@ -214,6 +214,14 @@ pub fn decode_value(
     Ok(decoded_to_py(py, &decoded))
 }
 
+/// Canonical "all fields" pvRequest body.
+///
+/// Selecting no specific top-level fields is encoded as this fixed 6-byte
+/// mask. Defined once here and reused by the codec submodule and the
+/// low-level channel module (via [`build_pv_request`](crate::channel)) so the
+/// literal is never duplicated.
+pub(crate) const ALL_FIELDS_PV_REQUEST: [u8; 6] = [0xfd, 0x02, 0x00, 0x80, 0x00, 0x00];
+
 /// Encode a pvRequest mask selecting specific top-level fields.  Pass an
 /// empty list or None to request all fields.
 #[pyfunction]
@@ -225,7 +233,7 @@ pub fn encode_pv_request(
 ) -> PyResult<PyObject> {
     let fields = fields.unwrap_or_default();
     let bytes = if fields.is_empty() {
-        vec![0xfd, 0x02, 0x00, 0x80, 0x00, 0x00]
+        ALL_FIELDS_PV_REQUEST.to_vec()
     } else {
         let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
         codec_encode_pv_request(&refs, is_be)

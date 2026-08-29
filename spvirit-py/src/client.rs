@@ -14,7 +14,6 @@ use spvirit_client::search::{build_auto_broadcast_targets, discover_servers};
 
 use crate::convert::{decoded_to_py, py_to_json};
 use crate::errors::to_py_err;
-use crate::monitor_update::PyMonitorUpdate;
 use crate::runtime::RUNTIME;
 
 // ─── GetResult ───────────────────────────────────────────────────────────────
@@ -368,23 +367,13 @@ impl PyClient {
                 let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
                 client
                     .pvmonitor_fields(&pv_name, &refs, |update| {
-                        let keep_going = Python::with_gil(|py| {
-                            let py_val = PyMonitorUpdate::from_update(py, update);
-                            match callback.call1(py, (py_val,)) {
-                                Ok(ret) => {
-                                    // If callback returns False, stop
-                                    ret.extract::<bool>(py).unwrap_or(true)
-                                }
-                                Err(e) => {
-                                    *cb_err = Some(e);
-                                    false
-                                }
+                        match crate::monitor_update::dispatch_monitor_update(&callback, update) {
+                            Ok(true) => ControlFlow::Continue(()),
+                            Ok(false) => ControlFlow::Break(()),
+                            Err(e) => {
+                                *cb_err = Some(e);
+                                ControlFlow::Break(())
                             }
-                        });
-                        if keep_going {
-                            ControlFlow::Continue(())
-                        } else {
-                            ControlFlow::Break(())
                         }
                     })
                     .await
@@ -457,22 +446,15 @@ impl PyClient {
             let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
             let result = client
                 .pvmonitor_fields(&task_pv, &refs, |update| {
-                    let keep_going = Python::with_gil(|py| {
-                        let py_val = PyMonitorUpdate::from_update(py, update);
-                        match callback.call1(py, (py_val,)) {
-                            Ok(ret) => ret.extract::<bool>(py).unwrap_or(true),
-                            Err(e) => {
-                                // No caller to raise into: record the failure
-                                // on the subscription and stop.
-                                *task_state.error.lock().unwrap() = Some(e.to_string());
-                                false
-                            }
+                    match crate::monitor_update::dispatch_monitor_update(&callback, update) {
+                        Ok(true) => ControlFlow::Continue(()),
+                        Ok(false) => ControlFlow::Break(()),
+                        Err(e) => {
+                            // No caller to raise into: record the failure on the
+                            // subscription and stop.
+                            *task_state.error.lock().unwrap() = Some(e.to_string());
+                            ControlFlow::Break(())
                         }
-                    });
-                    if keep_going {
-                        ControlFlow::Continue(())
-                    } else {
-                        ControlFlow::Break(())
                     }
                 })
                 .await;
