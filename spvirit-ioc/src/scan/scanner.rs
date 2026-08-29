@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -48,7 +48,21 @@ impl Scanner {
     /// Add `id` (with scan priority `phas`) to the periodic scan list for
     /// `period`. Lists are created lazily; `start()` spawns one thread per
     /// non-empty list.
+    ///
+    /// A zero period is refused (warned once, not registered): `periodic_loop`
+    /// computes deadlines as `start + n*period`, so a zero period makes every
+    /// deadline equal to `start`, and the overrun catch-up loop
+    /// (`while deadline_for(n) <= now`) would then spin `n` all the way to
+    /// `u64::MAX` on the very first tick instead of ever sleeping again --
+    /// a livelock that pegs a CPU core forever.
     pub fn add_periodic(&self, id: RecordId, phas: i32, period: Duration) {
+        if period.is_zero() {
+            tracing::warn!(
+                "add_periodic: ignoring zero-period scan request for {:?} (would livelock)",
+                id
+            );
+            return;
+        }
         let key = period.as_nanos() as u64;
         self.periodic
             .lock()
@@ -86,9 +100,21 @@ impl Scanner {
         let anchor = self.clock.now();
         let mut threads = self.threads.lock().unwrap();
         for key in keys {
-            let scanner = self.clone();
+            // `weak` (not a strong clone) so the thread never keeps `Scanner`
+            // alive: if it did, `Scanner::drop` could never run while any
+            // thread was alive (a strong-ref cycle), leaking the thread
+            // whenever a caller drops its handle without calling
+            // `shutdown()` explicitly. `clock` and `stop` are independent
+            // `Arc`s (not `Arc<Self>`), so cloning them does not re-create
+            // that cycle -- they let the thread sleep and observe shutdown
+            // without ever needing to upgrade `weak` for that.
+            let weak = Arc::downgrade(self);
+            let clock = self.clock.clone();
+            let stop = self.stop.clone();
             let period = Duration::from_nanos(key);
-            threads.push(std::thread::spawn(move || scanner.periodic_loop(key, period, anchor)));
+            threads.push(std::thread::spawn(move || {
+                Self::periodic_loop(weak, clock, stop, key, period, anchor)
+            }));
         }
     }
 
@@ -103,7 +129,28 @@ impl Scanner {
     /// One periodic thread's body: wait for each absolute deadline on the
     /// original grid (`start + n*period`), snapshot + process, then advance
     /// past any deadlines the pass overran (rate-limited warning on skips).
-    fn periodic_loop(self: Arc<Self>, key: PeriodKey, period: Duration, start: std::time::Instant) {
+    ///
+    /// Takes `Weak<Self>` rather than `Arc<Self>` deliberately: holding a
+    /// strong reference here would keep `Scanner` alive for as long as this
+    /// thread runs, so `Scanner::drop` could never fire while the thread was
+    /// alive (a strong-ref cycle) -- a caller who dropped their handle
+    /// without calling `shutdown()` would leak the thread forever. `clock`
+    /// and `stop` are separate `Arc`s (not derived from the weak handle), so
+    /// the thread can always sleep and observe a shutdown signal even after
+    /// `Scanner` itself is gone; `weak` is upgraded fresh each iteration,
+    /// strictly after waking and strictly before touching `periodic` or
+    /// calling `process_ids`, and the resulting strong ref is dropped again
+    /// (falls out of scope) before the next `sleep_until` -- so this thread
+    /// never holds a strong `Arc<Scanner>` while parked, which is exactly
+    /// what lets an owner's `drop()` reclaim it.
+    fn periodic_loop(
+        weak: Weak<Self>,
+        clock: Arc<dyn Clock>,
+        stop: Arc<AtomicBool>,
+        key: PeriodKey,
+        period: Duration,
+        start: std::time::Instant,
+    ) {
         // `key` is already the period in whole nanoseconds (see
         // `add_periodic`); using it directly (rather than
         // `period * n as u32`) avoids the u32-cast overflow a naive
@@ -112,21 +159,29 @@ impl Scanner {
         // `now + period` (which would drift under a slow pass).
         let deadline_for = |n: u64| start + Duration::from_nanos(Self::deadline_nanos(key, n));
         let mut n: u64 = 1;
-        while !self.stop.load(Ordering::Relaxed) {
+        while !stop.load(Ordering::Relaxed) {
             let deadline = deadline_for(n);
-            self.clock.sleep_until(deadline);
-            if self.stop.load(Ordering::Relaxed) {
+            clock.sleep_until(deadline);
+            if stop.load(Ordering::Relaxed) {
                 break;
             }
+            // `Scanner` may already be gone (owner dropped their last handle
+            // without calling `shutdown()`): in that case there is nothing
+            // left to scan, so exit exactly as a `stop` signal would.
+            let Some(this) = weak.upgrade() else { break };
             let ids = {
-                self.periodic
+                this.periodic
                     .lock()
                     .unwrap()
                     .get(&key)
                     .map(|l| l.snapshot())
                     .unwrap_or_default()
             };
-            self.process_ids(&ids);
+            this.process_ids(&ids);
+            // `this` (the only strong ref this thread ever holds) is dropped
+            // here, at the end of this block, before the loop goes back to
+            // `sleep_until` -- never held across a sleep.
+
             n += 1;
 
             // Overrun / missed-tick catch-up on the absolute grid: if the
@@ -134,7 +189,7 @@ impl Scanner {
             // the past, skip forward to the next future deadline instead of
             // rescheduling from `now` (which would let a slow pass drift the
             // whole schedule forward).
-            let now = self.clock.now();
+            let now = clock.now();
             let mut skipped = 0u64;
             while deadline_for(n) <= now {
                 n += 1;
@@ -198,8 +253,13 @@ impl Scanner {
 }
 
 impl Drop for Scanner {
+    /// A genuine RAII safety net: periodic threads hold only a `Weak<Self>`
+    /// (see `periodic_loop`), never a strong `Arc<Self>`, so dropping the
+    /// last strong handle -- even without ever calling `shutdown()` -- runs
+    /// this `drop`, which sets `stop`, wakes every thread, and joins them
+    /// before returning. If `shutdown()` was already called explicitly,
+    /// `threads` is already empty and this is a cheap idempotent no-op.
     fn drop(&mut self) {
-        // Idempotent: shutdown() is safe to call even if it already ran.
         self.shutdown();
     }
 }
@@ -560,6 +620,61 @@ mod tests {
             "remove_periodic must stop further fires for the removed id"
         );
 
+        scanner.shutdown();
+    }
+
+    #[test]
+    fn drop_without_explicit_shutdown_reclaims_the_thread() {
+        // Fix 1: the periodic thread holds only a `Weak<Scanner>` (see
+        // `periodic_loop`'s doc comment), never a strong `Arc<Scanner>`, so
+        // dropping the last strong handle -- with no `shutdown()` call at
+        // all -- must still run `Scanner::drop`, which sets `stop`, wakes
+        // the thread via `ManualClock::wake_all` (no real sleep or clock
+        // advance needed: the thread is parked with no deadline crossed
+        // yet, and only a wake can release it), and joins it before
+        // `drop()` returns. Proven with a bounded channel recv rather than
+        // just letting a hang fail the whole test binary.
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let clock = Arc::new(ManualClock::new());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
+        let a = db.lookup("PV:A").unwrap();
+        scanner.add_periodic(a, 0, Duration::from_millis(50));
+        scanner.start();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(scanner); // no explicit shutdown() call
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("Scanner::drop did not return within 5s: thread was not reclaimed");
+    }
+
+    #[test]
+    fn add_periodic_with_zero_period_is_ignored_not_livelocked() {
+        // Fix 2: a zero period makes every deadline equal `start`
+        // (`deadline_for(n) = start + n*0`), so the overrun catch-up loop
+        // (`while deadline_for(n) <= now`) would spin `n` to `u64::MAX` on
+        // the very first tick instead of ever sleeping again -- a
+        // CPU-pegging livelock. `add_periodic` must refuse to register it
+        // (and must not even spawn a thread for it in `start()`).
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let clock = Arc::new(ManualClock::new());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
+        let a = db.lookup("PV:A").unwrap();
+        scanner.add_periodic(a, 0, Duration::ZERO);
+        assert!(
+            scanner.periodic.lock().unwrap().is_empty(),
+            "a zero-period request must not be registered"
+        );
+
+        scanner.start();
+        assert!(
+            scanner.threads.lock().unwrap().is_empty(),
+            "no thread should be spawned for a period with nothing registered"
+        );
         scanner.shutdown();
     }
 }
