@@ -484,15 +484,21 @@ impl Expression {
                 // drops a NaN argument instead of propagating it. Written
                 // directly against the any-NaN-wins conclusion instead.
                 Op::Min(n) | Op::Max(n) => {
+                    // 4h: compute over `&stack[at..]` in place instead of
+                    // `split_off`, which allocated a fresh Vec per op. The
+                    // immutable borrow ends before `truncate`/`push` (owned
+                    // `f64` result), so this is NLL-clean. `at == 0` leaves
+                    // `[result]`, matching the old `split_off(0)` behavior.
                     let at = stack.len() - n;
-                    let tail = stack.split_off(at);
+                    let tail = &stack[at..];
                     let result = if tail.iter().any(|v| v.is_nan()) {
                         f64::NAN
                     } else if matches!(op, Op::Min(_)) {
-                        tail.into_iter().fold(f64::INFINITY, f64::min)
+                        tail.iter().copied().fold(f64::INFINITY, f64::min)
                     } else {
-                        tail.into_iter().fold(f64::NEG_INFINITY, f64::max)
+                        tail.iter().copied().fold(f64::NEG_INFINITY, f64::max)
                     };
+                    stack.truncate(at);
                     stack.push(result);
                 }
 
@@ -511,9 +517,11 @@ impl Expression {
                 // calcPerform.c:281-289 `case ISNAN`: OR-fold over `n`
                 // arguments - true if ANY is NaN.
                 Op::IsNan(n) => {
+                    // 4h: in-place OR-fold over `&stack[at..]`, no `split_off`
+                    // Vec allocation. Borrow ends before the mutation below.
                     let at = stack.len() - n;
-                    let tail = stack.split_off(at);
-                    let result = tail.iter().any(|v| v.is_nan());
+                    let result = stack[at..].iter().any(|v| v.is_nan());
+                    stack.truncate(at);
                     stack.push(if result { 1.0 } else { 0.0 });
                 }
                 // calcPerform.c:267-275 `case FINITE`: AND-fold over `n`
@@ -522,9 +530,11 @@ impl Expression {
                 // the trap RULINGS.md Ruling 6 and the task instructions
                 // both flag.
                 Op::Finite(n) => {
+                    // 4h: in-place AND-fold over `&stack[at..]`, no `split_off`
+                    // Vec allocation. Borrow ends before the mutation below.
                     let at = stack.len() - n;
-                    let tail = stack.split_off(at);
-                    let result = tail.iter().all(|v| v.is_finite());
+                    let result = stack[at..].iter().all(|v| v.is_finite());
+                    stack.truncate(at);
                     stack.push(if result { 1.0 } else { 0.0 });
                 }
 
@@ -928,6 +938,30 @@ mod tests {
         // Sanity: no NaN present still behaves normally with 4 args.
         assert_eq!(ev("MAX(A,B,C,D)", &[1.0, 4.0, 2.0, 3.0]), 4.0);
         assert_eq!(ev("MIN(A,B,C,D)", &[1.0, 4.0, 2.0, 3.0]), 1.0);
+    }
+
+    // 4h: the variadic ops (MIN/MAX/ISNAN/FINITE) now compute in place over
+    // `&stack[at..]` and `truncate(at)` instead of `split_off(at)`. When `at >
+    // 0` (values sit below the variadic arguments), those lower elements must
+    // survive untouched. An expression like `C + MIN(A,B)` compiles to postfix
+    // `C A B MIN +`, so at the variadic op the stack is `[C, A, B]` (at == 1),
+    // exercising the partial-stack path the old full-consuming tests (at == 0)
+    // never hit. Results must be identical to the pre-refactor semantics.
+    #[test]
+    fn variadic_ops_preserve_lower_stack_elements() {
+        let nan = f64::NAN;
+        // MIN/MAX fold over just the tail; the leading C is added afterward.
+        assert_eq!(ev("C+MIN(A,B)", &[1.0, 2.0, 10.0]), 11.0);
+        assert_eq!(ev("C+MAX(A,B)", &[1.0, 2.0, 10.0]), 12.0);
+        // NaN still propagates through MIN/MAX with a live element below.
+        assert!(ev("C+MAX(A,B)", &[1.0, nan, 10.0]).is_nan());
+        assert!(ev("C+MIN(A,B)", &[nan, 1.0, 10.0]).is_nan());
+        // ISNAN OR-fold over the tail, then combined with the preserved C.
+        assert_eq!(ev("C+ISNAN(A,B)", &[1.0, nan, 10.0]), 11.0);
+        assert_eq!(ev("C+ISNAN(A,B)", &[1.0, 2.0, 10.0]), 10.0);
+        // FINITE AND-fold over the tail, then combined with the preserved C.
+        assert_eq!(ev("C+FINITE(A,B)", &[1.0, 2.0, 10.0]), 11.0);
+        assert_eq!(ev("C+FINITE(A,B)", &[1.0, nan, 10.0]), 10.0);
     }
 
     #[test]
