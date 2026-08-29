@@ -203,6 +203,16 @@ impl PvaPacket {
         let payload = raw.to_vec();
         Self { header, payload }
     }
+    /// Fallible constructor for untrusted input (e.g. raw UDP datagrams).
+    ///
+    /// Returns `None` when `raw` is shorter than the 8-byte PVA header,
+    /// instead of panicking like [`PvaPacket::new`]. Use this on any
+    /// network-ingress path where the length is attacker-controlled.
+    pub fn try_new(raw: &[u8]) -> Option<PvaPacket> {
+        let header = PvaHeader::try_new(raw)?;
+        let payload = raw.to_vec();
+        Some(Self { header, payload })
+    }
     pub fn decode_payload(&mut self) -> Option<PvaPacketCommand> {
         let pva_header_size = 8;
         if self.payload.len() < pva_header_size {
@@ -1868,6 +1878,26 @@ impl fmt::Display for PvaOpPayload {
 mod tests {
     use super::*;
     use crate::spvd_decode::extract_nt_scalar_value;
+
+    #[test]
+    fn try_new_rejects_short_datagram_without_panic() {
+        // A malicious/truncated UDP datagram shorter than the 8-byte header
+        // must not panic; try_new returns None and the caller skips it.
+        for len in 0..8usize {
+            let short = vec![0xCAu8; len];
+            assert!(
+                PvaHeader::try_new(&short).is_none(),
+                "PvaHeader::try_new should reject {len} bytes"
+            );
+            assert!(
+                PvaPacket::try_new(&short).is_none(),
+                "PvaPacket::try_new should reject {len} bytes"
+            );
+        }
+        // Exactly 8 bytes is the minimum valid header and must succeed.
+        let ok = vec![0u8; 8];
+        assert!(PvaPacket::try_new(&ok).is_some());
+    }
 
     #[test]
     fn destroy_request_decodes_spec_and_legacy_forms() {
