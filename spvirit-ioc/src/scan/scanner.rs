@@ -45,6 +45,45 @@ impl Scanner {
         }
     }
 
+    /// Sweep every record whose `PINI` field is true, in ascending `PHAS`
+    /// (ties broken by `.db` definition order — `RecordDb::order()`'s
+    /// index), and process each one via [`Self::process_ids`]. Must run to
+    /// completion before any periodic thread is spawned (see `start`), so
+    /// startup-time initialization records finish before periodic scanning
+    /// can observe/depend on their output.
+    ///
+    /// Reuses `process_ids` (which flushes per record) rather than a
+    /// batch-flush variant: the spec's "flushed once at the end" wording
+    /// describes an equivalent, not a required, batching -- each posted
+    /// `(name, payload)` is its own monitor update regardless of how the
+    /// flushes are grouped, so per-record flushing here keeps lock
+    /// ordering, per-record panic isolation, and deferred-recursion handling
+    /// uniform with every other caller of `process_ids` (R-T8-FLUSH).
+    ///
+    /// This is a NEW, PHAS-ordered sweep distinct from the pre-existing
+    /// `IocSource::process_pini` (`source.rs`), which sweeps in `.db`
+    /// definition order only; that older path is left untouched (R-T8-DUP).
+    pub fn process_pini(&self) {
+        let mut sweep: Vec<(i32, usize, RecordId)> = self
+            .db
+            .order()
+            .iter()
+            .enumerate()
+            .filter_map(|(order_index, &id)| {
+                let (pini, phas) = self
+                    .db
+                    .with_set(id.set, |set| {
+                        let common = &set.get(id).common;
+                        (common.pini, common.phas)
+                    });
+                pini.then_some((phas, order_index, id))
+            })
+            .collect();
+        sweep.sort_by_key(|&(phas, order_index, _)| (phas, order_index));
+        let ids: Vec<RecordId> = sweep.into_iter().map(|(_, _, id)| id).collect();
+        self.process_ids(&ids);
+    }
+
     /// Add `id` (with scan priority `phas`) to the periodic scan list for
     /// `period`. Lists are created lazily; `start()` spawns one thread per
     /// non-empty list.
@@ -83,6 +122,10 @@ impl Scanner {
     /// Spawn one thread per non-empty periodic scan list. Call once; `self`
     /// must be held in an `Arc` so each thread can hold a strong reference.
     pub fn start(self: &Arc<Self>) {
+        // PINI runs to completion before any periodic thread is spawned
+        // (spec §PINI): startup-time initialization must finish first, not
+        // race the first periodic pass.
+        self.process_pini();
         let keys: Vec<PeriodKey> = {
             let periodic = self.periodic.lock().unwrap();
             periodic
@@ -686,6 +729,58 @@ mod tests {
         assert!(
             scanner.threads.lock().unwrap().is_empty(),
             "no thread should be spawned for a period with nothing registered"
+        );
+        scanner.shutdown();
+    }
+
+    #[test]
+    fn pini_records_process_at_startup_in_phas_order() {
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:A\") {\n field(INP, \"1\")\n field(PINI, \"YES\")\n field(PHAS, \"1\")\n}\n\
+             record(ai, \"PV:B\") {\n field(INP, \"2\")\n field(PINI, \"YES\")\n field(PHAS, \"0\")\n}\n\
+             record(ai, \"PV:C\") {\n field(INP, \"3\")\n}\n",
+        ));
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(ManualClock::new());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db, clock, sink.clone()));
+        scanner.process_pini();
+        // PV:B (PHAS 0) before PV:A (PHAS 1); PV:C (no PINI) absent.
+        assert_eq!(*sink.posted.lock().unwrap(), vec!["PV:B".to_string(), "PV:A".to_string()]);
+    }
+
+    #[test]
+    fn pini_ties_break_by_db_definition_order_not_name() {
+        // Both PHAS 0: PV:Z is defined first in the .db, so it must post
+        // first despite sorting after PV:A alphabetically -- proving the
+        // sort key is really (phas, order_index), not (phas, name).
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:Z\") {\n field(INP, \"1\")\n field(PINI, \"YES\")\n field(PHAS, \"0\")\n}\n\
+             record(ai, \"PV:A\") {\n field(INP, \"2\")\n field(PINI, \"YES\")\n field(PHAS, \"0\")\n}\n",
+        ));
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(ManualClock::new());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db, clock, sink.clone()));
+        scanner.process_pini();
+        assert_eq!(*sink.posted.lock().unwrap(), vec!["PV:Z".to_string(), "PV:A".to_string()]);
+    }
+
+    #[test]
+    fn start_runs_pini_before_any_periodic_thread_even_with_no_periodic_list() {
+        // Mutation-informed: kills a mutant that drops the `process_pini()`
+        // call from `start()` (or only calls it when a periodic list
+        // exists). No periodic scan list is registered at all here, so the
+        // only way PV:A can post is if `start()` itself runs the PINI sweep.
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:A\") {\n field(INP, \"1\")\n field(PINI, \"YES\")\n}\n",
+        ));
+        let clock = Arc::new(ManualClock::new());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db, clock, sink.clone()));
+        scanner.start();
+        assert_eq!(*sink.posted.lock().unwrap(), vec!["PV:A".to_string()]);
+        assert!(
+            scanner.threads.lock().unwrap().is_empty(),
+            "no periodic list was registered, so no thread should be spawned"
         );
         scanner.shutdown();
     }
