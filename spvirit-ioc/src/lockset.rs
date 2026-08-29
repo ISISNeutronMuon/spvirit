@@ -214,13 +214,18 @@ impl RecordDb {
         self.unresolved.clone()
     }
 
-    /// Run `f` with the lock set held. A poisoned lock means a previous
-    /// `process()` panicked mid-pass; recovering the guard would expose
-    /// half-updated records, so this propagates the panic.
+    /// Run `f` with the lock set held. If a previous `process()` panicked
+    /// mid-pass the lock is poisoned; we recover the guard via `into_inner`
+    /// rather than propagating. A permanently poisoned lock would kill all
+    /// future scanning of this set — far worse than the alternative: the
+    /// engine re-establishes each record's invariants at the top of the next
+    /// `process()` pass, so a transiently half-updated record is recomputed,
+    /// not observed by clients.
     pub fn with_set<T>(&self, set: usize, f: impl FnOnce(&mut LockSetData) -> T) -> T {
-        let mut guard = self.lock_sets[set]
-            .lock()
-            .expect("lock set poisoned by a panicking process() pass");
+        let mut guard = match self.lock_sets[set].lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         f(&mut guard)
     }
 }
@@ -283,6 +288,20 @@ mod tests {
         let b = d.lookup("PV:B").expect("PV:B exists");
         assert_ne!(a.set, b.set);
         assert_eq!(d.lock_set_count(), 2);
+    }
+
+    #[test]
+    fn poisoned_lock_set_recovers_on_next_pass() {
+        let d = db("record(ai, \"PV:A\") {\n}\n");
+        let a = d.lookup("PV:A").expect("PV:A exists");
+        // Poison the set: panic while holding the guard.
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            d.with_set(a.set, |_set| panic!("boom"));
+        }));
+        assert!(boom.is_err(), "the panic propagates out of the first pass");
+        // The next pass must NOT re-panic — the poisoned guard is recovered.
+        let v = d.with_set(a.set, |_set| 42);
+        assert_eq!(v, 42, "with_set recovers the poisoned lock instead of panicking");
     }
 
     #[test]
