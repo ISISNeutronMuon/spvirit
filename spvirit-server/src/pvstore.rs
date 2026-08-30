@@ -140,6 +140,28 @@ pub trait StoreSource: Source {
     fn set_monitor_registry(&self, registry: Arc<crate::monitor::MonitorRegistry>) {
         let _ = registry;
     }
+
+    /// Begin any scan-driven, self-clocked processing the store performs, now
+    /// that the server is up and the monitor registry is set. `handle` is the
+    /// server's runtime handle, for a store whose processing runs on its own
+    /// (non-runtime) threads and must reach back into async publish paths.
+    ///
+    /// Defaulted to a no-op: a store with nothing self-clocked needs it not.
+    /// `PvaServer` calls it once, after `set_monitor_registry`, before serving.
+    fn start_scanning(&self, handle: tokio::runtime::Handle) {
+        let _ = handle;
+    }
+
+    /// Stop what [`start_scanning`](StoreSource::start_scanning) began.
+    /// Defaulted to a no-op. Idempotent by contract.
+    fn stop_scanning(&self) {}
+
+    /// The store's scan [`EventSink`](crate::events::EventSink), if it has one,
+    /// so `PvaServer` can register it on the named-event fan-out and let
+    /// PVAccess-posted events drive event scan lists. Defaulted to `None`.
+    fn scanner_event_sink(&self) -> Option<Arc<dyn crate::events::EventSink>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

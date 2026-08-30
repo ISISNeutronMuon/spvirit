@@ -51,6 +51,10 @@ pub struct ProcCtx<'a> {
     depth: usize,
     /// The source of record timestamps for this pass.
     clock: &'a dyn crate::clock::Clock,
+    /// The record→async-support bindings for this pass, if any. Threaded the
+    /// same way as `clock`: absent (`None`) means every record processes
+    /// synchronously, which is what a plain [`ProcCtx::new`] gives.
+    async_registry: Option<&'a crate::scan::AsyncRegistry>,
 }
 
 const SYSTEM_CLOCK: crate::clock::SystemClock = crate::clock::SystemClock;
@@ -63,6 +67,7 @@ impl ProcCtx<'static> {
             trace: Vec::new(),
             depth: 0,
             clock: &SYSTEM_CLOCK,
+            async_registry: None,
         }
     }
 }
@@ -82,12 +87,39 @@ impl<'a> ProcCtx<'a> {
             trace: Vec::new(),
             depth: 0,
             clock,
+            async_registry: None,
+        }
+    }
+
+    /// Build a context that reads time from `clock` and resolves async device
+    /// support through `registry`. A record bound in `registry` takes the
+    /// two-phase path in `record_body`; every other record is synchronous.
+    pub fn with_async(
+        clock: &'a dyn crate::clock::Clock,
+        registry: &'a crate::scan::AsyncRegistry,
+    ) -> ProcCtx<'a> {
+        ProcCtx {
+            events: Vec::new(),
+            deferred: Vec::new(),
+            trace: Vec::new(),
+            depth: 0,
+            clock,
+            async_registry: Some(registry),
         }
     }
 
     /// The clock stamping this pass's record timestamps.
     pub fn clock(&self) -> &dyn crate::clock::Clock {
         self.clock
+    }
+
+    /// The async-support registry for this pass, if one was injected. The
+    /// borrow lives for the context's own lifetime `'a`, not the `&self`
+    /// borrow, so the caller can hold the returned reference across the
+    /// `&mut self` call that runs the support (mirroring how the registry is
+    /// threaded, distinct from [`clock`](Self::clock)'s `&self`-scoped borrow).
+    pub fn async_registry(&self) -> Option<&'a crate::scan::AsyncRegistry> {
+        self.async_registry
     }
 
     /// Queue a monitor. Ordering is observable to clients, so this appends.

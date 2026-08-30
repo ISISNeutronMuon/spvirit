@@ -21,7 +21,8 @@ use spvirit_types::ScalarValue;
 ///
 /// Fields outside this list fall through to [`dbcommon_default_value`].
 pub const IOC_FIELDS: &[&str] = &[
-    "NAME", "RTYP", "DTYP", "VAL", "DESC", "EGU", "SCAN", "PINI", "PHAS", "PACT", "DISA", "DISV",
+    "NAME", "RTYP", "DTYP", "VAL", "DESC", "EGU", "SCAN", "EVNT", "PINI", "PHAS", "PACT", "DISA",
+    "DISV",
     "DISS", "SDIS", "FLNK", "INP", "OUT", "DOL", "OMSL", "TSE", "TPRO", "UDF", "SEVR", "STAT",
     "PROC", "HIHI", "HIGH", "LOW", "LOLO", "HHSV", "HSV", "LSV", "LLSV", "HYST", "MDEL", "ADEL",
 ];
@@ -100,6 +101,7 @@ pub fn record_field_value(record: &Record, field: &str, names: TargetNames) -> O
         "DESC" => s(&c.desc),
         "EGU" => s(&record.egu),
         "SCAN" => s(&c.scan_raw),
+        "EVNT" => s(&c.evnt),
         "PINI" => s(if c.pini { "YES" } else { "NO" }),
         "PHAS" => i(c.phas),
         "PACT" => i(i32::from(c.pact)),
@@ -152,7 +154,8 @@ pub fn record_field_kind(kind: Kind, field: &str) -> Option<FieldKind> {
             Kind::Ai | Kind::Ao => FieldKind::Double,
             Kind::LongIn | Kind::LongOut | Kind::Bi | Kind::Bo => FieldKind::Int,
         }),
-        "NAME" | "RTYP" | "DTYP" | "DESC" | "EGU" | "SCAN" | "PINI" | "DISS" | "SDIS" | "FLNK"
+        "NAME" | "RTYP" | "DTYP" | "DESC" | "EGU" | "SCAN" | "EVNT" | "PINI" | "DISS" | "SDIS"
+        | "FLNK"
         | "INP" | "OUT" | "DOL" | "OMSL" | "SEVR" | "STAT" | "HHSV" | "HSV" | "LSV" | "LLSV" => {
             Some(FieldKind::Str)
         }

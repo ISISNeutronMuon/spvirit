@@ -84,14 +84,16 @@ fn process_inner(
         return Ok(());
     }
 
-    // 3. PACT guards the pass against re-entry through a link cycle.
-    set.get_mut(id).common.pact = true;
-
-    // 4. The type-specific body: read inputs, compute, check limits, stamp,
-    //    write outputs, post monitors, then FLNK. Filled in by Tasks 7-10.
+    // 3. The type-specific body: read inputs, compute, check limits, stamp,
+    //    write outputs, post monitors, then FLNK. `record_body` now owns
+    //    raising PACT: it captures the pre-pass PACT value (which the async
+    //    hook needs — see [`AsyncSupport`]) and *then* raises PACT as the
+    //    re-entry brake, so the raise moved out of here and into there. The
+    //    brake is still in force for the whole body: no nested `process()`
+    //    runs between the top of `record_body` and its raise.
     let body = record_body(set, id, ctx);
 
-    // 5. PACT itself is the flag; there is nothing left to decide here. As
+    // 4. PACT itself is the flag; there is nothing left to decide here. As
     //    in Base, a record's own `process()` clears `prec->pact` as the last
     //    thing a synchronous pass does — `record_body` now does that
     //    directly (see its doc comment) once its own work is complete. A
@@ -321,16 +323,68 @@ pub(crate) fn read_field(set: &LockSetData, id: RecordId, field: Field) -> Value
     }
 }
 
+/// Resets a record's PACT to clear if dropped while armed — a panic guard for
+/// the [`AsyncSupport::start`] call in [`record_body`].
+///
+/// `start` is arbitrary bound code that runs while PACT is raised. If it
+/// panics, the unwind skips `record_body`'s own PACT bookkeeping and would
+/// leave the record braked forever (`process`'s PACT check would swallow
+/// every later pass — see [`record_body`]'s doc comment and ruling
+/// R-T6-PACT). This guard is armed around the `start` call and disarmed the
+/// instant it returns normally, so it fires only on an unwind. It holds a raw
+/// pointer rather than a `&mut` because the same `&mut LockSetData` is used
+/// again by the body after `disarm`; the pointer is dereferenced only from
+/// `drop`, and only on the unwind path where nothing else is touching the
+/// lock set.
+struct PactResetGuard {
+    set: *mut LockSetData,
+    id: RecordId,
+    armed: bool,
+}
+
+impl PactResetGuard {
+    fn arm(set: &mut LockSetData, id: RecordId) -> PactResetGuard {
+        PactResetGuard {
+            set: set as *mut LockSetData,
+            id,
+            armed: true,
+        }
+    }
+
+    /// Cancel the reset. Called on every normal return from `start`.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PactResetGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: the `&mut LockSetData` this pointer came from is not used
+            // by anyone between `arm` and this drop — `start` borrows only
+            // `ctx`. We only reach here on an unwind out of `start`, so this is
+            // the sole live access to the lock set.
+            unsafe {
+                (*self.set).get_mut(self.id).common.pact = false;
+            }
+        }
+    }
+}
+
 /// The type-specific processing body.
 ///
 /// Input records read INP and store it. Output records take a desired value
 /// from DOL when OMSL says so, then write it through OUT. Both then check
 /// limits or UDF, stamp the time, and commit their alarm state.
 ///
-/// This is also where PACT is owned. `process_inner` sets `common.pact`
-/// before calling this function; mirroring Base, where a record type's own
-/// `process()` clears `prec->pact` unconditionally at the bottom of the
-/// function regardless of the status its device support returned, this
+/// This is also where PACT is owned — both raising and clearing it. This
+/// function captures the record's pre-pass PACT value (what Base's record
+/// `process()` reads into its `pact` local, and what a bound
+/// [`AsyncSupport::start`] is handed), then raises `common.pact` itself as
+/// the re-entry brake — `process_inner` used to raise it before the call and
+/// no longer does. Mirroring Base, where a record type's own `process()`
+/// clears `prec->pact` unconditionally at the bottom of the function
+/// regardless of the status its device support returned, this
 /// function clears PACT on *every* path that finishes handling the pass —
 /// whether the input/output side succeeded or failed. A `TooDeep` (or any
 /// other) error from `input_body`/`output_body` is not a two-phase-pending
@@ -362,24 +416,55 @@ pub(crate) fn read_field(set: &LockSetData, id: RecordId, field: Field) -> Value
 /// hook point described below, which is a distinct, deliberate return, not
 /// an error.
 ///
-/// This is also the declared seam for two-phase (async) device support,
-/// which sub-project A does not implement: the hook point a future
-/// `AsyncSupport` implementation would need is inside `input_body` (INP) or
-/// `output_body` (OUT), above, at the point the value is fetched or
-/// written. An implementation whose `start()` reports
-/// `AsyncOutcome::Pending` must return `Ok(())` from that call site without
-/// having finished its work, so it takes the success branch here (not the
-/// error branch) while genuinely being incomplete — a distinction this
-/// function cannot make on its own until B builds it; today, sub-project A
-/// has no such body, so every path through here is either a real success or
-/// a real failure. How a record binds to an `AsyncSupport` implementation (a
-/// registry, a per-record slot, or something else) is left undecided here;
-/// see [`AsyncSupport`]'s own doc comment for why.
+/// This is the live seam for two-phase (async) device support. The hook runs
+/// at the top of this function, before the synchronous body: a record bound
+/// in the [`AsyncRegistry`](crate::scan::AsyncRegistry) (reached through
+/// `ProcCtx`) has its [`AsyncSupport::start`] called with the pre-pass PACT
+/// value. A `Pending` outcome leaves PACT raised and returns `Ok(())` right
+/// there, skipping the whole synchronous second half; a `Complete` outcome
+/// falls through to the body below, exactly as an unbound record does. The
+/// hook sits above the body deliberately: raising PACT and then calling
+/// `start` means the operation is protected by the re-entry brake for its
+/// whole duration, and a panic out of `start` is caught by the drop guard
+/// (below) that resets PACT — the first reachable panic path through here,
+/// per ruling R-T6-PACT. That guard is disarmed on every normal return, so
+/// the legitimate `Pending` path keeps PACT set.
 pub(crate) fn record_body(
     set: &mut LockSetData,
     id: RecordId,
     ctx: &mut ProcCtx,
 ) -> Result<(), ProcError> {
+    // Capture PACT as it stood before this pass raised it — Base's `pact`
+    // local. `false` = initiating pass (entered via `process`, whose brake
+    // guarantees PACT was clear); `true` = completion pass (entered via
+    // `complete_async`, which requires PACT already set).
+    let pact_before = set.get(id).common.pact;
+    // Raise the re-entry brake for the whole body. Moved here from
+    // `process_inner` so the capture above sees the pre-pass value.
+    set.get_mut(id).common.pact = true;
+
+    // Async device-support hook. A bound record initiates or collects a
+    // two-phase operation here, before the synchronous body.
+    if let Some(reg) = ctx.async_registry()
+        && let Some(sup) = reg.get(id)
+    {
+        let name = set.get(id).name.clone();
+        let outcome = {
+            // `start` is arbitrary bound user code and may panic with PACT
+            // held. The guard resets PACT to clear on an unwind so the record
+            // is not braked forever (R-T6-PACT); `disarm` cancels it on the
+            // normal return, because `Pending` must keep PACT set.
+            let mut guard = PactResetGuard::arm(set, id);
+            let outcome = sup.start(&name, pact_before, ctx);
+            guard.disarm();
+            outcome
+        };
+        match outcome {
+            AsyncOutcome::Pending => return Ok(()),
+            AsyncOutcome::Complete => {}
+        }
+    }
+
     let kind = set.get(id).kind;
     let fetched = if kind.is_output() {
         output_body(set, id, ctx)
@@ -601,22 +686,30 @@ pub enum AsyncOutcome {
 
 /// Device support that may take longer than a processing pass.
 ///
-/// This is sub-project A's *declared contract* for sub-project B, not live
-/// machinery: A ships no implementation of it, and nothing in A's
-/// `record_body` calls `start()` — there is no call site to wire one into
-/// yet. See [`record_body`]'s doc comment for exactly which hook point
-/// (inside `input_body`/`output_body`, immediately before the PACT clear at
-/// the end of `record_body`) a future implementation must use, and what a
-/// `Pending` outcome requires of it. Deciding how a record binds to a
-/// specific `AsyncSupport` implementation — a registry, a per-record slot,
-/// how that lookup stays deterministic across a `.db` — is design work
-/// owned by the source-tier spec and sub-project B, not by this trait: A
-/// declares the gap rather than filling it in unspecified. [`complete_async`]
-/// exists so B's scan threads have a defined completion path today, and so
-/// the PACT semantics it depends on are covered by tests written against
-/// the engine that owns them, rather than retro-fitted later.
+/// This is now live machinery. A record is bound to an implementation through
+/// [`AsyncRegistry`](crate::scan::AsyncRegistry), which `record_body` reaches
+/// via `ProcCtx` (threaded like the clock). At the async hook point in
+/// `record_body` — before the synchronous body runs — a bound record's
+/// `start` is called.
+///
+/// `pact` follows EPICS Base's `pact` local: it is the record's PACT flag as
+/// it stood *before* this pass raised it, so `pact == false` means "initiate
+/// the operation" and `pact == true` means "collect a completed operation"
+/// (the pass driven by [`complete_async`]). The return value decides what the
+/// pass does next:
+/// - [`AsyncOutcome::Pending`]: the operation is outstanding. PACT stays set,
+///   `record_body` returns without running the second half (value/limits/
+///   monitors/FLNK/clear), and the device is expected to call
+///   [`complete_async`] when it finishes.
+/// - [`AsyncOutcome::Complete`]: the operation finished inside `start`;
+///   `record_body` falls through to the ordinary synchronous body, exactly as
+///   an unbound record does.
+///
+/// `start` is arbitrary bound code and may panic. `record_body` guards the
+/// call so a panic resets PACT rather than stranding the record braked
+/// forever (see `record_body`'s doc comment and ruling R-T6-PACT).
 pub trait AsyncSupport: Send + Sync {
-    fn start(&self, record: &str, ctx: &mut ProcCtx) -> AsyncOutcome;
+    fn start(&self, record: &str, pact: bool, ctx: &mut ProcCtx) -> AsyncOutcome;
 }
 
 /// Finish a record that returned from its body with PACT still set.
@@ -626,6 +719,20 @@ pub trait AsyncSupport: Send + Sync {
 /// itself once it reaches the end of a synchronous pass (see its doc
 /// comment). A record that is not active is left alone: a duplicate
 /// completion callback must not process the record twice.
+///
+/// This stays a thin re-enter by design. The carry-forward concern that
+/// re-running the whole body would *re-initiate* the operation is resolved by
+/// `record_body`'s Base-style PACT branch: on this pass PACT is already set,
+/// so a bound [`AsyncSupport::start`] is handed `pact == true` and *collects*
+/// the finished operation (returning [`AsyncOutcome::Complete`]) rather than
+/// starting a new one. The once-only correctness therefore lives in two
+/// places working together — this guard, which makes a *second* completion
+/// (PACT already cleared by the first) a no-op, and the support's `pact`
+/// branch, which keeps the *first* completion from re-initiating. The guard is
+/// load-bearing: without it, a duplicate callback would re-enter `record_body`
+/// with PACT clear, capture `pact_before == false`, and re-*initiate* the
+/// operation — see `duplicate_completion_does_not_process_twice`. Do not
+/// weaken it.
 pub fn complete_async(
     set: &mut LockSetData,
     id: RecordId,
@@ -649,6 +756,336 @@ mod tests {
 
     fn event_names(ctx: &mut ProcCtx) -> Vec<String> {
         ctx.take_events().into_iter().map(|(n, _)| n).collect()
+    }
+
+    // ---- Async support: registry + Base-style PACT-branched call site ----
+
+    use crate::clock::{Clock, ManualClock};
+    use crate::scan::delay::DelaySupport;
+    use crate::scan::AsyncRegistry;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Always reports the operation still outstanding.
+    struct AlwaysPending;
+    impl AsyncSupport for AlwaysPending {
+        fn start(&self, _record: &str, _pact: bool, _ctx: &mut ProcCtx) -> AsyncOutcome {
+            AsyncOutcome::Pending
+        }
+    }
+
+    /// Pending on the first call, Complete after, recording the `pact` value
+    /// it was handed on each call.
+    struct TwoPhase {
+        seen: Mutex<Vec<bool>>,
+    }
+    impl AsyncSupport for TwoPhase {
+        fn start(&self, _record: &str, pact: bool, _ctx: &mut ProcCtx) -> AsyncOutcome {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(pact);
+            if seen.len() == 1 {
+                AsyncOutcome::Pending
+            } else {
+                AsyncOutcome::Complete
+            }
+        }
+    }
+
+    /// Panics from `start`, to exercise the PACT drop guard (R-T6-PACT).
+    struct PanicOnStart;
+    impl AsyncSupport for PanicOnStart {
+        fn start(&self, _record: &str, _pact: bool, _ctx: &mut ProcCtx) -> AsyncOutcome {
+            panic!("boom in start");
+        }
+    }
+
+    #[test]
+    fn pending_start_sets_pact_and_defers_the_second_half() {
+        let clock = ManualClock::new();
+        clock.advance(Duration::from_secs(1));
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"5\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let reg = AsyncRegistry::new();
+        reg.bind(id, Arc::new(AlwaysPending));
+        let mut ctx = ProcCtx::with_async(&clock, &reg);
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("a pending start is not an error");
+            assert!(
+                set.get(id).common.pact,
+                "a Pending outcome must leave PACT set for the completion path"
+            );
+            assert_eq!(
+                set.get(id).time_ns,
+                0,
+                "the second half must be skipped: no timestamp is stamped"
+            );
+        });
+        assert!(
+            ctx.take_events().is_empty(),
+            "a Pending start posts no monitor: the second half did not run"
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_support_processes_synchronously_as_before() {
+        let clock = ManualClock::new();
+        clock.advance(Duration::from_secs(1));
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"5\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        // A registry with no binding for PV:A: it must behave exactly as it
+        // did before async support went live.
+        let reg = AsyncRegistry::new();
+        let mut ctx = ProcCtx::with_async(&clock, &reg);
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("process succeeds");
+            assert!(
+                !set.get(id).common.pact,
+                "a synchronous pass clears PACT"
+            );
+            assert!(
+                set.get(id).time_ns > 0,
+                "the body ran in one pass and stamped the time"
+            );
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:A".to_string()],
+            "an unbound record still posts its monitor in a single pass"
+        );
+    }
+
+    #[test]
+    fn start_sees_pact_true_on_the_completion_pass() {
+        let clock = ManualClock::new();
+        clock.advance(Duration::from_secs(1));
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"5\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let support = Arc::new(TwoPhase {
+            seen: Mutex::new(Vec::new()),
+        });
+        let reg = AsyncRegistry::new();
+        reg.bind(id, support.clone());
+        let mut ctx = ProcCtx::with_async(&clock, &reg);
+        // Initiating pass: pact=false -> Pending; no monitor yet.
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("a pending start is Ok");
+            assert!(
+                set.get(id).common.pact,
+                "PACT is held for the completion path"
+            );
+        });
+        assert!(
+            ctx.take_events().is_empty(),
+            "nothing posts while the operation is pending"
+        );
+        // Completion pass: complete_async re-enters; start sees pact=true and
+        // reports Complete, so the second half now runs and the monitor posts.
+        d.with_set(id.set, |set| {
+            complete_async(set, id, &mut ctx).expect("completion succeeds");
+            assert!(
+                !set.get(id).common.pact,
+                "a completed pass clears PACT"
+            );
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:A".to_string()],
+            "the monitor posts once the operation completes"
+        );
+        assert_eq!(
+            *support.seen.lock().unwrap(),
+            vec![false, true],
+            "start is handed pact=false to initiate, then pact=true to collect"
+        );
+    }
+
+    #[test]
+    fn an_async_start_panic_does_not_strand_pact() {
+        // The PANIC analogue of `a_too_deep_error_does_not_strand_pact_for_later_passes`.
+        // `AsyncSupport::start` is arbitrary bound code; a panic out of it must
+        // not leave PACT set, or `process`'s brake would swallow every later
+        // pass on this record forever (ruling R-T6-PACT).
+        let clock = ManualClock::new();
+        clock.advance(Duration::from_secs(1));
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"5\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let reg = AsyncRegistry::new();
+        reg.bind(id, Arc::new(PanicOnStart));
+        let mut ctx = ProcCtx::with_async(&clock, &reg);
+        let boom = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            d.with_set(id.set, |set| {
+                let _ = process(set, id, &mut ctx);
+            });
+        }));
+        assert!(boom.is_err(), "the panic propagates out of the pass");
+        // A subsequent ordinary pass (no async registry, so the hook is
+        // skipped) must actually run: if the guard failed to reset PACT, the
+        // brake in `process` would return early and this pass would do nothing.
+        let mut ctx2 = ProcCtx::with_clock(&clock);
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx2)
+                .expect("a plain pass must succeed after the panic");
+            assert!(
+                !set.get(id).common.pact,
+                "the drop guard reset PACT; it was not stranded"
+            );
+            assert!(
+                set.get(id).time_ns > 0,
+                "the recovered pass actually ran the body, not swallowed by a stuck PACT"
+            );
+        });
+        assert_eq!(
+            event_names(&mut ctx2),
+            vec!["PV:A".to_string()],
+            "the recovered pass posts its monitor"
+        );
+    }
+
+    #[test]
+    fn duplicate_completion_does_not_process_twice() {
+        // Locks `complete_async`'s once-only contract (its
+        // `if !set.get(id).common.pact { return Ok(()) }` guard): a second
+        // completion callback for the same operation must be a no-op, not a
+        // second process pass nor a re-initiation.
+        let clock = ManualClock::new();
+        clock.advance(Duration::from_secs(1));
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"5\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let support_clock: Arc<dyn Clock> = Arc::new(clock.clone());
+        let support = Arc::new(DelaySupport::new(support_clock, Duration::from_millis(50)));
+        let reg = AsyncRegistry::new();
+        reg.bind(id, support.clone());
+        let mut ctx = ProcCtx::with_async(&clock, &reg);
+
+        // Initiating pass: Pending, PACT set, nothing posts.
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("a pending start is Ok");
+            assert!(
+                set.get(id).common.pact,
+                "PACT is held for the completion path"
+            );
+        });
+        assert!(
+            ctx.take_events().is_empty(),
+            "nothing posts while the operation is pending"
+        );
+
+        // First completion: the second half runs, the monitor posts once, and
+        // PACT clears. (Kills a guard mutated to always-return / negated: those
+        // would skip the body here and post nothing.)
+        d.with_set(id.set, |set| {
+            complete_async(set, id, &mut ctx).expect("completion succeeds");
+            assert!(
+                !set.get(id).common.pact,
+                "a completed pass clears PACT"
+            );
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:A".to_string()],
+            "the monitor posts exactly once when the operation completes"
+        );
+
+        // Second completion: PACT is already clear. The guard must return early
+        // — NOT re-enter `record_body`. If the guard were removed, re-entry
+        // would capture pact_before=false, re-raise PACT, and re-initiate the
+        // (still-bound) DelaySupport back to Pending — leaving PACT *set*. So
+        // the PACT-clear assertion below is what kills the guard-removal mutant
+        // (a monitor-count check alone would not: a re-initiation posts
+        // nothing either).
+        d.with_set(id.set, |set| {
+            complete_async(set, id, &mut ctx).expect("a duplicate completion is Ok");
+            assert!(
+                !set.get(id).common.pact,
+                "a duplicate completion must not re-arm PACT: the guard held"
+            );
+        });
+        assert!(
+            ctx.take_events().is_empty(),
+            "a duplicate completion posts nothing: the record was not processed again"
+        );
+    }
+
+    #[test]
+    fn a_slow_async_record_interleaves_with_a_fast_periodic_one() {
+        // A slow async record (PV:SLOW, DelaySupport) stays Pending while a
+        // fast record (PV:FAST) processes and posts every tick. When the clock
+        // crosses SLOW's deadline and completion is driven, SLOW posts exactly
+        // once. Fully deterministic on a ManualClock — no real sleep.
+        let clock = ManualClock::new();
+        clock.advance(Duration::from_secs(1));
+        let d = db("record(ai, \"PV:SLOW\") {\n    field(INP, \"7\")\n}\n\
+                    record(ai, \"PV:FAST\") {\n}\n");
+        let slow = d.lookup("PV:SLOW").expect("PV:SLOW exists");
+        let fast = d.lookup("PV:FAST").expect("PV:FAST exists");
+        let support_clock: Arc<dyn Clock> = Arc::new(clock.clone());
+        let support = Arc::new(DelaySupport::new(support_clock, Duration::from_millis(50)));
+        let reg = AsyncRegistry::new();
+        reg.bind(slow, support.clone());
+        let mut ctx = ProcCtx::with_async(&clock, &reg);
+
+        // Initiate SLOW: it goes Pending and posts nothing.
+        d.with_set(slow.set, |set| {
+            process(set, slow, &mut ctx).expect("a pending start is Ok");
+            assert!(
+                set.get(slow).common.pact,
+                "SLOW holds PACT while its operation is outstanding"
+            );
+        });
+        assert!(
+            ctx.take_events().is_empty(),
+            "SLOW posts nothing while pending"
+        );
+        let deadline = support.deadline().expect("the initiating pass recorded a deadline");
+
+        // The fast record ticks every 10ms. Each tick posts, and SLOW stays
+        // Pending (a scan pass over it is a PACT no-op) the whole time.
+        let mut fast_posts = 0usize;
+        let mut tick = 0i64;
+        while clock.now() < deadline {
+            clock.advance(Duration::from_millis(10));
+            tick += 1;
+            d.with_set(fast.set, |set| {
+                // A genuinely changing input value, so each pass posts a monitor
+                // (a constant INP would plateau after the first pass).
+                set.get_mut(fast).val = Value::Double(tick as f64);
+                process(set, fast, &mut ctx).expect("FAST processes synchronously");
+            });
+            fast_posts += event_names(&mut ctx).len();
+            d.with_set(slow.set, |set| {
+                process(set, slow, &mut ctx).expect("an active record is not an error");
+                assert!(
+                    set.get(slow).common.pact,
+                    "SLOW stays Pending across FAST ticks"
+                );
+            });
+            assert!(
+                ctx.take_events().is_empty(),
+                "SLOW still posts nothing while pending"
+            );
+        }
+        assert_eq!(
+            fast_posts, 5,
+            "FAST posts once per 10ms tick across the 50ms delay"
+        );
+
+        // The clock has crossed SLOW's deadline; drive its completion.
+        assert!(
+            clock.now() >= deadline,
+            "the loop ran until the clock reached SLOW's deadline"
+        );
+        d.with_set(slow.set, |set| {
+            complete_async(set, slow, &mut ctx).expect("completion succeeds");
+            assert!(
+                !set.get(slow).common.pact,
+                "completion clears PACT"
+            );
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:SLOW".to_string()],
+            "SLOW posts exactly once, on completion"
+        );
     }
 
     #[test]

@@ -36,15 +36,18 @@ async fn the_ioc_serves_its_own_field_pvs() {
     }
 }
 
+/// Most field PVs remain read-only. Task 12 makes SCAN/EVNT/PHAS the sole
+/// writable exceptions (they route into the Scanner — see the unit tests in
+/// `source.rs`); every other field PV, such as EGU here, still rejects a put.
 #[tokio::test]
 async fn field_pvs_are_read_only() {
     let src = IocSource::from_db_str(DB).expect("loads");
-    let info = src.claim("PV:A.SCAN").await.expect("claimed");
-    assert!(!info.writable, "field writes are sub-project B's");
+    let info = src.claim("PV:A.EGU").await.expect("claimed");
+    assert!(!info.writable, "a non-Scanner field PV is not writable");
     let err = src
-        .put("PV:A.SCAN", &DecodedValue::Int32(1))
+        .put("PV:A.EGU", &DecodedValue::Int32(1))
         .await
-        .expect_err("puts to fields must fail");
+        .expect_err("puts to a read-only field must fail");
     assert!(err.contains("read-only"), "got {err}");
 }
 
