@@ -59,10 +59,12 @@ fn current_identity() -> Identity {
     }
 }
 
-/// The live PVs, in the stable order `names()`/the banner report them.
-/// `poke` is included here (it is readable — its value is an internal
-/// generation counter — as well as the only writable status PV).
-const LIVE: &[&str] = &["clients", "cache", "refs", "threads", "stats", "poke"];
+/// The live (get/subscribe) PVs, in the stable order `names()`/the banner
+/// report them. `poke` is included here (it is readable — its value is an
+/// internal generation counter — as well as the only writable status PV).
+/// `threads` is NOT here: p4p serves it as an RPC-only string (see
+/// `RPC_NAMES`).
+const LIVE: &[&str] = &["clients", "cache", "refs", "stats", "poke"];
 
 /// The static, always-zero bandwidth-counter PVs (spec §8.1) — not wired to
 /// any real per-PV/per-host byte counter in M1.
@@ -77,8 +79,10 @@ const STATIC_ZERO: &[&str] = &[
     "us:byhost:tx",
 ];
 
-/// RPC-only names (no `get`/`subscribe` value, only `rpc`).
-const RPC_NAMES: &[&str] = &["asTest"];
+/// RPC-only names (no `get`/`subscribe` value, only `rpc`). `asTest` dry-runs
+/// an ACL decision; `threads` returns a thread-dump string (p4p serves both
+/// as RPC-only `NTScalar('s')`).
+const RPC_NAMES: &[&str] = &["asTest", "threads"];
 
 /// The full set of suffixes this source serves, in a stable order: live,
 /// then static, then RPC. Both `StatusSource::names()` and
@@ -88,31 +92,31 @@ fn served_suffixes() -> impl Iterator<Item = &'static str> {
     LIVE.iter().chain(STATIC_ZERO.iter()).chain(RPC_NAMES.iter()).copied()
 }
 
-/// A cheap, cloneable "read the current scalar value" callback used by
-/// [`StatusHandles`]'s live scalar gauges (`threads`, `stats`).
-type Gauge = Arc<dyn Fn() -> f64 + Send + Sync>;
-
 /// A cheap, cloneable "read the current name list" callback used by
 /// [`StatusHandles`]'s live string-array PVs (`clients`, `cache`).
 type ListHandle = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
-/// Live-value handles `StatusSource` reads for its `clients`/`cache`/
-/// `threads`/`stats` PVs.
+/// A cheap, cloneable "read the current count" callback, used for the live
+/// field(s) of the `stats` [`epics:p2p/Stats:1.0`] structure.
+type CountHandle = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// Live-value handles `StatusSource` reads for its `clients`/`cache`/`stats`
+/// PVs.
 ///
 /// Cheap to clone (each field is an `Arc`), so a clone can be handed to the
 /// `subscribe` ticker task without borrowing the source. `refs` and the
 /// bandwidth PVs are served as NTTables built from no live source yet (empty
-/// rows), so they need no handle here.
+/// rows), so they need no handle here; `threads` is an RPC-only string with
+/// no gauge.
 #[derive(Clone)]
 pub struct StatusHandles {
     /// Downstream client names (p4p `clients`, an NTScalarArray-of-string).
     pub clients: ListHandle,
     /// Upstream channel-cache names (p4p `cache`, an NTScalarArray-of-string).
     pub cache: ListHandle,
-    /// tokio worker/task count (spvirit extension scalar; no p4p PV).
-    pub threads: Gauge,
-    /// Aggregate active-channel count (spvirit extension scalar; no p4p PV).
-    pub stats: Gauge,
+    /// Monitor-cache size — the one `stats` field (`mcacheSize`) spvirit has a
+    /// real live source for. The remaining `Stats` fields are stubbed to 0.
+    pub mcache_size: CountHandle,
 }
 
 impl StatusHandles {
@@ -120,12 +124,10 @@ impl StatusHandles {
     /// real `GatewaySource`/`UpstreamPool`.
     pub fn test() -> Self {
         let empty: ListHandle = Arc::new(Vec::new);
-        let zero: Gauge = Arc::new(|| 0.0);
         Self {
             clients: empty.clone(),
             cache: empty,
-            threads: zero.clone(),
-            stats: zero,
+            mcache_size: Arc::new(|| 0),
         }
     }
 
@@ -134,22 +136,21 @@ impl StatusHandles {
     ///   of upstream channels currently held in the monitor cache. This
     ///   genuinely changes as monitors come and go, so its NTScalarArray
     ///   payload changes and the monitor pump forwards a fresh frame.
-    /// - `stats` <- [`GatewaySource::upstream_monitor_count`], the number of
-    ///   distinct upstream monitors currently running (a live "active
-    ///   channels" aggregate).
+    /// - `stats.mcacheSize` <- [`GatewaySource::upstream_monitor_count`], the
+    ///   number of distinct upstream monitors currently running (p4p's
+    ///   monitor-cache size). This is live, so the `stats` structure updates.
     ///
     /// `clients` has no downstream-peer registry to read from in M1, so it is
     /// stubbed to an empty list (correct NTScalarArray shape, data-population
-    /// follow-up). `threads` has no thread-pool introspection source and is
-    /// stubbed to zero — documented M1 gaps, not oversights.
+    /// follow-up). The other five `Stats` fields have no M1 collector and are
+    /// stubbed to 0 — documented gaps, not oversights.
     pub fn from_gateway(src: &Arc<GatewaySource>) -> Self {
         let src_cache = src.clone();
         let src_stats = src.clone();
         Self {
             clients: Arc::new(Vec::new),
             cache: Arc::new(move || src_cache.upstream_monitor_names()),
-            threads: Arc::new(|| 0.0),
-            stats: Arc::new(move || src_stats.upstream_monitor_count() as f64),
+            mcache_size: Arc::new(move || src_stats.upstream_monitor_count() as u64),
         }
     }
 }
@@ -187,6 +188,77 @@ impl StatusSource {
     /// An NTScalarArray-of-string payload (p4p's shape for `clients`/`cache`).
     fn string_array_payload(items: Vec<String>) -> NtPayload {
         NtPayload::ScalarArray(NtScalarArray::from_value(ScalarArrayValue::Str(items)))
+    }
+
+    /// A nested `epics:nt/NTScalar:1.0` sub-structure carrying an unsigned-long
+    /// value, matching p4p's `NTScalar.buildType('L')` for each `Stats` field
+    /// (`value` + default `alarm`/`timeStamp`). Built as a [`PvValue`] tree so
+    /// it can be a field of the enclosing `Stats` structure.
+    fn ntscalar_ulong_field(v: u64) -> PvValue {
+        PvValue::Structure {
+            struct_id: "epics:nt/NTScalar:1.0".to_string(),
+            fields: vec![
+                ("value".to_string(), PvValue::Scalar(ScalarValue::U64(v))),
+                (
+                    "alarm".to_string(),
+                    PvValue::Structure {
+                        struct_id: "alarm_t".to_string(),
+                        fields: vec![
+                            ("severity".to_string(), PvValue::Scalar(ScalarValue::I32(0))),
+                            ("status".to_string(), PvValue::Scalar(ScalarValue::I32(0))),
+                            ("message".to_string(), PvValue::Scalar(ScalarValue::Str(String::new()))),
+                        ],
+                    },
+                ),
+                (
+                    "timeStamp".to_string(),
+                    PvValue::Structure {
+                        struct_id: "time_t".to_string(),
+                        fields: vec![
+                            ("secondsPastEpoch".to_string(), PvValue::Scalar(ScalarValue::I64(0))),
+                            ("nanoseconds".to_string(), PvValue::Scalar(ScalarValue::I32(0))),
+                            ("userTag".to_string(), PvValue::Scalar(ScalarValue::I32(0))),
+                        ],
+                    },
+                ),
+            ],
+        }
+    }
+
+    /// The `stats` structure — p4p's `epics:p2p/Stats:1.0`: six unsigned-long
+    /// cache/ban size fields, each a nested `NTScalar('L')`. Only `mcacheSize`
+    /// (the upstream monitor-cache size) has a live M1 source; the other five
+    /// are stubbed to 0 with the correct field names (shape-complete,
+    /// data-pending). Field order matches p4p's `statsType`.
+    fn stats_structure(mcache_size: u64) -> NtPayload {
+        NtPayload::Generic {
+            struct_id: "epics:p2p/Stats:1.0".to_string(),
+            fields: vec![
+                ("ccacheSize".to_string(), Self::ntscalar_ulong_field(0)),
+                ("mcacheSize".to_string(), Self::ntscalar_ulong_field(mcache_size)),
+                ("gcacheSize".to_string(), Self::ntscalar_ulong_field(0)),
+                ("banHostSize".to_string(), Self::ntscalar_ulong_field(0)),
+                ("banPVSize".to_string(), Self::ntscalar_ulong_field(0)),
+                ("banHostPVSize".to_string(), Self::ntscalar_ulong_field(0)),
+            ],
+        }
+    }
+
+    /// The `threads` RPC response — p4p serves it as an RPC-only
+    /// `NTScalar('s')` that dumps thread stacks. Rust has no `faulthandler`
+    /// equivalent and the gateway does no OS-thread introspection, so this
+    /// returns a shape-correct best-effort string rather than a fabricated
+    /// stack dump.
+    fn threads_payload() -> NtPayload {
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0);
+        let msg = format!(
+            "spvirit-gateway: OS thread stack-trace dump is not available (no \
+             faulthandler equivalent in Rust). available_parallelism={parallelism}; \
+             async work runs as tokio tasks, not dedicated OS threads."
+        );
+        NtPayload::Scalar(NtScalar::from_value(ScalarValue::Str(msg)))
     }
 
     /// The `refs` NTTable — p4p's `RefAdapter` shape: columns
@@ -251,8 +323,7 @@ impl StatusSource {
             "clients" => Self::string_array_payload((handles.clients)()),
             "cache" => Self::string_array_payload((handles.cache)()),
             "refs" => Self::refs_table(),
-            "threads" => Self::scalar_payload((handles.threads)()),
-            "stats" => Self::scalar_payload((handles.stats)()),
+            "stats" => Self::stats_structure((handles.mcache_size)()),
             "poke" => Self::scalar_payload(generation.load(Ordering::Relaxed) as f64),
             s if STATIC_ZERO.contains(&s) => Self::bandwidth_table(s),
             _ => return None,
@@ -334,7 +405,12 @@ impl Source for StatusSource {
                 return None;
             }
             let payload = if RPC_NAMES.contains(&suffix) {
-                Self::astest_response("", "", "", &Decision::Deny, &Decision::Deny)
+                // RPC-only PVs still advertise a result descriptor at claim
+                // time, each in its own shape.
+                match suffix {
+                    "threads" => Self::threads_payload(),
+                    _ => Self::astest_response("", "", "", &Decision::Deny, &Decision::Deny),
+                }
             } else {
                 Self::value_payload(suffix, &self.handles, &self.generation)?
             };
@@ -449,8 +525,17 @@ impl Source for StatusSource {
             let suffix = self
                 .suffix(&name)
                 .ok_or_else(|| format!("unclaimed status PV {name:?}"))?;
-            if suffix != "asTest" {
+            if !RPC_NAMES.contains(&suffix) {
                 return Err("RPC not supported".to_string());
+            }
+            // `threads` is an RPC-only string (p4p's stack-dump PV). Gate it
+            // through the same AccessControl (an RPC op on its own name), then
+            // return the best-effort thread description.
+            if suffix == "threads" {
+                if let Decision::Deny = self.access.decide(Op::Rpc, &name, &current_identity()) {
+                    return Err("access denied".to_string());
+                }
+                return Ok(Self::threads_payload());
             }
             let pv = Self::decoded_field_str(&args, "pv").unwrap_or_default();
             let id = Identity {
@@ -551,11 +636,35 @@ mod tests {
         let handles = StatusHandles {
             clients: Arc::new(Vec::new),
             cache: Arc::new(move || list.lock().unwrap().clone()),
-            threads: Arc::new(|| 0.0),
-            stats: Arc::new(|| 0.0),
+            mcache_size: Arc::new(|| 0),
         };
         let access = Arc::new(AccessControl::new(false, None, None));
         StatusSource::new(PREFIX.to_string(), access, handles)
+    }
+
+    /// A `StatusSource` whose `stats.mcacheSize` is driven by a
+    /// caller-controllable `u64`.
+    fn source_with_mcache(count: Arc<std::sync::atomic::AtomicU64>) -> StatusSource {
+        let handles = StatusHandles {
+            clients: Arc::new(Vec::new),
+            cache: Arc::new(Vec::new),
+            mcache_size: Arc::new(move || count.load(Ordering::Relaxed)),
+        };
+        let access = Arc::new(AccessControl::new(false, None, None));
+        StatusSource::new(PREFIX.to_string(), access, handles)
+    }
+
+    /// Digs the `value` (a `u64`) out of a nested `NTScalar('L')` `Stats`
+    /// field.
+    fn stats_field_u64(fields: &[(String, PvValue)], name: &str) -> u64 {
+        let f = fields.iter().find(|(n, _)| n == name).map(|(_, v)| v).expect("field");
+        let PvValue::Structure { fields: inner, .. } = f else {
+            panic!("{name} must be a nested NTScalar structure, got {f:?}");
+        };
+        match inner.iter().find(|(n, _)| n == "value").map(|(_, v)| v) {
+            Some(PvValue::Scalar(ScalarValue::U64(v))) => *v,
+            other => panic!("{name}.value must be a U64 scalar, got {other:?}"),
+        }
     }
 
     /// p4p shape: `clients`/`cache` are NTScalarArray-of-string, not scalars.
@@ -660,5 +769,64 @@ mod tests {
             StatusSource::string_array_payload(vec!["UP:CHAN".to_string()])
         );
         assert_ne!(first, second, "a changed value must produce a different frame");
+    }
+
+    /// p4p shape: `stats` is `epics:p2p/Stats:1.0` with six ulong cache/ban
+    /// fields; `mcacheSize` carries the live monitor-cache size.
+    #[tokio::test]
+    async fn stats_get_returns_stats_structure() {
+        let count = Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let src = source_with_mcache(count);
+        let p = src.get(&format!("{PREFIX}stats")).await.expect("get");
+        let NtPayload::Generic { struct_id, fields } = p else {
+            panic!("stats must be a Generic structure, got {p:?}");
+        };
+        assert_eq!(struct_id, "epics:p2p/Stats:1.0");
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["ccacheSize", "mcacheSize", "gcacheSize", "banHostSize", "banPVSize", "banHostPVSize"]
+        );
+        assert_eq!(stats_field_u64(&fields, "mcacheSize"), 3, "mcacheSize is the live field");
+        assert_eq!(stats_field_u64(&fields, "ccacheSize"), 0, "unwired fields stub to 0");
+    }
+
+    /// The `stats` structure updates: when `mcacheSize`'s source changes, the
+    /// subscribe ticker delivers a second, different frame past the pump dedup.
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_delivers_a_new_stats_frame_when_mcache_changes() {
+        let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let src = source_with_mcache(count.clone());
+
+        let mut rx = src.subscribe(&format!("{PREFIX}stats")).await.expect("subscribe");
+        let first = rx.recv().await.expect("first frame");
+
+        count.store(5, Ordering::Relaxed);
+        tokio::time::advance(TICK_PERIOD).await;
+        let second = rx.recv().await.expect("second frame");
+
+        assert_ne!(first, second, "a changed mcacheSize must produce a different frame");
+        let NtPayload::Generic { fields, .. } = &second else { panic!("stats must be Generic") };
+        assert_eq!(stats_field_u64(fields, "mcacheSize"), 5);
+    }
+
+    /// p4p access pattern: `threads` is RPC-only. `get`/`subscribe` must NOT
+    /// offer it as a value PV, and `rpc` returns an `NTScalar('s')` string.
+    #[tokio::test]
+    async fn threads_is_rpc_only_string() {
+        let src = source(false);
+        let name = format!("{PREFIX}threads");
+
+        assert!(src.get(&name).await.is_none(), "threads must not be a get value");
+        assert!(src.subscribe(&name).await.is_none(), "threads must not be subscribable");
+
+        let out = src.rpc(&name, &DecodedValue::Structure(vec![])).await.expect("rpc");
+        match out {
+            NtPayload::Scalar(nt) => assert!(
+                matches!(nt.value, ScalarValue::Str(_)),
+                "threads RPC must return a string scalar"
+            ),
+            other => panic!("threads RPC must return an NTScalar string, got {other:?}"),
+        }
     }
 }
