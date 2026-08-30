@@ -8,7 +8,10 @@
 # that no chapter documents yet. They must shrink to empty. Do not add to them.
 
 [allow]
-undocumented_tools = []
+# spload is an internal benchmark load driver (drive + watch) used only by the
+# loadtest/ harness, not a user-facing CLI tool — it is intentionally excluded
+# from the tools chapters rather than given a user doc page.
+undocumented_tools = ["spload"]
 undocumented_examples = [
   "spvirit-codec/examples/decode_packet.rs",
   "spvirit-server/examples/aggregate_source.rs",
