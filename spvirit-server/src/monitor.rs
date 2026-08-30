@@ -384,6 +384,16 @@ impl MonitorRegistry {
                     let Some(msg) = Self::build_monitor_frame(sub, payload) else {
                         return;
                     };
+                    // Same accounting as `notify_monitors`: attribute the
+                    // actual wire bytes of this (usually initial-snapshot)
+                    // frame before it moves into `to_send`. No `.await` in
+                    // this block, so no diag lock is held across one.
+                    if let Some(c) = self.bandwidth_counters() {
+                        c.ds_bypv_tx.add(pv_name, msg.len() as u64);
+                    }
+                    if let Some(r) = self.client_registry() {
+                        r.add_tx(sub.conn_id, msg.len() as u64);
+                    }
                     if sub.pipeline_enabled && sub.nfree > 0 {
                         sub.nfree -= 1;
                     }
@@ -780,6 +790,60 @@ mod tests {
         assert_eq!(
             byhost[0].2, expected_len,
             "registry conn tx must reflect the delivered frame's byte length"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_monitor_update_for_accounts_initial_snapshot_tx_bytes() {
+        // Task 8b: `send_monitor_update_for` delivers the INITIAL snapshot
+        // frame on every `MonitorRequest{start:true}` (handler.rs:1671), a
+        // separate delivery path from `notify_monitors` that Task 8 missed.
+        // It must attribute the same way: per-PV `ds_bypv_tx` and per-conn
+        // registry `tx`.
+        use crate::diag::{BandwidthCounters, ClientRegistry};
+
+        let reg = MonitorRegistry::new();
+        let counters = Arc::new(BandwidthCounters::new());
+        let client_registry = Arc::new(ClientRegistry::new());
+        let peer: std::net::SocketAddr = "127.0.0.1:5556".parse().unwrap();
+        client_registry.connect(1, peer);
+
+        reg.set_bandwidth_counters(counters.clone());
+        reg.set_client_registry(client_registry.clone());
+
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(tokio::io::sink()));
+        }
+        {
+            let mut mons = reg.monitors.lock().await;
+            let mut sub = make_sub(None);
+            sub.conn_id = 1;
+            sub.ioid = 42;
+            mons.insert("pv:initial".to_string(), vec![sub]);
+        }
+
+        let payload = nt_payload(1.0, 0);
+        reg.send_monitor_update_for("pv:initial", 1, 42, &payload)
+            .await;
+
+        let expected_len =
+            MonitorRegistry::build_monitor_frame(&make_sub(None), &payload)
+                .expect("first frame")
+                .len() as u64;
+
+        let pv_snap = counters.ds_bypv_tx.snapshot();
+        assert_eq!(
+            pv_snap,
+            vec![("pv:initial".to_string(), expected_len)],
+            "ds_bypv_tx must be credited with the initial-snapshot frame's byte length"
+        );
+
+        let byhost = client_registry.byhost(true);
+        assert_eq!(byhost.len(), 1, "expected exactly one host aggregate");
+        assert_eq!(
+            byhost[0].2, expected_len,
+            "registry conn tx must reflect the initial-snapshot frame's byte length"
         );
     }
 
