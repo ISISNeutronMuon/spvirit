@@ -6,12 +6,14 @@
 //! server, which is exactly the contract `Source::put` already has.
 
 use crate::build::build_records;
+use crate::clock::{Clock, SystemClock};
 use crate::ctx::ProcCtx;
 use crate::fields::{record_field_kind, record_field_value};
 use crate::graph::DependencyGraph;
-use crate::lockset::RecordDb;
+use crate::lockset::{RecordDb, RecordId};
 use crate::model::{Field, Value};
 use crate::process::{process, write_field};
+use crate::scan::{ProcSink, ScanSpec, Scanner, parse_scan};
 use crate::spec::{RecordSpec, unmodelled_fields};
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::db::{DbRecord, load_db_records, parse_db_records};
@@ -19,6 +21,7 @@ use spvirit_server::field_provider::{
     RecordFieldDesc, RecordFieldProvider, resolve_field_info, resolve_field_payload,
 };
 use spvirit_server::monitor::MonitorRegistry;
+use spvirit_server::record_fields::parse_field_ref;
 use spvirit_server::pvstore::{PvInfo, Source, StoreSource};
 use spvirit_server::simple_store::descriptor_for_payload;
 use spvirit_types::{NtPayload, ScalarValue};
@@ -39,7 +42,17 @@ const SUBSCRIBER_QUEUE: usize = 64;
 /// method is the refusal, checked by the compiler; Python, which has no such
 /// check, raises with that same text from `Ioc.add_record`.
 pub struct IocSource {
-    db: RecordDb,
+    /// Shared with the [`Scanner`] so both serve the same records: the put
+    /// handler updates `Common.scan_raw`/`phas`/`evnt` through this handle and
+    /// the Scanner processes the very same lock sets. `Scanner::new` requires
+    /// `Arc<RecordDb>`; every `self.db.*` call reaches through the `Arc` deref
+    /// unchanged.
+    db: Arc<RecordDb>,
+    /// The single authority for scan-list membership. Writable SCAN/EVNT/PHAS
+    /// puts route add/remove calls here; egress/lifecycle wiring
+    /// (start/shutdown/load_from_db/real ProcSink) is deferred to Task 15, so
+    /// this Scanner is constructed with a no-op sink and never started here.
+    scanner: Arc<Scanner>,
     /// Each record's kind, by name. Lets `field_descriptor` answer a channel
     /// search without taking the record's lock set, which is the whole point
     /// of the `dbNameToAddr`/`dbGetField` split.
@@ -125,14 +138,23 @@ impl IocSource {
             .iter()
             .map(|r| (r.name.clone(), r.kind))
             .collect::<HashMap<_, _>>();
-        let db = RecordDb::build(records);
+        let db = Arc::new(RecordDb::build(records));
         let id_names = db
             .names()
             .into_iter()
             .filter_map(|name| db.lookup(&name).map(|id| (id, name)))
             .collect::<HashMap<_, _>>();
+        // The Scanner shares `db` so it processes the same records the source
+        // serves. In production SystemClock is correct; a no-op ProcSink is a
+        // placeholder until Task 15 wires the real egress. It is never started
+        // here, so no thread is spawned and no clock is ever read — Task 12
+        // exercises only clock-independent membership add/remove.
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let sink: Arc<dyn ProcSink> = Arc::new(NoopSink);
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink));
         let source = IocSource {
             db,
+            scanner,
             kinds,
             id_names,
             subscribers: Mutex::new(HashMap::new()),
@@ -291,6 +313,162 @@ impl IocSource {
             other => Err(format!("cannot write {other:?} to a record")),
         }
     }
+
+    /// Render a put value as the string a text field (`SCAN`, `EVNT`) stores.
+    /// A client writes these as strings; a non-string arrives rendered.
+    fn decoded_as_string(value: &DecodedValue) -> String {
+        match value {
+            DecodedValue::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// Parse a put value as the `i32` `PHAS` takes. Accepts the integer wire
+    /// types directly and a string (as a client-typed field write would send),
+    /// rejecting anything that is not a whole number.
+    fn decoded_as_i32(value: &DecodedValue) -> Result<i32, String> {
+        match value {
+            DecodedValue::Int32(v) => Ok(*v),
+            DecodedValue::Int16(v) => Ok(*v as i32),
+            DecodedValue::Int64(v) => Ok(*v as i32),
+            DecodedValue::UInt16(v) => Ok(*v as i32),
+            DecodedValue::String(s) => s
+                .trim()
+                .parse::<i32>()
+                .map_err(|_| format!("PHAS: '{s}' is not an integer")),
+            other => Err(format!("PHAS: cannot write {other:?}")),
+        }
+    }
+
+    /// Route a write to a *field* PV. Only `SCAN`, `EVNT`, and `PHAS` are
+    /// writable and reach the Scanner; every other field PV stays read-only.
+    ///
+    /// Called only once `resolve_field_info` has confirmed the name is a real
+    /// field PV, so `parse_field_ref` and the base lookup both succeed for a
+    /// modelled field — the fallbacks below are defensive, not reachable via
+    /// the normal `put` entry.
+    fn put_field_pv(
+        &self,
+        name: &str,
+        value: &DecodedValue,
+    ) -> Result<Vec<(String, NtPayload)>, String> {
+        let field_ref = parse_field_ref(name).ok_or_else(|| format!("no record named '{name}'"))?;
+        let id = self
+            .db
+            .lookup(&field_ref.base)
+            .ok_or_else(|| format!("no record named '{name}'"))?;
+        match field_ref.field.as_str() {
+            "SCAN" => self.put_scan(id, value),
+            "PHAS" => self.put_phas(id, value),
+            "EVNT" => self.put_evnt(id, value),
+            _ => Err(format!("field PV '{name}' is read-only")),
+        }
+    }
+
+    /// Apply a `SCAN` write. An unparseable value is rejected before anything
+    /// changes, so both `scan_raw` and list membership are left untouched. A
+    /// valid value updates `scan_raw`, drops the record from every scan list,
+    /// then re-adds it per the new [`ScanSpec`]. `IoIntr` is never auto-added
+    /// (binding is explicit registration only, Task 11); `Passive` stays off
+    /// every list.
+    fn put_scan(
+        &self,
+        id: RecordId,
+        value: &DecodedValue,
+    ) -> Result<Vec<(String, NtPayload)>, String> {
+        let raw = Self::decoded_as_string(value);
+        // Parse first: an error here must leave membership unchanged.
+        let spec = parse_scan(&raw).map_err(|e| e.to_string())?;
+        // Take the lock only to read PHAS/EVNT and update scan_raw, then drop
+        // it before any Scanner call — the Scanner takes its own list locks and
+        // must never be called while the record lock set is held.
+        let (phas, evnt) = self.db.with_set(id.set, |set| {
+            let c = &mut set.get_mut(id).common;
+            c.scan_raw = raw;
+            (c.phas, c.evnt.clone())
+        });
+        self.scanner.remove_periodic(id);
+        self.scanner.remove_event(id);
+        self.scanner.unregister_io_intr(id);
+        match spec {
+            ScanSpec::Periodic(period) => self.scanner.add_periodic(id, phas, period),
+            ScanSpec::Event => self.scanner.add_event(id, phas, evnt),
+            // Explicit registration only (Task 11): a SCAN write never binds an
+            // I/O-Intr record to a source.
+            ScanSpec::IoIntr => {}
+            // Off every list.
+            ScanSpec::Passive => {}
+        }
+        Ok(Vec::new())
+    }
+
+    /// Apply a `PHAS` write. An unparseable value is rejected. On success the
+    /// new priority is stored and the record is re-inserted into whichever
+    /// scan list its current `SCAN` puts it on, so the list re-orders in place
+    /// (`ScanList::insert` updates an existing member's PHAS). An I/O-Intr
+    /// record cannot be re-ordered from here — its source key is unknown to
+    /// the put path — so its PHAS is stored but its list order is left to the
+    /// next explicit `register_io_intr`.
+    fn put_phas(
+        &self,
+        id: RecordId,
+        value: &DecodedValue,
+    ) -> Result<Vec<(String, NtPayload)>, String> {
+        let phas = Self::decoded_as_i32(value)?;
+        let (spec, evnt) = self.db.with_set(id.set, |set| {
+            let c = &mut set.get_mut(id).common;
+            c.phas = phas;
+            (parse_scan(&c.scan_raw), c.evnt.clone())
+        });
+        // A record whose stored SCAN no longer parses is on no list; nothing to
+        // re-order.
+        if let Ok(spec) = spec {
+            match spec {
+                ScanSpec::Periodic(period) => self.scanner.add_periodic(id, phas, period),
+                ScanSpec::Event => self.scanner.add_event(id, phas, evnt),
+                ScanSpec::IoIntr | ScanSpec::Passive => {}
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Apply an `EVNT` write. The value is always stored. If the record's
+    /// `SCAN` is `Event`, it is moved off its old event list and onto the one
+    /// keyed by the new value.
+    fn put_evnt(
+        &self,
+        id: RecordId,
+        value: &DecodedValue,
+    ) -> Result<Vec<(String, NtPayload)>, String> {
+        let evnt = Self::decoded_as_string(value);
+        let (spec, phas) = self.db.with_set(id.set, |set| {
+            let c = &mut set.get_mut(id).common;
+            c.evnt = evnt.clone();
+            (parse_scan(&c.scan_raw), c.phas)
+        });
+        if let Ok(ScanSpec::Event) = spec {
+            // `remove_event` clears the old key; `add_event` joins the new one.
+            self.scanner.remove_event(id);
+            self.scanner.add_event(id, phas, evnt);
+        }
+        Ok(Vec::new())
+    }
+
+    /// Reach the source's [`Scanner`] so a test can assert list membership
+    /// after a put (membership is not observable from `Common`).
+    #[cfg(test)]
+    pub fn scanner_for_test(&self) -> &Arc<Scanner> {
+        &self.scanner
+    }
+}
+
+/// A placeholder [`ProcSink`] for the source-owned Scanner. The Scanner's real
+/// egress (forwarding processed monitors into the server fan-out) is wired in
+/// Task 15; until then it is never started, so this sink is never called.
+struct NoopSink;
+
+impl ProcSink for NoopSink {
+    fn flush(&self, _events: Vec<(String, NtPayload)>, _trace: Vec<String>) {}
 }
 
 impl RecordFieldProvider for IocSource {
@@ -381,8 +559,10 @@ impl Source for IocSource {
         Box::pin(async move {
             let id = match self.db.lookup(&name) {
                 Some(id) => id,
+                // A field PV: SCAN/EVNT/PHAS are writable and route into the
+                // Scanner; every other field PV stays read-only.
                 None if resolve_field_info(self, &name).await.is_some() => {
-                    return Err(format!("field PV '{name}' is read-only"));
+                    return self.put_field_pv(&name, &value);
                 }
                 None => return Err(format!("no record named '{name}'")),
             };
@@ -567,6 +747,199 @@ mod tests {
             len <= 1,
             "field_subs must stay bounded under churn (an append-only Vec would \
              hold 100 here), got {len}"
+        );
+    }
+
+    // ----- Task 12: writable SCAN/EVNT/PHAS routed into the Scanner -----
+
+    use std::time::Duration;
+
+    fn s(v: &str) -> DecodedValue {
+        DecodedValue::String(v.to_string())
+    }
+
+    #[tokio::test]
+    async fn writing_scan_moves_the_record_between_lists() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        let id = source.db.lookup("PV:A").expect("record exists");
+        // Passive by default: on no periodic list.
+        assert!(source
+            .scanner_for_test()
+            .periodic_members(Duration::from_secs(1))
+            .is_empty());
+        Source::put(&source, "PV:A.SCAN", &s("1 second"))
+            .await
+            .expect("SCAN put succeeds");
+        assert_eq!(
+            source.scanner_for_test().periodic_members(Duration::from_secs(1)),
+            vec![id],
+            "the record must now be on the 1 Hz periodic list"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_passive_takes_the_record_off_every_list() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        let id = source.db.lookup("PV:A").expect("record exists");
+        Source::put(&source, "PV:A.SCAN", &s("1 second")).await.expect("put");
+        assert_eq!(
+            source.scanner_for_test().periodic_members(Duration::from_secs(1)),
+            vec![id]
+        );
+        Source::put(&source, "PV:A.SCAN", &s("Passive")).await.expect("put");
+        assert!(
+            source
+                .scanner_for_test()
+                .periodic_members(Duration::from_secs(1))
+                .is_empty(),
+            "Passive must take the record off the periodic list"
+        );
+    }
+
+    #[tokio::test]
+    async fn unparseable_scan_is_rejected_and_membership_unchanged() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        let id = source.db.lookup("PV:A").expect("record exists");
+        Source::put(&source, "PV:A.SCAN", &s("1 second")).await.expect("put");
+        let err = Source::put(&source, "PV:A.SCAN", &s("banana"))
+            .await
+            .expect_err("an unparseable SCAN must be rejected");
+        assert!(err.contains("banana"), "error must name the bad value, got: {err}");
+        // Membership is untouched: still on the 1 Hz list.
+        assert_eq!(
+            source.scanner_for_test().periodic_members(Duration::from_secs(1)),
+            vec![id]
+        );
+        // And scan_raw is untouched too.
+        assert_eq!(
+            source.field_value("PV:A", "SCAN").await,
+            Some(ScalarValue::Str("1 second".into())),
+            "a rejected SCAN put must not have altered scan_raw"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_phas_reorders_the_list() {
+        let source = IocSource::from_raw(vec![
+            raw_with_field("PV:A", "ai", "EGU", "C"),
+            raw_with_field("PV:B", "ai", "EGU", "C"),
+        ])
+        .expect("build");
+        let a = source.db.lookup("PV:A").expect("A");
+        let b = source.db.lookup("PV:B").expect("B");
+        Source::put(&source, "PV:A.SCAN", &s("1 second")).await.expect("put");
+        Source::put(&source, "PV:B.SCAN", &s("1 second")).await.expect("put");
+        // Both PHAS 0: insertion order A, B.
+        assert_eq!(
+            source.scanner_for_test().periodic_members(Duration::from_secs(1)),
+            vec![a, b]
+        );
+        // Raise A's PHAS: B (still 0) must now sort ahead of A.
+        Source::put(&source, "PV:A.PHAS", &DecodedValue::Int32(5)).await.expect("put");
+        assert_eq!(
+            source.scanner_for_test().periodic_members(Duration::from_secs(1)),
+            vec![b, a],
+            "a PHAS write must re-order the list in place"
+        );
+        // And the stored PHAS reads back.
+        assert_eq!(source.field_value("PV:A", "PHAS").await, Some(ScalarValue::I32(5)));
+    }
+
+    #[tokio::test]
+    async fn unparseable_phas_is_rejected_and_membership_unchanged() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        let id = source.db.lookup("PV:A").expect("record exists");
+        Source::put(&source, "PV:A.SCAN", &s("1 second")).await.expect("put");
+        let err = Source::put(&source, "PV:A.PHAS", &s("not-a-number"))
+            .await
+            .expect_err("an unparseable PHAS must be rejected");
+        assert!(!err.is_empty(), "must return a non-empty error");
+        assert_eq!(
+            source.scanner_for_test().periodic_members(Duration::from_secs(1)),
+            vec![id],
+            "a rejected PHAS put must not change membership"
+        );
+        assert_eq!(source.field_value("PV:A", "PHAS").await, Some(ScalarValue::I32(0)));
+    }
+
+    #[tokio::test]
+    async fn writing_evnt_moves_the_event_list_membership() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        let id = source.db.lookup("PV:A").expect("record exists");
+        Source::put(&source, "PV:A.EVNT", &s("a")).await.expect("put");
+        Source::put(&source, "PV:A.SCAN", &s("Event")).await.expect("put");
+        assert_eq!(source.scanner_for_test().event_members("a"), vec![id]);
+        assert!(source.scanner_for_test().event_members("b").is_empty());
+        // Move the record to a new event list by re-writing EVNT.
+        Source::put(&source, "PV:A.EVNT", &s("b")).await.expect("put");
+        assert!(
+            source.scanner_for_test().event_members("a").is_empty(),
+            "the record must leave its old event list"
+        );
+        assert_eq!(
+            source.scanner_for_test().event_members("b"),
+            vec![id],
+            "the record must join the new event list"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_evnt_does_not_join_a_list_when_scan_is_not_event() {
+        // A Passive record's EVNT is stored but joins no event list.
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        Source::put(&source, "PV:A.EVNT", &s("a")).await.expect("put");
+        assert!(source.scanner_for_test().event_members("a").is_empty());
+        assert_eq!(source.field_value("PV:A", "EVNT").await, Some(ScalarValue::Str("a".into())));
+    }
+
+    #[tokio::test]
+    async fn evnt_field_reads_back_the_stored_value() {
+        // Loaded from the .db, then updated by a put.
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EVNT", "seven")]).expect("build");
+        assert_eq!(
+            source.field_value("PV:A", "EVNT").await,
+            Some(ScalarValue::Str("seven".into())),
+            "EVNT must be read back from the .db-loaded value"
+        );
+        Source::put(&source, "PV:A.EVNT", &s("eight")).await.expect("put");
+        assert_eq!(
+            source.field_value("PV:A", "EVNT").await,
+            Some(ScalarValue::Str("eight".into())),
+            "EVNT must reflect the written value"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_writable_field_pv_is_still_read_only() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        let err = Source::put(&source, "PV:A.EGU", &s("V"))
+            .await
+            .expect_err("EGU must stay read-only");
+        assert!(err.contains("read-only"), "got: {err}");
+    }
+
+    /// An unmodelled field on a real record is not a field PV at all: the
+    /// `resolve_field_info` guard in `put` must reject it as "no record named"
+    /// rather than falling into the field-PV path and mislabelling it
+    /// read-only. Kills the mutant that replaces that match guard with `true`.
+    #[tokio::test]
+    async fn an_unmodelled_field_is_not_treated_as_a_field_pv() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        let err = Source::put(&source, "PV:A.NOTAFIELD", &s("x"))
+            .await
+            .expect_err("an unmodelled field must be rejected");
+        assert!(
+            err.contains("no record named"),
+            "an unmodelled field must not be treated as a (read-only) field PV, got: {err}"
         );
     }
 }

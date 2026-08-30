@@ -215,6 +215,7 @@ fn build_one(raw: &DbRecord) -> Result<Record, BuildError> {
             .get("SCAN")
             .cloned()
             .unwrap_or_else(|| "Passive".to_string()),
+        evnt: f.get("EVNT").cloned().unwrap_or_default(),
         pini: matches!(
             f.get("PINI")
                 .map(|s| s.trim().to_ascii_uppercase())

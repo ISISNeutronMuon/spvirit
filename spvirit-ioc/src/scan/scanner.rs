@@ -493,6 +493,43 @@ impl Scanner {
     }
 }
 
+#[cfg(test)]
+impl Scanner {
+    /// The processing order of the periodic list for `period`, or empty if
+    /// there is no such list. Test-only observability for Task 12's put
+    /// routing, which drives membership but cannot read it back from `Common`.
+    pub fn periodic_members(&self, period: Duration) -> Vec<RecordId> {
+        let key = period.as_nanos() as u64;
+        self.periodic
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|l| l.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// The processing order of the event list keyed by `event`, or empty.
+    pub fn event_members(&self, event: &str) -> Vec<RecordId> {
+        self.events
+            .lock()
+            .unwrap()
+            .get(event)
+            .map(|l| l.snapshot())
+            .unwrap_or_default()
+    }
+
+    /// The processing order of the I/O-interrupt list keyed by `source`, or
+    /// empty.
+    pub fn io_intr_members(&self, source: &str) -> Vec<RecordId> {
+        self.io_intr
+            .lock()
+            .unwrap()
+            .get(source)
+            .map(|l| l.snapshot())
+            .unwrap_or_default()
+    }
+}
+
 impl EventSink for Scanner {
     /// Drives an event-scan list from the server's named-event fan-out
     /// (`Events::post`). The returned future does purely synchronous work

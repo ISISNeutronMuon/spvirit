@@ -175,6 +175,11 @@ pub struct Common {
     /// The raw `SCAN` string. A does not act on it — sub-project B does —
     /// but the graph checks need to know whether a record is Passive.
     pub scan_raw: String,
+    /// The raw `EVNT` string: the event name an `SCAN="Event"` record joins.
+    /// Empty for every record that is not event-scanned. The put handler in
+    /// `source.rs` is the only writer; the `Scanner` keys its event lists by
+    /// this string.
+    pub evnt: String,
     pub pini: bool,
     pub phas: i32,
     pub pact: bool,
@@ -202,6 +207,7 @@ impl Default for Common {
         Common {
             desc: String::new(),
             scan_raw: "Passive".to_string(),
+            evnt: String::new(),
             pini: false,
             phas: 0,
             pact: false,
