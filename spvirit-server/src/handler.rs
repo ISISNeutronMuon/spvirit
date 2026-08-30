@@ -102,6 +102,13 @@ pub struct ServerState {
     /// against a field already in scope, matching how `cleanup_connection`
     /// (which lives on `MonitorRegistry` itself) reads it directly there.
     pub client_registry: Option<Arc<crate::diag::ClientRegistry>>,
+    /// The diagnostic [`BandwidthCounters`](crate::diag::BandwidthCounters)
+    /// to record wire bytes into, if one was installed on `registry` (via
+    /// [`MonitorRegistry::set_bandwidth_counters`]) before this state was
+    /// built. Captured here for the same reason as `client_registry`: the
+    /// read loop's byte-counting call sites (Task 9) get a plain
+    /// `if let Some(...)` against a field already in scope.
+    pub bandwidth_counters: Option<Arc<crate::diag::BandwidthCounters>>,
 }
 
 impl ServerState {
@@ -118,6 +125,7 @@ impl ServerState {
         listen_ip: IpAddr,
     ) -> Self {
         let client_registry = registry.client_registry();
+        let bandwidth_counters = registry.bandwidth_counters();
         Self {
             sources,
             registry,
@@ -132,6 +140,7 @@ impl ServerState {
             advertise_ip,
             listen_ip,
             client_registry,
+            bandwidth_counters,
         }
     }
 }

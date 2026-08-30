@@ -36,6 +36,14 @@ pub struct MonitorRegistry {
     /// `tokio::sync::Mutex` used elsewhere in this struct) because it's only
     /// ever held across a clone/assign, never across an `.await`.
     client_registry: std::sync::Mutex<Option<Arc<crate::diag::ClientRegistry>>>,
+    /// The diagnostic [`BandwidthCounters`](crate::diag::BandwidthCounters)
+    /// this registry's connection handler and monitor dispatch should record
+    /// wire bytes into, if one was installed via
+    /// [`Self::set_bandwidth_counters`]. `None` for servers that don't opt
+    /// into bandwidth accounting. A plain `std::sync::Mutex` for the same
+    /// reason as `client_registry`: only ever held across a clone/assign,
+    /// never across an `.await`.
+    bandwidth_counters: std::sync::Mutex<Option<Arc<crate::diag::BandwidthCounters>>>,
 }
 
 /// A pump task plus its cooperative-shutdown signal.
@@ -56,6 +64,7 @@ impl MonitorRegistry {
             conns: Mutex::new(HashMap::new()),
             pumps: Mutex::new(HashMap::new()),
             client_registry: std::sync::Mutex::new(None),
+            bandwidth_counters: std::sync::Mutex::new(None),
         }
     }
 
@@ -72,6 +81,22 @@ impl MonitorRegistry {
     /// The installed diagnostic client registry, if any.
     pub fn client_registry(&self) -> Option<Arc<crate::diag::ClientRegistry>> {
         self.client_registry.lock().unwrap().clone()
+    }
+
+    /// Install the diagnostic
+    /// [`BandwidthCounters`](crate::diag::BandwidthCounters) that this
+    /// registry's connection handler and monitor dispatch should record wire
+    /// bytes into. Threaded down from
+    /// `PvaServerBuilder::bandwidth_counters` via
+    /// `PvaServer::resolved_monitor_registry`, which calls this every time it
+    /// resolves the registry — so it's safe to call more than once.
+    pub fn set_bandwidth_counters(&self, counters: Arc<crate::diag::BandwidthCounters>) {
+        *self.bandwidth_counters.lock().unwrap() = Some(counters);
+    }
+
+    /// The installed diagnostic bandwidth counters, if any.
+    pub fn bandwidth_counters(&self) -> Option<Arc<crate::diag::BandwidthCounters>> {
+        self.bandwidth_counters.lock().unwrap().clone()
     }
 
     /// Ensure a single pump task is draining `rx` (a subscribe-only source's

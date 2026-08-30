@@ -76,6 +76,7 @@ pub struct PvaServerBuilder {
     guid: Option<[u8; 12]>,
     discovery_parity: bool,
     client_registry: Option<Arc<crate::diag::ClientRegistry>>,
+    bandwidth_counters: Option<Arc<crate::diag::BandwidthCounters>>,
 }
 
 impl PvaServerBuilder {
@@ -103,6 +104,7 @@ impl PvaServerBuilder {
             guid: None,
             discovery_parity: true,
             client_registry: None,
+            bandwidth_counters: None,
         }
     }
 
@@ -640,6 +642,21 @@ impl PvaServerBuilder {
         self
     }
 
+    /// Install a diagnostic
+    /// [`BandwidthCounters`](crate::diag::BandwidthCounters) that the
+    /// connection handler and monitor registry record wire bytes into, for
+    /// the gateway's per-PV and per-host bandwidth accounting.
+    ///
+    /// Threaded onto the resolved [`MonitorRegistry`] (and, from there, onto
+    /// [`crate::handler::ServerState`]) the first time the registry is
+    /// resolved — see [`PvaServer::resolved_monitor_registry`]. Not set by
+    /// default: servers that don't need bandwidth accounting pay nothing for
+    /// it.
+    pub fn bandwidth_counters(mut self, c: Arc<crate::diag::BandwidthCounters>) -> Self {
+        self.bandwidth_counters = Some(c);
+        self
+    }
+
     /// Enable alarm computation from limits.
     pub fn compute_alarms(mut self, enabled: bool) -> Self {
         self.compute_alarms = enabled;
@@ -773,6 +790,7 @@ impl PvaServerBuilder {
             events,
             start_hooks: self.start_hooks,
             client_registry: self.client_registry,
+            bandwidth_counters: self.bandwidth_counters,
         }
     }
 }
@@ -833,6 +851,9 @@ pub struct PvaServer {
     /// Set via [`PvaServerBuilder::client_registry`]; installed onto the
     /// resolved [`MonitorRegistry`] in [`Self::resolved_monitor_registry`].
     client_registry: Option<Arc<crate::diag::ClientRegistry>>,
+    /// Set via [`PvaServerBuilder::bandwidth_counters`]; installed onto the
+    /// resolved [`MonitorRegistry`] in [`Self::resolved_monitor_registry`].
+    bandwidth_counters: Option<Arc<crate::diag::BandwidthCounters>>,
 }
 
 impl PvaServer {
@@ -984,6 +1005,9 @@ impl PvaServer {
         // `serve_after_start_hooks` builds the `ServerState`.
         if let Some(cr) = &self.client_registry {
             registry.set_client_registry(cr.clone());
+        }
+        if let Some(bw) = &self.bandwidth_counters {
+            registry.set_bandwidth_counters(bw.clone());
         }
         registry
     }
@@ -1638,6 +1662,27 @@ mod tests {
             Arc::ptr_eq(&installed, &cr),
             "the exact ClientRegistry passed to the builder must be the one installed"
         );
+    }
+
+    #[tokio::test]
+    async fn builder_bandwidth_counters_is_threaded_onto_the_monitor_registry() {
+        let bw = Arc::new(crate::diag::BandwidthCounters::new());
+        let mut server = PvaServer::builder().bandwidth_counters(bw.clone()).build();
+        let mon = server.monitor_registry();
+        let installed = mon
+            .bandwidth_counters()
+            .expect("bandwidth_counters must be installed on the resolved MonitorRegistry");
+        assert!(
+            Arc::ptr_eq(&installed, &bw),
+            "the exact BandwidthCounters passed to the builder must be the one installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_without_bandwidth_counters_leaves_it_none() {
+        let mut server = PvaServer::builder().build();
+        let mon = server.monitor_registry();
+        assert!(mon.bandwidth_counters().is_none());
     }
 
     #[tokio::test]
