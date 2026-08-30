@@ -42,6 +42,22 @@ pub struct Scanner {
     /// synchronously (on the caller's thread) by [`Self::fire_event`], never
     /// spawned onto a background thread the way periodic lists are.
     events: Mutex<HashMap<String, ScanList>>,
+    /// I/O-interrupt scan lists, keyed by a source name. Fired synchronously
+    /// (on the caller's thread) by [`Self::scan_io_request`], mirroring
+    /// `events`/`fire_event` exactly.
+    ///
+    /// **Divergence from Base.** Real EPICS binds an "I/O Intr" record to a
+    /// source through its `.db` link/device-support pair (the device support
+    /// registers the record with the driver's interrupt callback at
+    /// `init_record` time). This codebase has no `.db` field naming an I/O
+    /// source and no device-support layer to do that registration
+    /// automatically, so binding here is explicit: Rust driver code calls
+    /// [`Self::register_io_intr`] directly with the source name. A `.db`
+    /// record with `SCAN="I/O Intr"` that nothing ever registers simply sits
+    /// inert -- it is only ever processed once some driver registers it and
+    /// later calls [`Self::scan_io_request`] -- which faithfully mirrors a
+    /// Base I/O-Intr record with no device support attached.
+    io_intr: Mutex<HashMap<String, ScanList>>,
     stop: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// Sender end of the bounded `scan_once` queue. `None` once `shutdown()`
@@ -69,6 +85,7 @@ impl Scanner {
             sink,
             periodic: Mutex::new(HashMap::new()),
             events: Mutex::new(HashMap::new()),
+            io_intr: Mutex::new(HashMap::new()),
             stop: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
             scan_once_tx: Mutex::new(Some(tx)),
@@ -215,6 +232,40 @@ impl Scanner {
                 .lock()
                 .unwrap()
                 .get(event)
+                .map(|l| l.snapshot())
+                .unwrap_or_default()
+        };
+        self.process_ids(&ids);
+    }
+
+    /// Register `id` (with scan priority `phas`) on the I/O-interrupt scan
+    /// list keyed by `source`. See the divergence note on the `io_intr`
+    /// field: there is no `.db`-driven binding, so a driver must call this
+    /// explicitly (typically at driver-init time) before
+    /// [`Self::scan_io_request`] will ever reach `id`.
+    pub fn register_io_intr(&self, id: RecordId, phas: i32, source: impl Into<String>) {
+        self.io_intr.lock().unwrap().entry(source.into()).or_default().insert(id, phas);
+    }
+
+    /// Remove `id` from every I/O-interrupt scan list it belongs to.
+    pub fn unregister_io_intr(&self, id: RecordId) {
+        let mut io_intr = self.io_intr.lock().unwrap();
+        for list in io_intr.values_mut() {
+            list.remove(id);
+        }
+    }
+
+    /// A driver's interrupt callback for `source`: snapshot the source's
+    /// I/O-interrupt scan list (lock/clone/unlock), then run `process_ids`
+    /// in PHAS order on the caller's thread -- mirroring [`Self::fire_event`]
+    /// exactly, including never holding the `io_intr` lock across
+    /// `process_ids`. An unknown source is a no-op.
+    pub fn scan_io_request(&self, source: &str) {
+        let ids = {
+            self.io_intr
+                .lock()
+                .unwrap()
+                .get(source)
                 .map(|l| l.snapshot())
                 .unwrap_or_default()
         };
@@ -1025,6 +1076,41 @@ mod tests {
         scanner.add_event(a, 0, "shutter".into());
         scanner.remove_event(a);
         scanner.fire_event("shutter");
+        assert!(sink.posted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_io_request_processes_registered_records_in_phas_order() {
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n\
+             record(ai, \"PV:B\") {\n field(INP, \"2\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let (a, b) = (db.lookup("PV:A").unwrap(), db.lookup("PV:B").unwrap());
+        scanner.register_io_intr(a, 1, "motor0");
+        scanner.register_io_intr(b, 0, "motor0");
+        scanner.scan_io_request("motor0");
+        assert_eq!(*sink.posted.lock().unwrap(), vec!["PV:B".to_string(), "PV:A".to_string()]);
+    }
+
+    #[test]
+    fn scan_io_request_for_unknown_source_is_a_noop() {
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Scanner::new(db, clock, sink.clone());
+        scanner.scan_io_request("ghost");
+        assert!(sink.posted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unregister_io_intr_stops_further_fires() {
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Scanner::new(db.clone(), clock, sink.clone());
+        let a = db.lookup("PV:A").unwrap();
+        scanner.register_io_intr(a, 0, "motor0");
+        scanner.unregister_io_intr(a);
+        scanner.scan_io_request("motor0");
         assert!(sink.posted.lock().unwrap().is_empty());
     }
 
