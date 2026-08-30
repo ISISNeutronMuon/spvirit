@@ -133,6 +133,69 @@ impl Default for ClientRegistry {
     }
 }
 
+/// A per-key cumulative byte counter.
+pub struct ByteMap {
+    counts: Mutex<HashMap<String, u64>>,
+}
+
+impl ByteMap {
+    pub fn new() -> Self {
+        Self {
+            counts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Add `n` bytes to the counter for `key`, creating it if absent.
+    pub fn add(&self, key: &str, n: u64) {
+        let mut counts = self.counts.lock().unwrap();
+        *counts.entry(key.to_string()).or_insert(0) += n;
+    }
+
+    /// Snapshot all key/count pairs.
+    pub fn snapshot(&self) -> Vec<(String, u64)> {
+        let counts = self.counts.lock().unwrap();
+        counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+}
+
+impl Default for ByteMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Cumulative wire-byte counters, keyed by PV name or by host, split by
+/// downstream (ds, gateway-to-client) and upstream (us, gateway-to-IOC)
+/// direction. `ds_byhost_{tx,rx}` are NOT here — they are derived from
+/// `ClientRegistry::byhost(..)`; do not add fields for them here.
+pub struct BandwidthCounters {
+    pub ds_bypv_tx: ByteMap,
+    pub ds_bypv_rx: ByteMap,
+    pub us_bypv_tx: ByteMap,
+    pub us_bypv_rx: ByteMap,
+    pub us_byhost_tx: ByteMap,
+    pub us_byhost_rx: ByteMap,
+}
+
+impl BandwidthCounters {
+    pub fn new() -> Self {
+        Self {
+            ds_bypv_tx: ByteMap::new(),
+            ds_bypv_rx: ByteMap::new(),
+            us_bypv_tx: ByteMap::new(),
+            us_bypv_rx: ByteMap::new(),
+            us_byhost_tx: ByteMap::new(),
+            us_byhost_rx: ByteMap::new(),
+        }
+    }
+}
+
+impl Default for BandwidthCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +247,25 @@ mod tests {
         assert_eq!(account, "bob");
         assert_eq!(client_ip, &ip.to_string());
         assert_eq!(*bytes, 150);
+    }
+
+    #[test]
+    fn bytemap_add_and_snapshot() {
+        let m = ByteMap::new();
+        m.add("PV:A", 10);
+        m.add("PV:A", 5);
+        m.add("PV:B", 3);
+        let mut s = m.snapshot();
+        s.sort();
+        assert_eq!(s, vec![("PV:A".to_string(), 15), ("PV:B".to_string(), 3)]);
+    }
+
+    #[test]
+    fn bandwidth_counters_have_all_six_bytemaps() {
+        let c = BandwidthCounters::new();
+        c.ds_bypv_tx.add("P", 1);
+        c.us_byhost_rx.add("H", 2);
+        assert_eq!(c.ds_bypv_tx.snapshot(), vec![("P".to_string(), 1)]);
+        assert_eq!(c.us_byhost_rx.snapshot(), vec![("H".to_string(), 2)]);
     }
 }
