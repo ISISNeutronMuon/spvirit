@@ -57,10 +57,9 @@ const TICK_PERIOD: Duration = Duration::from_secs(1);
 /// system clock is set before the UNIX epoch, which never happens in
 /// practice but keeps this infallible.
 ///
-/// Not yet called from `value_payload`/`subscribe` — wiring status PVs to
-/// stamp with a real time is a follow-up task; this and [`stamp`] land first
-/// so that task is a pure call-site change.
-#[allow(dead_code)]
+/// Called from `get` (stamped at read time) and the `subscribe` LIVE ticker
+/// (stamped at the moment a change is detected, so the timestamp reflects
+/// last-change time, not last-poll time) — see [`stamp`].
 fn now_ts() -> NtTimeStamp {
     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     NtTimeStamp {
@@ -79,7 +78,6 @@ fn now_ts() -> NtTimeStamp {
 ///   (`secondsPastEpoch`/`nanoseconds`) in place.
 /// - [`NtPayload::NdArray`]/[`NtPayload::Enum`]: not used by any status PV
 ///   today, so left untouched.
-#[allow(dead_code)]
 fn stamp(payload: &mut NtPayload, ts: NtTimeStamp) {
     match payload {
         NtPayload::Scalar(nt) => nt.time_stamp = Some(ts),
@@ -515,7 +513,15 @@ impl Source for StatusSource {
             if !LIVE.contains(&suffix) && !STATIC_ZERO.contains(&suffix) && suffix != "threads" {
                 return None;
             }
-            Self::value_payload(suffix, &self.handles, &self.generation)
+            let mut payload = Self::value_payload(suffix, &self.handles, &self.generation)?;
+            // Stamp with the current time at read time — `clients`/`cache`/
+            // `refs`/`stats`/`poke`/`threads` only. The bandwidth suffixes
+            // (`STATIC_ZERO`) are left untouched here; Task 13 moves them to
+            // LIVE and stamps them from a sampler.
+            if LIVE.contains(&suffix) || suffix == "threads" {
+                stamp(&mut payload, now_ts());
+            }
+            Some(payload)
         })
     }
 
@@ -567,19 +573,37 @@ impl Source for StatusSource {
                 let generation = self.generation.clone();
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(TICK_PERIOD);
+                    // `last` holds the last UNSTAMPED data payload — the
+                    // change-detection key — so a stamp (which always
+                    // differs, since it carries "now") never itself looks
+                    // like a data change. `last_ts` only advances when the
+                    // data actually changes, so the timestamp reflects
+                    // last-change time, not last-poll time.
+                    let mut last: Option<NtPayload> = None;
+                    // Not read until the `if` branch below writes it first
+                    // (always true on the first tick, since `last` starts
+                    // `None`), so no placeholder value is needed here.
+                    let mut last_ts: NtTimeStamp;
                     loop {
                         interval.tick().await;
-                        let Some(payload) = Self::value_payload(&suffix, &handles, &generation)
+                        let Some(data) = Self::value_payload(&suffix, &handles, &generation)
                         else {
                             break;
                         };
-                        // The value is re-read every tick; the server's monitor
-                        // pump suppresses byte-identical frames, so a client
-                        // sees a new frame only when the underlying list/gauge
-                        // actually changes — matching p4p's post-on-change.
-                        if tx.send(payload).await.is_err() {
-                            // Receiver dropped: stop ticking, don't leak the task.
-                            break;
+                        if last.as_ref() != Some(&data) {
+                            last_ts = now_ts();
+                            last = Some(data.clone());
+                            let mut out = data;
+                            stamp(&mut out, last_ts.clone());
+                            // The server's monitor pump suppresses
+                            // byte-identical frames, but we already only
+                            // send on a genuine data change — matching
+                            // p4p's post-on-change without relying on the
+                            // pump for de-dup here.
+                            if tx.send(out).await.is_err() {
+                                // Receiver dropped: stop ticking, don't leak the task.
+                                break;
+                            }
                         }
                     }
                 });
@@ -593,7 +617,9 @@ impl Source for StatusSource {
                 });
             } else if suffix == "threads" {
                 tokio::spawn(async move {
-                    let _ = tx.send(Self::threads_static_value()).await;
+                    let mut out = Self::threads_static_value();
+                    stamp(&mut out, now_ts());
+                    let _ = tx.send(out).await;
                     // Emit the static "RPC only" string once, then let `tx`
                     // drop. p4p's `threads` SharedPV value never changes (its
                     // RPC handler returns via `op.done` and never posts), so
@@ -881,20 +907,71 @@ mod tests {
 
         let mut rx = src.subscribe(&format!("{PREFIX}cache")).await.expect("subscribe");
 
-        // A fresh interval's first tick completes immediately.
+        // A fresh interval's first tick completes immediately. The ticker now
+        // stamps the outgoing frame with `now()`, so compare only the
+        // (unstamped) `value` field against the expected payload — the
+        // timestamp is checked separately.
         let first = rx.recv().await.expect("first frame");
-        assert_eq!(first, StatusSource::string_array_payload(vec![]));
+        let NtPayload::ScalarArray(a1) = &first else { panic!("cache must be a ScalarArray") };
+        assert_eq!(a1.value, ScalarArrayValue::Str(vec![]));
+        assert!(a1.time_stamp.seconds_past_epoch > 1_577_836_800, "get is stamped with now()");
 
         // Change the underlying value, then let one tick period elapse.
         list.lock().unwrap().push("UP:CHAN".to_string());
         tokio::time::advance(TICK_PERIOD).await;
 
         let second = rx.recv().await.expect("second frame");
-        assert_eq!(
-            second,
-            StatusSource::string_array_payload(vec!["UP:CHAN".to_string()])
-        );
+        let NtPayload::ScalarArray(a2) = &second else { panic!("cache must be a ScalarArray") };
+        assert_eq!(a2.value, ScalarArrayValue::Str(vec!["UP:CHAN".to_string()]));
         assert_ne!(first, second, "a changed value must produce a different frame");
+    }
+
+    /// `get` stamps the payload with `now()` at read time — closes the "1990
+    /// timestamp" bug for a plain (non-ticker) read.
+    #[tokio::test]
+    async fn get_clients_is_stamped_non_zero() {
+        let src = source(false);
+        let p = src.get(&format!("{PREFIX}clients")).await.expect("get");
+        let NtPayload::ScalarArray(a) = p else { panic!("clients must be a ScalarArray") };
+        assert!(a.time_stamp.seconds_past_epoch > 1_577_836_800, "get is stamped with now()");
+    }
+
+    /// The ticker's change-tracked stamp: an unchanged tick must NOT emit a
+    /// new frame (the unstamped data payload is the dedup key, so a fresh
+    /// `now()` stamp alone never forces a send); a changed tick emits a new
+    /// frame stamped with a `last_ts` that only advances on change.
+    #[tokio::test(start_paused = true)]
+    async fn ticker_stamp_advances_only_when_data_changes() {
+        let list = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let src = source_with_cache(list.clone());
+        let mut rx = src.subscribe(&format!("{PREFIX}cache")).await.expect("subscribe");
+
+        let f1 = rx.recv().await.expect("frame 1");
+        let NtPayload::ScalarArray(a1) = &f1 else { panic!("cache must be a ScalarArray") };
+        assert!(a1.time_stamp.seconds_past_epoch > 1_577_836_800, "stamped now");
+
+        // No data change across a tick -> the ticker must NOT emit a new
+        // frame. Yield a few times after advancing so the spawned ticker
+        // task actually gets polled (and decides not to send) before we
+        // assert the channel is empty.
+        tokio::time::advance(TICK_PERIOD).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "unchanged data must not produce a new frame"
+        );
+
+        // Now change the data and let a tick elapse -> a new, stamped frame
+        // whose timestamp has advanced (or stayed equal, if within the same
+        // wall-clock second).
+        list.lock().unwrap().push("UP:CHAN".into());
+        tokio::time::advance(TICK_PERIOD).await;
+        let f2 = rx.recv().await.expect("frame 2 (data changed)");
+        let NtPayload::ScalarArray(a2) = &f2 else { panic!("cache must be a ScalarArray") };
+        assert!(a2.time_stamp.seconds_past_epoch >= a1.time_stamp.seconds_past_epoch);
+        assert_eq!(a2.value, ScalarArrayValue::Str(vec!["UP:CHAN".into()]));
     }
 
     /// p4p shape: `stats` is `epics:p2p/Stats:1.0` with six ulong cache/ban
