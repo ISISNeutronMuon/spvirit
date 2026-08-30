@@ -50,15 +50,20 @@
 //!   entry point exists yet) and returns an error.
 //! - **Ops**: Ctrl-C shutdown is immediate (outstanding requests are
 //!   hard-cancelled), not a graceful drain.
+//! - A Prometheus `/metrics` endpoint (see [`metrics`]) exposes the gateway's
+//!   diagnostic counters as numeric gauges; it is enabled by the
+//!   `x-spvirit.metrics.enabled` config flag or, unconditionally, by
+//!   `spgateway --metrics`.
 //! - **Access control** (DENY filtering, `readOnly` enforcement) and the
-//!   metrics/audit/hot-reload/rate-limit features are parsed but **not**
-//!   enforced in M1 — they land in later milestones.
+//!   audit/hot-reload/rate-limit features are parsed but **not** enforced in
+//!   M1 — they land in later milestones.
 pub mod access;
 pub mod bridge;
 pub mod cache;
 pub mod config;
 pub mod convert;
 pub mod loopguard;
+pub mod metrics;
 pub mod proxy;
 pub mod runtime;
 pub mod status;

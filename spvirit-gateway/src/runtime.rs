@@ -27,6 +27,16 @@ const DEFAULT_NEG_CACHE_CAPACITY: usize = 128;
 /// `servers[]` entry, all sharing a single upstream [`UpstreamPool`].
 pub struct Runtime {
     servers: Vec<PvaServer>,
+    /// The shared upstream pool (retained so the metrics endpoint can read
+    /// `UpstreamPool::names().len()` live).
+    pool: Arc<UpstreamPool>,
+    /// One `GatewaySource` per server, retained so the metrics endpoint can
+    /// sum `upstream_monitor_count()` across servers.
+    sources: Vec<Arc<GatewaySource>>,
+    /// `Some((listen, path))` when the effective config has metrics enabled
+    /// (`x-spvirit.metrics.enabled`, possibly forced on by `--metrics`); the
+    /// endpoint is bound and served in [`Runtime::run`].
+    metrics: Option<(String, String)>,
 }
 
 impl Runtime {
@@ -52,6 +62,7 @@ impl Runtime {
 
         let pool = Arc::new(UpstreamPool::from_config(&cfg));
         let mut servers = Vec::with_capacity(cfg.servers.len());
+        let mut sources: Vec<Arc<GatewaySource>> = Vec::with_capacity(cfg.servers.len());
 
         // One GUID per server, generated before anything so the ban-set is
         // complete by the time any server's LoopGuard consults it.
@@ -113,6 +124,7 @@ impl Runtime {
             let server = builder.build();
 
             servers.push(server);
+            sources.push(src_arc);
 
             tracing::info!(
                 "spgateway: server '{}' -> {}:{} (udp {}), upstreams [{}]",
@@ -130,7 +142,23 @@ impl Runtime {
             cfg.clients.len(),
         );
 
-        Ok(Runtime { servers })
+        // Effective metrics setting: enabled by `x-spvirit.metrics.enabled`
+        // (the CLI's `--metrics`/`--metrics-listen` mutate this same config
+        // block before `from_config`, so both the `-T` and serving paths see
+        // the same effective value).
+        let metrics = cfg
+            .x_spvirit
+            .as_ref()
+            .and_then(|t| t.metrics.as_ref())
+            .filter(|m| m.enabled)
+            .map(|m| (m.listen.clone(), m.path.clone()));
+
+        Ok(Runtime {
+            servers,
+            pool,
+            sources,
+            metrics,
+        })
     }
 
     /// Run every server's serve loop concurrently until either all of them
@@ -141,6 +169,42 @@ impl Runtime {
             "spgateway: starting {} server(s); press Ctrl-C to stop",
             self.servers.len()
         );
+
+        // Metrics endpoint: bind up front so a bind failure is a FATAL
+        // startup error (the user explicitly asked for the endpoint). When
+        // disabled, `metrics_fut` is a never-completing `pending()` so it is
+        // simply an inert `select!` arm.
+        let metrics_fut = {
+            let metrics = self.metrics.clone();
+            let pool = self.pool.clone();
+            let sources = self.sources.clone();
+            async move {
+                match metrics {
+                    Some((listen, path)) => {
+                        let listener = crate::metrics::bind(&listen).await.map_err(|e| {
+                            tracing::error!("spgateway: metrics bind to {listen} failed: {e}");
+                            format!("metrics bind to {listen} failed: {e}")
+                        })?;
+                        let bound = listener.local_addr().map_err(|e| e.to_string())?;
+                        tracing::info!("spgateway: metrics endpoint on http://{bound}{path}");
+                        let provider: crate::metrics::SnapshotProvider = Arc::new(move || {
+                            crate::metrics::MetricsSnapshot {
+                                clients: pool.names().len() as u64,
+                                upstream_monitors: sources
+                                    .iter()
+                                    .map(|s| s.upstream_monitor_count() as u64)
+                                    .sum(),
+                                ..Default::default()
+                            }
+                        });
+                        crate::metrics::serve(listener, path, provider).await;
+                        Ok(())
+                    }
+                    None => std::future::pending::<Result<(), String>>().await,
+                }
+            }
+        };
+        tokio::pin!(metrics_fut);
 
         let mut set = tokio::task::JoinSet::new();
         for server in self.servers {
@@ -155,6 +219,9 @@ impl Runtime {
         tokio::select! {
             result = join_all(&mut set) => result,
             _ = tokio::signal::ctrl_c() => Ok(()),
+            // Only completes on a fatal metrics error (e.g. bind failure);
+            // the serve loop itself runs until the runtime is dropped.
+            res = &mut metrics_fut => res.map_err(Into::into),
         }
     }
 }

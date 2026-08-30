@@ -97,7 +97,7 @@ pub struct ServerCfg {
 }
 
 /// Top-level `x-spvirit` extension object (spec §5.2).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TopExt {
     #[serde(default)]
@@ -126,6 +126,19 @@ fn default_metrics_listen() -> String {
 
 fn default_metrics_path() -> String {
     "/metrics".to_string()
+}
+
+impl Default for MetricsExt {
+    /// Matches the serde field defaults (`enabled:false`, the default listen
+    /// address and path), so the CLI can synthesize a `MetricsExt` when the
+    /// config omits the block but `--metrics`/`--metrics-listen` is given.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_metrics_listen(),
+            path: default_metrics_path(),
+        }
+    }
 }
 
 /// `x-spvirit.audit` — structured JSON audit sink.
