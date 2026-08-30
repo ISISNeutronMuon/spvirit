@@ -29,6 +29,13 @@ pub struct MonitorRegistry {
     /// deliver their own updates ([`Source::pushes_own_updates`]) never get a
     /// pump entry — pumping them would double-deliver.
     pumps: Mutex<HashMap<String, PumpHandle>>,
+    /// The diagnostic [`ClientRegistry`](crate::diag::ClientRegistry) this
+    /// registry's connection lifecycle should populate, if one was installed
+    /// via [`Self::set_client_registry`]. `None` for servers that don't opt
+    /// into downstream-client tracking. A plain `std::sync::Mutex` (not the
+    /// `tokio::sync::Mutex` used elsewhere in this struct) because it's only
+    /// ever held across a clone/assign, never across an `.await`.
+    client_registry: std::sync::Mutex<Option<Arc<crate::diag::ClientRegistry>>>,
 }
 
 /// A pump task plus its cooperative-shutdown signal.
@@ -48,7 +55,23 @@ impl MonitorRegistry {
             monitors: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
             pumps: Mutex::new(HashMap::new()),
+            client_registry: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Install the diagnostic [`ClientRegistry`](crate::diag::ClientRegistry)
+    /// this registry's connection lifecycle (`cleanup_connection`) should
+    /// notify on disconnect. Threaded down from
+    /// `PvaServerBuilder::client_registry` via
+    /// `PvaServer::resolved_monitor_registry`, which calls this every time
+    /// it resolves the registry — so it's safe to call more than once.
+    pub fn set_client_registry(&self, registry: Arc<crate::diag::ClientRegistry>) {
+        *self.client_registry.lock().unwrap() = Some(registry);
+    }
+
+    /// The installed diagnostic client registry, if any.
+    pub fn client_registry(&self) -> Option<Arc<crate::diag::ClientRegistry>> {
+        self.client_registry.lock().unwrap().clone()
     }
 
     /// Ensure a single pump task is draining `rx` (a subscribe-only source's
@@ -404,6 +427,9 @@ impl MonitorRegistry {
         {
             let mut conns = self.conns.lock().await;
             conns.remove(&conn_id);
+        }
+        if let Some(cr) = self.client_registry() {
+            cr.disconnect(conn_id);
         }
         for pv in affected {
             self.retire_pump_if_idle(&pv).await;

@@ -94,6 +94,14 @@ pub struct ServerState {
     pub tcp_port: u16,
     pub advertise_ip: Option<IpAddr>,
     pub listen_ip: IpAddr,
+    /// The diagnostic [`ClientRegistry`](crate::diag::ClientRegistry) to
+    /// notify of connect/identity events, if one was installed on `registry`
+    /// (via [`MonitorRegistry::set_client_registry`]) before this state was
+    /// built. Captured here — rather than read off `registry` at each call
+    /// site — so the connect/identity hooks are a plain `if let Some(...)`
+    /// against a field already in scope, matching how `cleanup_connection`
+    /// (which lives on `MonitorRegistry` itself) reads it directly there.
+    pub client_registry: Option<Arc<crate::diag::ClientRegistry>>,
 }
 
 impl ServerState {
@@ -109,6 +117,7 @@ impl ServerState {
         advertise_ip: Option<IpAddr>,
         listen_ip: IpAddr,
     ) -> Self {
+        let client_registry = registry.client_registry();
         Self {
             sources,
             registry,
@@ -122,6 +131,7 @@ impl ServerState {
             tcp_port,
             advertise_ip,
             listen_ip,
+            client_registry,
         }
     }
 }
@@ -858,6 +868,12 @@ pub async fn handle_connection(
         conns.insert(conn_id, ConnWriter::new(writer));
     }
 
+    if let Some(cr) = &state.client_registry
+        && let Some(ctx) = crate::request_ctx::current_request()
+    {
+        cr.connect(conn_id, ctx.peer);
+    }
+
     let mut conn_state = ConnState::default();
 
     // Per EPICS PVA protocol: send SET_BYTE_ORDER control message before validation.
@@ -976,6 +992,9 @@ pub async fn handle_connection(
                     conn_id, version, is_be, val.buffer_size, val.qos, val.authz
                 );
                 crate::request_ctx::set_credentials(val.user.clone(), val.host.clone());
+                if let Some(cr) = &state.client_registry {
+                    cr.set_identity(conn_id, val.user.clone(), val.host.clone());
+                }
                 let resp = spvirit_codec::spvirit_encode::encode_connection_validated(
                     true, version, is_be,
                 );
