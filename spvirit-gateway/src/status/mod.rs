@@ -19,14 +19,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::pvstore::{PvInfo, Source};
 use spvirit_server::simple_store::descriptor_for_payload;
 use spvirit_types::{
-    NtPayload, NtScalar, NtScalarArray, NtTable, NtTableColumn, PvValue, ScalarArrayValue,
-    ScalarValue,
+    NtPayload, NtScalar, NtScalarArray, NtTable, NtTableColumn, NtTimeStamp, PvValue,
+    ScalarArrayValue, ScalarValue,
 };
 use tokio::sync::mpsc;
 
@@ -51,6 +51,70 @@ const TICK_PERIOD: Duration = Duration::from_secs(1);
 /// correctly, and a restrictive one fails closed. In particular, for a pure
 /// `readOnly` config `decide` short-circuits before any host/user match, so
 /// enforcement holds even with a default `Identity`.
+/// The current wall-clock time as an [`NtTimeStamp`] of UNIX seconds (NOT the
+/// EPICS 1990-01-01 epoch — see the "1990 timestamp" gateway bug this helper
+/// closes). Falls back to the zero duration (seconds/nanoseconds `0`) if the
+/// system clock is set before the UNIX epoch, which never happens in
+/// practice but keeps this infallible.
+///
+/// Not yet called from `value_payload`/`subscribe` — wiring status PVs to
+/// stamp with a real time is a follow-up task; this and [`stamp`] land first
+/// so that task is a pure call-site change.
+#[allow(dead_code)]
+fn now_ts() -> NtTimeStamp {
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    NtTimeStamp {
+        seconds_past_epoch: d.as_secs() as i64,
+        nanoseconds: d.subsec_nanos() as i32,
+        user_tag: 0,
+    }
+}
+
+/// Attaches `ts` to a status payload's timestamp field(s), per variant:
+/// - [`NtPayload::Scalar`]: sets the `Option<NtTimeStamp>` field.
+/// - [`NtPayload::ScalarArray`]: sets the (non-optional) `NtTimeStamp` field.
+/// - [`NtPayload::Table`]: sets the `Option<NtTimeStamp>` field.
+/// - [`NtPayload::Generic`] (the `stats` structure): stamps every nested
+///   `epics:nt/NTScalar:1.0` sub-structure's `timeStamp` sub-fields
+///   (`secondsPastEpoch`/`nanoseconds`) in place.
+/// - [`NtPayload::NdArray`]/[`NtPayload::Enum`]: not used by any status PV
+///   today, so left untouched.
+#[allow(dead_code)]
+fn stamp(payload: &mut NtPayload, ts: NtTimeStamp) {
+    match payload {
+        NtPayload::Scalar(nt) => nt.time_stamp = Some(ts),
+        NtPayload::ScalarArray(nt) => nt.time_stamp = ts,
+        NtPayload::Table(nt) => nt.time_stamp = Some(ts),
+        NtPayload::Generic { fields, .. } => {
+            for (_, v) in fields.iter_mut() {
+                let PvValue::Structure { fields: inner, .. } = v else {
+                    continue;
+                };
+                for (n, tv) in inner.iter_mut() {
+                    if n != "timeStamp" {
+                        continue;
+                    }
+                    let PvValue::Structure { fields: tf, .. } = tv else {
+                        continue;
+                    };
+                    for (fname, fval) in tf.iter_mut() {
+                        match fname.as_str() {
+                            "secondsPastEpoch" => {
+                                *fval = PvValue::Scalar(ScalarValue::I64(ts.seconds_past_epoch))
+                            }
+                            "nanoseconds" => {
+                                *fval = PvValue::Scalar(ScalarValue::I32(ts.nanoseconds))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        NtPayload::NdArray(_) | NtPayload::Enum(_) => {}
+    }
+}
+
 fn current_identity() -> Identity {
     let rc = spvirit_server::request_ctx::current_request();
     Identity {
@@ -590,6 +654,39 @@ mod tests {
     use super::*;
 
     const PREFIX: &str = "GW:STATUS:";
+
+    #[test]
+    fn now_ts_is_unix_seconds_not_epics_epoch() {
+        let ts = now_ts();
+        // Post-2020 UNIX seconds; proves no 1990-epoch offset and non-zero.
+        assert!(ts.seconds_past_epoch > 1_577_836_800, "got {}", ts.seconds_past_epoch);
+    }
+
+    #[test]
+    fn stamp_sets_scalar_array_and_table_and_generic_stats() {
+        let ts = NtTimeStamp { seconds_past_epoch: 42, nanoseconds: 7, user_tag: 0 };
+
+        let mut arr = StatusSource::string_array_payload(vec!["x".into()]);
+        stamp(&mut arr, ts.clone());
+        let NtPayload::ScalarArray(a) = &arr else { panic!() };
+        assert_eq!(a.time_stamp.seconds_past_epoch, 42);
+
+        let mut tbl = StatusSource::refs_table();
+        stamp(&mut tbl, ts.clone());
+        let NtPayload::Table(t) = &tbl else { panic!() };
+        assert_eq!(t.time_stamp.as_ref().unwrap().seconds_past_epoch, 42);
+
+        let mut st = StatusSource::stats_structure(5);
+        stamp(&mut st, ts.clone());
+        let NtPayload::Generic { fields, .. } = &st else { panic!() };
+        // mcacheSize's nested timeStamp.secondsPastEpoch is now 42.
+        let mc = fields.iter().find(|(n, _)| n == "mcacheSize").unwrap();
+        let PvValue::Structure { fields: inner, .. } = &mc.1 else { panic!() };
+        let tsf = inner.iter().find(|(n, _)| n == "timeStamp").unwrap();
+        let PvValue::Structure { fields: tf, .. } = &tsf.1 else { panic!() };
+        let secs = tf.iter().find(|(n, _)| n == "secondsPastEpoch").unwrap();
+        assert!(matches!(&secs.1, PvValue::Scalar(ScalarValue::I64(42))));
+    }
 
     fn source(read_only: bool) -> StatusSource {
         let access = Arc::new(AccessControl::new(read_only, None, None));
