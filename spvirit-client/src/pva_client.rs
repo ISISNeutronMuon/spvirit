@@ -310,7 +310,11 @@ impl PvaClient {
     /// Fetch the current value of a PV.
     pub async fn pvget(&self, pv_name: &str) -> Result<PvGetResult, PvGetError> {
         let opts = self.opts(pv_name);
-        low_level_pvget(&opts).await
+        let result = low_level_pvget(&opts).await?;
+        if let Some(sink) = &self.byte_sink {
+            sink.on_rx(pv_name, &result.server_host, result.raw_pva.len() as u64);
+        }
+        Ok(result)
     }
 
     /// Fetch a PV with field filtering (equivalent to `pvget -r "field(value,alarm)"`).
@@ -320,7 +324,11 @@ impl PvaClient {
         fields: &[&str],
     ) -> Result<PvGetResult, PvGetError> {
         let opts = self.opts(pv_name);
-        crate::client::pvget_fields(&opts, fields).await
+        let result = crate::client::pvget_fields(&opts, fields).await?;
+        if let Some(sink) = &self.byte_sink {
+            sink.on_rx(pv_name, &result.server_host, result.raw_pva.len() as u64);
+        }
+        Ok(result)
     }
 
     // ─── pvput ───────────────────────────────────────────────────────────

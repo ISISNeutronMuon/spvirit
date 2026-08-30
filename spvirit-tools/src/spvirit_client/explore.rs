@@ -238,6 +238,7 @@ where
                         raw_pva: bytes.clone(),
                         raw_pvd: op.body,
                         introspection: desc.clone(),
+                        server_host: server_addr.to_string(),
                     });
                 }
                 if op.subcmd == 0x10 {

@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use spvirit_server::diag::ClientRegistry;
+use spvirit_server::diag::{BandwidthCounters, ClientRegistry};
 use spvirit_server::{PvaServer, rand_guid};
 
 use crate::cache::negative::NegativeCache;
@@ -44,6 +44,15 @@ pub struct Runtime {
     /// `.client_registry()`, but this keeps the registry alive even before
     /// any server starts, and is available for future runtime-level readers).
     client_registry: Arc<ClientRegistry>,
+    /// The single [`BandwidthCounters`] shared by every upstream
+    /// [`spvirit_client::PvaClient`]'s `ByteSink` (via
+    /// `UpstreamPool::from_config_with_counters`) AND by every server this
+    /// gateway builds (via `PvaServer::bandwidth_counters`) — the
+    /// unification point where upstream (`us_*`) and downstream (`ds_*`)
+    /// wire-byte accounting land in ONE counter set. Retained here so a
+    /// future status-PV reader (Task 13) can read it without a server
+    /// reference.
+    bandwidth_counters: Arc<BandwidthCounters>,
 }
 
 impl Runtime {
@@ -54,6 +63,14 @@ impl Runtime {
     /// internals.
     pub fn client_registry(&self) -> &Arc<ClientRegistry> {
         &self.client_registry
+    }
+
+    /// The single [`BandwidthCounters`] shared by every upstream client's
+    /// `ByteSink` and every server's `ds_*` accounting. Exposed so tests
+    /// (and a future status-PV reader) can confirm the same `Arc` reached
+    /// every consumer, mirroring [`client_registry`](Self::client_registry).
+    pub fn bandwidth_counters(&self) -> &Arc<BandwidthCounters> {
+        &self.bandwidth_counters
     }
 
     /// Validate `cfg` and build a `Runtime` from it.
@@ -76,7 +93,18 @@ impl Runtime {
     pub fn from_config(cfg: GatewayConfig) -> Result<Self, ConfigError> {
         cfg.validate()?;
 
-        let pool = Arc::new(UpstreamPool::from_config(&cfg));
+        // One shared BandwidthCounters for the whole gateway, built BEFORE
+        // the upstream pool so the SAME `Arc` (never a second instance) is
+        // threaded into: every upstream `PvaClient`'s `ByteSink` (via
+        // `from_config_with_counters` below) and every server's `ds_*`
+        // accounting (via `.bandwidth_counters()` on each builder below) —
+        // the unification step that lets upstream and downstream byte
+        // counts land in one counter set.
+        let bandwidth_counters = Arc::new(BandwidthCounters::new());
+        let pool = Arc::new(UpstreamPool::from_config_with_counters(
+            &cfg,
+            Some(&bandwidth_counters),
+        ));
         let mut servers = Vec::with_capacity(cfg.servers.len());
         let mut sources: Vec<Arc<GatewaySource>> = Vec::with_capacity(cfg.servers.len());
         // One shared registry for the whole gateway: every server built below
@@ -126,6 +154,7 @@ impl Runtime {
                 .discovery_parity(server_cfg.discovery_parity)
                 .guid(server_guids[i])
                 .client_registry(client_registry.clone())
+                .bandwidth_counters(bandwidth_counters.clone())
                 .source("gateway", 0, src_arc.clone());
 
             // Status PVs claim under a lower `.source()` order (-10 <
@@ -182,6 +211,7 @@ impl Runtime {
             sources,
             metrics,
             client_registry,
+            bandwidth_counters,
         })
     }
 
@@ -330,6 +360,41 @@ mod tests {
             strong > n_servers,
             "expected the shared registry's strong count ({strong}) to exceed the \
              server count ({n_servers}) once every server + status source holds a clone"
+        );
+    }
+
+    /// The gateway's `bandwidth_counters` is ONE shared `Arc`, built once in
+    /// `from_config` and injected as the SAME instance into every upstream
+    /// client's `CountersSink` (via `UpstreamPool::from_config_with_counters`)
+    /// AND into every server's `ds_*` accounting (via
+    /// `PvaServer::bandwidth_counters`) — never a second
+    /// `BandwidthCounters::new()`. Like `client_registry_is_shared_with_every_server`,
+    /// this is a same-Arc wiring check via `Arc::strong_count`: the
+    /// `Runtime`'s own clone, plus one per server, plus one per upstream
+    /// client's sink, must exceed the server count alone.
+    #[test]
+    fn bandwidth_counters_is_shared_with_every_server_and_upstream_client() {
+        let mut cfg = GatewayConfig::from_json_str(BIDI).unwrap();
+        for s in &mut cfg.servers {
+            s.pvlist.clear();
+            s.access.clear();
+        }
+        let n_servers = cfg.servers.len();
+        assert!(n_servers > 0, "fixture must have at least one server for this check");
+        assert!(
+            !cfg.clients.is_empty(),
+            "fixture must have at least one client for this check"
+        );
+
+        let rt = Runtime::from_config(cfg).expect("valid config builds");
+        // Runtime's own clone + at least one clone per server + at least one
+        // clone per upstream client's CountersSink: strictly more than just
+        // the server count.
+        let strong = Arc::strong_count(rt.bandwidth_counters());
+        assert!(
+            strong > n_servers,
+            "expected the shared BandwidthCounters' strong count ({strong}) to exceed the \
+             server count ({n_servers}) once every server + upstream client sink holds a clone"
         );
     }
 }

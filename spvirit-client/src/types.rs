@@ -56,6 +56,12 @@ pub struct PvGetResult {
     pub raw_pva: Vec<u8>,
     pub raw_pvd: Vec<u8>,
     pub introspection: StructureDesc,
+    /// The upstream server host (`ip:port`) this GET/monitor-update was
+    /// received from — carried alongside `raw_pva` so a caller with a
+    /// [`crate::byte_sink::ByteSink`] (e.g. [`PvaClient`](crate::pva_client::PvaClient))
+    /// can attribute `raw_pva.len()` bytes to the right host without a
+    /// second network round-trip.
+    pub server_host: String,
 }
 
 #[derive(Debug)]
