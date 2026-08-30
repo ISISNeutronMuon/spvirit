@@ -104,7 +104,8 @@ async fn banner_lists_every_served_pv() {
     let lines = banner::status_pv_lines("GW:STS:");
     assert!(lines.iter().any(|l| l == "Status PV: GW:STS:clients"));
     assert!(lines.iter().any(|l| l == "Status PV: GW:STS:asTest"));
-    // 6 live (clients,cache,refs,threads,stats,poke) + 8 static bandwidth
-    // counters + 1 RPC (asTest) = 15.
+    // 5 live-ticker (clients,cache,refs,stats,poke) + 8 static bandwidth
+    // counters + `threads` (a static value PV that also serves RPC) + `asTest`
+    // (pure RPC) = 15.
     assert_eq!(lines.len(), 15);
 }

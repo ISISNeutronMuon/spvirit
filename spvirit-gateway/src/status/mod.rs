@@ -62,8 +62,9 @@ fn current_identity() -> Identity {
 /// The live (get/subscribe) PVs, in the stable order `names()`/the banner
 /// report them. `poke` is included here (it is readable — its value is an
 /// internal generation counter — as well as the only writable status PV).
-/// `threads` is NOT here: p4p serves it as an RPC-only string (see
-/// `RPC_NAMES`).
+/// `threads` is NOT in this ticker set: it is a *static* string value (served
+/// like the static bandwidth PVs — emit once, never changes) that *also*
+/// responds to RPC (see `RPC_NAMES`), so it is not driven by the live ticker.
 const LIVE: &[&str] = &["clients", "cache", "refs", "stats", "poke"];
 
 /// The static, always-zero bandwidth-counter PVs (spec §8.1) — not wired to
@@ -79,9 +80,11 @@ const STATIC_ZERO: &[&str] = &[
     "us:byhost:tx",
 ];
 
-/// RPC-only names (no `get`/`subscribe` value, only `rpc`). `asTest` dry-runs
-/// an ACL decision; `threads` returns a thread-dump string (p4p serves both
-/// as RPC-only `NTScalar('s')`).
+/// Names that respond to `rpc`. `asTest` is pure RPC (no readable value) and
+/// dry-runs an ACL decision. `threads` ALSO has a static get/subscribe value
+/// (`"RPC only"`); listing it here additionally makes it an RPC target that
+/// returns the richer thread-dump string — matching p4p, where `threads` is a
+/// `SharedPV(NTScalar('s'), initial='RPC only')` that also serves RPC.
 const RPC_NAMES: &[&str] = &["asTest", "threads"];
 
 /// The full set of suffixes this source serves, in a stable order: live,
@@ -106,8 +109,8 @@ type CountHandle = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// Cheap to clone (each field is an `Arc`), so a clone can be handed to the
 /// `subscribe` ticker task without borrowing the source. `refs` and the
 /// bandwidth PVs are served as NTTables built from no live source yet (empty
-/// rows), so they need no handle here; `threads` is an RPC-only string with
-/// no gauge.
+/// rows), so they need no handle here; `threads` is a static string with no
+/// gauge.
 #[derive(Clone)]
 pub struct StatusHandles {
     /// Downstream client names (p4p `clients`, an NTScalarArray-of-string).
@@ -244,12 +247,20 @@ impl StatusSource {
         }
     }
 
-    /// The `threads` RPC response — p4p serves it as an RPC-only
-    /// `NTScalar('s')` that dumps thread stacks. Rust has no `faulthandler`
-    /// equivalent and the gateway does no OS-thread introspection, so this
-    /// returns a shape-correct best-effort string rather than a fabricated
-    /// stack dump.
-    fn threads_payload() -> NtPayload {
+    /// The static `threads` get/subscribe value — p4p registers `threads` as a
+    /// `SharedPV(nt=NTScalar('s'), initial='RPC only')` whose value stays the
+    /// constant string `"RPC only"` forever (its RPC handler returns the stack
+    /// dump via `op.done` and never posts). We mirror that: a plain readable /
+    /// monitorable `NTScalar('s')` of `"RPC only"`.
+    fn threads_static_value() -> NtPayload {
+        NtPayload::Scalar(NtScalar::from_value(ScalarValue::Str("RPC only".into())))
+    }
+
+    /// The `threads` RPC response — p4p serves `threads` as an RPC that dumps
+    /// thread stacks. Rust has no `faulthandler` equivalent and the gateway
+    /// does no OS-thread introspection, so this returns a shape-correct
+    /// best-effort string rather than a fabricated stack dump.
+    fn threads_rpc_payload() -> NtPayload {
         let parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(0);
@@ -325,6 +336,7 @@ impl StatusSource {
             "refs" => Self::refs_table(),
             "stats" => Self::stats_structure((handles.mcache_size)()),
             "poke" => Self::scalar_payload(generation.load(Ordering::Relaxed) as f64),
+            "threads" => Self::threads_static_value(),
             s if STATIC_ZERO.contains(&s) => Self::bandwidth_table(s),
             _ => return None,
         })
@@ -408,7 +420,9 @@ impl Source for StatusSource {
                 // RPC-only PVs still advertise a result descriptor at claim
                 // time, each in its own shape.
                 match suffix {
-                    "threads" => Self::threads_payload(),
+                    // `threads` is both a value PV and an RPC target; advertise
+                    // the get/subscribe value shape (identical NTScalar('s')).
+                    "threads" => Self::threads_static_value(),
                     _ => Self::astest_response("", "", "", &Decision::Deny, &Decision::Deny),
                 }
             } else {
@@ -425,13 +439,16 @@ impl Source for StatusSource {
         let name = name.to_string();
         Box::pin(async move {
             let suffix = self.suffix(&name)?;
-            if RPC_NAMES.contains(&suffix) {
+            // `asTest` is pure RPC (no readable value). `threads` is BOTH a
+            // static gettable "RPC only" string AND an RPC target (p4p parity),
+            // so it is NOT excluded here.
+            if suffix == "asTest" {
                 return None;
             }
             if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
                 return None;
             }
-            if !LIVE.contains(&suffix) && !STATIC_ZERO.contains(&suffix) {
+            if !LIVE.contains(&suffix) && !STATIC_ZERO.contains(&suffix) && suffix != "threads" {
                 return None;
             }
             Self::value_payload(suffix, &self.handles, &self.generation)
@@ -471,7 +488,10 @@ impl Source for StatusSource {
         let name = name.to_string();
         Box::pin(async move {
             let suffix = self.suffix(&name)?.to_string();
-            if RPC_NAMES.contains(&suffix.as_str()) {
+            // `asTest` is pure RPC (nothing to monitor). `threads` IS
+            // subscribable — a static "RPC only" string served like the static
+            // bandwidth PVs (emit once, then close) — so it is NOT excluded.
+            if suffix == "asTest" {
                 return None;
             }
             if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
@@ -507,6 +527,14 @@ impl Source for StatusSource {
                     // rather than further updates, since no byte accounting
                     // exists to change the value.
                 });
+            } else if suffix == "threads" {
+                tokio::spawn(async move {
+                    let _ = tx.send(Self::threads_static_value()).await;
+                    // Emit the static "RPC only" string once, then let `tx`
+                    // drop. p4p's `threads` SharedPV value never changes (its
+                    // RPC handler returns via `op.done` and never posts), so
+                    // there are no further updates to send.
+                });
             } else {
                 return None;
             }
@@ -528,14 +556,15 @@ impl Source for StatusSource {
             if !RPC_NAMES.contains(&suffix) {
                 return Err("RPC not supported".to_string());
             }
-            // `threads` is an RPC-only string (p4p's stack-dump PV). Gate it
-            // through the same AccessControl (an RPC op on its own name), then
-            // return the best-effort thread description.
+            // `threads` also responds to RPC (p4p's stack-dump handler) — its
+            // get/subscribe value stays the static "RPC only" string, but RPC
+            // returns the richer best-effort description. Gate it through the
+            // same AccessControl (an RPC op on its own name).
             if suffix == "threads" {
                 if let Decision::Deny = self.access.decide(Op::Rpc, &name, &current_identity()) {
                     return Err("access denied".to_string());
                 }
-                return Ok(Self::threads_payload());
+                return Ok(Self::threads_rpc_payload());
             }
             let pv = Self::decoded_field_str(&args, "pv").unwrap_or_default();
             let id = Identity {
@@ -810,22 +839,42 @@ mod tests {
         assert_eq!(stats_field_u64(fields, "mcacheSize"), 5);
     }
 
-    /// p4p access pattern: `threads` is RPC-only. `get`/`subscribe` must NOT
-    /// offer it as a value PV, and `rpc` returns an `NTScalar('s')` string.
+    /// p4p parity: `threads` is a static gettable/subscribable `NTScalar('s')`
+    /// whose value is the constant `"RPC only"`, AND it responds to `rpc` with
+    /// the richer best-effort thread-dump string.
     #[tokio::test]
-    async fn threads_is_rpc_only_string() {
+    async fn threads_serves_static_string_and_rpc() {
         let src = source(false);
         let name = format!("{PREFIX}threads");
 
-        assert!(src.get(&name).await.is_none(), "threads must not be a get value");
-        assert!(src.subscribe(&name).await.is_none(), "threads must not be subscribable");
+        // get -> static "RPC only" string.
+        let got = src.get(&name).await.expect("threads must be a get value");
+        match got {
+            NtPayload::Scalar(nt) => {
+                assert_eq!(nt.value, ScalarValue::Str("RPC only".into()));
+            }
+            other => panic!("threads get must be an NTScalar string, got {other:?}"),
+        }
 
+        // subscribe -> the same static "RPC only" string (emitted once).
+        let mut rx = src.subscribe(&name).await.expect("threads must be subscribable");
+        match rx.recv().await.expect("threads subscribe frame") {
+            NtPayload::Scalar(nt) => {
+                assert_eq!(nt.value, ScalarValue::Str("RPC only".into()));
+            }
+            other => panic!("threads subscribe must be an NTScalar string, got {other:?}"),
+        }
+
+        // rpc -> a (richer) string scalar, distinct from the static value.
         let out = src.rpc(&name, &DecodedValue::Structure(vec![])).await.expect("rpc");
         match out {
-            NtPayload::Scalar(nt) => assert!(
-                matches!(nt.value, ScalarValue::Str(_)),
-                "threads RPC must return a string scalar"
-            ),
+            NtPayload::Scalar(nt) => match nt.value {
+                ScalarValue::Str(s) => assert_ne!(
+                    s, "RPC only",
+                    "threads RPC must return the richer description, not the static value"
+                ),
+                other => panic!("threads RPC must return a string scalar, got {other:?}"),
+            },
             other => panic!("threads RPC must return an NTScalar string, got {other:?}"),
         }
     }
