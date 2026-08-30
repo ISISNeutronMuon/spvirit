@@ -616,7 +616,7 @@ impl Source for StatusSource {
             // Hardening: a pvlist DENY hides the status PV entirely (claim
             // fails, so it is never registered for this identity). readOnly
             // does not affect Get, so this only bites on an explicit DENY.
-            if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
+            if let Decision::Deny = self.access.decide_local(Op::Get, &name, &current_identity()) {
                 return None;
             }
             let payload = if RPC_NAMES.contains(&suffix) {
@@ -648,7 +648,7 @@ impl Source for StatusSource {
             if suffix == "asTest" {
                 return None;
             }
-            if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
+            if let Decision::Deny = self.access.decide_local(Op::Get, &name, &current_identity()) {
                 return None;
             }
             if !LIVE.contains(&suffix) && suffix != "threads" {
@@ -685,7 +685,7 @@ impl Source for StatusSource {
             // For a pure `readOnly` config, `decide` short-circuits at step 1
             // (before any host/pvlist match), so even a default `Identity`
             // — as seen when called outside a request scope — enforces it.
-            if let Decision::Deny = self.access.decide(Op::Put, &name, &current_identity()) {
+            if let Decision::Deny = self.access.decide_local(Op::Put, &name, &current_identity()) {
                 return Err("access denied".to_string());
             }
             self.generation.fetch_add(1, Ordering::Relaxed);
@@ -706,7 +706,7 @@ impl Source for StatusSource {
             if suffix == "asTest" {
                 return None;
             }
-            if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
+            if let Decision::Deny = self.access.decide_local(Op::Get, &name, &current_identity()) {
                 return None;
             }
             let (tx, rx) = mpsc::channel(4);
@@ -791,7 +791,7 @@ impl Source for StatusSource {
             // returns the richer best-effort description. Gate it through the
             // same AccessControl (an RPC op on its own name).
             if suffix == "threads" {
-                if let Decision::Deny = self.access.decide(Op::Rpc, &name, &current_identity()) {
+                if let Decision::Deny = self.access.decide_local(Op::Rpc, &name, &current_identity()) {
                     return Err("access denied".to_string());
                 }
                 return Ok(Self::threads_rpc_payload());
@@ -809,9 +809,19 @@ impl Source for StatusSource {
         })
     }
 
+    /// Applies the same gate as [`claim`](Self::claim), so the listed set and
+    /// the served set cannot disagree: an explicitly denied status PV is
+    /// hidden from channel listing too, rather than being advertised as a
+    /// name that search then refuses.
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
         let prefix = self.prefix.clone();
-        Box::pin(async move { served_suffixes().map(|s| format!("{prefix}{s}")).collect() })
+        Box::pin(async move {
+            let id = current_identity();
+            served_suffixes()
+                .map(|s| format!("{prefix}{s}"))
+                .filter(|name| !matches!(self.access.decide_local(Op::Get, name, &id), Decision::Deny))
+                .collect()
+        })
     }
 }
 
@@ -1112,6 +1122,65 @@ mod tests {
         assert_ne!(a, b);
         // ...but their dedup keys are equal (same rows, timestamp cleared).
         assert_eq!(clear_stamp(&a), clear_stamp(&b));
+    }
+
+    /// A configured `pvlist` that simply says nothing about the status prefix
+    /// must NOT hide the gateway's own status PVs.
+    ///
+    /// `AccessControl::decide` is fail-closed on an unmatched name (it returns
+    /// `Decision::Deny`, access/mod.rs step 2), and `claim` treats any `Deny`
+    /// as "not mine". So every ordinary deployment — one that lists the data
+    /// PVs it proxies and nothing else — makes `has_pv` false for all 15
+    /// status PVs, the server answers search with `found=false`, and clients
+    /// fail with `Timeout("search response")` while `pvlist` still lists the
+    /// names (`names()` is ungated). Status PVs are gateway-local, not proxied
+    /// upstream names, so the proxy pvlist has no business hiding them.
+    #[tokio::test]
+    async fn a_pvlist_that_does_not_mention_the_status_prefix_still_serves_status_pvs() {
+        // A realistic proxy pvlist: allow the data PVs, say nothing about
+        // the gateway's own status prefix.
+        let pvlist = crate::access::pvlist::parse_pvlist("DEV:RNG:.*  ALLOW\n").unwrap();
+        let ac = Arc::new(AccessControl::new(false, Some(pvlist), None));
+        let src = StatusSource::new(PREFIX.to_string(), ac, StatusHandles::test());
+
+        // Control: the proxied data PV is allowed, proving the pvlist works.
+        assert!(
+            !matches!(
+                src.access.decide(Op::Get, "DEV:RNG:x", &Identity::default()),
+                Decision::Deny
+            ),
+            "control: the proxied PV must be allowed by this pvlist"
+        );
+
+        for suffix in served_suffixes() {
+            let name = format!("{PREFIX}{suffix}");
+            assert!(
+                src.claim(&name).await.is_some(),
+                "status PV {name} must be claimed (and so answer search) even \
+                 though the proxy pvlist does not mention it"
+            );
+        }
+    }
+
+    /// The counterpart to the test above: an *explicit* pvlist `DENY` on the
+    /// status prefix must still hide those PVs — from `claim` and from the
+    /// channel listing alike. This is the hardening the gate was written for,
+    /// and the fix for the unmatched case must not weaken it.
+    #[tokio::test]
+    async fn an_explicit_pvlist_deny_still_hides_status_pvs() {
+        let pvlist =
+            crate::access::pvlist::parse_pvlist("GW:STATUS:.*  DENY\n.*  ALLOW\n").unwrap();
+        let ac = Arc::new(AccessControl::new(false, Some(pvlist), None));
+        let src = StatusSource::new(PREFIX.to_string(), ac, StatusHandles::test());
+
+        assert!(
+            src.claim(&format!("{PREFIX}clients")).await.is_none(),
+            "an explicit DENY must still hide the status PV"
+        );
+        assert!(
+            src.names().await.is_empty(),
+            "a hidden status PV must not be advertised in the channel listing"
+        );
     }
 
     /// asTest returns p4p's `epics:p2p/Permission:1.0` with a nested
