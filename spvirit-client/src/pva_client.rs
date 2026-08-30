@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -29,6 +30,7 @@ use spvirit_codec::spvirit_encode::{
     encode_control_message, encode_get_field_request, encode_monitor_request, encode_put_request,
 };
 
+use crate::byte_sink::ByteSink;
 use crate::client::{ChannelConn, ensure_status_ok, establish_channel, pvget as low_level_pvget};
 use crate::put_encode::encode_put_payload;
 use crate::search::resolve_pv_server;
@@ -208,6 +210,7 @@ impl PvaClientBuilder {
             search_addr: self.search_addr,
             bind_addr: self.bind_addr,
             debug: self.debug,
+            byte_sink: None,
         }
     }
 }
@@ -223,7 +226,7 @@ impl PvaClientBuilder {
 /// let client = PvaClient::builder().build();
 /// let val = client.pvget("MY:PV").await?;
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PvaClient {
     udp_port: u16,
     tcp_port: u16,
@@ -236,12 +239,46 @@ pub struct PvaClient {
     search_addr: Option<std::net::IpAddr>,
     bind_addr: Option<std::net::IpAddr>,
     debug: bool,
+    /// Optional upstream wire-byte accounting hook (see [`ByteSink`]).
+    /// `None` by default; when set, `on_tx`/`on_rx` are called at the
+    /// encode-send / recv-decode boundaries with the real PV name, server
+    /// host, and wire-byte count.
+    byte_sink: Option<Arc<dyn ByteSink>>,
+}
+
+// `dyn ByteSink` does not implement `Debug`, so this is written by hand
+// rather than derived; it reports only whether a sink is installed.
+impl std::fmt::Debug for PvaClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PvaClient")
+            .field("udp_port", &self.udp_port)
+            .field("tcp_port", &self.tcp_port)
+            .field("timeout", &self.timeout)
+            .field("no_broadcast", &self.no_broadcast)
+            .field("name_servers", &self.name_servers)
+            .field("authnz_user", &self.authnz_user)
+            .field("authnz_host", &self.authnz_host)
+            .field("server_addr", &self.server_addr)
+            .field("search_addr", &self.search_addr)
+            .field("bind_addr", &self.bind_addr)
+            .field("debug", &self.debug)
+            .field("byte_sink", &self.byte_sink.is_some())
+            .finish()
+    }
 }
 
 impl PvaClient {
     /// Create a builder for configuring a [`PvaClient`].
     pub fn builder() -> PvaClientBuilder {
         PvaClientBuilder::new()
+    }
+
+    /// Install an optional [`ByteSink`] to observe upstream wire bytes.
+    ///
+    /// `None` by default (the no-op default): no host/name computation and
+    /// no trait call happens on the hot path unless a sink is installed.
+    pub fn set_byte_sink(&mut self, sink: Arc<dyn ByteSink>) {
+        self.byte_sink = Some(sink);
     }
 
     /// Build [`PvOptions`] for a given PV name, inheriting client-level settings.
@@ -319,6 +356,7 @@ impl PvaClient {
             version: _,
             is_be,
             mut reassembler,
+            server_addr,
             ..
         } = self.open_channel(pv_name).await?;
 
@@ -342,6 +380,9 @@ impl PvaClient {
             .map_err(|e| PvGetError::Protocol(format!("put encode: {e}")))?;
         let req = encode_put_request(sid, ioid, 0x00, &payload, PVA_VERSION, is_be);
         stream.write_all(&req).await?;
+        if let Some(sink) = &self.byte_sink {
+            sink.on_tx(pv_name, &server_addr.to_string(), req.len() as u64);
+        }
 
         // Read PUT response — verify status
         let resp_bytes = read_until(
@@ -506,6 +547,7 @@ impl PvaClient {
             version: _,
             is_be,
             mut reassembler,
+            server_addr,
             ..
         } = self.open_channel(pv_name).await?;
 
@@ -587,6 +629,9 @@ impl PvaClient {
                         Err(PvGetError::Timeout(_)) => continue,
                         Err(e) => return Err(e),
                     };
+                    if let Some(sink) = &self.byte_sink {
+                        sink.on_rx(pv_name, &server_addr.to_string(), bytes.len() as u64);
+                    }
                     let mut pkt = PvaPacket::new(&bytes);
                     if let Some(PvaPacketCommand::Op(op)) = pkt.decode_payload() {
                         if op.command == 13 && op.ioid == ioid && op.subcmd == 0x00 {
@@ -1087,5 +1132,183 @@ mod tests {
         // PvGetOptions is a type alias for PvOptions — verify it compiles and works
         let opts: crate::types::PvGetOptions = PvOptions::new("ALIAS:TEST".into());
         assert_eq!(opts.pv_name, "ALIAS:TEST");
+    }
+
+    // ─── ByteSink accounting ───────────────────────────────────────────
+
+    /// Recording [`ByteSink`] used to assert exact tx/rx calls below.
+    #[derive(Default)]
+    struct RecordingSink {
+        tx: std::sync::Mutex<Vec<(String, String, u64)>>,
+        rx: std::sync::Mutex<Vec<(String, String, u64)>>,
+    }
+
+    impl crate::byte_sink::ByteSink for RecordingSink {
+        fn on_tx(&self, pv: &str, host: &str, n: u64) {
+            self.tx
+                .lock()
+                .unwrap()
+                .push((pv.to_string(), host.to_string(), n));
+        }
+        fn on_rx(&self, pv: &str, host: &str, n: u64) {
+            self.rx
+                .lock()
+                .unwrap()
+                .push((pv.to_string(), host.to_string(), n));
+        }
+    }
+
+    /// A `ByteSink` installed on a `PvaClient` observes the real PV name,
+    /// the real server host, and the exact wire-byte length for both a PUT
+    /// (encode-send boundary in `pvput_fields`) and a MONITOR update
+    /// (recv-decode boundary in `pvmonitor_with_options`).
+    ///
+    /// Drives a genuine in-process `spvirit-server` `PvaServer` end to end —
+    /// not a mock of the call sites — so this exercises the real
+    /// `stream.write_all` / `read_frame_resumable` chokepoints.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn byte_sink_records_real_pv_host_and_wire_bytes_for_put_and_monitor() {
+        use spvirit_server::pva_server::PvaServer;
+        use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket as StdUdpSocket};
+        use std::sync::Arc;
+
+        const PV: &str = "BYTESINK:TEST";
+
+        fn free_tcp_port() -> u16 {
+            TcpListener::bind("127.0.0.1:0")
+                .expect("bind tcp")
+                .local_addr()
+                .expect("local_addr")
+                .port()
+        }
+        fn free_udp_port() -> u16 {
+            StdUdpSocket::bind("127.0.0.1:0")
+                .expect("bind udp")
+                .local_addr()
+                .expect("local_addr")
+                .port()
+        }
+
+        let tcp_port = free_tcp_port();
+        let udp_port = free_udp_port();
+
+        let server = PvaServer::builder()
+            .ao(PV, 1.0)
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .build();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let server_addr: SocketAddr = format!("127.0.0.1:{tcp_port}")
+            .parse()
+            .expect("server addr parse");
+
+        let recorder = Arc::new(RecordingSink::default());
+        let mut client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .server_addr(server_addr)
+            .build();
+        client.set_byte_sink(recorder.clone());
+
+        // PUT — exercises the encode-send boundary in `pvput_fields`.
+        client.pvput(PV, 42.0).await.expect("pvput");
+
+        // MONITOR — exercises the recv-decode boundary in
+        // `pvmonitor_with_options`; break after the first update.
+        let monitor = client.pvmonitor(PV, move |_update| ControlFlow::Break(()));
+        tokio::time::timeout(Duration::from_secs(5), monitor)
+            .await
+            .expect("monitor timed out")
+            .expect("monitor error");
+
+        let tx = recorder.tx.lock().unwrap();
+        assert!(!tx.is_empty(), "expected at least one on_tx call");
+        for (pv, host, n) in tx.iter() {
+            assert_eq!(pv, PV, "on_tx must report the real PV name");
+            assert_eq!(
+                host,
+                &server_addr.to_string(),
+                "on_tx must report the real server host"
+            );
+            assert!(*n > 0, "on_tx must report a nonzero wire-byte length");
+        }
+
+        let rx = recorder.rx.lock().unwrap();
+        assert!(!rx.is_empty(), "expected at least one on_rx call");
+        for (pv, host, n) in rx.iter() {
+            assert_eq!(pv, PV, "on_rx must report the real PV name");
+            assert_eq!(
+                host,
+                &server_addr.to_string(),
+                "on_rx must report the real server host"
+            );
+            assert!(*n > 0, "on_rx must report a nonzero wire-byte length");
+        }
+    }
+
+    /// With no sink installed, PUT/MONITOR behave exactly as before — the
+    /// `Option<Arc<dyn ByteSink>>` guard is a pure no-op. Mirrors the sink
+    /// test above but proves the default (no sink) path is unaffected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_byte_sink_is_a_pure_noop() {
+        use spvirit_server::pva_server::PvaServer;
+        use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket as StdUdpSocket};
+
+        const PV: &str = "BYTESINK:NOOP";
+
+        fn free_tcp_port() -> u16 {
+            TcpListener::bind("127.0.0.1:0")
+                .expect("bind tcp")
+                .local_addr()
+                .expect("local_addr")
+                .port()
+        }
+        fn free_udp_port() -> u16 {
+            StdUdpSocket::bind("127.0.0.1:0")
+                .expect("bind udp")
+                .local_addr()
+                .expect("local_addr")
+                .port()
+        }
+
+        let tcp_port = free_tcp_port();
+        let udp_port = free_udp_port();
+
+        let server = PvaServer::builder()
+            .ao(PV, 1.0)
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .build();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let server_addr: SocketAddr = format!("127.0.0.1:{tcp_port}")
+            .parse()
+            .expect("server addr parse");
+
+        // No `set_byte_sink` call — `byte_sink` stays `None`.
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .server_addr(server_addr)
+            .build();
+
+        client.pvput(PV, 7.0).await.expect("pvput");
+
+        let monitor = client.pvmonitor(PV, move |_update| ControlFlow::Break(()));
+        tokio::time::timeout(Duration::from_secs(5), monitor)
+            .await
+            .expect("monitor timed out")
+            .expect("monitor error");
     }
 }

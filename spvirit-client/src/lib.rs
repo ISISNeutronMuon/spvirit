@@ -36,6 +36,7 @@
 //! - [`SearchTarget`] — UDP/TCP search target address
 
 pub mod auth;
+pub mod byte_sink;
 pub mod client;
 pub mod format;
 pub mod put_encode;
@@ -44,6 +45,9 @@ pub mod pvlist;
 pub mod search;
 pub mod transport;
 pub mod types;
+
+// --- Re-exports: upstream byte accounting ---
+pub use byte_sink::ByteSink;
 
 // --- Re-exports: high-level API ---
 pub use pva_client::{
