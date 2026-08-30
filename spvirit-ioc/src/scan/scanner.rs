@@ -2,6 +2,8 @@
 //! record engine, never holding a scan-list lock across a process() call.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, Weak};
@@ -18,6 +20,7 @@ use crate::ctx::ProcCtx;
 use crate::lockset::{RecordDb, RecordId};
 use crate::process::process;
 use crate::scan::ScanList;
+use spvirit_server::events::EventSink;
 use spvirit_types::NtPayload;
 
 /// Where a completed pass's side effects go. The real impl (Task 15) forwards
@@ -35,6 +38,10 @@ pub struct Scanner {
     clock: Arc<dyn Clock>,
     sink: Arc<dyn ProcSink>,
     periodic: Mutex<HashMap<PeriodKey, ScanList>>,
+    /// Event-driven scan lists, keyed by the record's `EVNT` string. Fired
+    /// synchronously (on the caller's thread) by [`Self::fire_event`], never
+    /// spawned onto a background thread the way periodic lists are.
+    events: Mutex<HashMap<String, ScanList>>,
     stop: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// Sender end of the bounded `scan_once` queue. `None` once `shutdown()`
@@ -61,6 +68,7 @@ impl Scanner {
             clock,
             sink,
             periodic: Mutex::new(HashMap::new()),
+            events: Mutex::new(HashMap::new()),
             stop: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
             scan_once_tx: Mutex::new(Some(tx)),
@@ -171,6 +179,46 @@ impl Scanner {
         for list in periodic.values_mut() {
             list.remove(id);
         }
+    }
+
+    /// Add `id` (with scan priority `phas`) to the event-driven scan list
+    /// keyed by `event` (the record's `EVNT` field). An empty `event` string
+    /// means "no list" -- such a record is never added (Task 12 leaves
+    /// `EVNT` at its default, empty value for every non-event-scanned
+    /// record, so this guard is what keeps them all out of a `""`-keyed
+    /// list).
+    pub fn add_event(&self, id: RecordId, phas: i32, event: String) {
+        if event.is_empty() {
+            return;
+        }
+        self.events.lock().unwrap().entry(event).or_default().insert(id, phas);
+    }
+
+    /// Remove `id` from every event-driven scan list it belongs to.
+    pub fn remove_event(&self, id: RecordId) {
+        let mut events = self.events.lock().unwrap();
+        for list in events.values_mut() {
+            list.remove(id);
+        }
+    }
+
+    /// Fire the event-driven scan list keyed by `event`: snapshot it
+    /// (lock/clone/unlock), then run `process_ids` in PHAS order on the
+    /// caller's thread. Synchronous by design -- unlike periodic scanning,
+    /// event scanning must have completed by the time this call (and thus
+    /// `EventSink::on_event`'s returned future, and thus `Events::post`)
+    /// returns, so callers can rely on "records have processed when post
+    /// returns". An unknown event name is a no-op.
+    pub fn fire_event(&self, event: &str) {
+        let ids = {
+            self.events
+                .lock()
+                .unwrap()
+                .get(event)
+                .map(|l| l.snapshot())
+                .unwrap_or_default()
+        };
+        self.process_ids(&ids);
     }
 
     /// Spawn one thread per non-empty periodic scan list. Call once; `self`
@@ -391,6 +439,20 @@ impl Scanner {
                 }
             }
         }
+    }
+}
+
+impl EventSink for Scanner {
+    /// Drives an event-scan list from the server's named-event fan-out
+    /// (`Events::post`). The returned future does purely synchronous work
+    /// (`fire_event`) and awaits nothing, so by the time `Events::post`'s
+    /// `sink.on_event(event).await` resolves, every record in the list has
+    /// already been processed on `post`'s calling task -- preserving the
+    /// "records have processed when post returns" contract documented on
+    /// `EventSink` itself.
+    fn on_event(&self, event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let event = event.to_string();
+        Box::pin(async move { self.fire_event(&event) })
     }
 }
 
@@ -915,6 +977,73 @@ mod tests {
             scanner.scan_once(a);
         }
         assert!(scanner.scan_once_dropped() > 0);
+    }
+
+    #[test]
+    fn fire_event_processes_the_named_list_in_phas_order_on_caller_thread() {
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n\
+             record(ai, \"PV:B\") {\n field(INP, \"2\")\n}\n",
+        ));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let (a, b) = (db.lookup("PV:A").unwrap(), db.lookup("PV:B").unwrap());
+        scanner.add_event(a, 1, "shutter".into());
+        scanner.add_event(b, 0, "shutter".into());
+        scanner.fire_event("shutter"); // synchronous: results visible immediately
+        assert_eq!(*sink.posted.lock().unwrap(), vec!["PV:B".to_string(), "PV:A".to_string()]);
+    }
+
+    #[test]
+    fn firing_an_unknown_event_is_a_noop() {
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Scanner::new(db, clock, sink.clone());
+        scanner.fire_event("nobody");
+        assert!(sink.posted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_event_with_empty_evnt_string_is_a_noop() {
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Scanner::new(db.clone(), clock, sink.clone());
+        let a = db.lookup("PV:A").unwrap();
+        scanner.add_event(a, 0, String::new());
+        assert!(
+            scanner.events.lock().unwrap().is_empty(),
+            "an empty EVNT string must never create a list"
+        );
+    }
+
+    #[test]
+    fn remove_event_stops_further_fires() {
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Scanner::new(db.clone(), clock, sink.clone());
+        let a = db.lookup("PV:A").unwrap();
+        scanner.add_event(a, 0, "shutter".into());
+        scanner.remove_event(a);
+        scanner.fire_event("shutter");
+        assert!(sink.posted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn on_event_drives_the_list_via_the_event_sink_seam() {
+        // Register the Scanner as a sink on a real Events, post, assert processed.
+        use spvirit_server::events::Events;
+
+        let db = Arc::new(build_db("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n"));
+        let (clock, sink) = (Arc::new(ManualClock::new()), Arc::new(RecordingSink::default()));
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let a = db.lookup("PV:A").unwrap();
+        scanner.add_event(a, 0, "shutter".into());
+
+        let events = Events::new();
+        events.add_sink(scanner.clone());
+        events.post("shutter").await;
+
+        assert_eq!(*sink.posted.lock().unwrap(), vec!["PV:A".to_string()]);
     }
 
     #[test]
