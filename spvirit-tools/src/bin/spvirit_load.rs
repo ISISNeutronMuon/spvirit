@@ -133,6 +133,7 @@ async fn run_watch(
             opts.pv_name = pv_name(&prefix, p);
             set.spawn(async move {
                 let client = client_from_opts(&opts);
+                let pv_for_err = opts.pv_name.clone();
                 let cb = move |u: &MonitorUpdate| {
                     if stop.load(Ordering::Relaxed) {
                         return ControlFlow::Break(());
@@ -152,14 +153,50 @@ async fn run_watch(
                     }
                     ControlFlow::Continue(())
                 };
-                let _ = client.pvmonitor(&opts.pv_name, cb).await;
+                (pv_for_err, client.pvmonitor(&opts.pv_name, cb).await)
             });
         }
     }
 
-    tokio::time::sleep(window).await;
+    // A subscription that succeeds blocks in its read loop until `stop` is
+    // observed on a subsequent callback invocation, so any task that
+    // completes *before* the window elapses (and before we set `stop`) can
+    // only have done so because `pvmonitor` returned an error while opening
+    // or servicing the channel. Race the window sleep against draining those
+    // early completions so failures are surfaced (and not silently counted
+    // as connected), while a single bad subscription doesn't abort the run.
+    let mut connected = 0usize;
+    let sleep = tokio::time::sleep(window);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => break,
+            joined = set.join_next() => {
+                match joined {
+                    Some(Ok((pv, Err(e)))) => {
+                        eprintln!("spload watch: subscription to {pv} failed: {e}");
+                    }
+                    Some(Ok((_pv, Ok(())))) => {
+                        // Finished cleanly before the window elapsed (e.g. server closed
+                        // the subscription) — it was connected, just short-lived.
+                        connected += 1;
+                    }
+                    Some(Err(join_err)) => {
+                        eprintln!("spload watch: subscription task panicked: {join_err}");
+                    }
+                    None => break, // every subscription task has already finished
+                }
+            }
+        }
+    }
     stop.store(true, Ordering::Relaxed);
+    // Whatever's left is still running the monitor read loop, i.e. actually connected.
+    connected += set.len();
     set.shutdown().await;
+
+    if connected == 0 {
+        return Err("spload watch: all subscriptions failed to connect; nothing measured".into());
+    }
 
     let mut received_total = 0u64;
     let mut span_total = 0u64;
@@ -177,7 +214,7 @@ async fn run_watch(
     }
     all_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let summary = WatchSummary {
-        subscriptions: npvs * subs,
+        subscriptions: connected,
         window_s: window.as_secs_f64(),
         received_total,
         span_total,
@@ -210,6 +247,15 @@ pub(crate) fn target_pv(seq: u64, npvs: usize) -> usize {
     (seq % npvs.max(1) as u64) as usize
 }
 
+// Guard against `--pvs 0`: there is nothing to PUT to, and indexing an empty
+// `channels` vec below would otherwise panic instead of failing cleanly.
+pub(crate) fn require_at_least_one_pv(npvs: usize) -> Result<(), Box<dyn std::error::Error>> {
+    if npvs == 0 {
+        return Err("spload drive: --pvs must be at least 1 (0 PVs means nothing to PUT to)".into());
+    }
+    Ok(())
+}
+
 async fn run_drive(
     base_opts: spvirit_client::PvGetOptions,
     prefix: String,
@@ -218,6 +264,7 @@ async fn run_drive(
     duration: Duration,
     stamp: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    require_at_least_one_pv(npvs)?;
     let client = client_from_opts(&base_opts);
     // One persistent PUT channel per PV (keeps its reader task alive across puts).
     let mut channels: Vec<spvirit_client::PvaChannel> = Vec::with_capacity(npvs);
@@ -402,6 +449,12 @@ mod tests {
         assert_eq!(puts_due(100.0, std::time::Duration::from_millis(2500)), 250);
         assert_eq!(puts_due(1000.0, std::time::Duration::from_secs(1)), 1000);
         assert_eq!(puts_due(0.0, std::time::Duration::from_secs(5)), 0);
+    }
+
+    #[test]
+    fn require_at_least_one_pv_rejects_zero() {
+        assert!(require_at_least_one_pv(0).is_err());
+        assert!(require_at_least_one_pv(1).is_ok());
     }
 
     #[test]
