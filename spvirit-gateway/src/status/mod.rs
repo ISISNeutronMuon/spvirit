@@ -24,12 +24,14 @@ use std::time::Duration;
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::pvstore::{PvInfo, Source};
 use spvirit_server::simple_store::descriptor_for_payload;
-use spvirit_types::{NtPayload, NtScalar, PvValue, ScalarValue};
+use spvirit_types::{
+    NtPayload, NtScalar, NtScalarArray, NtTable, NtTableColumn, PvValue, ScalarArrayValue,
+    ScalarValue,
+};
 use tokio::sync::mpsc;
 
 use crate::access::{AccessControl, Decision, Identity, Op};
 use crate::proxy::GatewaySource;
-use crate::upstream::UpstreamPool;
 
 /// How often the `subscribe` ticker refreshes a live PV's value.
 const TICK_PERIOD: Duration = Duration::from_secs(1);
@@ -86,70 +88,68 @@ fn served_suffixes() -> impl Iterator<Item = &'static str> {
     LIVE.iter().chain(STATIC_ZERO.iter()).chain(RPC_NAMES.iter()).copied()
 }
 
-/// A cheap, cloneable "read the current value" callback used by
-/// [`StatusHandles`]'s live gauges.
+/// A cheap, cloneable "read the current scalar value" callback used by
+/// [`StatusHandles`]'s live scalar gauges (`threads`, `stats`).
 type Gauge = Arc<dyn Fn() -> f64 + Send + Sync>;
 
+/// A cheap, cloneable "read the current name list" callback used by
+/// [`StatusHandles`]'s live string-array PVs (`clients`, `cache`).
+type ListHandle = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Live-value handles `StatusSource` reads for its `clients`/`cache`/
-/// `refs`/`threads`/`stats` PVs.
+/// `threads`/`stats` PVs.
 ///
 /// Cheap to clone (each field is an `Arc`), so a clone can be handed to the
-/// `subscribe` ticker task without borrowing the source.
+/// `subscribe` ticker task without borrowing the source. `refs` and the
+/// bandwidth PVs are served as NTTables built from no live source yet (empty
+/// rows), so they need no handle here.
 #[derive(Clone)]
 pub struct StatusHandles {
-    pub clients: Gauge,
-    pub cache: Gauge,
-    pub refs: Gauge,
+    /// Downstream client names (p4p `clients`, an NTScalarArray-of-string).
+    pub clients: ListHandle,
+    /// Upstream channel-cache names (p4p `cache`, an NTScalarArray-of-string).
+    pub cache: ListHandle,
+    /// tokio worker/task count (spvirit extension scalar; no p4p PV).
     pub threads: Gauge,
+    /// Aggregate active-channel count (spvirit extension scalar; no p4p PV).
     pub stats: Gauge,
 }
 
 impl StatusHandles {
-    /// All gauges stubbed to zero — used by unit tests that don't need a
+    /// All handles stubbed empty/zero — used by unit tests that don't need a
     /// real `GatewaySource`/`UpstreamPool`.
     pub fn test() -> Self {
+        let empty: ListHandle = Arc::new(Vec::new);
         let zero: Gauge = Arc::new(|| 0.0);
         Self {
-            clients: zero.clone(),
-            cache: zero.clone(),
-            refs: zero.clone(),
+            clients: empty.clone(),
+            cache: empty,
             threads: zero.clone(),
             stats: zero,
         }
     }
 
-    /// Wires the handles the runtime has a real M1 source for:
-    /// - `clients` <- the number of upstream clients configured on this
-    ///   server's shared [`UpstreamPool`].
-    /// - `cache` <- [`GatewaySource::upstream_monitor_count`], the number of
-    ///   distinct upstream monitors currently running.
+    /// Wires the handles the runtime has a real M1 data source for:
+    /// - `cache` <- [`GatewaySource::upstream_monitor_names`], the live list
+    ///   of upstream channels currently held in the monitor cache. This
+    ///   genuinely changes as monitors come and go, so its NTScalarArray
+    ///   payload changes and the monitor pump forwards a fresh frame.
+    /// - `stats` <- [`GatewaySource::upstream_monitor_count`], the number of
+    ///   distinct upstream monitors currently running (a live "active
+    ///   channels" aggregate).
     ///
-    /// `refs`, `threads`, and `stats` have no obvious M1 data source yet
-    /// (no per-binding refcount, no thread-pool introspection, no
-    /// aggregate request-stats collector exists in the gateway) and are
-    /// stubbed to zero — a documented M1 gap, not an oversight.
-    pub fn from_gateway(src: &Arc<GatewaySource>, pool: &Arc<UpstreamPool>) -> Self {
-        let n_clients = pool.names().len() as f64;
-        let src = src.clone();
-        let zero: Gauge = Arc::new(|| 0.0);
+    /// `clients` has no downstream-peer registry to read from in M1, so it is
+    /// stubbed to an empty list (correct NTScalarArray shape, data-population
+    /// follow-up). `threads` has no thread-pool introspection source and is
+    /// stubbed to zero — documented M1 gaps, not oversights.
+    pub fn from_gateway(src: &Arc<GatewaySource>) -> Self {
+        let src_cache = src.clone();
+        let src_stats = src.clone();
         Self {
-            clients: Arc::new(move || n_clients),
-            cache: Arc::new(move || src.upstream_monitor_count() as f64),
-            refs: zero.clone(),
-            threads: zero.clone(),
-            stats: zero,
-        }
-    }
-
-    fn read(&self, suffix: &str, generation: &AtomicU64) -> Option<f64> {
-        match suffix {
-            "clients" => Some((self.clients)()),
-            "cache" => Some((self.cache)()),
-            "refs" => Some((self.refs)()),
-            "threads" => Some((self.threads)()),
-            "stats" => Some((self.stats)()),
-            "poke" => Some(generation.load(Ordering::Relaxed) as f64),
-            _ => None,
+            clients: Arc::new(Vec::new),
+            cache: Arc::new(move || src_cache.upstream_monitor_names()),
+            threads: Arc::new(|| 0.0),
+            stats: Arc::new(move || src_stats.upstream_monitor_count() as f64),
         }
     }
 }
@@ -184,11 +184,85 @@ impl StatusSource {
         NtPayload::Scalar(NtScalar::from_value(ScalarValue::F64(v)))
     }
 
-    fn decision_str(d: &Decision) -> &'static str {
-        match d {
-            Decision::Allow | Decision::AllowAliased(_) => "allow",
-            Decision::Deny => "deny",
-        }
+    /// An NTScalarArray-of-string payload (p4p's shape for `clients`/`cache`).
+    fn string_array_payload(items: Vec<String>) -> NtPayload {
+        NtPayload::ScalarArray(NtScalarArray::from_value(ScalarArrayValue::Str(items)))
+    }
+
+    /// The `refs` NTTable — p4p's `RefAdapter` shape: columns
+    /// `type`/`count`/`delta` labelled `Type`/`Count`/`Delta`. No refcount
+    /// collector exists in M1, so the rows are empty (correct shape, data
+    /// follow-up).
+    fn refs_table() -> NtPayload {
+        NtPayload::Table(NtTable {
+            labels: vec!["Type".into(), "Count".into(), "Delta".into()],
+            columns: vec![
+                NtTableColumn { name: "type".into(), values: ScalarArrayValue::Str(vec![]) },
+                NtTableColumn { name: "count".into(), values: ScalarArrayValue::U32(vec![]) },
+                NtTableColumn { name: "delta".into(), values: ScalarArrayValue::I32(vec![]) },
+            ],
+            descriptor: None,
+            alarm: None,
+            time_stamp: None,
+        })
+    }
+
+    /// A bandwidth-counter NTTable matching p4p's `TableBuilder` shapes. The
+    /// `bypv` tables carry `name`/`rate` (labels `PV` + direction); `us:byhost`
+    /// carries `name`/`rate` (labels `Server` + direction); `ds:byhost` adds an
+    /// `account` column (labels `Account`/`Client` + direction). No per-PV /
+    /// per-host byte accounting exists in M1, so every table has empty rows
+    /// (correct shape, `0` rows != "no traffic"; data follow-up).
+    fn bandwidth_table(suffix: &str) -> NtPayload {
+        let dir_label = if suffix.ends_with(":tx") { "TX (B/s)" } else { "RX (B/s)" };
+        let (labels, columns) = if suffix.starts_with("ds:byhost:") {
+            (
+                vec!["Account".into(), "Client".into(), dir_label.into()],
+                vec![
+                    NtTableColumn { name: "account".into(), values: ScalarArrayValue::Str(vec![]) },
+                    NtTableColumn { name: "name".into(), values: ScalarArrayValue::Str(vec![]) },
+                    NtTableColumn { name: "rate".into(), values: ScalarArrayValue::F64(vec![]) },
+                ],
+            )
+        } else {
+            // `*:bypv:*` -> "PV"; `us:byhost:*` -> "Server".
+            let name_label = if suffix.contains(":byhost:") { "Server" } else { "PV" };
+            (
+                vec![name_label.into(), dir_label.into()],
+                vec![
+                    NtTableColumn { name: "name".into(), values: ScalarArrayValue::Str(vec![]) },
+                    NtTableColumn { name: "rate".into(), values: ScalarArrayValue::F64(vec![]) },
+                ],
+            )
+        };
+        NtPayload::Table(NtTable { labels, columns, descriptor: None, alarm: None, time_stamp: None })
+    }
+
+    /// Builds the current value payload for a non-RPC status PV suffix, in the
+    /// p4p-matched shape. Free of `&self` borrows on anything but the two
+    /// arguments so the `subscribe` ticker task can call it from a cloned
+    /// [`StatusHandles`] + generation counter.
+    fn value_payload(
+        suffix: &str,
+        handles: &StatusHandles,
+        generation: &AtomicU64,
+    ) -> Option<NtPayload> {
+        Some(match suffix {
+            "clients" => Self::string_array_payload((handles.clients)()),
+            "cache" => Self::string_array_payload((handles.cache)()),
+            "refs" => Self::refs_table(),
+            "threads" => Self::scalar_payload((handles.threads)()),
+            "stats" => Self::scalar_payload((handles.stats)()),
+            "poke" => Self::scalar_payload(generation.load(Ordering::Relaxed) as f64),
+            s if STATIC_ZERO.contains(&s) => Self::bandwidth_table(s),
+            _ => return None,
+        })
+    }
+
+    /// Whether an access [`Decision`] grants the operation (an alias rewrite
+    /// still grants it).
+    fn allowed(d: &Decision) -> bool {
+        matches!(d, Decision::Allow | Decision::AllowAliased(_))
     }
 
     /// Reads a `DecodedValue::Structure` field by name as a string, per the
@@ -205,20 +279,41 @@ impl StatusSource {
         })
     }
 
-    /// Builds the `asTest` NT response: the three per-op verdicts as
-    /// allow/deny strings, plus a short summary string.
-    fn astest_response(pv: &str, get_d: &Decision, put_d: &Decision, rpc_d: &Decision) -> NtPayload {
-        let get_s = Self::decision_str(get_d);
-        let put_s = Self::decision_str(put_d);
-        let rpc_s = Self::decision_str(rpc_d);
-        let summary = format!("asTest {pv:?}: get={get_s}, put={put_s}, rpc={rpc_s}");
-        NtPayload::Generic {
-            struct_id: "spvirit:gateway/AsTestResult:1.0".to_string(),
+    /// Builds the `asTest` RPC response in p4p's shape: the
+    /// `epics:p2p/Permission:1.0` structure carrying the queried `pv`,
+    /// `account`/`peer` echoed from the request, and a nested `permission`
+    /// sub-structure of boolean verdicts (`put`/`rpc`, plus `uncached`/`audit`
+    /// which spvirit does not model yet and reports `false`).
+    ///
+    /// spvirit does not expose `roles`/`asg`/`asl` from its `AccessControl`,
+    /// so those p4p fields are present (shape parity) but empty/zero — a
+    /// data-population follow-up, not a shape divergence.
+    fn astest_response(
+        pv: &str,
+        account: &str,
+        peer: &str,
+        put_d: &Decision,
+        rpc_d: &Decision,
+    ) -> NtPayload {
+        let permission = PvValue::Structure {
+            struct_id: String::new(),
             fields: vec![
-                ("get".to_string(), PvValue::Scalar(ScalarValue::Str(get_s.to_string()))),
-                ("put".to_string(), PvValue::Scalar(ScalarValue::Str(put_s.to_string()))),
-                ("rpc".to_string(), PvValue::Scalar(ScalarValue::Str(rpc_s.to_string()))),
-                ("summary".to_string(), PvValue::Scalar(ScalarValue::Str(summary))),
+                ("put".to_string(), PvValue::Scalar(ScalarValue::Bool(Self::allowed(put_d)))),
+                ("rpc".to_string(), PvValue::Scalar(ScalarValue::Bool(Self::allowed(rpc_d)))),
+                ("uncached".to_string(), PvValue::Scalar(ScalarValue::Bool(false))),
+                ("audit".to_string(), PvValue::Scalar(ScalarValue::Bool(false))),
+            ],
+        };
+        NtPayload::Generic {
+            struct_id: "epics:p2p/Permission:1.0".to_string(),
+            fields: vec![
+                ("pv".to_string(), PvValue::Scalar(ScalarValue::Str(pv.to_string()))),
+                ("account".to_string(), PvValue::Scalar(ScalarValue::Str(account.to_string()))),
+                ("peer".to_string(), PvValue::Scalar(ScalarValue::Str(peer.to_string()))),
+                ("roles".to_string(), PvValue::ScalarArray(ScalarArrayValue::Str(vec![]))),
+                ("asg".to_string(), PvValue::Scalar(ScalarValue::Str(String::new()))),
+                ("asl".to_string(), PvValue::Scalar(ScalarValue::I32(0))),
+                ("permission".to_string(), permission),
             ],
         }
     }
@@ -239,9 +334,9 @@ impl Source for StatusSource {
                 return None;
             }
             let payload = if RPC_NAMES.contains(&suffix) {
-                Self::astest_response("", &Decision::Deny, &Decision::Deny, &Decision::Deny)
+                Self::astest_response("", "", "", &Decision::Deny, &Decision::Deny)
             } else {
-                Self::scalar_payload(self.handles.read(suffix, &self.generation).unwrap_or(0.0))
+                Self::value_payload(suffix, &self.handles, &self.generation)?
             };
             Some(PvInfo {
                 descriptor: descriptor_for_payload(&payload),
@@ -260,14 +355,10 @@ impl Source for StatusSource {
             if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
                 return None;
             }
-            let v = if LIVE.contains(&suffix) {
-                self.handles.read(suffix, &self.generation)?
-            } else if STATIC_ZERO.contains(&suffix) {
-                0.0
-            } else {
+            if !LIVE.contains(&suffix) && !STATIC_ZERO.contains(&suffix) {
                 return None;
-            };
-            Some(Self::scalar_payload(v))
+            }
+            Self::value_payload(suffix, &self.handles, &self.generation)
         })
     }
 
@@ -318,10 +409,15 @@ impl Source for StatusSource {
                     let mut interval = tokio::time::interval(TICK_PERIOD);
                     loop {
                         interval.tick().await;
-                        let Some(v) = handles.read(&suffix, &generation) else {
+                        let Some(payload) = Self::value_payload(&suffix, &handles, &generation)
+                        else {
                             break;
                         };
-                        if tx.send(Self::scalar_payload(v)).await.is_err() {
+                        // The value is re-read every tick; the server's monitor
+                        // pump suppresses byte-identical frames, so a client
+                        // sees a new frame only when the underlying list/gauge
+                        // actually changes — matching p4p's post-on-change.
+                        if tx.send(payload).await.is_err() {
                             // Receiver dropped: stop ticking, don't leak the task.
                             break;
                         }
@@ -329,9 +425,11 @@ impl Source for StatusSource {
                 });
             } else if STATIC_ZERO.contains(&suffix.as_str()) {
                 tokio::spawn(async move {
-                    let _ = tx.send(Self::scalar_payload(0.0)).await;
-                    // Emit once, then let `tx` drop — the receiver observes
-                    // a closed channel (idle) rather than further updates.
+                    let _ = tx.send(Self::bandwidth_table(&suffix)).await;
+                    // Emit the (static, empty) bandwidth table once, then let
+                    // `tx` drop — the receiver observes a closed channel (idle)
+                    // rather than further updates, since no byte accounting
+                    // exists to change the value.
                 });
             } else {
                 return None;
@@ -359,10 +457,11 @@ impl Source for StatusSource {
                 host: Self::decoded_field_str(&args, "host"),
                 user: Self::decoded_field_str(&args, "user"),
             };
-            let get_d = self.access.decide(Op::Get, &pv, &id);
+            let account = id.user.clone().unwrap_or_default();
+            let peer = id.host.clone().unwrap_or_default();
             let put_d = self.access.decide(Op::Put, &pv, &id);
             let rpc_d = self.access.decide(Op::Rpc, &pv, &id);
-            Ok(Self::astest_response(&pv, &get_d, &put_d, &rpc_d))
+            Ok(Self::astest_response(&pv, &account, &peer, &put_d, &rpc_d))
         })
     }
 
@@ -441,5 +540,125 @@ mod tests {
             res.unwrap_err().contains("read-only"),
             "non-poke status PVs are rejected as read-only before the access gate"
         );
+    }
+
+    /// A `StatusSource` whose `cache` list is driven by a caller-controllable
+    /// `Vec<String>` — lets a test change the underlying value without a real
+    /// `GatewaySource`, so the ticker's post-on-change behaviour is testable.
+    fn source_with_cache(
+        list: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> StatusSource {
+        let handles = StatusHandles {
+            clients: Arc::new(Vec::new),
+            cache: Arc::new(move || list.lock().unwrap().clone()),
+            threads: Arc::new(|| 0.0),
+            stats: Arc::new(|| 0.0),
+        };
+        let access = Arc::new(AccessControl::new(false, None, None));
+        StatusSource::new(PREFIX.to_string(), access, handles)
+    }
+
+    /// p4p shape: `clients`/`cache` are NTScalarArray-of-string, not scalars.
+    #[tokio::test]
+    async fn clients_and_cache_get_returns_string_array() {
+        let src = source(false);
+        for suffix in ["clients", "cache"] {
+            let p = src.get(&format!("{PREFIX}{suffix}")).await.expect("get");
+            match p {
+                NtPayload::ScalarArray(a) => {
+                    assert!(matches!(a.value, ScalarArrayValue::Str(_)), "{suffix} must be a string array");
+                }
+                other => panic!("{suffix} must be an NTScalarArray, got {other:?}"),
+            }
+        }
+    }
+
+    /// p4p shape: `refs` is an NTTable labelled `Type`/`Count`/`Delta`.
+    #[tokio::test]
+    async fn refs_get_returns_ntt_table_with_expected_labels() {
+        let src = source(false);
+        let p = src.get(&format!("{PREFIX}refs")).await.expect("get");
+        let NtPayload::Table(t) = p else {
+            panic!("refs must be an NTTable, got {p:?}");
+        };
+        assert_eq!(t.labels, vec!["Type", "Count", "Delta"]);
+        let names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["type", "count", "delta"]);
+    }
+
+    /// p4p shape: the bandwidth PVs are NTTables. `ds:byhost:*` has the extra
+    /// `Account` column; the rate column's label is direction-specific.
+    #[tokio::test]
+    async fn bandwidth_pvs_are_tables_with_p4p_columns() {
+        let src = source(false);
+
+        let p = src.get(&format!("{PREFIX}us:bypv:tx")).await.expect("get");
+        let NtPayload::Table(t) = p else { panic!("bandwidth PV must be a table") };
+        assert_eq!(t.labels, vec!["PV", "TX (B/s)"]);
+
+        let p = src.get(&format!("{PREFIX}ds:byhost:rx")).await.expect("get");
+        let NtPayload::Table(t) = p else { panic!("bandwidth PV must be a table") };
+        assert_eq!(t.labels, vec!["Account", "Client", "RX (B/s)"]);
+        let names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["account", "name", "rate"]);
+
+        let p = src.get(&format!("{PREFIX}us:byhost:tx")).await.expect("get");
+        let NtPayload::Table(t) = p else { panic!("bandwidth PV must be a table") };
+        assert_eq!(t.labels, vec!["Server", "TX (B/s)"]);
+    }
+
+    /// asTest returns p4p's `epics:p2p/Permission:1.0` with a nested
+    /// `permission` sub-structure, and `readOnly` reports `put=false`.
+    #[tokio::test]
+    async fn astest_returns_permission_shape() {
+        let ac = Arc::new(AccessControl::new(true, None, None)); // readOnly
+        let src = StatusSource::new(PREFIX.to_string(), ac, StatusHandles::test());
+        let args = DecodedValue::Structure(vec![
+            ("pv".to_string(), DecodedValue::String("SOMEPV".to_string())),
+            ("user".to_string(), DecodedValue::String("alice".to_string())),
+            ("host".to_string(), DecodedValue::String("10.0.0.1".to_string())),
+        ]);
+        let out = src.rpc(&format!("{PREFIX}asTest"), &args).await.expect("rpc");
+        let NtPayload::Generic { struct_id, fields } = out else {
+            panic!("asTest must return a Generic structure");
+        };
+        assert_eq!(struct_id, "epics:p2p/Permission:1.0");
+        // account/peer echoed from the request args.
+        let account = fields.iter().find(|(n, _)| n == "account").map(|(_, v)| v);
+        assert!(matches!(account, Some(PvValue::Scalar(ScalarValue::Str(s))) if s == "alice"));
+        // nested permission.put is false under readOnly.
+        let perm = fields.iter().find(|(n, _)| n == "permission").map(|(_, v)| v).expect("permission");
+        let PvValue::Structure { fields: pf, .. } = perm else {
+            panic!("permission must be a sub-structure");
+        };
+        let put = pf.iter().find(|(n, _)| n == "put").map(|(_, v)| v);
+        assert!(matches!(put, Some(PvValue::Scalar(ScalarValue::Bool(false)))), "readOnly => put denied");
+    }
+
+    /// The core of the "diag PVs don't update" fix: when the underlying list
+    /// changes, the ticker produces a *different* frame and the subscribe
+    /// receiver observes it. Driven deterministically with a paused clock —
+    /// no wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn subscribe_delivers_a_new_frame_when_the_cache_list_changes() {
+        let list = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let src = source_with_cache(list.clone());
+
+        let mut rx = src.subscribe(&format!("{PREFIX}cache")).await.expect("subscribe");
+
+        // A fresh interval's first tick completes immediately.
+        let first = rx.recv().await.expect("first frame");
+        assert_eq!(first, StatusSource::string_array_payload(vec![]));
+
+        // Change the underlying value, then let one tick period elapse.
+        list.lock().unwrap().push("UP:CHAN".to_string());
+        tokio::time::advance(TICK_PERIOD).await;
+
+        let second = rx.recv().await.expect("second frame");
+        assert_eq!(
+            second,
+            StatusSource::string_array_payload(vec!["UP:CHAN".to_string()])
+        );
+        assert_ne!(first, second, "a changed value must produce a different frame");
     }
 }

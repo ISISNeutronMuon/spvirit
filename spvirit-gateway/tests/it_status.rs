@@ -8,31 +8,7 @@ use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_gateway::access::AccessControl;
 use spvirit_gateway::status::{StatusHandles, StatusSource, banner};
 use spvirit_server::pvstore::Source;
-use spvirit_types::{NtPayload, PvValue, ScalarValue};
-
-/// Digs an `f64` out of either an `NtPayload::Scalar` (the shape
-/// `StatusSource::get` returns for its live/static PVs) or an
-/// `NtPayload::Generic`'s `"value"` field, matching the pattern the
-/// passthrough tests use for the gateway's own NT payloads.
-fn extract_f64_value(p: &NtPayload) -> f64 {
-    match p {
-        NtPayload::Scalar(nt) => match nt.value {
-            ScalarValue::F64(x) => x,
-            ref other => panic!("expected F64 scalar, got {other:?}"),
-        },
-        NtPayload::Generic { fields, .. } => {
-            for (name, v) in fields {
-                if name == "value"
-                    && let PvValue::Scalar(ScalarValue::F64(x)) = v
-                {
-                    return *x;
-                }
-            }
-            panic!("no scalar F64 \"value\" field in {fields:?}");
-        }
-        other => panic!("expected NtPayload::Scalar or Generic, got {other:?}"),
-    }
-}
+use spvirit_types::{NtPayload, PvValue, ScalarArrayValue, ScalarValue};
 
 /// Builds the `asTest` RPC argument structure: `{pv, user, host}`, all
 /// strings.
@@ -44,19 +20,28 @@ fn decoded_astest_args(pv: &str, user: &str, host: &str) -> DecodedValue {
     ])
 }
 
-/// True if the `asTest` RPC response reports `Put` as denied.
+/// True if the `asTest` RPC response (p4p `epics:p2p/Permission:1.0`) reports
+/// `put` as denied in its nested `permission` sub-structure.
 fn astest_put_denied(out: &NtPayload) -> bool {
     let NtPayload::Generic { fields, .. } = out else {
         panic!("expected NtPayload::Generic, got {out:?}");
     };
-    for (name, v) in fields {
+    let perm = fields
+        .iter()
+        .find(|(n, _)| n == "permission")
+        .map(|(_, v)| v)
+        .expect("permission sub-structure");
+    let PvValue::Structure { fields: pf, .. } = perm else {
+        panic!("permission must be a sub-structure, got {perm:?}");
+    };
+    for (name, v) in pf {
         if name == "put"
-            && let PvValue::Scalar(ScalarValue::Str(s)) = v
+            && let PvValue::Scalar(ScalarValue::Bool(b)) = v
         {
-            return s == "deny";
+            return !*b;
         }
     }
-    panic!("no \"put\" field in {fields:?}");
+    panic!("no \"put\" field in {pf:?}");
 }
 
 #[tokio::test]
@@ -72,14 +57,35 @@ async fn status_source_claims_prefixed_pvs() {
 }
 
 #[tokio::test]
-async fn static_bandwidth_pvs_read_zero() {
+async fn static_bandwidth_pvs_are_empty_tables() {
     let ss = StatusSource::new(
         "GW:STS:".into(),
         Arc::new(AccessControl::new(false, None, None)),
         StatusHandles::test(),
     );
     let v = ss.get("GW:STS:us:bypv:rx").await.expect("get");
-    assert_eq!(extract_f64_value(&v), 0.0);
+    let NtPayload::Table(t) = v else {
+        panic!("bandwidth PV must be an NTTable, got {v:?}");
+    };
+    assert_eq!(t.labels, vec!["PV", "RX (B/s)"]);
+    // Static in M1: no byte accounting, so zero rows.
+    for col in &t.columns {
+        assert_eq!(col.values.len(), 0, "column {} must have no rows", col.name);
+    }
+}
+
+#[tokio::test]
+async fn clients_pv_is_a_string_array() {
+    let ss = StatusSource::new(
+        "GW:STS:".into(),
+        Arc::new(AccessControl::new(false, None, None)),
+        StatusHandles::test(),
+    );
+    let v = ss.get("GW:STS:clients").await.expect("get");
+    let NtPayload::ScalarArray(a) = v else {
+        panic!("clients must be an NTScalarArray, got {v:?}");
+    };
+    assert!(matches!(a.value, ScalarArrayValue::Str(_)));
 }
 
 #[tokio::test]

@@ -102,7 +102,7 @@ impl Runtime {
                 let status = Arc::new(StatusSource::new(
                     server_cfg.statusprefix.clone(),
                     access.clone(),
-                    StatusHandles::from_gateway(&src_arc, &pool),
+                    StatusHandles::from_gateway(&src_arc),
                 ));
                 for line in banner::status_pv_lines(&server_cfg.statusprefix) {
                     tracing::info!("{line}");
