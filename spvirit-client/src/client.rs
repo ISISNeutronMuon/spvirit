@@ -197,6 +197,7 @@ pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetR
         version,
         is_be,
         mut reassembler,
+        server_addr,
         ..
     } = conn;
 
@@ -259,6 +260,7 @@ pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetR
                     raw_pva: data_resp,
                     raw_pvd: op.body,
                     introspection: desc,
+                    server_host: server_addr.to_string(),
                 });
             }
             Err(PvGetError::Decode("no decoded value".to_string()))

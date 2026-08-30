@@ -34,6 +34,7 @@ pub mod conn_writer;
 pub mod convert;
 pub mod db;
 pub mod decode;
+pub mod diag;
 pub mod events;
 pub mod field_provider;
 pub mod group;

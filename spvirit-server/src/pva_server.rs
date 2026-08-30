@@ -75,6 +75,8 @@ pub struct PvaServerBuilder {
     event_sinks: Vec<Arc<dyn crate::events::EventSink>>,
     guid: Option<[u8; 12]>,
     discovery_parity: bool,
+    client_registry: Option<Arc<crate::diag::ClientRegistry>>,
+    bandwidth_counters: Option<Arc<crate::diag::BandwidthCounters>>,
 }
 
 impl PvaServerBuilder {
@@ -101,6 +103,8 @@ impl PvaServerBuilder {
             event_sinks: Vec::new(),
             guid: None,
             discovery_parity: true,
+            client_registry: None,
+            bandwidth_counters: None,
         }
     }
 
@@ -624,6 +628,35 @@ impl PvaServerBuilder {
         self
     }
 
+    /// Install a diagnostic [`ClientRegistry`](crate::diag::ClientRegistry)
+    /// that tracks downstream PVA clients — connect, identity (the decoded
+    /// `ca` user/host), and disconnect — for the gateway's `clients`
+    /// diagnostic PV and per-host bandwidth accounting.
+    ///
+    /// Threaded onto the resolved [`MonitorRegistry`] (and, from there, onto
+    /// [`crate::handler::ServerState`]) the first time the registry is
+    /// resolved — see [`PvaServer::resolved_monitor_registry`]. Not set by
+    /// default: servers that don't need client tracking pay nothing for it.
+    pub fn client_registry(mut self, r: Arc<crate::diag::ClientRegistry>) -> Self {
+        self.client_registry = Some(r);
+        self
+    }
+
+    /// Install a diagnostic
+    /// [`BandwidthCounters`](crate::diag::BandwidthCounters) that the
+    /// connection handler and monitor registry record wire bytes into, for
+    /// the gateway's per-PV and per-host bandwidth accounting.
+    ///
+    /// Threaded onto the resolved [`MonitorRegistry`] (and, from there, onto
+    /// [`crate::handler::ServerState`]) the first time the registry is
+    /// resolved — see [`PvaServer::resolved_monitor_registry`]. Not set by
+    /// default: servers that don't need bandwidth accounting pay nothing for
+    /// it.
+    pub fn bandwidth_counters(mut self, c: Arc<crate::diag::BandwidthCounters>) -> Self {
+        self.bandwidth_counters = Some(c);
+        self
+    }
+
     /// Enable alarm computation from limits.
     pub fn compute_alarms(mut self, enabled: bool) -> Self {
         self.compute_alarms = enabled;
@@ -756,6 +789,8 @@ impl PvaServerBuilder {
             monitor_registry: Arc::new(std::sync::OnceLock::new()),
             events,
             start_hooks: self.start_hooks,
+            client_registry: self.client_registry,
+            bandwidth_counters: self.bandwidth_counters,
         }
     }
 }
@@ -813,6 +848,12 @@ pub struct PvaServer {
     monitor_registry: Arc<std::sync::OnceLock<Arc<MonitorRegistry>>>,
     events: Arc<crate::events::Events>,
     start_hooks: Vec<crate::events::StartHook>,
+    /// Set via [`PvaServerBuilder::client_registry`]; installed onto the
+    /// resolved [`MonitorRegistry`] in [`Self::resolved_monitor_registry`].
+    client_registry: Option<Arc<crate::diag::ClientRegistry>>,
+    /// Set via [`PvaServerBuilder::bandwidth_counters`]; installed onto the
+    /// resolved [`MonitorRegistry`] in [`Self::resolved_monitor_registry`].
+    bandwidth_counters: Option<Arc<crate::diag::BandwidthCounters>>,
 }
 
 impl PvaServer {
@@ -951,9 +992,24 @@ impl PvaServer {
     /// `run_start_hooks()`, and `serve_after_start_hooks()` so they always
     /// agree on the exact same `Arc`, regardless of call order.
     fn resolved_monitor_registry(&self) -> Arc<MonitorRegistry> {
-        self.monitor_registry
+        let registry = self
+            .monitor_registry
             .get_or_init(|| Arc::new(MonitorRegistry::new()))
-            .clone()
+            .clone();
+        // Idempotent: installs the same Arc on every call, so it's safe that
+        // this runs on each resolution rather than only the first. Must
+        // happen before any caller builds a `ServerState` off this registry
+        // (`ServerState::new` snapshots `registry.client_registry()` once at
+        // construction time), which — for `run()`/`start()` — is guaranteed
+        // by `run_start_hooks` resolving the registry before
+        // `serve_after_start_hooks` builds the `ServerState`.
+        if let Some(cr) = &self.client_registry {
+            registry.set_client_registry(cr.clone());
+        }
+        if let Some(bw) = &self.bandwidth_counters {
+            registry.set_bandwidth_counters(bw.clone());
+        }
+        registry
     }
 
     /// Start the PVA server (UDP search + TCP handler + beacon + scan tasks).
@@ -1592,6 +1648,41 @@ mod tests {
         server.run_start_hooks().await.expect("hooks must succeed");
 
         assert_eq!(log.lock().unwrap().as_slice(), &["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn builder_client_registry_is_threaded_onto_the_monitor_registry() {
+        let cr = Arc::new(crate::diag::ClientRegistry::new());
+        let mut server = PvaServer::builder().client_registry(cr.clone()).build();
+        let mon = server.monitor_registry();
+        let installed = mon
+            .client_registry()
+            .expect("client_registry must be installed on the resolved MonitorRegistry");
+        assert!(
+            Arc::ptr_eq(&installed, &cr),
+            "the exact ClientRegistry passed to the builder must be the one installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_bandwidth_counters_is_threaded_onto_the_monitor_registry() {
+        let bw = Arc::new(crate::diag::BandwidthCounters::new());
+        let mut server = PvaServer::builder().bandwidth_counters(bw.clone()).build();
+        let mon = server.monitor_registry();
+        let installed = mon
+            .bandwidth_counters()
+            .expect("bandwidth_counters must be installed on the resolved MonitorRegistry");
+        assert!(
+            Arc::ptr_eq(&installed, &bw),
+            "the exact BandwidthCounters passed to the builder must be the one installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_without_bandwidth_counters_leaves_it_none() {
+        let mut server = PvaServer::builder().build();
+        let mon = server.monitor_registry();
+        assert!(mon.bandwidth_counters().is_none());
     }
 
     #[tokio::test]

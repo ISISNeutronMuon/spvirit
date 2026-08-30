@@ -94,6 +94,21 @@ pub struct ServerState {
     pub tcp_port: u16,
     pub advertise_ip: Option<IpAddr>,
     pub listen_ip: IpAddr,
+    /// The diagnostic [`ClientRegistry`](crate::diag::ClientRegistry) to
+    /// notify of connect/identity events, if one was installed on `registry`
+    /// (via [`MonitorRegistry::set_client_registry`]) before this state was
+    /// built. Captured here — rather than read off `registry` at each call
+    /// site — so the connect/identity hooks are a plain `if let Some(...)`
+    /// against a field already in scope, matching how `cleanup_connection`
+    /// (which lives on `MonitorRegistry` itself) reads it directly there.
+    pub client_registry: Option<Arc<crate::diag::ClientRegistry>>,
+    /// The diagnostic [`BandwidthCounters`](crate::diag::BandwidthCounters)
+    /// to record wire bytes into, if one was installed on `registry` (via
+    /// [`MonitorRegistry::set_bandwidth_counters`]) before this state was
+    /// built. Captured here for the same reason as `client_registry`: the
+    /// read loop's byte-counting call sites (Task 9) get a plain
+    /// `if let Some(...)` against a field already in scope.
+    pub bandwidth_counters: Option<Arc<crate::diag::BandwidthCounters>>,
 }
 
 impl ServerState {
@@ -109,6 +124,8 @@ impl ServerState {
         advertise_ip: Option<IpAddr>,
         listen_ip: IpAddr,
     ) -> Self {
+        let client_registry = registry.client_registry();
+        let bandwidth_counters = registry.bandwidth_counters();
         Self {
             sources,
             registry,
@@ -122,6 +139,8 @@ impl ServerState {
             tcp_port,
             advertise_ip,
             listen_ip,
+            client_registry,
+            bandwidth_counters,
         }
     }
 }
@@ -858,6 +877,12 @@ pub async fn handle_connection(
         conns.insert(conn_id, ConnWriter::new(writer));
     }
 
+    if let Some(cr) = &state.client_registry
+        && let Some(ctx) = crate::request_ctx::current_request()
+    {
+        cr.connect(conn_id, ctx.peer);
+    }
+
     let mut conn_state = ConnState::default();
 
     // Per EPICS PVA protocol: send SET_BYTE_ORDER control message before validation.
@@ -936,6 +961,13 @@ pub async fn handle_connection(
         }
         last_activity = Instant::now();
 
+        // Per-host downstream RX: count every inbound frame's on-wire bytes
+        // (header + payload) exactly once, regardless of command type, before
+        // segment reassembly folds multi-frame messages together.
+        if let Some(cr) = &state.client_registry {
+            cr.add_rx(conn_id, (header.len() + payload_len) as u64);
+        }
+
         // Segment reassembly is delegated to the shared codec state machine.
         // Control frames come back verbatim and are answered here; they never
         // reach command dispatch below.
@@ -976,6 +1008,9 @@ pub async fn handle_connection(
                     conn_id, version, is_be, val.buffer_size, val.qos, val.authz
                 );
                 crate::request_ctx::set_credentials(val.user.clone(), val.host.clone());
+                if let Some(cr) = &state.client_registry {
+                    cr.set_identity(conn_id, val.user.clone(), val.host.clone());
+                }
                 let resp = spvirit_codec::spvirit_encode::encode_connection_validated(
                     true, version, is_be,
                 );
@@ -1070,6 +1105,19 @@ pub async fn handle_connection(
                         .await;
                     continue;
                 };
+
+                // Per-PV downstream RX: PUT frames only. This is a documented
+                // approximation -- most downstream RX is puts, and other
+                // command types don't resolve to a single clean PV to
+                // attribute their bytes to. Counts this frame's on-wire
+                // payload (both PUT INIT and PUT DATA frames), independent of
+                // the per-host counter above (a different counter and a
+                // different dimension, not a double count).
+                if payload.command == 11
+                    && let Some(c) = &state.bandwidth_counters
+                {
+                    c.ds_bypv_rx.add(&pv_name, payload_len as u64);
+                }
 
                 let is_init = (payload.subcmd & 0x08) != 0;
 

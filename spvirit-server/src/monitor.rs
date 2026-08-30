@@ -29,6 +29,21 @@ pub struct MonitorRegistry {
     /// deliver their own updates ([`Source::pushes_own_updates`]) never get a
     /// pump entry — pumping them would double-deliver.
     pumps: Mutex<HashMap<String, PumpHandle>>,
+    /// The diagnostic [`ClientRegistry`](crate::diag::ClientRegistry) this
+    /// registry's connection lifecycle should populate, if one was installed
+    /// via [`Self::set_client_registry`]. `None` for servers that don't opt
+    /// into downstream-client tracking. A plain `std::sync::Mutex` (not the
+    /// `tokio::sync::Mutex` used elsewhere in this struct) because it's only
+    /// ever held across a clone/assign, never across an `.await`.
+    client_registry: std::sync::Mutex<Option<Arc<crate::diag::ClientRegistry>>>,
+    /// The diagnostic [`BandwidthCounters`](crate::diag::BandwidthCounters)
+    /// this registry's connection handler and monitor dispatch should record
+    /// wire bytes into, if one was installed via
+    /// [`Self::set_bandwidth_counters`]. `None` for servers that don't opt
+    /// into bandwidth accounting. A plain `std::sync::Mutex` for the same
+    /// reason as `client_registry`: only ever held across a clone/assign,
+    /// never across an `.await`.
+    bandwidth_counters: std::sync::Mutex<Option<Arc<crate::diag::BandwidthCounters>>>,
 }
 
 /// A pump task plus its cooperative-shutdown signal.
@@ -48,7 +63,40 @@ impl MonitorRegistry {
             monitors: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
             pumps: Mutex::new(HashMap::new()),
+            client_registry: std::sync::Mutex::new(None),
+            bandwidth_counters: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Install the diagnostic [`ClientRegistry`](crate::diag::ClientRegistry)
+    /// this registry's connection lifecycle (`cleanup_connection`) should
+    /// notify on disconnect. Threaded down from
+    /// `PvaServerBuilder::client_registry` via
+    /// `PvaServer::resolved_monitor_registry`, which calls this every time
+    /// it resolves the registry — so it's safe to call more than once.
+    pub fn set_client_registry(&self, registry: Arc<crate::diag::ClientRegistry>) {
+        *self.client_registry.lock().unwrap() = Some(registry);
+    }
+
+    /// The installed diagnostic client registry, if any.
+    pub fn client_registry(&self) -> Option<Arc<crate::diag::ClientRegistry>> {
+        self.client_registry.lock().unwrap().clone()
+    }
+
+    /// Install the diagnostic
+    /// [`BandwidthCounters`](crate::diag::BandwidthCounters) that this
+    /// registry's connection handler and monitor dispatch should record wire
+    /// bytes into. Threaded down from
+    /// `PvaServerBuilder::bandwidth_counters` via
+    /// `PvaServer::resolved_monitor_registry`, which calls this every time it
+    /// resolves the registry — so it's safe to call more than once.
+    pub fn set_bandwidth_counters(&self, counters: Arc<crate::diag::BandwidthCounters>) {
+        *self.bandwidth_counters.lock().unwrap() = Some(counters);
+    }
+
+    /// The installed diagnostic bandwidth counters, if any.
+    pub fn bandwidth_counters(&self) -> Option<Arc<crate::diag::BandwidthCounters>> {
+        self.bandwidth_counters.lock().unwrap().clone()
     }
 
     /// Ensure a single pump task is draining `rx` (a subscribe-only source's
@@ -128,6 +176,11 @@ impl MonitorRegistry {
     /// never coalesced).
     pub async fn send_msg(&self, conn_id: u64, msg: Vec<u8>) {
         if let Some(cw) = self.conn_writer(conn_id).await {
+            // One-shot reply: the PV (if any) isn't known here, so only
+            // credit the per-host byhost attribution, not a per-PV counter.
+            if let Some(r) = self.client_registry() {
+                r.add_tx(conn_id, msg.len() as u64);
+            }
             cw.send_control(msg).await;
         }
     }
@@ -234,6 +287,15 @@ impl MonitorRegistry {
                         // No-op update — preserve pipeline credit.
                         continue;
                     };
+                    // Attribute the actual wire bytes this subscriber will
+                    // receive. Both counters take only short internal locks
+                    // (no `.await` in this block), so this is safe here.
+                    if let Some(c) = self.bandwidth_counters() {
+                        c.ds_bypv_tx.add(pv_name, msg.len() as u64);
+                    }
+                    if let Some(r) = self.client_registry() {
+                        r.add_tx(sub.conn_id, msg.len() as u64);
+                    }
                     if sub.pipeline_enabled && sub.nfree > 0 {
                         sub.nfree -= 1;
                     }
@@ -322,6 +384,16 @@ impl MonitorRegistry {
                     let Some(msg) = Self::build_monitor_frame(sub, payload) else {
                         return;
                     };
+                    // Same accounting as `notify_monitors`: attribute the
+                    // actual wire bytes of this (usually initial-snapshot)
+                    // frame before it moves into `to_send`. No `.await` in
+                    // this block, so no diag lock is held across one.
+                    if let Some(c) = self.bandwidth_counters() {
+                        c.ds_bypv_tx.add(pv_name, msg.len() as u64);
+                    }
+                    if let Some(r) = self.client_registry() {
+                        r.add_tx(sub.conn_id, msg.len() as u64);
+                    }
                     if sub.pipeline_enabled && sub.nfree > 0 {
                         sub.nfree -= 1;
                     }
@@ -404,6 +476,9 @@ impl MonitorRegistry {
         {
             let mut conns = self.conns.lock().await;
             conns.remove(&conn_id);
+        }
+        if let Some(cr) = self.client_registry() {
+            cr.disconnect(conn_id);
         }
         for pv in affected {
             self.retire_pump_if_idle(&pv).await;
@@ -666,6 +741,110 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             std::task::Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn notify_monitors_accounts_downstream_tx_bytes_per_pv_and_host() {
+        // Task 8: `notify_monitors` must attribute the actual wire bytes
+        // delivered to each subscriber into both the per-PV `BandwidthCounters`
+        // and the per-connection `ClientRegistry` (which derives byhost tx).
+        use crate::diag::{BandwidthCounters, ClientRegistry};
+
+        let reg = MonitorRegistry::new();
+        let counters = Arc::new(BandwidthCounters::new());
+        let client_registry = Arc::new(ClientRegistry::new());
+        let peer: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        client_registry.connect(1, peer);
+
+        reg.set_bandwidth_counters(counters.clone());
+        reg.set_client_registry(client_registry.clone());
+
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(tokio::io::sink()));
+        }
+        {
+            let mut mons = reg.monitors.lock().await;
+            let mut sub = make_sub(None);
+            sub.conn_id = 1;
+            mons.insert("pv:acct".to_string(), vec![sub]);
+        }
+
+        let payload = nt_payload(1.0, 0);
+        reg.notify_monitors("pv:acct", &payload).await;
+
+        let expected_len =
+            MonitorRegistry::build_monitor_frame(&make_sub(None), &payload)
+                .expect("first frame")
+                .len() as u64;
+
+        let pv_snap = counters.ds_bypv_tx.snapshot();
+        assert_eq!(
+            pv_snap,
+            vec![("pv:acct".to_string(), expected_len)],
+            "ds_bypv_tx must be credited with the delivered frame's byte length"
+        );
+
+        let byhost = client_registry.byhost(true);
+        assert_eq!(byhost.len(), 1, "expected exactly one host aggregate");
+        assert_eq!(
+            byhost[0].2, expected_len,
+            "registry conn tx must reflect the delivered frame's byte length"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_monitor_update_for_accounts_initial_snapshot_tx_bytes() {
+        // Task 8b: `send_monitor_update_for` delivers the INITIAL snapshot
+        // frame on every `MonitorRequest{start:true}` (handler.rs:1671), a
+        // separate delivery path from `notify_monitors` that Task 8 missed.
+        // It must attribute the same way: per-PV `ds_bypv_tx` and per-conn
+        // registry `tx`.
+        use crate::diag::{BandwidthCounters, ClientRegistry};
+
+        let reg = MonitorRegistry::new();
+        let counters = Arc::new(BandwidthCounters::new());
+        let client_registry = Arc::new(ClientRegistry::new());
+        let peer: std::net::SocketAddr = "127.0.0.1:5556".parse().unwrap();
+        client_registry.connect(1, peer);
+
+        reg.set_bandwidth_counters(counters.clone());
+        reg.set_client_registry(client_registry.clone());
+
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(tokio::io::sink()));
+        }
+        {
+            let mut mons = reg.monitors.lock().await;
+            let mut sub = make_sub(None);
+            sub.conn_id = 1;
+            sub.ioid = 42;
+            mons.insert("pv:initial".to_string(), vec![sub]);
+        }
+
+        let payload = nt_payload(1.0, 0);
+        reg.send_monitor_update_for("pv:initial", 1, 42, &payload)
+            .await;
+
+        let expected_len =
+            MonitorRegistry::build_monitor_frame(&make_sub(None), &payload)
+                .expect("first frame")
+                .len() as u64;
+
+        let pv_snap = counters.ds_bypv_tx.snapshot();
+        assert_eq!(
+            pv_snap,
+            vec![("pv:initial".to_string(), expected_len)],
+            "ds_bypv_tx must be credited with the initial-snapshot frame's byte length"
+        );
+
+        let byhost = client_registry.byhost(true);
+        assert_eq!(byhost.len(), 1, "expected exactly one host aggregate");
+        assert_eq!(
+            byhost[0].2, expected_len,
+            "registry conn tx must reflect the initial-snapshot frame's byte length"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

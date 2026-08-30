@@ -23,10 +23,12 @@
 //! underlying *counts* as gauges (Prometheus has no array/table shape). Real
 //! data is sourced from the same low-level accessors the status source uses
 //! ([`crate::upstream::UpstreamPool::names`] and
-//! [`crate::proxy::GatewaySource::upstream_monitor_count`]); the remaining
-//! diagnostics (`refs`/`threads`/`stats` and the per-PV/host bandwidth
-//! counters) have no M1 data source and are emitted as shape-complete
-//! `0`-valued gauges with correct `# HELP`/`# TYPE` lines.
+//! [`crate::proxy::GatewaySource::upstream_monitor_count`]); the per-PV/host
+//! bandwidth gauges are cumulative totals summed from the shared
+//! [`BandwidthCounters`] and [`ClientRegistry`] (see [`snapshot_from_bandwidth`]).
+//! The remaining diagnostics (`refs`/`threads`/`stats`) have no M1 data
+//! source and are emitted as shape-complete `0`-valued gauges with correct
+//! `# HELP`/`# TYPE` lines.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +36,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+
+use spvirit_server::diag::{BandwidthCounters, ClientRegistry};
 
 /// The Prometheus text exposition content-type (format version 0.0.4).
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4";
@@ -81,8 +85,15 @@ pub struct MetricsSnapshot {
     pub threads: u64,
     /// Shape-complete stub: aggregate request stats (no M1 source).
     pub stats: u64,
-    /// Shape-complete bandwidth stubs (bytes), mirroring the status source's
-    /// always-zero `ds:`/`us:` `bypv`/`byhost` `rx`/`tx` counters.
+    /// Cumulative bandwidth totals (bytes), mirroring the status source's
+    /// `ds:`/`us:` `bypv`/`byhost` `rx`/`tx` counters, summed across every
+    /// key in the underlying per-PV/host map. Populated by
+    /// [`snapshot_from_bandwidth`].
+    ///
+    /// Exception: `ds_byhost_rx_bytes`/`ds_byhost_tx_bytes` below are NOT
+    /// cumulative — they are summed from `ClientRegistry::byhost`, which
+    /// tracks only currently-connected downstream hosts, so those two
+    /// values fall when a client disconnects.
     pub ds_bypv_rx_bytes: u64,
     pub ds_bypv_tx_bytes: u64,
     pub ds_byhost_rx_bytes: u64,
@@ -91,6 +102,40 @@ pub struct MetricsSnapshot {
     pub us_bypv_tx_bytes: u64,
     pub us_byhost_rx_bytes: u64,
     pub us_byhost_tx_bytes: u64,
+}
+
+/// Sum a `ByteMap`/`ClientRegistry::byhost` style snapshot's byte counts
+/// into a single cumulative total. `pairs` is an iterator of tuples whose
+/// last element is the byte count (`(key, bytes)` for a `ByteMap`
+/// snapshot, `(account, client_ip, bytes)` for `ClientRegistry::byhost`).
+fn sum_last<T, I: IntoIterator<Item = T>>(pairs: I, last: impl Fn(&T) -> u64) -> u64 {
+    pairs.into_iter().map(|t| last(&t)).sum()
+}
+
+/// Build the six `ByteMap`-backed byte-gauge fields (`ds_bypv_*`,
+/// `us_bypv_*`, `us_byhost_*`) plus the two registry-derived `ds_byhost_*`
+/// fields from the shared cumulative counters, leaving every other
+/// [`MetricsSnapshot`] field at its default. Callers (the runtime's
+/// `SnapshotProvider`) fill in `clients`/`upstream_monitors` on top via a
+/// struct-update.
+///
+/// `ds_byhost_{tx,rx}` have no `ByteMap` (see [`BandwidthCounters`]'s docs)
+/// and are instead derived from `ClientRegistry::byhost`.
+pub fn snapshot_from_bandwidth(
+    counters: &BandwidthCounters,
+    registry: &ClientRegistry,
+) -> MetricsSnapshot {
+    MetricsSnapshot {
+        ds_bypv_tx_bytes: sum_last(counters.ds_bypv_tx.snapshot(), |(_, b)| *b),
+        ds_bypv_rx_bytes: sum_last(counters.ds_bypv_rx.snapshot(), |(_, b)| *b),
+        us_bypv_tx_bytes: sum_last(counters.us_bypv_tx.snapshot(), |(_, b)| *b),
+        us_bypv_rx_bytes: sum_last(counters.us_bypv_rx.snapshot(), |(_, b)| *b),
+        us_byhost_tx_bytes: sum_last(counters.us_byhost_tx.snapshot(), |(_, b)| *b),
+        us_byhost_rx_bytes: sum_last(counters.us_byhost_rx.snapshot(), |(_, b)| *b),
+        ds_byhost_tx_bytes: sum_last(registry.byhost(true), |(_, _, b)| *b),
+        ds_byhost_rx_bytes: sum_last(registry.byhost(false), |(_, _, b)| *b),
+        ..Default::default()
+    }
 }
 
 /// A cheap, cloneable "produce the current snapshot" callback. The runtime
@@ -152,49 +197,49 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
     gauge(
         &mut out,
         "spgateway_ds_bypv_rx_bytes",
-        "Downstream bytes received, per PV (shape-complete, data pending).",
+        "Cumulative downstream bytes received, summed across all PVs.",
         s.ds_bypv_rx_bytes,
     );
     gauge(
         &mut out,
         "spgateway_ds_bypv_tx_bytes",
-        "Downstream bytes sent, per PV (shape-complete, data pending).",
+        "Cumulative downstream bytes sent, summed across all PVs.",
         s.ds_bypv_tx_bytes,
     );
     gauge(
         &mut out,
         "spgateway_ds_byhost_rx_bytes",
-        "Downstream bytes received, per host (shape-complete, data pending).",
+        "Downstream bytes received, summed across currently-connected hosts (drops on disconnect, not cumulative).",
         s.ds_byhost_rx_bytes,
     );
     gauge(
         &mut out,
         "spgateway_ds_byhost_tx_bytes",
-        "Downstream bytes sent, per host (shape-complete, data pending).",
+        "Downstream bytes sent, summed across currently-connected hosts (drops on disconnect, not cumulative).",
         s.ds_byhost_tx_bytes,
     );
     gauge(
         &mut out,
         "spgateway_us_bypv_rx_bytes",
-        "Upstream bytes received, per PV (shape-complete, data pending).",
+        "Cumulative upstream bytes received, summed across all PVs.",
         s.us_bypv_rx_bytes,
     );
     gauge(
         &mut out,
         "spgateway_us_bypv_tx_bytes",
-        "Upstream bytes sent, per PV (shape-complete, data pending).",
+        "Cumulative upstream bytes sent, summed across all PVs.",
         s.us_bypv_tx_bytes,
     );
     gauge(
         &mut out,
         "spgateway_us_byhost_rx_bytes",
-        "Upstream bytes received, per host (shape-complete, data pending).",
+        "Cumulative upstream bytes received, summed across all hosts.",
         s.us_byhost_rx_bytes,
     );
     gauge(
         &mut out,
         "spgateway_us_byhost_tx_bytes",
-        "Upstream bytes sent, per host (shape-complete, data pending).",
+        "Cumulative upstream bytes sent, summed across all hosts.",
         s.us_byhost_tx_bytes,
     );
 
@@ -364,21 +409,76 @@ mod tests {
     #[test]
     fn render_emits_shape_complete_zero_stubs() {
         let body = render_prometheus(&MetricsSnapshot::default());
-        for name in [
-            "spgateway_refs",
-            "spgateway_threads",
-            "spgateway_stats",
-            "spgateway_ds_bypv_rx_bytes",
-            "spgateway_ds_bypv_tx_bytes",
-            "spgateway_ds_byhost_rx_bytes",
-            "spgateway_ds_byhost_tx_bytes",
-            "spgateway_us_bypv_rx_bytes",
-            "spgateway_us_bypv_tx_bytes",
-            "spgateway_us_byhost_rx_bytes",
-            "spgateway_us_byhost_tx_bytes",
-        ] {
+        for name in ["spgateway_refs", "spgateway_threads", "spgateway_stats"] {
             assert!(body.contains(&format!("# TYPE {name} gauge\n")), "missing TYPE for {name}");
             assert!(body.contains(&format!("\n{name} 0\n")), "missing zero value for {name}");
+        }
+    }
+
+    /// `snapshot_from_bandwidth` sums each `BandwidthCounters` `ByteMap`
+    /// across all its keys (per-PV / per-upstream-host) and, for the two
+    /// `ds_byhost_*` fields (no `ByteMap`, see `BandwidthCounters`'s docs),
+    /// sums `ClientRegistry::byhost`'s third element instead — proving the
+    /// `/metrics` byte gauges reflect real cumulative totals rather than the
+    /// old always-zero stub.
+    #[test]
+    fn snapshot_from_bandwidth_sums_every_byte_gauge_and_renders_gauge_type() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let counters = BandwidthCounters::new();
+        counters.ds_bypv_tx.add("PV:A", 10);
+        counters.ds_bypv_tx.add("PV:B", 5); // -> ds_bypv_tx total 15
+        counters.ds_bypv_rx.add("PV:A", 1);
+        counters.ds_bypv_rx.add("PV:B", 2); // -> ds_bypv_rx total 3
+        counters.us_bypv_tx.add("PV:A", 100); // -> us_bypv_tx total 100
+        counters.us_bypv_rx.add("PV:A", 7);
+        counters.us_bypv_rx.add("PV:B", 8); // -> us_bypv_rx total 15
+        counters.us_byhost_tx.add("ioc1", 40);
+        counters.us_byhost_tx.add("ioc2", 60); // -> us_byhost_tx total 100
+        counters.us_byhost_rx.add("ioc1", 4); // -> us_byhost_rx total 4
+
+        let registry = ClientRegistry::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let peer1 = SocketAddr::new(ip, 40000);
+        let peer2 = SocketAddr::new(ip, 40001);
+        registry.connect(1, peer1);
+        registry.connect(2, peer2);
+        registry.add_tx(1, 20);
+        registry.add_tx(2, 30); // -> ds_byhost_tx total 50
+        registry.add_rx(1, 9); // -> ds_byhost_rx total 9
+
+        let snap = snapshot_from_bandwidth(&counters, &registry);
+        assert_eq!(snap.ds_bypv_tx_bytes, 15);
+        assert_eq!(snap.ds_bypv_rx_bytes, 3);
+        assert_eq!(snap.us_bypv_tx_bytes, 100);
+        assert_eq!(snap.us_bypv_rx_bytes, 15);
+        assert_eq!(snap.us_byhost_tx_bytes, 100);
+        assert_eq!(snap.us_byhost_rx_bytes, 4);
+        assert_eq!(snap.ds_byhost_tx_bytes, 50);
+        assert_eq!(snap.ds_byhost_rx_bytes, 9);
+        // Fields outside the bandwidth helper's scope stay at their default.
+        assert_eq!(snap.clients, 0);
+        assert_eq!(snap.upstream_monitors, 0);
+
+        let body = render_prometheus(&snap);
+        for (name, expected) in [
+            ("spgateway_ds_bypv_tx_bytes", 15),
+            ("spgateway_ds_bypv_rx_bytes", 3),
+            ("spgateway_us_bypv_tx_bytes", 100),
+            ("spgateway_us_bypv_rx_bytes", 15),
+            ("spgateway_us_byhost_tx_bytes", 100),
+            ("spgateway_us_byhost_rx_bytes", 4),
+            ("spgateway_ds_byhost_tx_bytes", 50),
+            ("spgateway_ds_byhost_rx_bytes", 9),
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {name} gauge\n")),
+                "expected {name} to stay a gauge"
+            );
+            assert!(
+                body.contains(&format!("\n{name} {expected}\n")),
+                "expected `{name} {expected}` in body, got:\n{body}"
+            );
         }
     }
 
