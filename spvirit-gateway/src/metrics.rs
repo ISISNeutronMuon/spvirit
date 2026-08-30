@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 /// The Prometheus text exposition content-type (format version 0.0.4).
 pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4";
@@ -44,6 +45,22 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 /// How long a single connection may take to send its request line before we
 /// drop it, so a slow/silent client never pins a task forever.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long we allow writing+flushing the response to take before dropping the
+/// connection, so a client that sends a valid request then stops reading
+/// (response-side slowloris) cannot hold the handler + socket open forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ceiling on concurrently-handled connections. A permit is held for each
+/// in-flight handler; the accept loop waits for one before accepting, bounding
+/// the FDs the endpoint can accumulate (which otherwise feeds an EMFILE
+/// condition under a connection flood).
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
+/// Backoff applied after a failed `accept()` so a *persistent* accept error
+/// (EMFILE/ENFILE — the process/system FD table is full, which returns Err
+/// immediately and repeatedly) cannot busy-spin a core or flood the logs.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 /// A self-contained snapshot of the gateway's diagnostic counters at one
 /// instant, rendered by [`render_prometheus`]. Kept free of any I/O or live
@@ -199,19 +216,37 @@ pub async fn bind(addr: &str) -> std::io::Result<TcpListener> {
 /// Per-connection errors (accept failures, slow clients) are logged and
 /// otherwise ignored — one bad client must never take the endpoint down.
 pub async fn serve(listener: TcpListener, path: String, provider: SnapshotProvider) {
+    let limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     loop {
+        // Backpressure: acquire a connection permit BEFORE accepting, so a
+        // burst of clients cannot spawn unbounded handler tasks (each holding
+        // an FD). The owned permit is moved into the handler and released when
+        // it finishes. The semaphore is never closed, so `acquire_owned` only
+        // errors on a poisoned/closed semaphore — treat that as unreachable.
+        let Ok(permit) = limiter.clone().acquire_owned().await else {
+            return;
+        };
         match listener.accept().await {
             Ok((stream, _peer)) => {
                 let path = path.clone();
-                let snapshot = provider();
+                let provider = provider.clone();
                 tokio::spawn(async move {
+                    // Hold the permit for the handler's lifetime; released on drop.
+                    let _permit = permit;
+                    // Produce the snapshot INSIDE the task so the accept loop
+                    // never blocks on it (it clones + discards a Vec via len()).
+                    let snapshot = provider();
                     if let Err(e) = handle_connection(stream, &path, snapshot).await {
                         tracing::debug!("metrics: connection error: {e}");
                     }
                 });
             }
             Err(e) => {
+                // A persistent accept error (EMFILE/ENFILE) returns Err
+                // immediately and repeatedly; back off so it cannot busy-spin.
                 tracing::warn!("metrics: accept error: {e}");
+                drop(permit);
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
             }
         }
     }
@@ -234,9 +269,17 @@ async fn handle_connection(
     };
 
     let response = route(&request_line, path, &snapshot);
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
-    Ok(())
+    // Bound the write+flush: a client that sent a valid request line then
+    // stopped reading must not pin the handler + socket open indefinitely.
+    let write = async {
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await
+    };
+    match tokio::time::timeout(WRITE_TIMEOUT, write).await {
+        Ok(r) => r,
+        // Timed out mid-response: drop the connection.
+        Err(_) => Ok(()),
+    }
 }
 
 /// Read from `stream` until the first `\r\n` (end of the request line) or the
@@ -401,6 +444,88 @@ mod tests {
         let resp = String::from_utf8_lossy(&resp);
         assert!(resp.starts_with("HTTP/1.1 404 Not Found\r\n"), "resp was: {resp}");
 
+        server.abort();
+    }
+
+    /// Helper: spawn a metrics server on an ephemeral port, returning its addr
+    /// and the JoinHandle.
+    async fn spawn_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = bind("127.0.0.1:0").await.expect("bind ephemeral");
+        let addr = listener.local_addr().unwrap();
+        let provider: SnapshotProvider = Arc::new(|| MetricsSnapshot {
+            clients: 1,
+            ..Default::default()
+        });
+        let handle = tokio::spawn(serve(listener, "/metrics".to_string(), provider));
+        (addr, handle)
+    }
+
+    /// Helper: one full request/response round-trip, returning the response.
+    async fn get(addr: std::net::SocketAddr, req: &[u8]) -> String {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(req).await.unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    /// (a) A client that opens a connection and sends only a partial,
+    /// never-terminated request line must not wedge the server: a subsequent
+    /// well-formed request is still served. The stuck client is held open for
+    /// the duration so its handler is genuinely still in flight.
+    #[tokio::test]
+    async fn partial_request_does_not_wedge_the_server() {
+        let (addr, server) = spawn_server().await;
+
+        // Stuck client: valid start, no CRLF, never closes.
+        let mut stuck = TcpStream::connect(addr).await.unwrap();
+        stuck.write_all(b"GET /metr").await.unwrap();
+
+        // A fresh client is still served promptly.
+        let resp = get(addr, b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp was: {resp}");
+
+        drop(stuck);
+        server.abort();
+    }
+
+    /// (b) An oversized request line (> `MAX_REQUEST_BYTES`) is bounded: the
+    /// server does not panic, still answers, and keeps serving afterwards.
+    #[tokio::test]
+    async fn oversized_request_line_is_bounded() {
+        let (addr, server) = spawn_server().await;
+
+        // ~9 KiB single token with no CRLF until the very end. The server
+        // caps its read at MAX_REQUEST_BYTES and closes after responding;
+        // because unread inbound bytes remain, the peer may observe a RST
+        // (esp. on Windows) rather than a clean response — either is fine, the
+        // point is the server neither panics nor wedges. Writes/reads here are
+        // therefore best-effort.
+        let mut req = Vec::from(&b"GET /"[..]);
+        req.resize(req.len() + 9 * 1024, b'a');
+        req.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n\r\n");
+        if let Ok(mut client) = TcpStream::connect(addr).await {
+            let _ = client.write_all(&req).await;
+            let mut resp = Vec::new();
+            let _ = client.read_to_end(&mut resp).await;
+        }
+
+        // Server survives and serves the next request cleanly.
+        let resp = get(addr, b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "resp was: {resp}");
+
+        server.abort();
+    }
+
+    /// (c) A non-GET method returns 405 over a real socket.
+    #[tokio::test]
+    async fn wrong_method_returns_405_over_socket() {
+        let (addr, server) = spawn_server().await;
+        let resp = get(addr, b"DELETE /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+            "resp was: {resp}"
+        );
         server.abort();
     }
 }
