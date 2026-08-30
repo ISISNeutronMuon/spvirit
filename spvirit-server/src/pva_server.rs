@@ -1012,6 +1012,18 @@ impl PvaServer {
             // tier 2's (`SimplePvStore`'s) field source answers for the builtin store's.
             let as_source: Arc<dyn Source> = ioc.clone();
             sources.add_store("ioc", 5, as_source).await;
+
+            // Wire the IOC's scan engine into the server lifecycle. Register
+            // its Scanner as a named-event sink first (so PVAccess-posted
+            // events drive event scan lists), then start scanning: this loads
+            // every record onto its scan lists and spawns the scan threads.
+            // Started here — after the registry is set, before serving — so the
+            // first PINI/periodic pass can already publish to monitor clients,
+            // through the same egress a host-side write uses.
+            if let Some(sink) = ioc.scanner_event_sink() {
+                self.events.add_sink(sink);
+            }
+            ioc.start_scanning(tokio::runtime::Handle::current());
         }
 
         // IOC/QSRV-style record field access (<name>.<FIELD>, <FIELD>$) so

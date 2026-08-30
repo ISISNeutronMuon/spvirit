@@ -19,7 +19,7 @@ use crate::clock::Clock;
 use crate::ctx::ProcCtx;
 use crate::lockset::{RecordDb, RecordId};
 use crate::process::process;
-use crate::scan::ScanList;
+use crate::scan::{ScanList, ScanSpec, parse_scan};
 use spvirit_server::events::EventSink;
 use spvirit_types::NtPayload;
 
@@ -161,6 +161,45 @@ impl Scanner {
         sweep.sort_by_key(|&(phas, order_index, _)| (phas, order_index));
         let ids: Vec<RecordId> = sweep.into_iter().map(|(_, _, id)| id).collect();
         self.process_ids(&ids);
+    }
+
+    /// Populate every scan list from the loaded database.
+    ///
+    /// The load-time counterpart to Task 12's runtime `SCAN`/`EVNT`/`PHAS`
+    /// puts: iterate `db.order()`, `parse_scan` each record's stored `SCAN`
+    /// string, and route it to the same add method a put would
+    /// (`IocSource::put_scan`). Sharing the add methods is the point — a
+    /// record loaded with `SCAN="1 second"` and one later written to it land
+    /// on the identical list, in the identical way.
+    ///
+    /// Must be called once, before [`Self::start`], so the lists are complete
+    /// before any thread is spawned (R-T12-LOADORDER). `IoIntr` is never
+    /// auto-added (binding is explicit registration only, Task 11); `Passive`
+    /// stays off every list; an unparseable stored `SCAN` leaves the record
+    /// off every list (warned once), exactly as a bad put is rejected.
+    pub fn load_from_db(&self) {
+        for &id in self.db.order() {
+            let (scan_raw, phas, evnt) = self.db.with_set(id.set, |set| {
+                let c = &set.get(id).common;
+                (c.scan_raw.clone(), c.phas, c.evnt.clone())
+            });
+            let spec = match parse_scan(&scan_raw) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    tracing::warn!(
+                        "load_from_db: {:?} has an unparseable SCAN '{scan_raw}' ({e}); \
+                         leaving it off every scan list",
+                        id
+                    );
+                    continue;
+                }
+            };
+            match spec {
+                ScanSpec::Periodic(period) => self.add_periodic(id, phas, period),
+                ScanSpec::Event => self.add_event(id, phas, evnt),
+                ScanSpec::IoIntr | ScanSpec::Passive => {}
+            }
+        }
     }
 
     /// Add `id` (with scan priority `phas`) to the periodic scan list for

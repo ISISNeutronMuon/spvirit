@@ -18,8 +18,10 @@ use crate::spec::{RecordSpec, unmodelled_fields};
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::db::{DbRecord, load_db_records, parse_db_records};
 use spvirit_server::field_provider::{
-    RecordFieldDesc, RecordFieldProvider, resolve_field_info, resolve_field_payload,
+    RecordFieldDesc, RecordFieldProvider, field_is_writable, resolve_field_info,
+    resolve_field_payload,
 };
+use spvirit_server::events::EventSink;
 use spvirit_server::monitor::MonitorRegistry;
 use spvirit_server::record_fields::parse_field_ref;
 use spvirit_server::pvstore::{PvInfo, Source, StoreSource};
@@ -28,8 +30,30 @@ use spvirit_types::{NtPayload, ScalarValue};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::mpsc;
+
+/// The subscriber map both [`IocSource::flush`] (the put path) and
+/// [`EgressSink::flush`] (the scan path) feed, so a monitor sees byte-identical
+/// updates whichever drove the record.
+type SubscriberMap = Arc<Mutex<HashMap<String, Vec<mpsc::Sender<NtPayload>>>>>;
+
+/// Feed a completed pass's monitors to the PV-group subscriber channels.
+///
+/// A `try_send` failure — full *or* closed channel — drops the sender: a full
+/// channel means the subscriber cannot keep up, a closed one means it is gone,
+/// and neither may ever block a processing pass. This is the same rule
+/// `SimplePvStore` applies to its own subscriber lists, and it is shared here so
+/// the put and scan egress paths cannot drift apart.
+fn feed_subscribers(subscribers: &Mutex<HashMap<String, Vec<mpsc::Sender<NtPayload>>>>, events: &[(String, NtPayload)]) {
+    let mut subs = subscribers.lock().expect("subscriber map poisoned");
+    for (name, payload) in events {
+        let Some(senders) = subs.get_mut(name) else {
+            continue;
+        };
+        senders.retain(|tx| tx.try_send(payload.clone()).is_ok());
+    }
+}
 
 /// Depth of a subscriber's monitor channel. Matches `SimplePvStore`'s
 /// `mpsc::channel(64)` in `Source::subscribe`.
@@ -49,10 +73,17 @@ pub struct IocSource {
     /// unchanged.
     db: Arc<RecordDb>,
     /// The single authority for scan-list membership. Writable SCAN/EVNT/PHAS
-    /// puts route add/remove calls here; egress/lifecycle wiring
-    /// (start/shutdown/load_from_db/real ProcSink) is deferred to Task 15, so
-    /// this Scanner is constructed with a no-op sink and never started here.
+    /// puts route add/remove calls here; scan-driven processing is started by
+    /// [`IocSource::start_scanning`] (via `StoreSource`) once the server is up,
+    /// and its [`EgressSink`] publishes each pass through the same egress a
+    /// host-side write uses.
     scanner: Arc<Scanner>,
+    /// The Scanner's [`ProcSink`], held here too so [`start_scanning`] can hand
+    /// it the runtime handle its std scan threads need to publish. Shares the
+    /// `subscribers` and `registry` handles below.
+    ///
+    /// [`start_scanning`]: IocSource::start_scanning
+    egress: Arc<EgressSink>,
     /// Each record's kind, by name. Lets `field_descriptor` answer a channel
     /// search without taking the record's lock set, which is the whole point
     /// of the `dbNameToAddr`/`dbGetField` split.
@@ -60,7 +91,9 @@ pub struct IocSource {
     /// Each record's name, by slot id — how a resolved link target gets
     /// rendered back to a name without reaching into another lock set.
     id_names: HashMap<crate::lockset::RecordId, String>,
-    subscribers: Mutex<HashMap<String, Vec<mpsc::Sender<NtPayload>>>>,
+    /// Shared with [`EgressSink`] (an `Arc`) so the put path and the scan path
+    /// feed the very same subscriber channels.
+    subscribers: SubscriberMap,
     /// Senders for open *field* subscriptions. Field values are served as a
     /// one-shot snapshot in A2 — live field monitors arrive with the field
     /// writes in sub-project B — so these are retained only to keep the
@@ -76,8 +109,10 @@ pub struct IocSource {
     /// startup and read once per host-side write, and the guard is never held
     /// across an await — `set_value` clones the `Arc` out and drops the guard
     /// before it publishes. That is load-bearing, not incidental; A2's review
-    /// established that no lock in this crate crosses an await.
-    registry: RwLock<Option<Arc<MonitorRegistry>>>,
+    /// established that no lock in this crate crosses an await. Shared with
+    /// [`EgressSink`] (an `Arc`) so the scan path publishes through the same
+    /// registry `set_monitor_registry` hands over.
+    registry: Arc<RwLock<Option<Arc<MonitorRegistry>>>>,
 }
 
 /// A minimal, opaque `Debug` — `RecordDb` and friends don't derive it, and
@@ -145,21 +180,31 @@ impl IocSource {
             .filter_map(|name| db.lookup(&name).map(|id| (id, name)))
             .collect::<HashMap<_, _>>();
         // The Scanner shares `db` so it processes the same records the source
-        // serves. In production SystemClock is correct; a no-op ProcSink is a
-        // placeholder until Task 15 wires the real egress. It is never started
-        // here, so no thread is spawned and no clock is ever read — Task 12
-        // exercises only clock-independent membership add/remove.
+        // serves, and its `EgressSink` shares `subscribers`/`registry` so a
+        // scan-driven pass publishes through exactly the egress a host-side
+        // write does. In production SystemClock is correct. The Scanner is not
+        // started here — `start_scanning` does that once the server is up — so
+        // no thread is spawned and no clock is read until then; a bare engine
+        // under test (Task 12) never starts it and its sink is never called.
+        let subscribers: SubscriberMap = Arc::new(Mutex::new(HashMap::new()));
+        let registry: Arc<RwLock<Option<Arc<MonitorRegistry>>>> = Arc::new(RwLock::new(None));
+        let egress = Arc::new(EgressSink {
+            subscribers: subscribers.clone(),
+            registry: registry.clone(),
+            handle: OnceLock::new(),
+        });
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-        let sink: Arc<dyn ProcSink> = Arc::new(NoopSink);
+        let sink: Arc<dyn ProcSink> = egress.clone();
         let scanner = Arc::new(Scanner::new(db.clone(), clock, sink));
         let source = IocSource {
             db,
             scanner,
+            egress,
             kinds,
             id_names,
-            subscribers: Mutex::new(HashMap::new()),
+            subscribers,
             field_subs: Mutex::new(Vec::new()),
-            registry: RwLock::new(None),
+            registry,
         };
         // Report the load-time diagnostics once, here, rather than on every
         // pass. None of them is fatal.
@@ -243,18 +288,11 @@ impl IocSource {
             tracing::debug!(target: "spvirit_ioc", "{line}");
         }
         let events = ctx.take_events();
-        let mut subs = self.subscribers.lock().expect("subscriber map poisoned");
-        for (name, payload) in &events {
-            let Some(senders) = subs.get_mut(name) else {
-                continue;
-            };
-            // `try_send` fails both when the channel is full and when it is
-            // closed. Either way the subscriber cannot keep up (or is gone),
-            // and a full channel must never block a processing pass, so it
-            // is dropped exactly like a closed one — the same rule
-            // `SimplePvStore` applies to its own subscriber lists.
-            senders.retain(|tx| tx.try_send(payload.clone()).is_ok());
-        }
+        // The put path feeds only the subscriber channels; the *handler*
+        // publishes these events to the monitor registry (`notify_changed_records`),
+        // so `flush` must not, or a client PUT would double-notify. The scan
+        // path has no handler, so `EgressSink::flush` does both — see there.
+        feed_subscribers(&self.subscribers, &events);
         events
     }
 
@@ -462,13 +500,46 @@ impl IocSource {
     }
 }
 
-/// A placeholder [`ProcSink`] for the source-owned Scanner. The Scanner's real
-/// egress (forwarding processed monitors into the server fan-out) is wired in
-/// Task 15; until then it is never started, so this sink is never called.
-struct NoopSink;
+/// The source-owned Scanner's [`ProcSink`]: forwards a completed scan pass's
+/// monitors into exactly the egress a host-side write uses — the subscriber
+/// fan-out *and* the monitor registry — so a scan-driven update is
+/// indistinguishable from a put-driven one downstream. `set_value` performs
+/// these same two steps (`flush` then `notify_monitors`); this is their
+/// shared shape for the path that has no handler to publish for it.
+struct EgressSink {
+    subscribers: SubscriberMap,
+    registry: Arc<RwLock<Option<Arc<MonitorRegistry>>>>,
+    /// The server's runtime handle, set once by [`IocSource::start_scanning`]
+    /// before the Scanner is started. `flush` runs on a std scan thread (never
+    /// a runtime worker), so it `block_on`s the async `notify_monitors` — the
+    /// same await `set_value` runs inline. Unset (and unused) for a bare engine
+    /// under test, whose Scanner is never started.
+    handle: OnceLock<tokio::runtime::Handle>,
+}
 
-impl ProcSink for NoopSink {
-    fn flush(&self, _events: Vec<(String, NtPayload)>, _trace: Vec<String>) {}
+impl ProcSink for EgressSink {
+    fn flush(&self, events: Vec<(String, NtPayload)>, trace: Vec<String>) {
+        for line in trace {
+            tracing::debug!(target: "spvirit_ioc", "{line}");
+        }
+        feed_subscribers(&self.subscribers, &events);
+        // Publish to the monitor registry exactly as `set_value` does after a
+        // put. Without a runtime handle (never started) or a registry (a bare
+        // engine), there is nobody to publish to — correct, and unreachable in
+        // a running server, which sets both before `Scanner::start`.
+        let Some(handle) = self.handle.get() else {
+            return;
+        };
+        // Clone the Arc out and drop the guard before the block_on: no lock in
+        // this crate crosses an await, and block_on drives one.
+        let registry = self.registry.read().expect("registry lock poisoned").clone();
+        let Some(registry) = registry else {
+            return;
+        };
+        for (name, payload) in &events {
+            handle.block_on(registry.notify_monitors(name, payload));
+        }
+    }
 }
 
 impl RecordFieldProvider for IocSource {
@@ -499,6 +570,13 @@ impl RecordFieldProvider for IocSource {
             let kind = *self.kinds.get(&base)?;
             record_field_kind(kind, &field).map(|kind| RecordFieldDesc { kind })
         })
+    }
+
+    /// SCAN/EVNT/PHAS are writable on the IOC tier: `put_field_pv` routes them
+    /// into the Scanner. Every other field PV is read-only, and the flag is
+    /// honest — `put` accepts exactly what a claim advertises.
+    fn field_writable(&self, field: &str) -> bool {
+        field_is_writable(field)
     }
 }
 
@@ -626,6 +704,47 @@ impl StoreSource for IocSource {
 
     fn set_monitor_registry(&self, registry: Arc<MonitorRegistry>) {
         self.set_registry(registry);
+    }
+
+    /// Start scan-driven processing once the server is up.
+    ///
+    /// Hands the [`EgressSink`] the runtime `handle` its std scan threads need
+    /// to publish, populates every scan list from the loaded database, then
+    /// starts the scan threads. The order is deliberate (R-T12-LOADORDER):
+    /// the handle is set so the first PINI/periodic pass can publish, lists are
+    /// loaded before any thread is spawned, and `Scanner::start` runs the PINI
+    /// sweep before spawning. Called by `PvaServer` after the registry is set
+    /// and before serving begins.
+    fn start_scanning(&self, handle: tokio::runtime::Handle) {
+        // `OnceLock::set` ignores a second call; `Scanner::start`/`load_from_db`
+        // are each meant to run once. A duplicate `start_scanning` is a caller
+        // bug, not something to paper over, but the set at least stays sane.
+        let _ = self.egress.handle.set(handle);
+        self.scanner.load_from_db();
+        self.scanner.start();
+    }
+
+    /// Stop scan-driven processing: signal the scan threads and join them.
+    /// Idempotent (`Scanner::shutdown` is); also run from [`Drop`].
+    fn stop_scanning(&self) {
+        self.scanner.shutdown();
+    }
+
+    /// The Scanner as an [`EventSink`], for the server to register on its
+    /// named-event fan-out so PVAccess-posted events drive event scan lists.
+    fn scanner_event_sink(&self) -> Option<Arc<dyn EventSink>> {
+        Some(self.scanner.clone())
+    }
+}
+
+impl Drop for IocSource {
+    /// Stop the scan threads when the engine is dropped. The server also holds
+    /// the Scanner alive as a registered `EventSink`, so relying on
+    /// `Scanner::drop` alone would leave the threads running until that clone
+    /// is dropped too; calling `shutdown` here stops them the moment the engine
+    /// goes away. Idempotent and cheap when scanning was never started.
+    fn drop(&mut self) {
+        self.scanner.shutdown();
     }
 }
 

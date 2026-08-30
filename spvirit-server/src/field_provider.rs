@@ -34,6 +34,14 @@ pub struct RecordFieldDesc {
     pub kind: FieldKind,
 }
 
+/// The field PVs that are writable when a tier's put path routes them into the
+/// Scanner: `SCAN`, `EVNT`, `PHAS`. Every other field PV is read-only. Shared
+/// so the IOC engine and any provider that honours field writes agree on the
+/// set rather than each hard-coding it.
+pub fn field_is_writable(field: &str) -> bool {
+    matches!(field, "SCAN" | "EVNT" | "PHAS")
+}
+
 /// A store that can resolve `<record>.<FIELD>` references.
 ///
 /// The implementors are the two stores: `SimplePvStore` (below) and
@@ -61,6 +69,18 @@ pub trait RecordFieldProvider: Send + Sync {
         base: &str,
         field: &str,
     ) -> Pin<Box<dyn Future<Output = Option<RecordFieldDesc>> + Send + '_>>;
+
+    /// Whether a put to `<record>.<field>` is accepted on this tier.
+    ///
+    /// The default is read-only: a tier that has no field-write path (the
+    /// builtin store, the Python tier) must not advertise a field as writable
+    /// and then refuse the put. The IOC engine overrides this to accept
+    /// `SCAN`/`EVNT`/`PHAS` (see [`field_is_writable`]), which its `put`
+    /// routes into the Scanner — so the flag stays honest per tier.
+    fn field_writable(&self, field: &str) -> bool {
+        let _ = field;
+        false
+    }
 }
 
 /// The [`FieldKind`] a scalar value serves as.
@@ -122,8 +142,11 @@ pub async fn resolve_field_payload(
 /// Resolve `<base>.<FIELD>[$]` to channel metadata through `provider`,
 /// without reading the value.
 ///
-/// Field PVs are read-only in A2: field writes are sub-project B's, matching
-/// Base's separate `dbPutField` verb.
+/// Writability is the provider's to decide: `field_descriptor` reports it per
+/// field, and this carries the flag through unchanged. Sub-project B makes
+/// `SCAN`/`EVNT`/`PHAS` writable on the IOC tier (they route into the
+/// Scanner); every other field PV stays read-only, matching Base's separate
+/// `dbPutField` verb.
 pub async fn resolve_field_info(provider: &dyn RecordFieldProvider, name: &str) -> Option<PvInfo> {
     let field_ref = parse_field_ref(name)?;
     let desc = provider
@@ -131,7 +154,7 @@ pub async fn resolve_field_info(provider: &dyn RecordFieldProvider, name: &str) 
         .await?;
     Some(PvInfo {
         descriptor: descriptor_for_kind(desc.kind, field_ref.long_string)?,
-        writable: false,
+        writable: provider.field_writable(&field_ref.field),
     })
 }
 
@@ -196,6 +219,9 @@ mod tests {
             fields.insert("RTYP", ScalarValue::Str("ao".into()));
             fields.insert("DESC", ScalarValue::Str("A test output".into()));
             fields.insert("VAL", ScalarValue::F64(2.34));
+            fields.insert("SCAN", ScalarValue::Str("1 second".into()));
+            fields.insert("EVNT", ScalarValue::Str("0".into()));
+            fields.insert("PHAS", ScalarValue::I32(0));
             Self {
                 fields,
                 value_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -238,6 +264,12 @@ mod tests {
                 })
             })
         }
+
+        // Stands in for the IOC tier: SCAN/EVNT/PHAS are writable, and the
+        // put path (not modelled here) would route them into the Scanner.
+        fn field_writable(&self, field: &str) -> bool {
+            field_is_writable(field)
+        }
     }
 
     #[tokio::test]
@@ -267,12 +299,38 @@ mod tests {
     async fn resolve_field_info_never_reads_the_value() {
         let p = FakeProvider::new();
         let info = resolve_field_info(&p, "SIM:AO.VAL").await.expect("claimed");
-        assert!(!info.writable, "field PVs are read-only in A2");
+        assert!(!info.writable, "a genuinely read-only field PV stays read-only");
         assert_eq!(
             p.value_calls(),
             0,
             "claim must answer from field_descriptor alone — this is the \
              dbNameToAddr/dbGetField split the seam exists for"
+        );
+    }
+
+    /// SCAN/EVNT/PHAS are the writable field PVs (they route into the
+    /// Scanner); every other field, VAL included, stays read-only. The claim
+    /// carries the provider's per-field flag through unchanged, and still
+    /// without reading any value.
+    #[tokio::test]
+    async fn scan_evnt_phas_claim_writable_while_other_fields_do_not() {
+        let p = FakeProvider::new();
+        for field in ["SCAN", "EVNT", "PHAS"] {
+            let info = resolve_field_info(&p, &format!("SIM:AO.{field}"))
+                .await
+                .expect("claimed");
+            assert!(info.writable, "{field} must claim writable");
+        }
+        for field in ["VAL", "DESC", "RTYP"] {
+            let info = resolve_field_info(&p, &format!("SIM:AO.{field}"))
+                .await
+                .expect("claimed");
+            assert!(!info.writable, "{field} must claim read-only");
+        }
+        assert_eq!(
+            p.value_calls(),
+            0,
+            "writability is answered from the descriptor, not by reading"
         );
     }
 
