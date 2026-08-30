@@ -264,6 +264,8 @@ impl Runtime {
             let metrics = self.metrics.clone();
             let pool = self.pool.clone();
             let sources = self.sources.clone();
+            let bandwidth_counters = self.bandwidth_counters.clone();
+            let client_registry = self.client_registry.clone();
             async move {
                 match metrics {
                     Some((listen, path)) => {
@@ -280,7 +282,10 @@ impl Runtime {
                                     .iter()
                                     .map(|s| s.upstream_monitor_count() as u64)
                                     .sum(),
-                                ..Default::default()
+                                ..crate::metrics::snapshot_from_bandwidth(
+                                    &bandwidth_counters,
+                                    &client_registry,
+                                )
                             }
                         });
                         crate::metrics::serve(listener, path, provider).await;
