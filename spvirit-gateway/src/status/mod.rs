@@ -14,6 +14,9 @@
 //! the server's per-PV pump drains it.
 
 pub mod banner;
+pub mod sampler;
+
+pub use sampler::{BandwidthSampler, RateSnapshot};
 
 use std::future::Future;
 use std::pin::Pin;

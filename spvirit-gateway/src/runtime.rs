@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use spvirit_server::diag::{BandwidthCounters, ClientRegistry};
@@ -14,8 +14,12 @@ use crate::cache::negative::NegativeCache;
 use crate::config::{ConfigError, GatewayConfig};
 use crate::loopguard::LoopGuard;
 use crate::proxy::GatewaySource;
-use crate::status::{StatusHandles, StatusSource, banner};
+use crate::status::{BandwidthSampler, RateSnapshot, StatusHandles, StatusSource, banner};
 use crate::upstream::UpstreamPool;
+
+/// How often the [`BandwidthSampler`] converts cumulative byte counters into
+/// a fresh [`RateSnapshot`].
+const SAMPLER_TICK_PERIOD: Duration = Duration::from_secs(1);
 
 /// Default negative-search-cache TTL used when a server has no `x-spvirit
 /// .negativeCache` override.
@@ -53,6 +57,15 @@ pub struct Runtime {
     /// future status-PV reader (Task 13) can read it without a server
     /// reference.
     bandwidth_counters: Arc<BandwidthCounters>,
+    /// The latest 1 Hz [`RateSnapshot`] produced by the [`BandwidthSampler`]
+    /// spawned in [`Runtime::run`], converting `bandwidth_counters` +
+    /// `client_registry`'s cumulative byte counts into B/s rows. `std::sync
+    /// ::Mutex` is correct here (not a tokio mutex): every read/write is a
+    /// short, synchronous swap, never held across an `.await`. Retained on
+    /// `Runtime` (rather than only inside the spawned task) so a future
+    /// status-PV/`/metrics` reader (Tasks 13/14) can read it without a
+    /// server reference, mirroring `bandwidth_counters`/`client_registry`.
+    rate_snapshot: Arc<Mutex<RateSnapshot>>,
 }
 
 impl Runtime {
@@ -71,6 +84,14 @@ impl Runtime {
     /// every consumer, mirroring [`client_registry`](Self::client_registry).
     pub fn bandwidth_counters(&self) -> &Arc<BandwidthCounters> {
         &self.bandwidth_counters
+    }
+
+    /// The latest 1 Hz [`RateSnapshot`] produced by the [`BandwidthSampler`],
+    /// shared with a future status-PV/`/metrics` reader. Exposed so tests
+    /// (and Tasks 13/14) can read the current rate rows without a server
+    /// reference, mirroring [`bandwidth_counters`](Self::bandwidth_counters).
+    pub fn rate_snapshot(&self) -> &Arc<Mutex<RateSnapshot>> {
+        &self.rate_snapshot
     }
 
     /// Validate `cfg` and build a `Runtime` from it.
@@ -205,6 +226,8 @@ impl Runtime {
             .filter(|m| m.enabled)
             .map(|m| (m.listen.clone(), m.path.clone()));
 
+        let rate_snapshot = Arc::new(Mutex::new(RateSnapshot::default()));
+
         Ok(Runtime {
             servers,
             pool,
@@ -212,6 +235,7 @@ impl Runtime {
             metrics,
             client_registry,
             bandwidth_counters,
+            rate_snapshot,
         })
     }
 
@@ -268,6 +292,27 @@ impl Runtime {
             // task, before it would otherwise need to be held across an
             // await point in the joiner.
             set.spawn(async move { server.run().await.map_err(|e| e.to_string()) });
+        }
+
+        // The 1 Hz BandwidthSampler: joined into the SAME `JoinSet` as the
+        // servers above, rather than a bare `tokio::spawn`, so it shares
+        // their exact shutdown mechanism — this task, like a server's
+        // `run()`, loops forever (never returns `Ok`), and is dropped
+        // (cancelled) the moment the outer `select!` below resolves via
+        // Ctrl-C or a fatal metrics error, precisely mirroring how a server
+        // task is torn down. No new shutdown path is introduced.
+        {
+            let counters = self.bandwidth_counters.clone();
+            let registry = self.client_registry.clone();
+            let snapshot = self.rate_snapshot.clone();
+            set.spawn(async move {
+                let mut sampler = BandwidthSampler::new(counters, registry, snapshot);
+                let mut interval = tokio::time::interval(SAMPLER_TICK_PERIOD);
+                loop {
+                    interval.tick().await;
+                    sampler.tick();
+                }
+            });
         }
 
         tokio::select! {
