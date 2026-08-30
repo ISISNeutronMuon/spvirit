@@ -27,6 +27,7 @@ tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
 chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.145"
 regex = "1.11.2"
 dns-lookup = "3.0.0"
@@ -39,7 +40,6 @@ color-eyre = { version = "0.6.5", optional = true }
 
 [dev-dependencies]
 toml = "0.8"
-serde = { version = "1", features = ["derive"] }
 
 [[bin]]
 name = "spget"
@@ -105,3 +105,8 @@ required-features = ["server", "tui"]
 name = "spgateway"
 path = "src/bin/spgateway.rs"
 required-features = ["client", "server"]
+
+[[bin]]
+name = "spload"
+path = "src/bin/spvirit_load.rs"
+required-features = ["client"]

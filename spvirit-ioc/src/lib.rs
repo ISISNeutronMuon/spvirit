@@ -16,12 +16,14 @@
 
 pub mod alarm;
 pub mod build;
+pub mod clock;
 pub mod ctx;
 pub mod fields;
 pub mod graph;
 pub mod lockset;
 pub mod model;
 pub mod process;
+pub mod scan;
 pub mod source;
 pub mod spec;
 #[cfg(test)]

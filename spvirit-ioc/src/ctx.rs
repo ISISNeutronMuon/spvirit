@@ -35,8 +35,12 @@ impl std::fmt::Display for ProcError {
 impl std::error::Error for ProcError {}
 
 /// Accumulated side effects for one top-level processing pass.
-#[derive(Debug, Default)]
-pub struct ProcCtx {
+///
+/// Carries the `Clock` that stamps record timestamps, so a pass reads time
+/// through the injected clock rather than calling `SystemTime::now` directly.
+/// `Debug` is not derived: `&dyn Clock` is not `Debug`, and nothing formats a
+/// `ProcCtx`.
+pub struct ProcCtx<'a> {
     /// Monitors to publish, in post order.
     events: Vec<(String, NtPayload)>,
     /// Records in *other* lock sets that must be processed after this pass.
@@ -45,11 +49,45 @@ pub struct ProcCtx {
     /// TPRO trace lines, emitted after the lock is dropped.
     pub trace: Vec<String>,
     depth: usize,
+    /// The source of record timestamps for this pass.
+    clock: &'a dyn crate::clock::Clock,
 }
 
-impl ProcCtx {
-    pub fn new() -> ProcCtx {
-        ProcCtx::default()
+const SYSTEM_CLOCK: crate::clock::SystemClock = crate::clock::SystemClock;
+
+impl ProcCtx<'static> {
+    pub fn new() -> ProcCtx<'static> {
+        ProcCtx {
+            events: Vec::new(),
+            deferred: Vec::new(),
+            trace: Vec::new(),
+            depth: 0,
+            clock: &SYSTEM_CLOCK,
+        }
+    }
+}
+
+impl Default for ProcCtx<'static> {
+    fn default() -> Self {
+        ProcCtx::new()
+    }
+}
+
+impl<'a> ProcCtx<'a> {
+    /// Build a context whose record timestamps come from `clock`.
+    pub fn with_clock(clock: &'a dyn crate::clock::Clock) -> ProcCtx<'a> {
+        ProcCtx {
+            events: Vec::new(),
+            deferred: Vec::new(),
+            trace: Vec::new(),
+            depth: 0,
+            clock,
+        }
+    }
+
+    /// The clock stamping this pass's record timestamps.
+    pub fn clock(&self) -> &dyn crate::clock::Clock {
+        self.clock
     }
 
     /// Queue a monitor. Ordering is observable to clients, so this appends.
@@ -89,7 +127,14 @@ impl ProcCtx {
     }
 
     /// Leave one level of recursion.
+    ///
+    /// Every `push_depth` that returned `Ok` must be matched by exactly one
+    /// `pop_depth`. An unmatched pop is a control-flow bug (a missing pop on
+    /// an early-return path, or a double pop): it fails loudly in debug and
+    /// still saturates in release so a shipped binary degrades rather than
+    /// panics.
     pub fn pop_depth(&mut self) {
+        debug_assert!(self.depth > 0, "pop_depth underflow: push/pop imbalance");
         self.depth = self.depth.saturating_sub(1);
     }
 
@@ -157,5 +202,12 @@ mod tests {
                 record: "PV:DEEP".to_string()
             }
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "pop_depth underflow")]
+    fn pop_without_push_panics_in_debug() {
+        let mut ctx = ProcCtx::new();
+        ctx.pop_depth(); // depth is 0 — an unmatched pop is a bug
     }
 }
