@@ -719,6 +719,20 @@ pub trait AsyncSupport: Send + Sync {
 /// itself once it reaches the end of a synchronous pass (see its doc
 /// comment). A record that is not active is left alone: a duplicate
 /// completion callback must not process the record twice.
+///
+/// This stays a thin re-enter by design. The carry-forward concern that
+/// re-running the whole body would *re-initiate* the operation is resolved by
+/// `record_body`'s Base-style PACT branch: on this pass PACT is already set,
+/// so a bound [`AsyncSupport::start`] is handed `pact == true` and *collects*
+/// the finished operation (returning [`AsyncOutcome::Complete`]) rather than
+/// starting a new one. The once-only correctness therefore lives in two
+/// places working together — this guard, which makes a *second* completion
+/// (PACT already cleared by the first) a no-op, and the support's `pact`
+/// branch, which keeps the *first* completion from re-initiating. The guard is
+/// load-bearing: without it, a duplicate callback would re-enter `record_body`
+/// with PACT clear, capture `pact_before == false`, and re-*initiate* the
+/// operation — see `duplicate_completion_does_not_process_twice`. Do not
+/// weaken it.
 pub fn complete_async(
     set: &mut LockSetData,
     id: RecordId,
@@ -746,7 +760,8 @@ mod tests {
 
     // ---- Async support: registry + Base-style PACT-branched call site ----
 
-    use crate::clock::ManualClock;
+    use crate::clock::{Clock, ManualClock};
+    use crate::scan::delay::DelaySupport;
     use crate::scan::AsyncRegistry;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -923,6 +938,153 @@ mod tests {
             event_names(&mut ctx2),
             vec!["PV:A".to_string()],
             "the recovered pass posts its monitor"
+        );
+    }
+
+    #[test]
+    fn duplicate_completion_does_not_process_twice() {
+        // Locks `complete_async`'s once-only contract (its
+        // `if !set.get(id).common.pact { return Ok(()) }` guard): a second
+        // completion callback for the same operation must be a no-op, not a
+        // second process pass nor a re-initiation.
+        let clock = ManualClock::new();
+        clock.advance(Duration::from_secs(1));
+        let d = db("record(ai, \"PV:A\") {\n    field(INP, \"5\")\n}\n");
+        let id = d.lookup("PV:A").expect("PV:A exists");
+        let support_clock: Arc<dyn Clock> = Arc::new(clock.clone());
+        let support = Arc::new(DelaySupport::new(support_clock, Duration::from_millis(50)));
+        let reg = AsyncRegistry::new();
+        reg.bind(id, support.clone());
+        let mut ctx = ProcCtx::with_async(&clock, &reg);
+
+        // Initiating pass: Pending, PACT set, nothing posts.
+        d.with_set(id.set, |set| {
+            process(set, id, &mut ctx).expect("a pending start is Ok");
+            assert!(
+                set.get(id).common.pact,
+                "PACT is held for the completion path"
+            );
+        });
+        assert!(
+            ctx.take_events().is_empty(),
+            "nothing posts while the operation is pending"
+        );
+
+        // First completion: the second half runs, the monitor posts once, and
+        // PACT clears. (Kills a guard mutated to always-return / negated: those
+        // would skip the body here and post nothing.)
+        d.with_set(id.set, |set| {
+            complete_async(set, id, &mut ctx).expect("completion succeeds");
+            assert!(
+                !set.get(id).common.pact,
+                "a completed pass clears PACT"
+            );
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:A".to_string()],
+            "the monitor posts exactly once when the operation completes"
+        );
+
+        // Second completion: PACT is already clear. The guard must return early
+        // — NOT re-enter `record_body`. If the guard were removed, re-entry
+        // would capture pact_before=false, re-raise PACT, and re-initiate the
+        // (still-bound) DelaySupport back to Pending — leaving PACT *set*. So
+        // the PACT-clear assertion below is what kills the guard-removal mutant
+        // (a monitor-count check alone would not: a re-initiation posts
+        // nothing either).
+        d.with_set(id.set, |set| {
+            complete_async(set, id, &mut ctx).expect("a duplicate completion is Ok");
+            assert!(
+                !set.get(id).common.pact,
+                "a duplicate completion must not re-arm PACT: the guard held"
+            );
+        });
+        assert!(
+            ctx.take_events().is_empty(),
+            "a duplicate completion posts nothing: the record was not processed again"
+        );
+    }
+
+    #[test]
+    fn a_slow_async_record_interleaves_with_a_fast_periodic_one() {
+        // A slow async record (PV:SLOW, DelaySupport) stays Pending while a
+        // fast record (PV:FAST) processes and posts every tick. When the clock
+        // crosses SLOW's deadline and completion is driven, SLOW posts exactly
+        // once. Fully deterministic on a ManualClock — no real sleep.
+        let clock = ManualClock::new();
+        clock.advance(Duration::from_secs(1));
+        let d = db("record(ai, \"PV:SLOW\") {\n    field(INP, \"7\")\n}\n\
+                    record(ai, \"PV:FAST\") {\n}\n");
+        let slow = d.lookup("PV:SLOW").expect("PV:SLOW exists");
+        let fast = d.lookup("PV:FAST").expect("PV:FAST exists");
+        let support_clock: Arc<dyn Clock> = Arc::new(clock.clone());
+        let support = Arc::new(DelaySupport::new(support_clock, Duration::from_millis(50)));
+        let reg = AsyncRegistry::new();
+        reg.bind(slow, support.clone());
+        let mut ctx = ProcCtx::with_async(&clock, &reg);
+
+        // Initiate SLOW: it goes Pending and posts nothing.
+        d.with_set(slow.set, |set| {
+            process(set, slow, &mut ctx).expect("a pending start is Ok");
+            assert!(
+                set.get(slow).common.pact,
+                "SLOW holds PACT while its operation is outstanding"
+            );
+        });
+        assert!(
+            ctx.take_events().is_empty(),
+            "SLOW posts nothing while pending"
+        );
+        let deadline = support.deadline().expect("the initiating pass recorded a deadline");
+
+        // The fast record ticks every 10ms. Each tick posts, and SLOW stays
+        // Pending (a scan pass over it is a PACT no-op) the whole time.
+        let mut fast_posts = 0usize;
+        let mut tick = 0i64;
+        while clock.now() < deadline {
+            clock.advance(Duration::from_millis(10));
+            tick += 1;
+            d.with_set(fast.set, |set| {
+                // A genuinely changing input value, so each pass posts a monitor
+                // (a constant INP would plateau after the first pass).
+                set.get_mut(fast).val = Value::Double(tick as f64);
+                process(set, fast, &mut ctx).expect("FAST processes synchronously");
+            });
+            fast_posts += event_names(&mut ctx).len();
+            d.with_set(slow.set, |set| {
+                process(set, slow, &mut ctx).expect("an active record is not an error");
+                assert!(
+                    set.get(slow).common.pact,
+                    "SLOW stays Pending across FAST ticks"
+                );
+            });
+            assert!(
+                ctx.take_events().is_empty(),
+                "SLOW still posts nothing while pending"
+            );
+        }
+        assert_eq!(
+            fast_posts, 5,
+            "FAST posts once per 10ms tick across the 50ms delay"
+        );
+
+        // The clock has crossed SLOW's deadline; drive its completion.
+        assert!(
+            clock.now() >= deadline,
+            "the loop ran until the clock reached SLOW's deadline"
+        );
+        d.with_set(slow.set, |set| {
+            complete_async(set, slow, &mut ctx).expect("completion succeeds");
+            assert!(
+                !set.get(slow).common.pact,
+                "completion clears PACT"
+            );
+        });
+        assert_eq!(
+            event_names(&mut ctx),
+            vec!["PV:SLOW".to_string()],
+            "SLOW posts exactly once, on completion"
         );
     }
 
