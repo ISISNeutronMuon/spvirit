@@ -961,6 +961,13 @@ pub async fn handle_connection(
         }
         last_activity = Instant::now();
 
+        // Per-host downstream RX: count every inbound frame's on-wire bytes
+        // (header + payload) exactly once, regardless of command type, before
+        // segment reassembly folds multi-frame messages together.
+        if let Some(cr) = &state.client_registry {
+            cr.add_rx(conn_id, (header.len() + payload_len) as u64);
+        }
+
         // Segment reassembly is delegated to the shared codec state machine.
         // Control frames come back verbatim and are answered here; they never
         // reach command dispatch below.
@@ -1098,6 +1105,19 @@ pub async fn handle_connection(
                         .await;
                     continue;
                 };
+
+                // Per-PV downstream RX: PUT frames only. This is a documented
+                // approximation -- most downstream RX is puts, and other
+                // command types don't resolve to a single clean PV to
+                // attribute their bytes to. Counts this frame's on-wire
+                // payload (both PUT INIT and PUT DATA frames), independent of
+                // the per-host counter above (a different counter and a
+                // different dimension, not a double count).
+                if payload.command == 11
+                    && let Some(c) = &state.bandwidth_counters
+                {
+                    c.ds_bypv_rx.add(&pv_name, payload_len as u64);
+                }
 
                 let is_init = (payload.subcmd & 0x08) != 0;
 
