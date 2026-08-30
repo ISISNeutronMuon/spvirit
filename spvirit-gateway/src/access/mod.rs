@@ -94,6 +94,39 @@ impl AccessControl {
     /// the caller. No CIDR, no DNS resolution. Task 11 supplies the peer's
     /// IP string as `id.host`.
     pub fn decide(&self, op: Op, pv: &str, id: &Identity) -> Decision {
+        self.decide_inner(op, pv, id, false)
+    }
+
+    /// Decides `op` on a **gateway-local** PV — one this process serves
+    /// itself (the status PVs), not a name proxied from upstream.
+    ///
+    /// Identical to [`decide`](Self::decide) except that a `pvlist` which
+    /// does not match `pv` leaves it at the `DEFAULT` binding instead of
+    /// denying it. `readOnly`, an explicit pvlist `DENY`, and ACF all still
+    /// bind exactly as they do for proxied names.
+    ///
+    /// A `pvlist` selects which *upstream* names the gateway proxies, so an
+    /// ordinary one lists the data PVs and never mentions the status prefix.
+    /// Routing status PVs through the fail-closed [`decide`](Self::decide)
+    /// made every such deployment deny all of them: `StatusSource::claim`
+    /// read the `Deny` as "not mine", search answered `found=false`, and
+    /// clients timed out waiting for a search response while `pvlist` still
+    /// listed the names.
+    pub fn decide_local(&self, op: Op, pv: &str, id: &Identity) -> Decision {
+        self.decide_inner(op, pv, id, true)
+    }
+
+    /// Shared body of [`decide`](Self::decide) and
+    /// [`decide_local`](Self::decide_local). `unmatched_is_default` picks the
+    /// treatment of a configured `pvlist` with no rule for `pv`: fail closed
+    /// (proxied names) or fall through to the `DEFAULT` binding (local ones).
+    fn decide_inner(
+        &self,
+        op: Op,
+        pv: &str,
+        id: &Identity,
+        unmatched_is_default: bool,
+    ) -> Decision {
         // Step 1: readOnly overrides everything for writes/RPCs; Get is
         // unaffected.
         if self.read_only && matches!(op, Op::Put | Op::Rpc) {
@@ -117,6 +150,10 @@ impl AccessControl {
                                 .is_some_and(|h| r.from_hosts.iter().any(|fh| fh == h)))
                 });
                 match matched {
+                    None if unmatched_is_default => (pv.to_string(), Binding {
+                        asg: "DEFAULT".to_string(),
+                        asl: 0,
+                    }),
                     None => return Decision::Deny,
                     Some(rule) => match &rule.action {
                         PvlistAction::Deny => return Decision::Deny,
