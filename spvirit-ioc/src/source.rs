@@ -113,6 +113,14 @@ pub struct IocSource {
     /// [`EgressSink`] (an `Arc`) so the scan path publishes through the same
     /// registry `set_monitor_registry` hands over.
     registry: Arc<RwLock<Option<Arc<MonitorRegistry>>>>,
+    /// The async task that drains [`EgressSink`]'s notify channel, awaiting
+    /// `notify_monitors` per item. Spawned by [`start_scanning`], aborted by
+    /// [`stop_scanning`] and [`Drop`]. `Mutex<Option<…>>` for interior
+    /// mutability behind `&self` and idempotent teardown (`take` once).
+    ///
+    /// [`start_scanning`]: IocSource::start_scanning
+    /// [`stop_scanning`]: IocSource::stop_scanning
+    notify_drain: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// A minimal, opaque `Debug` — `RecordDb` and friends don't derive it, and
@@ -136,6 +144,23 @@ impl IocSource {
          whose links join two existing sets would invalidate every outstanding \
          id. EPICS Base has the same restriction — dbLoadRecords after iocInit \
          is unsupported. Pass every record to Ioc(records=[...]) at once.";
+
+    /// Abort the monitor-notify drain task, if one is running.
+    ///
+    /// `take`s the handle so a second call (e.g. `stop_scanning` then `Drop`)
+    /// is a no-op — idempotent teardown. Aborting is enough: the drain only
+    /// awaits `notify_monitors`, which holds no cross-await lock, so there is
+    /// nothing to unwind cleanly.
+    fn abort_notify_drain(&self) {
+        if let Some(handle) = self
+            .notify_drain
+            .lock()
+            .expect("notify_drain lock poisoned")
+            .take()
+        {
+            handle.abort();
+        }
+    }
 
     pub fn from_db_file(path: &str) -> Result<IocSource, String> {
         let raw = load_db_records(path, &HashMap::new()).map_err(|e| e.to_string())?;
@@ -180,9 +205,11 @@ impl IocSource {
             .filter_map(|name| db.lookup(&name).map(|id| (id, name)))
             .collect::<HashMap<_, _>>();
         // The Scanner shares `db` so it processes the same records the source
-        // serves, and its `EgressSink` shares `subscribers`/`registry` so a
-        // scan-driven pass publishes through exactly the egress a host-side
-        // write does. In production SystemClock is correct. The Scanner is not
+        // serves, and its `EgressSink` shares `subscribers` so a scan-driven
+        // pass feeds the same subscriber fan-out a host-side write does; the
+        // monitor-registry half is published by the drain task (spawned by
+        // `start_scanning`), which reads the source's own `registry`. In
+        // production SystemClock is correct. The Scanner is not
         // started here — `start_scanning` does that once the server is up — so
         // no thread is spawned and no clock is read until then; a bare engine
         // under test (Task 12) never starts it and its sink is never called.
@@ -190,8 +217,7 @@ impl IocSource {
         let registry: Arc<RwLock<Option<Arc<MonitorRegistry>>>> = Arc::new(RwLock::new(None));
         let egress = Arc::new(EgressSink {
             subscribers: subscribers.clone(),
-            registry: registry.clone(),
-            handle: OnceLock::new(),
+            notify_tx: OnceLock::new(),
         });
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let sink: Arc<dyn ProcSink> = egress.clone();
@@ -205,6 +231,7 @@ impl IocSource {
             subscribers,
             field_subs: Mutex::new(Vec::new()),
             registry,
+            notify_drain: Mutex::new(None),
         };
         // Report the load-time diagnostics once, here, rather than on every
         // pass. None of them is fatal.
@@ -508,13 +535,22 @@ impl IocSource {
 /// shared shape for the path that has no handler to publish for it.
 struct EgressSink {
     subscribers: SubscriberMap,
-    registry: Arc<RwLock<Option<Arc<MonitorRegistry>>>>,
-    /// The server's runtime handle, set once by [`IocSource::start_scanning`]
-    /// before the Scanner is started. `flush` runs on a std scan thread (never
-    /// a runtime worker), so it `block_on`s the async `notify_monitors` — the
-    /// same await `set_value` runs inline. Unset (and unused) for a bare engine
-    /// under test, whose Scanner is never started.
-    handle: OnceLock<tokio::runtime::Handle>,
+    /// Sender to the monitor-notify drain task, set once by
+    /// [`IocSource::start_scanning`]. `flush` hands each `(name, payload)` here
+    /// with a synchronous, non-blocking `send` instead of awaiting
+    /// `notify_monitors` inline — so `flush` is safe to call from **any**
+    /// thread: a std periodic scan thread, the serve worker running the startup
+    /// PINI sweep, or a runtime worker running an event fire via `post_event`.
+    /// A dedicated async task (spawned alongside this sender) awaits
+    /// `notify_monitors` per item, in order, so per-monitor delivery order is
+    /// preserved and delivery only shifts by one task hop. Unset (and unused)
+    /// for a bare engine under test, whose Scanner is never started.
+    ///
+    /// This replaces an earlier `block_on(notify_monitors(...))`, which panicked
+    /// ("cannot start a runtime from within a runtime") whenever `flush` ran on
+    /// a runtime worker — i.e. for every PINI and every posted event. See
+    /// `events.rs`, which made `EventSink` async for exactly this reason.
+    notify_tx: OnceLock<mpsc::UnboundedSender<(String, NtPayload)>>,
 }
 
 impl ProcSink for EgressSink {
@@ -523,21 +559,17 @@ impl ProcSink for EgressSink {
             tracing::debug!(target: "spvirit_ioc", "{line}");
         }
         feed_subscribers(&self.subscribers, &events);
-        // Publish to the monitor registry exactly as `set_value` does after a
-        // put. Without a runtime handle (never started) or a registry (a bare
-        // engine), there is nobody to publish to — correct, and unreachable in
-        // a running server, which sets both before `Scanner::start`.
-        let Some(handle) = self.handle.get() else {
+        // Hand the monitor-registry half to the drain task. `send` on an
+        // unbounded channel is synchronous and never blocks, so this is safe on
+        // any thread — unlike the `block_on` it replaces. No sender (Scanner
+        // never started) means nobody to publish to: correct for a bare engine,
+        // unreachable in a running server, which sets it before `Scanner::start`.
+        let Some(tx) = self.notify_tx.get() else {
             return;
         };
-        // Clone the Arc out and drop the guard before the block_on: no lock in
-        // this crate crosses an await, and block_on drives one.
-        let registry = self.registry.read().expect("registry lock poisoned").clone();
-        let Some(registry) = registry else {
-            return;
-        };
-        for (name, payload) in &events {
-            handle.block_on(registry.notify_monitors(name, payload));
+        for event in events {
+            // `Err` only if the drain task is gone (teardown); nothing to do.
+            let _ = tx.send(event);
         }
     }
 }
@@ -708,26 +740,50 @@ impl StoreSource for IocSource {
 
     /// Start scan-driven processing once the server is up.
     ///
-    /// Hands the [`EgressSink`] the runtime `handle` its std scan threads need
-    /// to publish, populates every scan list from the loaded database, then
-    /// starts the scan threads. The order is deliberate (R-T12-LOADORDER):
-    /// the handle is set so the first PINI/periodic pass can publish, lists are
-    /// loaded before any thread is spawned, and `Scanner::start` runs the PINI
-    /// sweep before spawning. Called by `PvaServer` after the registry is set
-    /// and before serving begins.
+    /// Opens the [`EgressSink`]'s monitor-notify channel and spawns its async
+    /// drain task on `handle`, populates every scan list from the loaded
+    /// database, then starts the scan threads. The order is deliberate
+    /// (R-T12-LOADORDER): the notify channel and its drain exist *before* any
+    /// processing, so the startup PINI sweep inside `Scanner::start` (which runs
+    /// inline on this task — a runtime worker) can publish; lists are loaded
+    /// before any thread is spawned; and `Scanner::start` runs the PINI sweep
+    /// before spawning. Called by `PvaServer` after the registry is set and
+    /// before serving begins.
+    ///
+    /// The drain task is what makes `flush` safe on any thread: `flush` only
+    /// ever does a sync `send`, and the awaiting of `notify_monitors` happens
+    /// here, on the runtime, one item at a time in order.
     fn start_scanning(&self, handle: tokio::runtime::Handle) {
         // `OnceLock::set` ignores a second call; `Scanner::start`/`load_from_db`
         // are each meant to run once. A duplicate `start_scanning` is a caller
-        // bug, not something to paper over, but the set at least stays sane.
-        let _ = self.egress.handle.set(handle);
+        // bug, not something to paper over, but the set at least stays sane —
+        // and we only spawn a drain for the sender that actually took.
+        let (tx, mut rx) = mpsc::unbounded_channel::<(String, NtPayload)>();
+        if self.egress.notify_tx.set(tx).is_ok() {
+            let registry = self.registry.clone();
+            let drain = handle.spawn(async move {
+                while let Some((name, payload)) = rx.recv().await {
+                    // Read the registry per item, exactly as the old inline
+                    // flush did per pass: a scan-driven update is published
+                    // through the very same `notify_monitors` a host write uses.
+                    let registry = registry.read().expect("registry lock poisoned").clone();
+                    if let Some(registry) = registry {
+                        registry.notify_monitors(&name, &payload).await;
+                    }
+                }
+            });
+            *self.notify_drain.lock().expect("notify_drain lock poisoned") = Some(drain);
+        }
         self.scanner.load_from_db();
         self.scanner.start();
     }
 
-    /// Stop scan-driven processing: signal the scan threads and join them.
-    /// Idempotent (`Scanner::shutdown` is); also run from [`Drop`].
+    /// Stop scan-driven processing: signal the scan threads and join them, and
+    /// abort the monitor-notify drain task. Idempotent (`Scanner::shutdown` is,
+    /// and the drain abort `take`s once); also run from [`Drop`].
     fn stop_scanning(&self) {
         self.scanner.shutdown();
+        self.abort_notify_drain();
     }
 
     /// The Scanner as an [`EventSink`], for the server to register on its
@@ -745,6 +801,7 @@ impl Drop for IocSource {
     /// goes away. Idempotent and cheap when scanning was never started.
     fn drop(&mut self) {
         self.scanner.shutdown();
+        self.abort_notify_drain();
     }
 }
 

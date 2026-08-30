@@ -34,7 +34,7 @@ use spvirit_client::{PvOptions, pvmonitor};
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_ioc::IocSource;
 use spvirit_server::pva_server::PvaServer;
-use spvirit_server::pvstore::{Source, StoreSource};
+use spvirit_server::pvstore::Source;
 
 fn free_tcp_port() -> Option<u16> {
     TcpListener::bind("127.0.0.1:0").ok()?.local_addr().ok().map(|a| a.port())
@@ -202,23 +202,125 @@ async fn a_scan_field_claim_is_writable_end_to_end() {
     assert!(!egu.writable, "an ordinary field PV (EGU) stays read-only");
 }
 
-/// The engine offers its Scanner as an `EventSink`, so the server can register
-/// it and event-driven records fire when an event is posted. Without this the
-/// server's `add_sink` call in `serve_after_start_hooks` would register nothing
-/// and every `SCAN("Event …")` record would go dark. (The Scanner's own
-/// event-list firing is covered by `scanner.rs`'s
-/// `on_event_drives_the_list_via_the_event_sink_seam`; this pins the wiring
-/// seam the server depends on.)
+/// A `PINI("YES")` record must be processed at server startup and its value
+/// delivered to a client — the server must **not** panic bringing it up.
+///
+/// The startup PINI sweep runs inside `Scanner::start()`, which
+/// `start_scanning` calls **on the async serve task (a runtime worker)**. If
+/// `EgressSink::flush` published by `block_on`-ing `notify_monitors`, that
+/// `block_on` would panic ("cannot start a runtime from within a runtime"),
+/// unwind the serve future, and the server would never serve — this test would
+/// then time out. `PINI:A` links a constant source (42) and is undefined until
+/// processed, so a client seeing 42 proves the PINI pass both ran and
+/// published without crashing startup.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_engine_offers_its_scanner_as_an_event_sink() {
-    const DB: &str = "record(ai, \"EV:A\") {\n\
-        field(INP, \"1\")\n\
-        field(SCAN, \"Event shutter\")\n\
+async fn a_pini_record_is_processed_at_startup_without_panicking() {
+    let (Some(tcp), Some(udp)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("skipping: no free loopback ports");
+        return;
+    };
+
+    const DB: &str = "record(ai, \"PINI:SRC\") {\n\
+        field(INP, \"42\")\n\
+    }\n\
+    record(ai, \"PINI:A\") {\n\
+        field(INP, \"PINI:SRC\")\n\
+        field(PINI, \"YES\")\n\
     }\n";
-    let ioc = IocSource::from_db_str(DB).expect("the database loads");
+
+    let ioc = Arc::new(IocSource::from_db_str(DB).expect("the database loads"));
+    let server = PvaServer::builder()
+        .port(tcp)
+        .udp_port(udp)
+        .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .ioc(ioc)
+        .build();
+    tokio::spawn(async move { server.run().await.map_err(|e| e.to_string()) });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let (rx, mon) = spawn_monitor(opts_for("PINI:A", tcp, udp));
+    let pini_post =
+        tokio::task::spawn_blocking(move || recv_value(&rx, 42.0, Duration::from_secs(6)))
+            .await
+            .expect("blocking recv task");
+    mon.abort();
+
     assert!(
-        StoreSource::scanner_event_sink(&ioc).is_some(),
-        "the engine must hand the server a Scanner event sink to register"
+        pini_post.is_some(),
+        "a PINI record must be processed at startup and its linked value (42) \
+         delivered — a `block_on` in flush on the serve worker would panic and \
+         crash the server before it ever served"
+    );
+}
+
+/// An event scan record must deliver a monitor frame when its event is posted.
+///
+/// `Events::post` awaits each `EventSink` inline on a **runtime task**, so the
+/// Scanner's `on_event` → `fire_event` → `process_ids` → `flush` chain runs on
+/// a runtime worker. A `block_on` there would panic, be swallowed by `post`'s
+/// `catch_unwind`, and the record would **silently** never notify. This drives
+/// the real path — `RunningServer::post_event` → the registered sink → a client
+/// monitor — and asserts the frame actually arrives.
+///
+/// `EV:A` reads a settable `ao` source through an (NPP) link and is on
+/// `SCAN("Event shutter")`, so nothing but the event can move it: the source is
+/// set to 55 without processing `EV:A`, then the event is posted, and the client
+/// must see 55.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_record_delivers_a_monitor_frame_via_post_event() {
+    let (Some(tcp), Some(udp)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("skipping: no free loopback ports");
+        return;
+    };
+
+    const DB: &str = "record(ao, \"EV:SRC\") {\n\
+        field(DOL, \"0\")\n\
+    }\n\
+    record(ai, \"EV:A\") {\n\
+        field(INP, \"EV:SRC\")\n\
+        field(SCAN, \"Event\")\n\
+        field(EVNT, \"shutter\")\n\
+    }\n";
+
+    let ioc = Arc::new(IocSource::from_db_str(DB).expect("the database loads"));
+    let ioc_host = ioc.clone();
+    // `serve(...).start()` yields a `RunningServer` whose `post_event` reaches
+    // the registered Scanner event sink — the real dispatch path.
+    let server = PvaServer::serve(Vec::<spvirit_server::AnyPv>::new())
+        .port(tcp)
+        .udp_port(udp)
+        .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .ioc(ioc)
+        .start()
+        .await
+        .expect("server starts");
+    // Let `serve_after_start_hooks` register the Scanner as an event sink and
+    // spawn its notify drain before we fire.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (rx, mon) = spawn_monitor(opts_for("EV:A", tcp, udp));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Point the (NPP) source at 55 without processing EV:A; only the event may.
+    ioc_host
+        .set_value("EV:SRC", DecodedValue::Float64(55.0))
+        .await
+        .expect("host write to source");
+    // Fire the event: reaches the Scanner through the registered EventSink.
+    server.post_event("shutter").await;
+
+    let event_post =
+        tokio::task::spawn_blocking(move || recv_value(&rx, 55.0, Duration::from_secs(5)))
+            .await
+            .expect("blocking recv task");
+    mon.abort();
+    server.abort();
+
+    assert!(
+        event_post.is_some(),
+        "an event scan record must deliver its processed value (55) when the \
+         event is posted — a `block_on` in flush on the post_event worker would \
+         panic and be swallowed, so the update would silently never arrive"
     );
 }
 
