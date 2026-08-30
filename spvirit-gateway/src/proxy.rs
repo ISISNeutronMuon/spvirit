@@ -132,6 +132,13 @@ impl GatewaySource {
     pub fn upstream_monitor_count(&self) -> usize {
         self.monitors.upstream_count()
     }
+
+    /// Names of the upstream channels currently held in the monitor cache —
+    /// the live data behind the `cache` status PV (p4p's "upstream channel
+    /// cache summary"). Cheap snapshot; no lock held across an await.
+    pub fn upstream_monitor_names(&self) -> Vec<String> {
+        self.monitors.names()
+    }
 }
 
 impl Source for GatewaySource {

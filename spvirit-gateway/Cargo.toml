@@ -24,4 +24,4 @@ get_if_addrs = "0.5.3"
 regex = "1.11.2"
 
 [dev-dependencies]
-tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "time", "test-util"] }

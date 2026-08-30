@@ -204,6 +204,20 @@ impl MonitorCache {
     pub fn upstream_count(&self) -> usize {
         self.entries.lock().unwrap().len()
     }
+
+    /// PV names of all live upstream monitor entries — the "channel cache"
+    /// summary p4p's `cache` status PV reports. A cheap snapshot taken under
+    /// the entries lock (no lock held across an await); duplicates are
+    /// possible when the same real name is reached through more than one
+    /// client, matching p4p's per-channel listing.
+    pub fn names(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(_client, real_name)| real_name.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]

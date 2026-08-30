@@ -199,11 +199,22 @@ Setting a server's `statusprefix` (e.g. `"gw:status:"`) serves 15
 introspection PVs under that prefix, gated through the same `AccessControl`
 as the data plane:
 
-| Group | PVs | Notes |
+The shapes match the p4p gateway's status PVs (not plain scalars): `clients`
+and `cache` are `NTScalarArray` string lists, `refs` and the bandwidth PVs are
+`NTTable`s, and `asTest` returns p4p's `epics:p2p/Permission:1.0` structure.
+Live PVs post a fresh monitor frame whenever their underlying value changes
+(the monitor pump suppresses byte-identical frames, so a constant value posts
+once and then stays quiet — matching p4p's post-on-change).
+
+| Group | PVs | Shape / Notes |
 |---|---|---|
-| Live | `clients`, `cache`, `refs`, `threads`, `stats`, `poke` | `clients` and `cache` read real counters (configured upstream client count; active upstream monitor count). `refs`, `threads`, and `stats` currently read `0.0` — no M1 data source exists yet for per-binding refcounts, thread-pool introspection, or aggregate request stats. `poke` is the one writable status PV: a `put` bumps an internal generation counter, and `poke`'s own value reports it — useful for confirming the status source is alive. |
-| Static | `ds:bypv:rx`, `ds:bypv:tx`, `ds:byhost:rx`, `ds:byhost:tx`, `us:bypv:rx`, `us:bypv:tx`, `us:byhost:rx`, `us:byhost:tx` | Bandwidth counters, always `0.0` in M1 — no per-PV/per-host byte accounting exists yet. |
-| RPC | `asTest` | Diagnostic: evaluates `get`/`put`/rpc access for a `{pv, user, host}` argument struct against this server's `AccessControl` and returns the three allow/deny verdicts plus a summary string, without touching any upstream. |
+| Live | `clients`, `cache` | `NTScalarArray` (string list). `cache` is the live list of upstream channels held in the monitor cache — it updates as monitors come and go. `clients` (the downstream-peer list) has no M1 registry to read yet, so it is served as an empty list (correct shape; data-population follow-up). |
+| Live | `refs` | `NTTable` with columns `type`/`count`/`delta` (labels `Type`/`Count`/`Delta`), matching p4p's `RefAdapter`. No object-refcount collector exists in M1, so the rows are empty (correct shape; data follow-up). |
+| Live | `stats` | `epics:p2p/Stats:1.0` structure of cache-size counters, matching p4p's `statsType` (six `NTScalar('L')` ulong fields: `ccacheSize`, `mcacheSize`, `gcacheSize`, `banHostSize`, `banPVSize`, `banHostPVSize`). `mcacheSize` is live (the active upstream-monitor count); the other five are `0` — spvirit has no channel/GC caches or ban lists in M1 (correct shape; data follow-up). |
+| Live (writable) | `poke` | `NTScalar`. The one writable status PV: a `put` bumps an internal generation counter, and `poke`'s own value reports it — useful for confirming the status source is alive. |
+| Static | `ds:bypv:rx/tx`, `ds:byhost:rx/tx`, `us:bypv:rx/tx`, `us:byhost:rx/tx` | `NTTable`s matching p4p's bandwidth tables (`bypv` -> `PV`/rate; `us:byhost` -> `Server`/rate; `ds:byhost` -> `Account`/`Client`/rate; the rate column is labelled `TX (B/s)`/`RX (B/s)`). All have empty rows in M1 — no per-PV/per-host byte accounting exists yet, so `0` rows != "no traffic". |
+| Static + RPC | `threads` | Gettable/subscribable static `NTScalar('s')` whose value is the constant string `"RPC only"`, matching p4p's `SharedPV(nt=NTScalar('s'), initial='RPC only')`. It **also** responds to RPC, which returns a shape-correct best-effort thread summary (available-parallelism plus a note that an OS-level stack dump is not collected and that work runs on tokio async tasks). As in p4p, the get/subscribe value never changes — the richer detail is available only via RPC. |
+| RPC | `asTest` | Diagnostic: evaluates `put`/`rpc` access for a `{pv, user, host}` argument struct against this server's `AccessControl`, without touching any upstream. Returns p4p's `epics:p2p/Permission:1.0` structure (`pv`, `account`, `peer`, plus a nested `permission` sub-structure of `put`/`rpc`/`uncached`/`audit` booleans). `roles`/`asg`/`asl` are present for shape parity but empty/zero — spvirit's `AccessControl` does not model them yet. |
 
 ## Trust boundary
 
