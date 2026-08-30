@@ -135,6 +135,12 @@ impl Runtime {
         // visible to that server's own `clients` PV.
         let client_registry = Arc::new(ClientRegistry::new());
 
+        // One shared rate snapshot for the whole gateway, built BEFORE the
+        // servers loop so the status source (below) can wire its
+        // `bandwidth` handle to the SAME `Arc<Mutex<RateSnapshot>>` the
+        // `BandwidthSampler` (started in `run`, below) writes into.
+        let rate_snapshot = Arc::new(Mutex::new(RateSnapshot::default()));
+
         // One GUID per server, generated before anything so the ban-set is
         // complete by the time any server's LoopGuard consults it.
         let server_guids: Vec<[u8; 12]> = cfg.servers.iter().map(|_| rand_guid()).collect();
@@ -186,7 +192,11 @@ impl Runtime {
                 let status = Arc::new(StatusSource::new(
                     server_cfg.statusprefix.clone(),
                     access.clone(),
-                    StatusHandles::from_gateway_with(&src_arc, client_registry.clone()),
+                    StatusHandles::from_gateway_with(
+                        &src_arc,
+                        client_registry.clone(),
+                        rate_snapshot.clone(),
+                    ),
                 ));
                 for line in banner::status_pv_lines(&server_cfg.statusprefix) {
                     tracing::info!("{line}");
@@ -225,8 +235,6 @@ impl Runtime {
             .and_then(|t| t.metrics.as_ref())
             .filter(|m| m.enabled)
             .map(|m| (m.listen.clone(), m.path.clone()));
-
-        let rate_snapshot = Arc::new(Mutex::new(RateSnapshot::default()));
 
         Ok(Runtime {
             servers,

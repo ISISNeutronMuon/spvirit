@@ -20,8 +20,8 @@ pub use sampler::{BandwidthSampler, RateSnapshot};
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spvirit_codec::spvd_decode::DecodedValue;
@@ -117,6 +117,26 @@ fn stamp(payload: &mut NtPayload, ts: NtTimeStamp) {
     }
 }
 
+/// Strips a payload's timestamp, producing the change-detection key the
+/// `subscribe` LIVE ticker uses for its `last` dedup comparison (see
+/// [`stamp`]'s caller in `subscribe`). Every other LIVE builder already
+/// returns an untimestamped payload, so this is a no-op for them; the 8
+/// bandwidth tables are the one case where the raw [`value_payload`] output
+/// carries a real timestamp (`bandwidth_table` stamps it with the sampler's
+/// `RateSnapshot::ts` so a direct `get` returns the true sample time) that
+/// would otherwise change every tick — even when the underlying rate rows
+/// do not — and falsely look like a data change.
+fn clear_stamp(payload: &NtPayload) -> NtPayload {
+    let mut p = payload.clone();
+    match &mut p {
+        NtPayload::Scalar(nt) => nt.time_stamp = None,
+        NtPayload::ScalarArray(nt) => nt.time_stamp = NtTimeStamp::default(),
+        NtPayload::Table(nt) => nt.time_stamp = None,
+        NtPayload::Generic { .. } | NtPayload::NdArray(_) | NtPayload::Enum(_) => {}
+    }
+    p
+}
+
 fn current_identity() -> Identity {
     let rc = spvirit_server::request_ctx::current_request();
     Identity {
@@ -128,14 +148,36 @@ fn current_identity() -> Identity {
 /// The live (get/subscribe) PVs, in the stable order `names()`/the banner
 /// report them. `poke` is included here (it is readable — its value is an
 /// internal generation counter — as well as the only writable status PV).
-/// `threads` is NOT in this ticker set: it is a *static* string value (served
-/// like the static bandwidth PVs — emit once, never changes) that *also*
-/// responds to RPC (see `RPC_NAMES`), so it is not driven by the live ticker.
-const LIVE: &[&str] = &["clients", "cache", "refs", "stats", "poke"];
+/// `threads` is NOT in this ticker set: it is a *static* string value (emit
+/// once, never changes) that *also* responds to RPC (see `RPC_NAMES`), so it
+/// is not driven by the live ticker.
+///
+/// The 8 bandwidth-table suffixes (spec §8.1, `BANDWIDTH_SUFFIXES`) were a
+/// one-shot `STATIC_ZERO` set pre-Task 13; they now live here too, refreshed
+/// once per tick from the `BandwidthSampler`'s `RateSnapshot`.
+const LIVE: &[&str] = &[
+    "clients",
+    "cache",
+    "refs",
+    "stats",
+    "poke",
+    "ds:bypv:rx",
+    "ds:bypv:tx",
+    "ds:byhost:rx",
+    "ds:byhost:tx",
+    "us:bypv:rx",
+    "us:bypv:tx",
+    "us:byhost:rx",
+    "us:byhost:tx",
+];
 
-/// The static, always-zero bandwidth-counter PVs (spec §8.1) — not wired to
-/// any real per-PV/per-host byte counter in M1.
-const STATIC_ZERO: &[&str] = &[
+/// The bandwidth-table PV suffixes (spec §8.1) — a subset of `LIVE`, kept as
+/// its own list so `value_payload` can dispatch them to `bandwidth_table`
+/// and `get` can skip the generic now()-restamp for them (their payload is
+/// already stamped with the sampler's `RateSnapshot::ts`, the true sample
+/// time, which the generic restamp would otherwise clobber with the current
+/// wall clock).
+const BANDWIDTH_SUFFIXES: &[&str] = &[
     "ds:bypv:rx",
     "ds:bypv:tx",
     "ds:byhost:rx",
@@ -153,12 +195,12 @@ const STATIC_ZERO: &[&str] = &[
 /// `SharedPV(NTScalar('s'), initial='RPC only')` that also serves RPC.
 const RPC_NAMES: &[&str] = &["asTest", "threads"];
 
-/// The full set of suffixes this source serves, in a stable order: live,
-/// then static, then RPC. Both `StatusSource::names()` and
+/// The full set of suffixes this source serves, in a stable order: live
+/// (bandwidth tables included), then RPC. Both `StatusSource::names()` and
 /// `banner::status_pv_lines` draw from this single iterator so the served
 /// set and the banner cannot drift apart.
 fn served_suffixes() -> impl Iterator<Item = &'static str> {
-    LIVE.iter().chain(STATIC_ZERO.iter()).chain(RPC_NAMES.iter()).copied()
+    LIVE.iter().chain(RPC_NAMES.iter()).copied()
 }
 
 /// A cheap, cloneable "read the current name list" callback used by
@@ -169,14 +211,20 @@ type ListHandle = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 /// field(s) of the `stats` [`epics:p2p/Stats:1.0`] structure.
 type CountHandle = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-/// Live-value handles `StatusSource` reads for its `clients`/`cache`/`stats`
-/// PVs.
+/// A cheap, cloneable "read the current bandwidth-rate snapshot" callback
+/// used by [`StatusHandles`]'s 8 live bandwidth-table PVs. Cloning the
+/// closure is cheap (it captures a clone of the shared
+/// `Arc<Mutex<RateSnapshot>>`); each call locks briefly and returns an owned
+/// clone of the snapshot.
+type BandwidthHandle = Arc<dyn Fn() -> RateSnapshot + Send + Sync>;
+
+/// Live-value handles `StatusSource` reads for its `clients`/`cache`/`stats`/
+/// bandwidth PVs.
 ///
 /// Cheap to clone (each field is an `Arc`), so a clone can be handed to the
-/// `subscribe` ticker task without borrowing the source. `refs` and the
-/// bandwidth PVs are served as NTTables built from no live source yet (empty
-/// rows), so they need no handle here; `threads` is a static string with no
-/// gauge.
+/// `subscribe` ticker task without borrowing the source. `refs` is served as
+/// an NTTable built from no live source yet (empty rows), so it needs no
+/// handle here; `threads` is a static string with no gauge.
 #[derive(Clone)]
 pub struct StatusHandles {
     /// Downstream client names (p4p `clients`, an NTScalarArray-of-string).
@@ -186,6 +234,9 @@ pub struct StatusHandles {
     /// Monitor-cache size — the one `stats` field (`mcacheSize`) spvirit has a
     /// real live source for. The remaining `Stats` fields are stubbed to 0.
     pub mcache_size: CountHandle,
+    /// The current per-second rate snapshot backing the 8 bandwidth-table
+    /// PVs (p4p `ds:bypv:*`/`ds:byhost:*`/`us:bypv:*`/`us:byhost:*`).
+    pub bandwidth: BandwidthHandle,
 }
 
 impl StatusHandles {
@@ -197,6 +248,7 @@ impl StatusHandles {
             clients: empty.clone(),
             cache: empty,
             mcache_size: Arc::new(|| 0),
+            bandwidth: Arc::new(RateSnapshot::default),
         }
     }
 
@@ -212,7 +264,9 @@ impl StatusHandles {
     /// `clients` has no downstream-peer registry to read from in M1, so it is
     /// stubbed to an empty list (correct NTScalarArray shape, data-population
     /// follow-up). The other five `Stats` fields have no M1 collector and are
-    /// stubbed to 0 — documented gaps, not oversights.
+    /// stubbed to 0 — documented gaps, not oversights. `bandwidth` is stubbed
+    /// to an empty [`RateSnapshot`] (correct shape, no rows) — callers that
+    /// have a real sampler use [`Self::from_gateway_with`] instead.
     pub fn from_gateway(src: &Arc<GatewaySource>) -> Self {
         let src_cache = src.clone();
         let src_stats = src.clone();
@@ -220,21 +274,29 @@ impl StatusHandles {
             clients: Arc::new(Vec::new),
             cache: Arc::new(move || src_cache.upstream_monitor_names()),
             mcache_size: Arc::new(move || src_stats.upstream_monitor_count() as u64),
+            bandwidth: Arc::new(RateSnapshot::default),
         }
     }
 
-    /// Like [`Self::from_gateway`], but also wires `clients` to a real
-    /// [`ClientRegistry`] snapshot: `user@ip` for an identified downstream
-    /// connection, else the bare peer IP, sorted for a stable diagnostic
-    /// listing.
+    /// Like [`Self::from_gateway`], but also wires:
+    /// - `clients` to a real [`ClientRegistry`] snapshot: `user@ip` for an
+    ///   identified downstream connection, else the bare peer IP, sorted for
+    ///   a stable diagnostic listing.
+    /// - `bandwidth` to the runtime's shared `Arc<Mutex<RateSnapshot>>` (the
+    ///   `BandwidthSampler`'s output — see `Runtime::rate_snapshot`), so
+    ///   each call returns the latest 1 Hz sample.
     ///
-    /// Takes the registry as an explicit `Arc` (rather than folding it into
-    /// `from_gateway`) so a later task (bandwidth handles) can add one more
-    /// `Arc`-handle parameter here without disturbing `from_gateway`'s
-    /// existing (registry-free) callers/tests.
-    pub fn from_gateway_with(src: &Arc<GatewaySource>, client_registry: Arc<ClientRegistry>) -> Self {
+    /// Takes the registry and rate-snapshot handle as explicit `Arc`s
+    /// (rather than folding them into `from_gateway`) so `from_gateway`'s
+    /// existing (data-source-free) callers/tests are undisturbed.
+    pub fn from_gateway_with(
+        src: &Arc<GatewaySource>,
+        client_registry: Arc<ClientRegistry>,
+        rate_snapshot: Arc<Mutex<RateSnapshot>>,
+    ) -> Self {
         let mut handles = Self::from_gateway(src);
         handles.clients = clients_list_handle(client_registry);
+        handles.bandwidth = bandwidth_snapshot_handle(rate_snapshot);
         handles
     }
 }
@@ -257,6 +319,15 @@ fn clients_list_handle(registry: Arc<ClientRegistry>) -> ListHandle {
         v.sort();
         v
     })
+}
+
+/// Builds the `bandwidth` [`BandwidthHandle`] over the shared
+/// `Arc<Mutex<RateSnapshot>>` the `BandwidthSampler` writes into: each call
+/// locks briefly and returns an owned clone of the latest snapshot. Factored
+/// out of [`StatusHandles::from_gateway_with`] to mirror
+/// [`clients_list_handle`].
+fn bandwidth_snapshot_handle(snapshot: Arc<Mutex<RateSnapshot>>) -> BandwidthHandle {
+    Arc::new(move || snapshot.lock().unwrap().clone())
 }
 
 /// A [`Source`] serving the gateway's status/introspection PVs under a
@@ -391,35 +462,66 @@ impl StatusSource {
         })
     }
 
-    /// A bandwidth-counter NTTable matching p4p's `TableBuilder` shapes. The
-    /// `bypv` tables carry `name`/`rate` (labels `PV` + direction); `us:byhost`
-    /// carries `name`/`rate` (labels `Server` + direction); `ds:byhost` adds an
-    /// `account` column (labels `Account`/`Client` + direction). No per-PV /
-    /// per-host byte accounting exists in M1, so every table has empty rows
-    /// (correct shape, `0` rows != "no traffic"; data follow-up).
-    fn bandwidth_table(suffix: &str) -> NtPayload {
+    /// A bandwidth-counter NTTable matching p4p's `TableBuilder` shapes,
+    /// filled from the matching `Vec` of `snap` (Task 12's `RateSnapshot`).
+    /// The `bypv` tables carry `name`/`rate` (labels `PV` + direction);
+    /// `us:byhost` carries `name`/`rate` (labels `Server` + direction);
+    /// `ds:byhost` adds an `account` column (labels `Account`/`Client` +
+    /// direction). `time_stamp` is set to `snap.ts` — the sampler's true
+    /// sample time — so a direct `get` reports when the rows were last
+    /// computed (see `clear_stamp` for how the LIVE ticker still dedups
+    /// correctly despite this per-sample timestamp).
+    fn bandwidth_table(suffix: &str, snap: &RateSnapshot) -> NtPayload {
         let dir_label = if suffix.ends_with(":tx") { "TX (B/s)" } else { "RX (B/s)" };
-        let (labels, columns) = if suffix.starts_with("ds:byhost:") {
-            (
-                vec!["Account".into(), "Client".into(), dir_label.into()],
-                vec![
-                    NtTableColumn { name: "account".into(), values: ScalarArrayValue::Str(vec![]) },
-                    NtTableColumn { name: "name".into(), values: ScalarArrayValue::Str(vec![]) },
-                    NtTableColumn { name: "rate".into(), values: ScalarArrayValue::F64(vec![]) },
+        if suffix.starts_with("ds:byhost:") {
+            let rows = if suffix.ends_with(":tx") { &snap.ds_byhost_tx } else { &snap.ds_byhost_rx };
+            let mut accounts = Vec::with_capacity(rows.len());
+            let mut clients = Vec::with_capacity(rows.len());
+            let mut rates = Vec::with_capacity(rows.len());
+            for (account, client, rate) in rows {
+                accounts.push(account.clone());
+                clients.push(client.clone());
+                rates.push(*rate);
+            }
+            return NtPayload::Table(NtTable {
+                labels: vec!["Account".into(), "Client".into(), dir_label.into()],
+                columns: vec![
+                    NtTableColumn { name: "account".into(), values: ScalarArrayValue::Str(accounts) },
+                    NtTableColumn { name: "name".into(), values: ScalarArrayValue::Str(clients) },
+                    NtTableColumn { name: "rate".into(), values: ScalarArrayValue::F64(rates) },
                 ],
-            )
-        } else {
-            // `*:bypv:*` -> "PV"; `us:byhost:*` -> "Server".
-            let name_label = if suffix.contains(":byhost:") { "Server" } else { "PV" };
-            (
-                vec![name_label.into(), dir_label.into()],
-                vec![
-                    NtTableColumn { name: "name".into(), values: ScalarArrayValue::Str(vec![]) },
-                    NtTableColumn { name: "rate".into(), values: ScalarArrayValue::F64(vec![]) },
-                ],
-            )
+                descriptor: None,
+                alarm: None,
+                time_stamp: Some(snap.ts.clone()),
+            });
+        }
+        let rows: &[(String, f64)] = match suffix {
+            "ds:bypv:tx" => &snap.ds_bypv_tx,
+            "ds:bypv:rx" => &snap.ds_bypv_rx,
+            "us:bypv:tx" => &snap.us_bypv_tx,
+            "us:bypv:rx" => &snap.us_bypv_rx,
+            "us:byhost:tx" => &snap.us_byhost_tx,
+            "us:byhost:rx" => &snap.us_byhost_rx,
+            _ => unreachable!("bandwidth_table called with non-bandwidth suffix {suffix:?}"),
         };
-        NtPayload::Table(NtTable { labels, columns, descriptor: None, alarm: None, time_stamp: None })
+        // `*:bypv:*` -> "PV"; `us:byhost:*` -> "Server".
+        let name_label = if suffix.contains(":byhost:") { "Server" } else { "PV" };
+        let mut names = Vec::with_capacity(rows.len());
+        let mut rates = Vec::with_capacity(rows.len());
+        for (name, rate) in rows {
+            names.push(name.clone());
+            rates.push(*rate);
+        }
+        NtPayload::Table(NtTable {
+            labels: vec![name_label.into(), dir_label.into()],
+            columns: vec![
+                NtTableColumn { name: "name".into(), values: ScalarArrayValue::Str(names) },
+                NtTableColumn { name: "rate".into(), values: ScalarArrayValue::F64(rates) },
+            ],
+            descriptor: None,
+            alarm: None,
+            time_stamp: Some(snap.ts.clone()),
+        })
     }
 
     /// Builds the current value payload for a non-RPC status PV suffix, in the
@@ -438,7 +540,7 @@ impl StatusSource {
             "stats" => Self::stats_structure((handles.mcache_size)()),
             "poke" => Self::scalar_payload(generation.load(Ordering::Relaxed) as f64),
             "threads" => Self::threads_static_value(),
-            s if STATIC_ZERO.contains(&s) => Self::bandwidth_table(s),
+            s if BANDWIDTH_SUFFIXES.contains(&s) => Self::bandwidth_table(s, &(handles.bandwidth)()),
             _ => return None,
         })
     }
@@ -549,15 +651,16 @@ impl Source for StatusSource {
             if let Decision::Deny = self.access.decide(Op::Get, &name, &current_identity()) {
                 return None;
             }
-            if !LIVE.contains(&suffix) && !STATIC_ZERO.contains(&suffix) && suffix != "threads" {
+            if !LIVE.contains(&suffix) && suffix != "threads" {
                 return None;
             }
             let mut payload = Self::value_payload(suffix, &self.handles, &self.generation)?;
             // Stamp with the current time at read time — `clients`/`cache`/
-            // `refs`/`stats`/`poke`/`threads` only. The bandwidth suffixes
-            // (`STATIC_ZERO`) are left untouched here; Task 13 moves them to
-            // LIVE and stamps them from a sampler.
-            if LIVE.contains(&suffix) || suffix == "threads" {
+            // `refs`/`stats`/`poke`/`threads`. The 8 bandwidth suffixes are
+            // excluded here: `bandwidth_table` already stamped them with the
+            // sampler's true sample time (`RateSnapshot::ts`), which this
+            // wall-clock restamp would otherwise clobber.
+            if (LIVE.contains(&suffix) && !BANDWIDTH_SUFFIXES.contains(&suffix)) || suffix == "threads" {
                 stamp(&mut payload, now_ts());
             }
             Some(payload)
@@ -598,8 +701,8 @@ impl Source for StatusSource {
         Box::pin(async move {
             let suffix = self.suffix(&name)?.to_string();
             // `asTest` is pure RPC (nothing to monitor). `threads` IS
-            // subscribable — a static "RPC only" string served like the static
-            // bandwidth PVs (emit once, then close) — so it is NOT excluded.
+            // subscribable — a static "RPC only" string (emit once, then
+            // close) — so it is NOT excluded.
             if suffix == "asTest" {
                 return None;
             }
@@ -612,12 +715,17 @@ impl Source for StatusSource {
                 let generation = self.generation.clone();
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(TICK_PERIOD);
-                    // `last` holds the last UNSTAMPED data payload — the
-                    // change-detection key — so a stamp (which always
-                    // differs, since it carries "now") never itself looks
-                    // like a data change. `last_ts` only advances when the
-                    // data actually changes, so the timestamp reflects
-                    // last-change time, not last-poll time.
+                    // `last` holds the last dedup KEY — the change-detection
+                    // key — computed via `clear_stamp` so a stamp (which
+                    // always differs, since it carries "now") never itself
+                    // looks like a data change. This also covers the 8
+                    // bandwidth suffixes, whose raw payload already carries a
+                    // real (sampler) timestamp that changes every tick even
+                    // when the underlying rate rows do not — `clear_stamp` is
+                    // a no-op for every other LIVE payload, which already
+                    // carries none. `last_ts` only advances when the data
+                    // actually changes, so the timestamp reflects last-change
+                    // time, not last-poll time.
                     let mut last: Option<NtPayload> = None;
                     // Not read until the `if` branch below writes it first
                     // (always true on the first tick, since `last` starts
@@ -629,9 +737,10 @@ impl Source for StatusSource {
                         else {
                             break;
                         };
-                        if last.as_ref() != Some(&data) {
+                        let key = clear_stamp(&data);
+                        if last.as_ref() != Some(&key) {
                             last_ts = now_ts();
-                            last = Some(data.clone());
+                            last = Some(key);
                             let mut out = data;
                             stamp(&mut out, last_ts.clone());
                             // The server's monitor pump suppresses
@@ -645,14 +754,6 @@ impl Source for StatusSource {
                             }
                         }
                     }
-                });
-            } else if STATIC_ZERO.contains(&suffix.as_str()) {
-                tokio::spawn(async move {
-                    let _ = tx.send(Self::bandwidth_table(&suffix)).await;
-                    // Emit the (static, empty) bandwidth table once, then let
-                    // `tx` drop — the receiver observes a closed channel (idle)
-                    // rather than further updates, since no byte accounting
-                    // exists to change the value.
                 });
             } else if suffix == "threads" {
                 tokio::spawn(async move {
@@ -828,6 +929,7 @@ mod tests {
             clients: Arc::new(Vec::new),
             cache: Arc::new(move || list.lock().unwrap().clone()),
             mcache_size: Arc::new(|| 0),
+            bandwidth: Arc::new(RateSnapshot::default),
         };
         let access = Arc::new(AccessControl::new(false, None, None));
         StatusSource::new(PREFIX.to_string(), access, handles)
@@ -840,6 +942,7 @@ mod tests {
             clients: Arc::new(Vec::new),
             cache: Arc::new(Vec::new),
             mcache_size: Arc::new(move || count.load(Ordering::Relaxed)),
+            bandwidth: Arc::new(RateSnapshot::default),
         };
         let access = Arc::new(AccessControl::new(false, None, None));
         StatusSource::new(PREFIX.to_string(), access, handles)
@@ -905,7 +1008,10 @@ mod tests {
     }
 
     /// p4p shape: the bandwidth PVs are NTTables. `ds:byhost:*` has the extra
-    /// `Account` column; the rate column's label is direction-specific.
+    /// `Account` column; the rate column's label is direction-specific. This
+    /// uses the empty `StatusHandles::test()` bandwidth handle, so it only
+    /// exercises the shape (labels/column names), not the row content —
+    /// see `bandwidth_table_serves_live_rows_from_the_sampler` for that.
     #[tokio::test]
     async fn bandwidth_pvs_are_tables_with_p4p_columns() {
         let src = source(false);
@@ -913,6 +1019,7 @@ mod tests {
         let p = src.get(&format!("{PREFIX}us:bypv:tx")).await.expect("get");
         let NtPayload::Table(t) = p else { panic!("bandwidth PV must be a table") };
         assert_eq!(t.labels, vec!["PV", "TX (B/s)"]);
+        assert!(t.columns.iter().all(|c| c.values.is_empty()));
 
         let p = src.get(&format!("{PREFIX}ds:byhost:rx")).await.expect("get");
         let NtPayload::Table(t) = p else { panic!("bandwidth PV must be a table") };
@@ -923,6 +1030,88 @@ mod tests {
         let p = src.get(&format!("{PREFIX}us:byhost:tx")).await.expect("get");
         let NtPayload::Table(t) = p else { panic!("bandwidth PV must be a table") };
         assert_eq!(t.labels, vec!["Server", "TX (B/s)"]);
+    }
+
+    /// A `StatusHandles.bandwidth` closure returning a non-empty
+    /// `RateSnapshot` makes `get` serve the sampled rows, with the sample's
+    /// own timestamp (not the current wall clock) on the payload — proving
+    /// the bandwidth PVs are wired to Task 12's sampler rather than the old
+    /// always-empty stub.
+    #[tokio::test]
+    async fn bandwidth_table_serves_live_rows_from_the_sampler() {
+        let snap_ts = NtTimeStamp { seconds_past_epoch: 1_700_000_000, nanoseconds: 5, user_tag: 0 };
+        let handles = StatusHandles {
+            bandwidth: Arc::new({
+                let snap_ts = snap_ts.clone();
+                move || RateSnapshot {
+                    ts: snap_ts.clone(),
+                    ds_bypv_tx: vec![("PV:X".to_string(), 1234.0)],
+                    ..Default::default()
+                }
+            }),
+            ..StatusHandles::test()
+        };
+        let access = Arc::new(AccessControl::new(false, None, None));
+        let src = StatusSource::new(PREFIX.to_string(), access, handles);
+
+        let p = src.get(&format!("{PREFIX}ds:bypv:tx")).await.expect("get");
+        let NtPayload::Table(t) = p else { panic!("bandwidth PV must be a table") };
+        assert_eq!(t.labels, vec!["PV", "TX (B/s)"]);
+        let name_col = t.columns.iter().find(|c| c.name == "name").expect("name column");
+        assert_eq!(name_col.values, ScalarArrayValue::Str(vec!["PV:X".to_string()]));
+        let rate_col = t.columns.iter().find(|c| c.name == "rate").expect("rate column");
+        assert_eq!(rate_col.values, ScalarArrayValue::F64(vec![1234.0]));
+        assert_eq!(t.time_stamp, Some(snap_ts.clone()));
+        assert!(t.time_stamp.as_ref().unwrap().seconds_past_epoch > 0);
+    }
+
+    /// `ds:byhost:*` rows are `(account, client, rate)` 3-tuples from the
+    /// snapshot, surfaced as the 3-column account/client/rate table shape.
+    #[tokio::test]
+    async fn bandwidth_byhost_table_serves_live_account_client_rows() {
+        let handles = StatusHandles {
+            bandwidth: Arc::new(|| RateSnapshot {
+                ds_byhost_tx: vec![("alice".to_string(), "10.0.0.1".to_string(), 42.0)],
+                ..Default::default()
+            }),
+            ..StatusHandles::test()
+        };
+        let access = Arc::new(AccessControl::new(false, None, None));
+        let src = StatusSource::new(PREFIX.to_string(), access, handles);
+
+        let p = src.get(&format!("{PREFIX}ds:byhost:tx")).await.expect("get");
+        let NtPayload::Table(t) = p else { panic!("bandwidth PV must be a table") };
+        assert_eq!(t.labels, vec!["Account", "Client", "TX (B/s)"]);
+        let account_col = t.columns.iter().find(|c| c.name == "account").expect("account column");
+        assert_eq!(account_col.values, ScalarArrayValue::Str(vec!["alice".to_string()]));
+        let client_col = t.columns.iter().find(|c| c.name == "name").expect("client column");
+        assert_eq!(client_col.values, ScalarArrayValue::Str(vec!["10.0.0.1".to_string()]));
+        let rate_col = t.columns.iter().find(|c| c.name == "rate").expect("rate column");
+        assert_eq!(rate_col.values, ScalarArrayValue::F64(vec![42.0]));
+    }
+
+    /// The LIVE ticker must not re-post when the sampler produces identical
+    /// rows on consecutive ticks, even though `RateSnapshot::ts` itself
+    /// changes every tick — i.e. the dedup key must be timestamp-free
+    /// (`clear_stamp`), not the raw stamped table.
+    #[test]
+    fn clear_stamp_makes_identical_bandwidth_rows_dedup_despite_ts_change() {
+        let snap_a = RateSnapshot {
+            ts: NtTimeStamp { seconds_past_epoch: 1, nanoseconds: 0, user_tag: 0 },
+            ds_bypv_tx: vec![("PV:X".to_string(), 10.0)],
+            ..Default::default()
+        };
+        let snap_b = RateSnapshot {
+            ts: NtTimeStamp { seconds_past_epoch: 2, nanoseconds: 0, user_tag: 0 },
+            ds_bypv_tx: vec![("PV:X".to_string(), 10.0)],
+            ..Default::default()
+        };
+        let a = StatusSource::bandwidth_table("ds:bypv:tx", &snap_a);
+        let b = StatusSource::bandwidth_table("ds:bypv:tx", &snap_b);
+        // Raw payloads differ (different time_stamp)...
+        assert_ne!(a, b);
+        // ...but their dedup keys are equal (same rows, timestamp cleared).
+        assert_eq!(clear_stamp(&a), clear_stamp(&b));
     }
 
     /// asTest returns p4p's `epics:p2p/Permission:1.0` with a nested
