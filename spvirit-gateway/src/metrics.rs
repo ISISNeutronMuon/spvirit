@@ -89,6 +89,11 @@ pub struct MetricsSnapshot {
     /// `ds:`/`us:` `bypv`/`byhost` `rx`/`tx` counters, summed across every
     /// key in the underlying per-PV/host map. Populated by
     /// [`snapshot_from_bandwidth`].
+    ///
+    /// Exception: `ds_byhost_rx_bytes`/`ds_byhost_tx_bytes` below are NOT
+    /// cumulative — they are summed from `ClientRegistry::byhost`, which
+    /// tracks only currently-connected downstream hosts, so those two
+    /// values fall when a client disconnects.
     pub ds_bypv_rx_bytes: u64,
     pub ds_bypv_tx_bytes: u64,
     pub ds_byhost_rx_bytes: u64,
@@ -204,13 +209,13 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
     gauge(
         &mut out,
         "spgateway_ds_byhost_rx_bytes",
-        "Cumulative downstream bytes received, summed across all hosts.",
+        "Downstream bytes received, summed across currently-connected hosts (drops on disconnect, not cumulative).",
         s.ds_byhost_rx_bytes,
     );
     gauge(
         &mut out,
         "spgateway_ds_byhost_tx_bytes",
-        "Cumulative downstream bytes sent, summed across all hosts.",
+        "Downstream bytes sent, summed across currently-connected hosts (drops on disconnect, not cumulative).",
         s.ds_byhost_tx_bytes,
     );
     gauge(
