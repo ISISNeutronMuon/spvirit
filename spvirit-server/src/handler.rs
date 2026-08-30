@@ -274,6 +274,21 @@ pub fn search_reply_target(addr: &[u8; 16], port: u16, peer: SocketAddr) -> Sock
     SocketAddr::new(target_ip, target_port)
 }
 
+/// Normalize a configured advertise address for use in a search reply.
+///
+/// An all-zeros (`UNSPECIFIED`) address is never a connectable endpoint, yet
+/// callers routinely hold `Some(0.0.0.0)` when the server binds all interfaces
+/// without an explicit advertise IP (e.g. the gateway passes its unset
+/// `interface` through as `advertise_ip = Some(0.0.0.0)`). Emitting that
+/// verbatim tells clients "the server is at 0.0.0.0", which they cannot connect
+/// to — every `pvget`/monitor then times out even though the search itself was
+/// answered. Treating it as `None` lets callers fall through to a real fallback
+/// (the accepting connection's local address on TCP, or
+/// [`infer_udp_response_ip`] on UDP).
+pub fn effective_advertise_ip(ip: Option<IpAddr>) -> Option<IpAddr> {
+    ip.filter(|a| !a.is_unspecified())
+}
+
 /// Bind the fixed UDP search port with `SO_REUSEADDR` (and `SO_REUSEPORT`
 /// on Unix) so other local PVA consumers such as `p4p` can also listen on
 /// the same well-known port. On macOS in particular, a plain
@@ -737,16 +752,20 @@ pub async fn run_udp_search(
                     debug!("UDP search: no matches and response not required");
                     continue;
                 }
-                let resp_ip = if let Some(ip) = advertise_ip {
-                    ip
-                } else if !addr.ip().is_unspecified() {
-                    addr.ip()
-                } else if let Some(ip) = infer_udp_response_ip(peer) {
-                    debug!("UDP search: inferred response address {}", ip);
-                    ip
-                } else {
-                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-                };
+                // `Some(0.0.0.0)` (all-interface bind, no explicit advertise IP)
+                // is treated as unset so we fall through to the bound socket
+                // address and finally to inferring the local IP toward this
+                // peer — never emitting a zero address a client cannot reach.
+                let resp_ip = effective_advertise_ip(advertise_ip)
+                    .or_else(|| effective_advertise_ip(Some(addr.ip())))
+                    .or_else(|| {
+                        let inferred = infer_udp_response_ip(peer);
+                        if let Some(ip) = inferred {
+                            debug!("UDP search: inferred response address {}", ip);
+                        }
+                        inferred
+                    })
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                 let addr_bytes = if resp_ip.is_unspecified() {
                     debug!("UDP search: responding with zero address (unspecified listen)");
                     [0u8; 16]
@@ -870,6 +889,11 @@ pub async fn handle_connection(
     conn_id: u64,
     conn_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // The local address the client reached us on: on an all-interface bind
+    // this is the concrete, routable interface the client just connected to,
+    // making it the ideal thing to advertise in a search reply when no explicit
+    // advertise IP is configured.
+    let conn_local_addr = stream.local_addr().ok();
     let (mut reader, writer) = stream.into_split();
 
     {
@@ -1897,7 +1921,13 @@ pub async fn handle_connection(
                     }
                     let server_discovery_ping = payload.pv_requests.is_empty();
                     let found = server_discovery_ping || !cids.is_empty();
-                    let resp_ip = state.advertise_ip.unwrap_or(state.listen_ip);
+                    // Prefer an explicit advertise IP; otherwise fall back to the
+                    // concrete local address this client connected to (rather than
+                    // `listen_ip`, which may be the unspecified all-interface bind
+                    // that would emit an unconnectable zero address).
+                    let resp_ip = effective_advertise_ip(state.advertise_ip)
+                        .or_else(|| effective_advertise_ip(conn_local_addr.map(|a| a.ip())))
+                        .unwrap_or(state.listen_ip);
                     let addr_bytes = if resp_ip.is_unspecified() {
                         [0u8; 16]
                     } else {
@@ -1962,6 +1992,31 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket as TokioUdpSocket;
+
+    #[test]
+    fn effective_advertise_ip_rejects_unspecified() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // A real address is passed through unchanged.
+        let real = IpAddr::V4(Ipv4Addr::new(130, 246, 91, 228));
+        assert_eq!(effective_advertise_ip(Some(real)), Some(real));
+
+        // The bug: `Some(0.0.0.0)` is NOT a connectable endpoint. It arises
+        // whenever a server binds all interfaces without an explicit advertise
+        // IP. It must be treated as "unset" so callers fall through to a real
+        // fallback instead of emitting a zero address in the search reply
+        // (which clients receive as "server at 0.0.0.0" and cannot connect to).
+        assert_eq!(
+            effective_advertise_ip(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))),
+            None
+        );
+        assert_eq!(
+            effective_advertise_ip(Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED))),
+            None
+        );
+
+        // None stays None.
+        assert_eq!(effective_advertise_ip(None), None);
+    }
 
     #[test]
     fn pipeline_window_is_clamped_at_init_and_across_acks() {
