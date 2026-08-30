@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use spvirit_server::diag::ClientRegistry;
 use spvirit_server::{PvaServer, rand_guid};
 
 use crate::cache::negative::NegativeCache;
@@ -37,9 +38,24 @@ pub struct Runtime {
     /// (`x-spvirit.metrics.enabled`, possibly forced on by `--metrics`); the
     /// endpoint is bound and served in [`Runtime::run`].
     metrics: Option<(String, String)>,
+    /// The single [`ClientRegistry`] shared by every server this gateway
+    /// builds and by the status source's `clients` PV — retained so it lives
+    /// as long as the gateway (a server holds its own clone via
+    /// `.client_registry()`, but this keeps the registry alive even before
+    /// any server starts, and is available for future runtime-level readers).
+    client_registry: Arc<ClientRegistry>,
 }
 
 impl Runtime {
+    /// The single [`ClientRegistry`] shared by every server this gateway
+    /// built and (when configured) by the status source's `clients` PV.
+    /// Exposed so tests can confirm the same `Arc` reached every consumer
+    /// (via `Arc::strong_count`/`Arc::ptr_eq`) without exposing per-server
+    /// internals.
+    pub fn client_registry(&self) -> &Arc<ClientRegistry> {
+        &self.client_registry
+    }
+
     /// Validate `cfg` and build a `Runtime` from it.
     ///
     /// Builds one shared [`UpstreamPool`] for the whole configuration (every
@@ -63,6 +79,12 @@ impl Runtime {
         let pool = Arc::new(UpstreamPool::from_config(&cfg));
         let mut servers = Vec::with_capacity(cfg.servers.len());
         let mut sources: Vec<Arc<GatewaySource>> = Vec::with_capacity(cfg.servers.len());
+        // One shared registry for the whole gateway: every server built below
+        // is injected with a clone of this SAME `Arc`, and the status source
+        // (when a `statusprefix` is configured) reads from another clone —
+        // so a connection recorded by any server's lifecycle hooks is
+        // visible to that server's own `clients` PV.
+        let client_registry = Arc::new(ClientRegistry::new());
 
         // One GUID per server, generated before anything so the ban-set is
         // complete by the time any server's LoopGuard consults it.
@@ -103,6 +125,7 @@ impl Runtime {
                 .advertise_ip(interface_ip)
                 .discovery_parity(server_cfg.discovery_parity)
                 .guid(server_guids[i])
+                .client_registry(client_registry.clone())
                 .source("gateway", 0, src_arc.clone());
 
             // Status PVs claim under a lower `.source()` order (-10 <
@@ -113,7 +136,7 @@ impl Runtime {
                 let status = Arc::new(StatusSource::new(
                     server_cfg.statusprefix.clone(),
                     access.clone(),
-                    StatusHandles::from_gateway(&src_arc),
+                    StatusHandles::from_gateway_with(&src_arc, client_registry.clone()),
                 ));
                 for line in banner::status_pv_lines(&server_cfg.statusprefix) {
                     tracing::info!("{line}");
@@ -158,6 +181,7 @@ impl Runtime {
             pool,
             sources,
             metrics,
+            client_registry,
         })
     }
 
@@ -275,5 +299,37 @@ mod tests {
         let n_servers = cfg.servers.len();
         let rt = Runtime::from_config(cfg).expect("valid config builds");
         assert_eq!(rt.servers.len(), n_servers);
+    }
+
+    /// The gateway's `client_registry` is one shared `Arc`, injected into
+    /// every server (via `.client_registry()`) AND into the status source's
+    /// `clients` handle (when `statusprefix` is set). This is a same-Arc
+    /// wiring check (not a full end-to-end connection test): a config with
+    /// `n` servers, each with a non-empty `statusprefix`, should leave the
+    /// registry's strong count at more than just the `Runtime`'s own clone —
+    /// proving the servers/status sources hold clones of it rather than each
+    /// building their own registry.
+    #[test]
+    fn client_registry_is_shared_with_every_server() {
+        let mut cfg = GatewayConfig::from_json_str(BIDI).unwrap();
+        for s in &mut cfg.servers {
+            s.pvlist.clear();
+            s.access.clear();
+            s.statusprefix = format!("{}:STATUS:", s.name);
+        }
+        let n_servers = cfg.servers.len();
+        assert!(n_servers > 0, "fixture must have at least one server for this check");
+
+        let rt = Runtime::from_config(cfg).expect("valid config builds");
+        // The `Runtime`'s own clone, plus at least one clone per server
+        // (injected via `.client_registry()`) and one per status source
+        // (`from_gateway_with`): strictly more than 1, and consistent with
+        // `n_servers` servers each holding onto their own clone(s).
+        let strong = Arc::strong_count(rt.client_registry());
+        assert!(
+            strong > n_servers,
+            "expected the shared registry's strong count ({strong}) to exceed the \
+             server count ({n_servers}) once every server + status source holds a clone"
+        );
     }
 }

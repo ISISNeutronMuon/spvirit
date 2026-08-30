@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_server::diag::ClientRegistry;
 use spvirit_server::pvstore::{PvInfo, Source};
 use spvirit_server::simple_store::descriptor_for_payload;
 use spvirit_types::{
@@ -218,6 +219,41 @@ impl StatusHandles {
             mcache_size: Arc::new(move || src_stats.upstream_monitor_count() as u64),
         }
     }
+
+    /// Like [`Self::from_gateway`], but also wires `clients` to a real
+    /// [`ClientRegistry`] snapshot: `user@ip` for an identified downstream
+    /// connection, else the bare peer IP, sorted for a stable diagnostic
+    /// listing.
+    ///
+    /// Takes the registry as an explicit `Arc` (rather than folding it into
+    /// `from_gateway`) so a later task (bandwidth handles) can add one more
+    /// `Arc`-handle parameter here without disturbing `from_gateway`'s
+    /// existing (registry-free) callers/tests.
+    pub fn from_gateway_with(src: &Arc<GatewaySource>, client_registry: Arc<ClientRegistry>) -> Self {
+        let mut handles = Self::from_gateway(src);
+        handles.clients = clients_list_handle(client_registry);
+        handles
+    }
+}
+
+/// Builds the `clients` [`ListHandle`] over a [`ClientRegistry`]: each
+/// connection renders as `user@ip` when identified, else the bare peer IP,
+/// with the result sorted for a stable diagnostic listing. Factored out of
+/// [`StatusHandles::from_gateway_with`] so it can be exercised directly by a
+/// unit test that has no need for a real [`GatewaySource`].
+fn clients_list_handle(registry: Arc<ClientRegistry>) -> ListHandle {
+    Arc::new(move || {
+        let mut v: Vec<String> = registry
+            .snapshot()
+            .iter()
+            .map(|e| match &e.user {
+                Some(u) => format!("{u}@{}", e.peer.ip()),
+                None => e.peer.ip().to_string(),
+            })
+            .collect();
+        v.sort();
+        v
+    })
 }
 
 /// A [`Source`] serving the gateway's status/introspection PVs under a
@@ -817,6 +853,24 @@ mod tests {
             Some(PvValue::Scalar(ScalarValue::U64(v))) => *v,
             other => panic!("{name}.value must be a U64 scalar, got {other:?}"),
         }
+    }
+
+    /// The `clients` PV is populated from a real [`ClientRegistry`] snapshot:
+    /// an identified connection renders as `user@ip`, an unidentified one as
+    /// the bare peer IP, and the list comes back sorted.
+    #[test]
+    fn from_gateway_with_clients_reflects_registry_snapshot() {
+        let registry = Arc::new(ClientRegistry::new());
+        let peer_a: std::net::SocketAddr = "10.0.0.6:12345".parse().unwrap();
+        let peer_b: std::net::SocketAddr = "10.0.0.5:23456".parse().unwrap();
+        registry.connect(1, peer_a);
+        registry.set_identity(1, Some("alice".to_string()), None);
+        registry.connect(2, peer_b);
+        // conn 2 has no identity set: renders as the bare peer IP.
+
+        let clients_handle = clients_list_handle(registry);
+        let clients = clients_handle();
+        assert_eq!(clients, vec!["10.0.0.5".to_string(), "alice@10.0.0.6".to_string()]);
     }
 
     /// p4p shape: `clients`/`cache` are NTScalarArray-of-string, not scalars.
