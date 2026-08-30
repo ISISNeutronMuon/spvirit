@@ -176,6 +176,11 @@ impl MonitorRegistry {
     /// never coalesced).
     pub async fn send_msg(&self, conn_id: u64, msg: Vec<u8>) {
         if let Some(cw) = self.conn_writer(conn_id).await {
+            // One-shot reply: the PV (if any) isn't known here, so only
+            // credit the per-host byhost attribution, not a per-PV counter.
+            if let Some(r) = self.client_registry() {
+                r.add_tx(conn_id, msg.len() as u64);
+            }
             cw.send_control(msg).await;
         }
     }
@@ -282,6 +287,15 @@ impl MonitorRegistry {
                         // No-op update — preserve pipeline credit.
                         continue;
                     };
+                    // Attribute the actual wire bytes this subscriber will
+                    // receive. Both counters take only short internal locks
+                    // (no `.await` in this block), so this is safe here.
+                    if let Some(c) = self.bandwidth_counters() {
+                        c.ds_bypv_tx.add(pv_name, msg.len() as u64);
+                    }
+                    if let Some(r) = self.client_registry() {
+                        r.add_tx(sub.conn_id, msg.len() as u64);
+                    }
                     if sub.pipeline_enabled && sub.nfree > 0 {
                         sub.nfree -= 1;
                     }
@@ -717,6 +731,56 @@ mod tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             std::task::Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn notify_monitors_accounts_downstream_tx_bytes_per_pv_and_host() {
+        // Task 8: `notify_monitors` must attribute the actual wire bytes
+        // delivered to each subscriber into both the per-PV `BandwidthCounters`
+        // and the per-connection `ClientRegistry` (which derives byhost tx).
+        use crate::diag::{BandwidthCounters, ClientRegistry};
+
+        let reg = MonitorRegistry::new();
+        let counters = Arc::new(BandwidthCounters::new());
+        let client_registry = Arc::new(ClientRegistry::new());
+        let peer: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        client_registry.connect(1, peer);
+
+        reg.set_bandwidth_counters(counters.clone());
+        reg.set_client_registry(client_registry.clone());
+
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(tokio::io::sink()));
+        }
+        {
+            let mut mons = reg.monitors.lock().await;
+            let mut sub = make_sub(None);
+            sub.conn_id = 1;
+            mons.insert("pv:acct".to_string(), vec![sub]);
+        }
+
+        let payload = nt_payload(1.0, 0);
+        reg.notify_monitors("pv:acct", &payload).await;
+
+        let expected_len =
+            MonitorRegistry::build_monitor_frame(&make_sub(None), &payload)
+                .expect("first frame")
+                .len() as u64;
+
+        let pv_snap = counters.ds_bypv_tx.snapshot();
+        assert_eq!(
+            pv_snap,
+            vec![("pv:acct".to_string(), expected_len)],
+            "ds_bypv_tx must be credited with the delivered frame's byte length"
+        );
+
+        let byhost = client_registry.byhost(true);
+        assert_eq!(byhost.len(), 1, "expected exactly one host aggregate");
+        assert_eq!(
+            byhost[0].2, expected_len,
+            "registry conn tx must reflect the delivered frame's byte length"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
