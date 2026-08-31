@@ -589,8 +589,8 @@ mod tests {
         resolver.enqueue("GLOBAL:PV"); // deduped
         tokio::time::sleep(Duration::from_millis(200)).await;
         let after = global_stats();
-        assert!(after.started >= before.started + 1);
-        assert!(after.deduped >= before.deduped + 1);
+        assert!(after.started > before.started);
+        assert!(after.deduped > before.deduped);
     }
 
     #[test]
@@ -601,8 +601,8 @@ mod tests {
         note_try_claim(TryClaim::No);
         note_try_claim(TryClaim::Unknown);
         let after = global_stats();
-        assert!(after.try_claim_yes >= before.try_claim_yes + 1);
+        assert!(after.try_claim_yes > before.try_claim_yes);
         assert!(after.try_claim_no >= before.try_claim_no + 2);
-        assert!(after.try_claim_unknown >= before.try_claim_unknown + 1);
+        assert!(after.try_claim_unknown > before.try_claim_unknown);
     }
 }
