@@ -2760,6 +2760,109 @@ mod tests {
         );
     }
 
+    /// Send one search and wait for a response that reports `cid` *not*
+    /// found. Retries like [`search_finds`]; every retry is decided the same
+    /// way, so this does not perturb the resolver counters a caller asserts
+    /// on afterwards.
+    async fn search_answers_absent(
+        client: &TokioUdpSocket,
+        server_addr: SocketAddr,
+        cid: u32,
+        name: &str,
+        budget: StdDuration,
+    ) -> bool {
+        let request = encode_search_request(cid, 0x01, 0, [0u8; 16], &[(cid, name)], 2, false);
+        let deadline = std::time::Instant::now() + budget;
+        let mut buf = [0u8; 2048];
+        while std::time::Instant::now() < deadline {
+            client.send_to(&request, server_addr).await.unwrap();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let wait = remaining.min(StdDuration::from_millis(20));
+            if let Ok(Ok((n, _))) = tokio::time::timeout(wait, client.recv_from(&mut buf)).await {
+                let Some(mut pkt) = spvirit_codec::epics_decode::PvaPacket::try_new(&buf[..n])
+                else {
+                    continue;
+                };
+                if let Some(spvirit_codec::epics_decode::PvaPacketCommand::SearchResponse(p)) =
+                    pkt.decode_payload()
+                    && p.seq == cid
+                    && !p.found
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// V2-4: the deliverable of the decisive-`try_claim` work, not merely its
+    /// self-consistency.
+    ///
+    /// The three tests shipped with that change all assert `try_claim` agrees
+    /// with `claim` — a property an all-`Unknown` implementation satisfies
+    /// just as well, which is exactly what the code did *before* the fix and
+    /// exactly the defect. This stands the search loop up over the production
+    /// composition instead (a `SimplePvStore` plus the `RecordFieldSource`
+    /// that every `PvaServer` registers at order 10) and asserts the outcome:
+    /// both a served name and an absent one are settled on the **first**
+    /// datagram, with the background resolver never started.
+    ///
+    /// `started == 0` is the load-bearing assertion. While `RecordFieldSource`
+    /// answered `Unknown`, its single vote made the registry's aggregate
+    /// `Unknown` for *every* name on *every* server, so an absent name cost a
+    /// resolver round trip and a client retry before anyone could say no.
+    #[tokio::test]
+    async fn the_production_composition_settles_names_without_the_resolver() {
+        let server = crate::PvaServer::builder().ai("LOCAL:PV", 1.0).build();
+        let store = server.store().clone();
+        let sources = Arc::new(SourceRegistry::new());
+        sources.add("builtin", 0, store.clone()).await;
+        sources
+            .add(
+                "record-fields",
+                10,
+                Arc::new(crate::record_fields::RecordFieldSource::new(store.clone())),
+            )
+            .await;
+        let (server_addr, client, state) = spawn_search_server(sources).await;
+
+        let found = search_finds(
+            &client,
+            server_addr,
+            31,
+            "LOCAL:PV",
+            StdDuration::from_secs(2),
+        )
+        .await;
+        assert!(found, "a served local PV was not answered");
+        assert_eq!(
+            state.search_resolver.stats().started,
+            0,
+            "a served local PV was sent to the background resolver; it should \
+             have been decided from memory on the first datagram"
+        );
+
+        let answered = search_answers_absent(
+            &client,
+            server_addr,
+            32,
+            "LOCAL:ABSENT",
+            StdDuration::from_secs(2),
+        )
+        .await;
+        assert!(
+            answered,
+            "the absent-name search was never answered; the test proves nothing"
+        );
+        assert_eq!(
+            state.search_resolver.stats().started,
+            0,
+            "an absent plain name started a background resolution: the \
+             registry's aggregate is not decisive over the production \
+             composition, so every miss costs a round trip and a client retry"
+        );
+    }
+
     /// V1's HIGH-1, inverted into an acceptance test.
     ///
     /// Making the enumeration lazy narrowed the head-of-line vector to
