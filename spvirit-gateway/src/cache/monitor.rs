@@ -89,6 +89,18 @@ impl MonitorEntry {
         });
         !subs.is_empty()
     }
+
+    /// Drops every downstream `Sender`, closing each subscriber's receiver.
+    ///
+    /// Used only on the upstream-death teardown path: removing the entry's
+    /// `Arc` from `MonitorCache::entries` is NOT enough to close the
+    /// downstream receivers, because the spawned upstream task holds its own
+    /// clone of the `Arc` (and therefore of the `subs` vector). Dropping the
+    /// senders here is what makes the server-side pump's `rx.recv()` return
+    /// `None`, which is the signal Layer 2 turns into DESTROY_CHANNEL.
+    pub fn close_all(&self) {
+        self.subs.lock().unwrap().clear();
+    }
 }
 
 /// Dedup + fan-out cache for upstream monitors, keyed by `(client_name,
@@ -196,6 +208,28 @@ impl MonitorCache {
             entries.remove(key);
         }
         false
+    }
+
+    /// Removes `entry` from the map for `key`, if `key` still maps to exactly
+    /// this `Arc`.
+    ///
+    /// The upstream-death counterpart to `dispatch_or_retire`'s retirement
+    /// half. `dispatch_or_retire` only ever runs on a fan-out, and an upstream
+    /// that died produces no fan-out — so without this the entry stays in the
+    /// map forever and every later `subscribe` for the same key takes the
+    /// `Some(entry)` branch, attaching to an entry whose upstream task is
+    /// already gone (permanently silent from birth).
+    ///
+    /// The `Arc::ptr_eq` guard mirrors `dispatch_or_retire:193-197` exactly:
+    /// a replacement entry created for the same key while this teardown was in
+    /// flight must never be removed by the dead upstream's cleanup.
+    pub fn retire(&self, key: &MonitorKey, entry: &Arc<MonitorEntry>) {
+        let mut entries = self.entries.lock().unwrap();
+        if let Some(current) = entries.get(key)
+            && Arc::ptr_eq(current, entry)
+        {
+            entries.remove(key);
+        }
     }
 
     /// Number of distinct upstream monitors currently tracked (live
@@ -495,5 +529,93 @@ mod tests {
             panic!("expected Generic");
         };
         assert!(matches!(fields[0].1, PvValue::Scalar(ScalarValue::F64(x)) if (x - 2.0).abs() < 1e-9));
+    }
+
+    /// Upstream-death teardown, half one: `retire` removes the entry from the
+    /// map so a later `subscribe` for the same key takes the `None` branch and
+    /// spawns a fresh upstream, instead of attaching to a dead one (Site B).
+    #[test]
+    fn retire_removes_the_entry_so_a_later_subscribe_spawns_a_fresh_upstream() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let mut captured_entry = None;
+        let _rx = cache.subscribe(key.clone(), |entry| captured_entry = Some(entry));
+        let entry = captured_entry.expect("spawn_upstream captured the entry");
+        assert_eq!(cache.upstream_count(), 1);
+
+        cache.retire(&key, &entry);
+        assert_eq!(
+            cache.upstream_count(),
+            0,
+            "retire must remove the dead entry from the map"
+        );
+
+        let mut spawn_calls = 0;
+        let _rx2 = cache.subscribe(key.clone(), |_entry| spawn_calls += 1);
+        assert_eq!(
+            spawn_calls, 1,
+            "after retirement a fresh subscribe must spawn a new upstream"
+        );
+    }
+
+    /// `retire` must be `Arc::ptr_eq`-guarded exactly as
+    /// `dispatch_or_retire:193-197` is: a replacement entry created
+    /// concurrently for the same key must never be removed by the dead
+    /// upstream's teardown.
+    #[test]
+    fn retire_leaves_a_replacement_entry_for_the_same_key_alone() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let mut first = None;
+        let _rx1 = cache.subscribe(key.clone(), |entry| first = Some(entry));
+        let dead = first.expect("first entry");
+
+        // The dead upstream is retired, then a replacement is created...
+        cache.retire(&key, &dead);
+        let mut second = None;
+        let _rx2 = cache.subscribe(key.clone(), |entry| second = Some(entry));
+        let live = second.expect("replacement entry");
+        assert!(!Arc::ptr_eq(&dead, &live));
+
+        // ...and a late, duplicate retire of the DEAD entry must not touch it.
+        cache.retire(&key, &dead);
+        assert_eq!(
+            cache.upstream_count(),
+            1,
+            "a stale retire must not remove the live replacement entry"
+        );
+    }
+
+    /// Upstream-death teardown, half two: removing the map's `Arc` is not
+    /// enough — the spawned task holds a clone, so the `Sender`s survive and
+    /// downstream receivers never close. `close_all` drops them, which is what
+    /// makes the server-side pump observe `rx.recv() == None` (Layer 2).
+    #[test]
+    fn close_all_drops_every_sender_so_receivers_observe_closure() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let mut captured_entry = None;
+        let mut rx1 = cache.subscribe(key.clone(), |entry| captured_entry = Some(entry));
+        let mut rx2 = cache.subscribe(key.clone(), |_| {});
+        let entry = captured_entry.expect("spawn_upstream captured the entry");
+
+        // Hold a clone, exactly as the spawned upstream task does: removing the
+        // map entry alone leaves these senders alive.
+        let task_clone = entry.clone();
+        cache.retire(&key, &entry);
+        assert!(
+            !matches!(rx1.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "retire alone must not close the receivers (the task clone holds them)"
+        );
+
+        task_clone.close_all();
+        assert!(
+            matches!(rx1.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "close_all must close the first subscriber's receiver"
+        );
+        assert!(
+            matches!(rx2.try_recv(), Err(mpsc::error::TryRecvError::Disconnected)),
+            "close_all must close the second subscriber's receiver"
+        );
     }
 }
