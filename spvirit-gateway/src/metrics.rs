@@ -116,6 +116,34 @@ pub struct MetricsSnapshot {
     /// non-zero rate here means searches are being dropped under load —
     /// the signal that was entirely invisible during the observed outage.
     pub search_resolve_dropped_full: u64,
+    /// Background resolutions that found the PV.
+    pub search_resolve_completed_found: u64,
+    /// Background resolutions that concluded the PV is absent.
+    ///
+    /// Paired with `completed_found` this is what separates a gateway that
+    /// keeps failing to resolve the *same* names from one carrying healthy
+    /// miss traffic: `started` alone cannot tell them apart, because both
+    /// look like a steady stream of resolutions.
+    pub search_resolve_completed_missing: u64,
+}
+
+/// Copy the resolver's counters into a [`MetricsSnapshot`].
+///
+/// The gateway runtime's `SnapshotProvider` builds its snapshot in a closure
+/// that no test can reach; this is that closure's resolver half, lifted out
+/// so the field-by-field mapping is pinned by a test rather than by review.
+pub fn apply_resolve_stats(
+    snap: &mut MetricsSnapshot,
+    r: &spvirit_server::search_resolve::ResolveStatsSnapshot,
+) {
+    snap.search_try_claim_yes = r.try_claim_yes;
+    snap.search_try_claim_no = r.try_claim_no;
+    snap.search_try_claim_unknown = r.try_claim_unknown;
+    snap.search_resolve_started = r.started;
+    snap.search_resolve_deduped = r.deduped;
+    snap.search_resolve_dropped_full = r.dropped_full;
+    snap.search_resolve_completed_found = r.completed_found;
+    snap.search_resolve_completed_missing = r.completed_missing;
 }
 
 /// Sum a `ByteMap`/`ClientRegistry::byhost` style snapshot's byte counts
@@ -301,6 +329,18 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
         "spgateway_search_resolve_dropped_full_total",
         "Resolutions shed because the concurrency cap was exhausted.",
         s.search_resolve_dropped_full,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_completed_found_total",
+        "Background name resolutions that found the PV.",
+        s.search_resolve_completed_found,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_completed_missing_total",
+        "Background name resolutions that concluded the PV is absent.",
+        s.search_resolve_completed_missing,
     );
 
     out
@@ -698,6 +738,8 @@ mod tests {
             search_resolve_started: 44,
             search_resolve_deduped: 55,
             search_resolve_dropped_full: 66,
+            search_resolve_completed_found: 77,
+            search_resolve_completed_missing: 88,
             ..Default::default()
         };
         let body = render_prometheus(&snap);
@@ -708,6 +750,8 @@ mod tests {
             ("spgateway_search_resolve_started_total", 44),
             ("spgateway_search_resolve_deduped_total", 55),
             ("spgateway_search_resolve_dropped_full_total", 66),
+            ("spgateway_search_resolve_completed_found_total", 77),
+            ("spgateway_search_resolve_completed_missing_total", 88),
         ] {
             // These only ever increase, so they must be declared `counter` —
             // a gauge would let a scraper compute meaningless rates.
@@ -720,5 +764,49 @@ mod tests {
                 "expected `{name} {expected}` in body, got:\n{body}"
             );
         }
+    }
+
+    /// B-3/MEDIUM-3: the runtime's `SnapshotProvider` closure was the only
+    /// place the resolver counters were copied into the snapshot, and nothing
+    /// could call it — every field could have been wired to zero, or to the
+    /// wrong source field, and the suite stayed green. Eight distinct values
+    /// pin the mapping: a dropped field reports 0 and a swapped pair reports
+    /// its neighbour's value, and both fail here.
+    #[test]
+    fn the_runtime_bridge_carries_every_resolver_counter_through() {
+        let stats = spvirit_server::search_resolve::ResolveStatsSnapshot {
+            started: 1,
+            deduped: 2,
+            dropped_full: 3,
+            completed_found: 4,
+            completed_missing: 5,
+            try_claim_yes: 6,
+            try_claim_no: 7,
+            try_claim_unknown: 8,
+        };
+        let mut snap = MetricsSnapshot::default();
+        apply_resolve_stats(&mut snap, &stats);
+
+        assert_eq!(snap.search_resolve_started, 1);
+        assert_eq!(snap.search_resolve_deduped, 2);
+        assert_eq!(snap.search_resolve_dropped_full, 3);
+        assert_eq!(snap.search_resolve_completed_found, 4);
+        assert_eq!(snap.search_resolve_completed_missing, 5);
+        assert_eq!(snap.search_try_claim_yes, 6);
+        assert_eq!(snap.search_try_claim_no, 7);
+        assert_eq!(snap.search_try_claim_unknown, 8);
+
+        // And the rendered body actually carries them, so a bridge that fills
+        // the struct but a `render_prometheus` that forgets a line still
+        // fails.
+        let body = render_prometheus(&snap);
+        assert!(
+            body.contains("\nspgateway_search_resolve_completed_found_total 4\n"),
+            "got:\n{body}"
+        );
+        assert!(
+            body.contains("\nspgateway_search_resolve_completed_missing_total 5\n"),
+            "got:\n{body}"
+        );
     }
 }

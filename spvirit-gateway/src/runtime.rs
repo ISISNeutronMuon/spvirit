@@ -281,23 +281,22 @@ impl Runtime {
                             // through a total outage, which is exactly the
                             // failure a counter is supposed to make visible.
                             let r = spvirit_server::search_resolve::global_stats();
-                            crate::metrics::MetricsSnapshot {
+                            let mut snap = crate::metrics::MetricsSnapshot {
                                 clients: pool.names().len() as u64,
                                 upstream_monitors: sources
                                     .iter()
                                     .map(|s| s.upstream_monitor_count() as u64)
                                     .sum(),
-                                search_try_claim_yes: r.try_claim_yes,
-                                search_try_claim_no: r.try_claim_no,
-                                search_try_claim_unknown: r.try_claim_unknown,
-                                search_resolve_started: r.started,
-                                search_resolve_deduped: r.deduped,
-                                search_resolve_dropped_full: r.dropped_full,
                                 ..crate::metrics::snapshot_from_bandwidth(
                                     &bandwidth_counters,
                                     &client_registry,
                                 )
-                            }
+                            };
+                            // Field-by-field in `metrics::apply_resolve_stats`,
+                            // where a test can reach it — this closure cannot be
+                            // called from one.
+                            crate::metrics::apply_resolve_stats(&mut snap, &r);
+                            snap
                         });
                         crate::metrics::serve(listener, path, provider).await;
                         Ok(())
