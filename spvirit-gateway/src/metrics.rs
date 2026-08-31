@@ -102,6 +102,62 @@ pub struct MetricsSnapshot {
     pub us_bypv_tx_bytes: u64,
     pub us_byhost_rx_bytes: u64,
     pub us_byhost_tx_bytes: u64,
+    /// Search names answered from memory, needing no I/O.
+    pub search_try_claim_yes: u64,
+    /// Search names known absent without any I/O.
+    pub search_try_claim_no: u64,
+    /// Search names that required a background resolution.
+    pub search_try_claim_unknown: u64,
+    /// Background resolutions started.
+    pub search_resolve_started: u64,
+    /// Resolutions suppressed because the name was already resolving.
+    pub search_resolve_deduped: u64,
+    /// Resolutions shed because the concurrency cap was exhausted. A
+    /// non-zero rate here means searches are being dropped under load —
+    /// the signal that was entirely invisible during the observed outage.
+    pub search_resolve_dropped_full: u64,
+    /// Background resolutions that found the PV.
+    pub search_resolve_completed_found: u64,
+    /// Background resolutions that concluded the PV is absent.
+    ///
+    /// Paired with `completed_found` this is what separates a gateway that
+    /// keeps failing to resolve the *same* names from one carrying healthy
+    /// miss traffic: `started` alone cannot tell them apart, because both
+    /// look like a steady stream of resolutions.
+    pub search_resolve_completed_missing: u64,
+    /// Pattern/wildcard enumerations shed without being answered because the
+    /// enumeration cap was saturated.
+    ///
+    /// A shed pattern query is answered with silence, so this is the *only*
+    /// visible trace of one. A sustained non-zero rate means wildcard/pvlist
+    /// queries are being dropped; a rate that never returns to zero means
+    /// upstreams are hung in `names()` and every enumeration is running out
+    /// its timeout, in which case pattern queries are not answered at all for
+    /// as long as the hang lasts — the enumeration bound returns the permits,
+    /// but the next queries to take them hang in turn. Retries do not help,
+    /// and the client sees an unresponsive wildcard rather than an error, so
+    /// this counter is what distinguishes it from "no one is asking".
+    pub search_pattern_enum_shed: u64,
+}
+
+/// Copy the resolver's counters into a [`MetricsSnapshot`].
+///
+/// The gateway runtime's `SnapshotProvider` builds its snapshot in a closure
+/// that no test can reach; this is that closure's resolver half, lifted out
+/// so the field-by-field mapping is pinned by a test rather than by review.
+pub fn apply_resolve_stats(
+    snap: &mut MetricsSnapshot,
+    r: &spvirit_server::search_resolve::ResolveStatsSnapshot,
+) {
+    snap.search_try_claim_yes = r.try_claim_yes;
+    snap.search_try_claim_no = r.try_claim_no;
+    snap.search_try_claim_unknown = r.try_claim_unknown;
+    snap.search_resolve_started = r.started;
+    snap.search_resolve_deduped = r.deduped;
+    snap.search_resolve_dropped_full = r.dropped_full;
+    snap.search_resolve_completed_found = r.completed_found;
+    snap.search_resolve_completed_missing = r.completed_missing;
+    snap.search_pattern_enum_shed = r.pattern_enum_shed;
 }
 
 /// Sum a `ByteMap`/`ClientRegistry::byhost` style snapshot's byte counts
@@ -149,7 +205,7 @@ pub type SnapshotProvider = Arc<dyn Fn() -> MetricsSnapshot + Send + Sync>;
 pub fn render_prometheus(s: &MetricsSnapshot) -> String {
     let mut out = String::with_capacity(2048);
 
-    fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
+    fn metric(out: &mut String, name: &str, help: &str, kind: &str, value: u64) {
         out.push_str("# HELP ");
         out.push_str(name);
         out.push(' ');
@@ -157,11 +213,21 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
         out.push('\n');
         out.push_str("# TYPE ");
         out.push_str(name);
-        out.push_str(" gauge\n");
+        out.push(' ');
+        out.push_str(kind);
+        out.push('\n');
         out.push_str(name);
         out.push(' ');
         out.push_str(&value.to_string());
         out.push('\n');
+    }
+
+    fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
+        metric(out, name, help, "gauge", value);
+    }
+
+    fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+        metric(out, name, help, "counter", value);
     }
 
     gauge(
@@ -241,6 +307,60 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
         "spgateway_us_byhost_tx_bytes",
         "Cumulative upstream bytes sent, summed across all hosts.",
         s.us_byhost_tx_bytes,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_try_claim_yes_total",
+        "Search names answered from memory with no I/O.",
+        s.search_try_claim_yes,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_try_claim_no_total",
+        "Search names known to be absent with no I/O.",
+        s.search_try_claim_no,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_try_claim_unknown_total",
+        "Search names that required a background resolution.",
+        s.search_try_claim_unknown,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_started_total",
+        "Background name resolutions started.",
+        s.search_resolve_started,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_deduped_total",
+        "Resolutions suppressed because the name was already resolving.",
+        s.search_resolve_deduped,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_dropped_full_total",
+        "Resolutions shed because the concurrency cap was exhausted.",
+        s.search_resolve_dropped_full,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_completed_found_total",
+        "Background name resolutions that found the PV.",
+        s.search_resolve_completed_found,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_completed_missing_total",
+        "Background name resolutions that concluded the PV is absent.",
+        s.search_resolve_completed_missing,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_pattern_enum_shed_total",
+        "Pattern/wildcard enumerations shed without being answered.",
+        s.search_pattern_enum_shed,
     );
 
     out
@@ -627,5 +747,90 @@ mod tests {
             "resp was: {resp}"
         );
         server.abort();
+    }
+
+    #[test]
+    fn render_emits_the_search_resolver_counters_as_counters_not_gauges() {
+        let snap = MetricsSnapshot {
+            search_try_claim_yes: 11,
+            search_try_claim_no: 22,
+            search_try_claim_unknown: 33,
+            search_resolve_started: 44,
+            search_resolve_deduped: 55,
+            search_resolve_dropped_full: 66,
+            search_resolve_completed_found: 77,
+            search_resolve_completed_missing: 88,
+            search_pattern_enum_shed: 99,
+            ..Default::default()
+        };
+        let body = render_prometheus(&snap);
+        for (name, expected) in [
+            ("spgateway_search_try_claim_yes_total", 11),
+            ("spgateway_search_try_claim_no_total", 22),
+            ("spgateway_search_try_claim_unknown_total", 33),
+            ("spgateway_search_resolve_started_total", 44),
+            ("spgateway_search_resolve_deduped_total", 55),
+            ("spgateway_search_resolve_dropped_full_total", 66),
+            ("spgateway_search_resolve_completed_found_total", 77),
+            ("spgateway_search_resolve_completed_missing_total", 88),
+            ("spgateway_search_pattern_enum_shed_total", 99),
+        ] {
+            // These only ever increase, so they must be declared `counter` —
+            // a gauge would let a scraper compute meaningless rates.
+            assert!(
+                body.contains(&format!("# TYPE {name} counter\n")),
+                "expected {name} to be a counter"
+            );
+            assert!(
+                body.contains(&format!("\n{name} {expected}\n")),
+                "expected `{name} {expected}` in body, got:\n{body}"
+            );
+        }
+    }
+
+    /// B-3/MEDIUM-3: the runtime's `SnapshotProvider` closure was the only
+    /// place the resolver counters were copied into the snapshot, and nothing
+    /// could call it — every field could have been wired to zero, or to the
+    /// wrong source field, and the suite stayed green. Nine distinct values
+    /// pin the mapping: a dropped field reports 0 and a swapped pair reports
+    /// its neighbour's value, and both fail here.
+    #[test]
+    fn the_runtime_bridge_carries_every_resolver_counter_through() {
+        let stats = spvirit_server::search_resolve::ResolveStatsSnapshot {
+            started: 1,
+            deduped: 2,
+            dropped_full: 3,
+            completed_found: 4,
+            completed_missing: 5,
+            try_claim_yes: 6,
+            try_claim_no: 7,
+            try_claim_unknown: 8,
+            pattern_enum_shed: 9,
+        };
+        let mut snap = MetricsSnapshot::default();
+        apply_resolve_stats(&mut snap, &stats);
+
+        assert_eq!(snap.search_resolve_started, 1);
+        assert_eq!(snap.search_resolve_deduped, 2);
+        assert_eq!(snap.search_resolve_dropped_full, 3);
+        assert_eq!(snap.search_resolve_completed_found, 4);
+        assert_eq!(snap.search_resolve_completed_missing, 5);
+        assert_eq!(snap.search_try_claim_yes, 6);
+        assert_eq!(snap.search_try_claim_no, 7);
+        assert_eq!(snap.search_try_claim_unknown, 8);
+        assert_eq!(snap.search_pattern_enum_shed, 9);
+
+        // And the rendered body actually carries them, so a bridge that fills
+        // the struct but a `render_prometheus` that forgets a line still
+        // fails.
+        let body = render_prometheus(&snap);
+        assert!(
+            body.contains("\nspgateway_search_resolve_completed_found_total 4\n"),
+            "got:\n{body}"
+        );
+        assert!(
+            body.contains("\nspgateway_search_resolve_completed_missing_total 5\n"),
+            "got:\n{body}"
+        );
     }
 }

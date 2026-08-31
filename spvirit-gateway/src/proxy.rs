@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use spvirit_codec::spvd_decode::DecodedValue;
-use spvirit_server::pvstore::{PvInfo, Source};
+use spvirit_server::pvstore::{PvInfo, Source, TryClaim};
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
 
@@ -47,11 +47,15 @@ use crate::upstream::UpstreamPool;
 /// one fails closed (no host/user to match against). Whenever a request
 /// scope *is* present, the peer IP is always present too, so `host` is only
 /// `None` in that out-of-scope case.
+///
+/// Delegates to [`spvirit_server::request_ctx::request_identity`] rather than
+/// reading `current_request` itself, so this crate's notion of "who is
+/// asking" and `SourceRegistry`'s resolver-memo key can never drift apart.
 fn current_identity() -> Identity {
-    let rc = spvirit_server::request_ctx::current_request();
+    let (peer, user) = spvirit_server::request_ctx::request_identity();
     Identity {
-        host: rc.as_ref().map(|c| c.peer.ip().to_string()),
-        user: rc.and_then(|c| c.user),
+        host: peer.map(|ip| ip.to_string()),
+        user,
     }
 }
 
@@ -142,6 +146,26 @@ impl GatewaySource {
 }
 
 impl Source for GatewaySource {
+    fn try_claim(&self, name: &str) -> TryClaim {
+        // Same order as `claim`: negative cache, then access, then bindings.
+        // Anything this cannot settle is `Unknown` — the search path will have
+        // it resolved in the background and answer the client's retry.
+        if self.neg.is_missing(name, Instant::now()) {
+            return TryClaim::No;
+        }
+        if let Decision::Deny = self.access.decide(Op::Get, name, &current_identity()) {
+            return TryClaim::No;
+        }
+        let Ok(bindings) = self.bindings.try_lock() else {
+            return TryClaim::Unknown;
+        };
+        if bindings.contains_key(name) {
+            TryClaim::Yes
+        } else {
+            TryClaim::Unknown
+        }
+    }
+
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
@@ -380,17 +404,15 @@ mod tests {
     use crate::config::GatewayConfig;
     use std::time::Duration;
 
-    #[tokio::test]
-    async fn claim_returns_none_when_no_clients_configured() {
+    fn test_source(neg: Arc<NegativeCache>, access: Arc<AccessControl>) -> GatewaySource {
         let cfg = GatewayConfig::from_json_str(r#"{"version":2,"clients":[],"servers":[]}"#)
             .unwrap();
         let pool = Arc::new(UpstreamPool::from_config(&cfg));
-        let neg = Arc::new(NegativeCache::new(Duration::from_secs(30), 128));
         let guard = Arc::new(LoopGuard::build(
             &cfg,
             &crate::config::ServerCfg {
                 // (interface: vec![] below picks up the 0.0.0.0 local-IP
-                // backstop; harmless for this no-clients-configured test.)
+                // backstop; harmless for these no-clients-configured tests.)
                 name: "s".into(),
                 clients: vec![],
                 interface: vec![],
@@ -409,8 +431,122 @@ mod tests {
             },
             std::collections::HashSet::new(),
         ));
-        let access = Arc::new(AccessControl::new(false, None, None));
-        let src = GatewaySource::new(pool, vec![], neg, guard, 0, access);
+        GatewaySource::new(pool, vec![], neg, guard, 0, access)
+    }
+
+    fn open_neg() -> Arc<NegativeCache> {
+        Arc::new(NegativeCache::new(Duration::from_secs(30), 128))
+    }
+
+    fn allow_all() -> Arc<AccessControl> {
+        Arc::new(AccessControl::new(false, None, None))
+    }
+
+    #[tokio::test]
+    async fn claim_returns_none_when_no_clients_configured() {
+        let src = test_source(open_neg(), allow_all());
         assert!(src.claim("ANY:PV").await.is_none());
+    }
+
+    /// Before a binding exists, `try_claim` cannot say `Yes` (that would be a
+    /// search reply for a name that isn't actually bound yet); once one is
+    /// inserted directly, it must. This before/after shape is what makes the
+    /// test actually exercise the `bindings.contains_key` branch — the prior
+    /// "unknown before a binding exists" test on its own would still pass
+    /// even if that branch (the entire performance point of the task) were
+    /// deleted.
+    #[tokio::test]
+    async fn gateway_try_claim_is_yes_once_a_binding_exists() {
+        let src = test_source(open_neg(), allow_all());
+        assert_eq!(
+            src.try_claim("BOUND:PV"),
+            TryClaim::Unknown,
+            "before: no binding yet"
+        );
+
+        src.bindings.lock().unwrap().insert(
+            "BOUND:PV".to_string(),
+            Binding {
+                client_name: "c".into(),
+                real_name: "BOUND:PV".into(),
+                struct_id: None,
+                last_get: Mutex::new(None),
+            },
+        );
+
+        assert_eq!(
+            src.try_claim("BOUND:PV"),
+            TryClaim::Yes,
+            "after: a binding now exists"
+        );
+    }
+
+    /// Pins the documented precedence inside `try_claim`: the negative cache
+    /// and an access `Deny` must both outrank an existing binding, exactly as
+    /// they do in `claim`. Without this, a future reordering could report a
+    /// negatively-cached or denied name as `Yes` just because a stale binding
+    /// still sits in the map.
+    #[tokio::test]
+    async fn gateway_try_claim_negative_cache_and_deny_outrank_an_existing_binding() {
+        let neg = open_neg();
+        let src = test_source(neg.clone(), allow_all());
+        src.bindings.lock().unwrap().insert(
+            "BOUND:PV".to_string(),
+            Binding {
+                client_name: "c".into(),
+                real_name: "BOUND:PV".into(),
+                struct_id: None,
+                last_get: Mutex::new(None),
+            },
+        );
+        neg.record_miss("BOUND:PV", Instant::now());
+        assert_eq!(
+            src.try_claim("BOUND:PV"),
+            TryClaim::No,
+            "a negative-cache hit must outrank an existing binding"
+        );
+
+        let access = Arc::new(AccessControl::new(
+            false,
+            Some(crate::access::pvlist::parse_pvlist("SECRET:.*  DENY\n.*  ALLOW\n").unwrap()),
+            None,
+        ));
+        let src2 = test_source(open_neg(), access);
+        src2.bindings.lock().unwrap().insert(
+            "SECRET:PV".to_string(),
+            Binding {
+                client_name: "c".into(),
+                real_name: "SECRET:PV".into(),
+                struct_id: None,
+                last_get: Mutex::new(None),
+            },
+        );
+        assert_eq!(
+            src2.try_claim("SECRET:PV"),
+            TryClaim::No,
+            "an access Deny must outrank an existing binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_try_claim_is_no_for_a_negatively_cached_name() {
+        let neg = open_neg();
+        neg.record_miss("GONE:PV", Instant::now());
+        let src = test_source(neg, allow_all());
+        assert_eq!(src.try_claim("GONE:PV"), TryClaim::No);
+        // A name the cache has never seen is still Unknown, not No.
+        assert_eq!(src.try_claim("OTHER:PV"), TryClaim::Unknown);
+    }
+
+    #[tokio::test]
+    async fn gateway_try_claim_is_no_for_a_denied_name() {
+        let access = Arc::new(AccessControl::new(
+            false,
+            Some(crate::access::pvlist::parse_pvlist("SECRET:.*  DENY\n.*  ALLOW\n").unwrap()),
+            None,
+        ));
+        let src = test_source(open_neg(), access);
+        assert_eq!(src.try_claim("SECRET:PV"), TryClaim::No);
+        assert_eq!(src.try_claim("PUBLIC:PV"), TryClaim::Unknown);
     }
 }

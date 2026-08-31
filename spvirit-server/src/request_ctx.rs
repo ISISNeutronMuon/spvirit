@@ -14,7 +14,7 @@
 //! after `ConnectionValidation` decodes the peer's `ca` credentials.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 /// Snapshot of the current connection's identity, as seen by a [`Source`](crate::pvstore::Source).
@@ -51,6 +51,25 @@ where
     CONN_IDENTITY.scope(identity, fut)
 }
 
+/// Run `fut` with an *existing* [`RequestContext`] re-installed — peer and
+/// credentials both.
+///
+/// `tokio::task_local!` values are inherited by everything a task awaits but
+/// **not** by a task it spawns. Background resolution deliberately runs on a
+/// spawned task, so without this the identity would silently vanish: a source
+/// consulting [`current_request`] would see `None`, and a restrictive access
+/// policy would fail closed against a name the requester can in fact see.
+pub(crate) fn scope_with<F>(ctx: RequestContext, fut: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    let identity = Arc::new(ConnIdentity {
+        peer: ctx.peer,
+        creds: Mutex::new(Some((ctx.user, ctx.host))),
+    });
+    CONN_IDENTITY.scope(identity, fut)
+}
+
 /// Update the user/host credentials for the current connection's context.
 ///
 /// Wired at `ConnectionValidation` (cmd=1): the handler calls this after
@@ -83,6 +102,29 @@ pub fn current_request() -> Option<RequestContext> {
         .ok()
 }
 
+/// The identity fields that are actually trustworthy for an access decision:
+/// the peer IP (never spoofable — it is the TCP/UDP source address, not a
+/// client-asserted string) and the self-asserted `ca` user.
+///
+/// This is the **single** source of truth for "who is asking" outside of
+/// `current_request` itself. [`crate::pvstore::SourceRegistry`]'s resolver
+/// memo and `spvirit-gateway`'s `AccessControl::decide` identity must derive
+/// from the same two fields — two independent readings of "the requester's
+/// identity" that can drift is exactly the defect class this crate has
+/// already shipped twice (the display.form and NT-descriptor bugs). The
+/// client-asserted `ca` *host* string is deliberately excluded: it grants no
+/// security (a client can claim anything) and including it would only
+/// fragment identity keys that should collide.
+///
+/// Returns `(None, None)` outside a [`scope`]d task, matching
+/// `current_request`'s `None`.
+pub fn request_identity() -> (Option<IpAddr>, Option<String>) {
+    match current_request() {
+        Some(ctx) => (Some(ctx.peer.ip()), ctx.user),
+        None => (None, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +154,22 @@ mod tests {
             assert_eq!(ctx.peer, peer);
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn scope_with_reinstalls_peer_and_credentials_on_a_spawned_task() {
+        let peer: SocketAddr = "10.9.8.7:5075".parse().unwrap();
+        let ctx = RequestContext {
+            peer,
+            user: Some("operator1".into()),
+            host: Some("ws-42".into()),
+        };
+        let seen = tokio::spawn(scope_with(ctx, async { current_request() }))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen.peer, peer);
+        assert_eq!(seen.user.as_deref(), Some("operator1"));
+        assert_eq!(seen.host.as_deref(), Some("ws-42"));
     }
 }

@@ -16,7 +16,7 @@ use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 use crate::monitor::MonitorRegistry;
-use crate::pvstore::{PvInfo, Source};
+use crate::pvstore::{PvInfo, Source, TryClaim};
 use crate::types::{RecordData, RecordInstance};
 
 /// Callback invoked after a PUT value is applied to a record.
@@ -391,6 +391,22 @@ impl Source for SimplePvStore {
     /// handler must not also pump `subscribe` — doing so would double-deliver.
     fn pushes_own_updates(&self) -> bool {
         true
+    }
+
+    fn try_claim(&self, name: &str) -> TryClaim {
+        // `pvs` is only ever held for map operations, never across an await,
+        // so contention here is a vanishingly short window — but `try_read`
+        // makes "never blocks" a property of the code rather than a habit.
+        match self.pvs.try_read() {
+            Ok(pvs) => {
+                if pvs.contains_key(name) {
+                    TryClaim::Yes
+                } else {
+                    TryClaim::No
+                }
+            }
+            Err(_) => TryClaim::Unknown,
+        }
     }
 
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
@@ -1450,5 +1466,16 @@ record(ao, "DB:AO") {
         let res = Source::put(&store, "W", &dv).await;
         assert!(res.is_ok());
         assert_eq!(store.get_value("W").await, Some(ScalarValue::F64(5.0)));
+    }
+
+    #[tokio::test]
+    async fn try_claim_agrees_with_claim_for_the_simple_store() {
+        let mut records = std::collections::HashMap::new();
+        records.insert("PRESENT".to_string(), make_ai("PRESENT", 1.0));
+        let store = SimplePvStore::new(records, HashMap::new(), Vec::new(), false);
+        assert_eq!(store.try_claim("PRESENT"), TryClaim::Yes);
+        assert!(Source::claim(&store, "PRESENT").await.is_some());
+        assert_eq!(store.try_claim("ABSENT"), TryClaim::No);
+        assert!(Source::claim(&store, "ABSENT").await.is_none());
     }
 }

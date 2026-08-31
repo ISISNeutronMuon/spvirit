@@ -289,7 +289,7 @@ use tokio::sync::mpsc;
 use spvirit_codec::spvd_decode::{DecodedValue, FieldDesc, FieldType, StructureDesc, TypeCode};
 use spvirit_types::{NtPayload, PvValue, ScalarArrayValue, ScalarValue};
 
-use crate::pvstore::{PvInfo, Source, SourceRegistry};
+use crate::pvstore::{PvInfo, Source, SourceRegistry, TryClaim};
 use crate::simple_store::descriptor_for_payload;
 
 /// A [`Source`] that serves group PVs composed from multiple member PVs.
@@ -354,6 +354,21 @@ impl GroupSource {
 }
 
 impl Source for GroupSource {
+    /// Decisive both ways, from the same `groups` map `claim` consults.
+    ///
+    /// `claim`'s only fallible step is `self.groups.get(&name)?` — everything
+    /// after it (the descriptor build, the writability probe) always yields a
+    /// `PvInfo`. `groups` is a plain `HashMap`, fixed at construction, so a
+    /// `contains_key` is a lock-free, allocation-free, exact mirror of that
+    /// predicate: `Yes` really will be served, and `No` really can never be.
+    fn try_claim(&self, name: &str) -> TryClaim {
+        if self.groups.contains_key(name) {
+            TryClaim::Yes
+        } else {
+            TryClaim::No
+        }
+    }
+
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
@@ -1157,5 +1172,26 @@ mod tests {
 
         // "*" doesn't go through field validation.
         assert!(parse_group_config(json).is_ok());
+    }
+
+    #[tokio::test]
+    async fn try_claim_agrees_with_claim_for_the_group_source() {
+        let json = r#"{
+            "GRP:present": {
+                "a": { "+channel": "R:a", "+type": "plain" }
+            }
+        }"#;
+        let groups: HashMap<String, GroupPvDef> = parse_group_config(json)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.name.clone(), g))
+            .collect();
+        let source = GroupSource::new(Arc::new(SourceRegistry::new()), groups);
+
+        assert_eq!(source.try_claim("GRP:present"), TryClaim::Yes);
+        assert!(Source::claim(&source, "GRP:present").await.is_some());
+
+        assert_eq!(source.try_claim("GRP:absent"), TryClaim::No);
+        assert!(Source::claim(&source, "GRP:absent").await.is_none());
     }
 }
