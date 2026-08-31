@@ -2283,6 +2283,90 @@ mod tests {
     use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket as TokioUdpSocket;
 
+    /// V6 MEDIUM-2. `collect_visible_pv_names` sorts and *then* truncates, so
+    /// `pvlist_max` discloses the alphabetically-first names. Swapping the two
+    /// steps discloses a different set entirely — the names that happened to
+    /// come first in source order — and nothing observed that.
+    ///
+    /// The integration tests cannot see it: `SourceRegistry::names()` already
+    /// sorts its fan-out, so by the time the spawned enumeration calls this
+    /// function the input order and the sorted order agree. The unsorted input
+    /// below is the whole point; `Z:ZED` must be the name that is dropped.
+    #[test]
+    fn collect_visible_pv_names_sorts_before_it_truncates() {
+        let unsorted = [
+            "Z:ZED".to_string(),
+            "A:ALPHA".to_string(),
+            "M:MID".to_string(),
+        ];
+
+        // Anti-vacuity: with no cap in play, all three come back, sorted.
+        assert_eq!(
+            collect_visible_pv_names(&unsorted, PvListMode::Discover, None, 100),
+            vec!["A:ALPHA", "M:MID", "Z:ZED"],
+            "the function is not sorting at all"
+        );
+
+        // The load-bearing case. Truncating first would keep the source-order
+        // prefix `["Z:ZED", "A:ALPHA"]` and sort it to `["A:ALPHA", "Z:ZED"]`.
+        assert_eq!(
+            collect_visible_pv_names(&unsorted, PvListMode::Discover, None, 2),
+            vec!["A:ALPHA", "M:MID"],
+            "`pvlist_max` disclosed the source-order prefix rather than the \
+             alphabetically-first names: the truncation is happening before \
+             the sort, so which names a wildcard reveals depends on source \
+             registration order"
+        );
+
+        // A cap of one is the sharpest form of the same contract.
+        assert_eq!(
+            collect_visible_pv_names(&unsorted, PvListMode::Discover, None, 1),
+            vec!["A:ALPHA"],
+            "the single visible name must be the first in sort order"
+        );
+    }
+
+    /// The rest of the ordering contract: filtering happens before the sort
+    /// and before the cap, and the `__pvlist` entry is appended *after* the
+    /// truncation and only when there is room for it under `pvlist_max`.
+    #[test]
+    fn collect_visible_pv_names_filters_then_sorts_then_caps_then_appends_pvlist() {
+        let names = [
+            "Z:ZED".to_string(),
+            "A:ALPHA".to_string(),
+            "X:SKIP".to_string(),
+            "M:MID".to_string(),
+        ];
+        let allow = Regex::new("^[AMZ]:").unwrap();
+
+        // The filter removes `X:SKIP` before the cap is applied, so a cap of 2
+        // sees three candidates and keeps the two smallest of *those*.
+        assert_eq!(
+            collect_visible_pv_names(&names, PvListMode::Discover, Some(&allow), 2),
+            vec!["A:ALPHA", "M:MID"],
+            "the allow-pattern must be applied before the sort and the cap"
+        );
+
+        // `List` mode appends `__pvlist`, but only while the truncated list is
+        // still short of `max_items` — the cap bounds the whole reply.
+        assert_eq!(
+            collect_visible_pv_names(&names, PvListMode::List, None, 2),
+            vec!["A:ALPHA", "M:MID"],
+            "`__pvlist` was appended past `pvlist_max`"
+        );
+        assert_eq!(
+            collect_visible_pv_names(&names, PvListMode::List, None, 10),
+            vec!["A:ALPHA", "M:MID", "X:SKIP", "Z:ZED", "__pvlist"],
+            "`__pvlist` must be appended, after the sort, when there is room"
+        );
+
+        // Empty input is not a special case.
+        assert_eq!(
+            collect_visible_pv_names(&[], PvListMode::Discover, None, 5),
+            Vec::<String>::new()
+        );
+    }
+
     #[test]
     fn effective_advertise_ip_rejects_unspecified() {
         use std::net::{Ipv4Addr, Ipv6Addr};
