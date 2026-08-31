@@ -38,7 +38,7 @@ use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue, Scalar
 use crate::conn_writer::ConnWriter;
 use crate::decode::decode_put_body;
 use crate::monitor::MonitorRegistry;
-use crate::pvstore::SourceRegistry;
+use crate::pvstore::{SourceRegistry, TryClaim};
 use crate::state::{ConnState, MonitorState, MonitorSub};
 
 /// Hard server-side ceiling on a pipelined monitor's outstanding-frame credit,
@@ -109,6 +109,12 @@ pub struct ServerState {
     /// read loop's byte-counting call sites (Task 9) get a plain
     /// `if let Some(...)` against a field already in scope.
     pub bandwidth_counters: Option<Arc<crate::diag::BandwidthCounters>>,
+    /// Resolves PV names the search path could not answer from memory.
+    ///
+    /// Built here rather than passed in because `ServerState::new` is the
+    /// only constructor and every server wants one; there is no configuration
+    /// to thread through.
+    pub search_resolver: Arc<crate::search_resolve::SearchResolver>,
 }
 
 impl ServerState {
@@ -126,6 +132,7 @@ impl ServerState {
     ) -> Self {
         let client_registry = registry.client_registry();
         let bandwidth_counters = registry.bandwidth_counters();
+        let search_resolver = Arc::new(crate::search_resolve::SearchResolver::new(sources.clone()));
         Self {
             sources,
             registry,
@@ -141,6 +148,7 @@ impl ServerState {
             listen_ip,
             client_registry,
             bandwidth_counters,
+            search_resolver,
         }
     }
 }
@@ -727,13 +735,33 @@ pub async fn run_udp_search(
                     );
                     let mut cids = Vec::new();
                     for (cid, name) in &payload.pv_requests {
-                        if state.sources.has_pv(name).await
-                            || is_virtual_event_pv(name)
+                        if is_virtual_event_pv(name)
                             || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
                             || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
                         {
                             cids.push(*cid);
                             continue;
+                        }
+                        // `try_claim` never blocks. Anything it cannot decide
+                        // is resolved on a background task and answered on the
+                        // client's next search retry — awaiting resolution here
+                        // would stop this task reading datagrams for every
+                        // other client, which is the whole defect.
+                        match state.sources.try_claim(name) {
+                            TryClaim::Yes => {
+                                cids.push(*cid);
+                                continue;
+                            }
+                            TryClaim::Unknown => {
+                                // A wildcard is answered from the visible-name
+                                // list below; resolving it upstream is
+                                // meaningless and would pollute the negative
+                                // cache with a name no server owns.
+                                if !is_pattern_query(name) {
+                                    state.search_resolver.enqueue(name);
+                                }
+                            }
+                            TryClaim::No => {}
                         }
                         if state.pvlist_mode != PvListMode::Off
                             && is_pattern_query(name)
@@ -1904,13 +1932,24 @@ pub async fn handle_connection(
                     );
                     let mut cids = Vec::new();
                     for (cid, name) in &payload.pv_requests {
-                        if state.sources.has_pv(name).await
-                            || is_virtual_event_pv(name)
+                        if is_virtual_event_pv(name)
                             || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
                             || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
                         {
                             cids.push(*cid);
                             continue;
+                        }
+                        match state.sources.try_claim(name) {
+                            TryClaim::Yes => {
+                                cids.push(*cid);
+                                continue;
+                            }
+                            TryClaim::Unknown => {
+                                if !is_pattern_query(name) {
+                                    state.search_resolver.enqueue(name);
+                                }
+                            }
+                            TryClaim::No => {}
                         }
                         if state.pvlist_mode != PvListMode::Off
                             && is_pattern_query(name)
