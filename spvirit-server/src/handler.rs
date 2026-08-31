@@ -281,10 +281,23 @@ pub const PATTERN_ENUM_CONCURRENCY: usize = 4;
 /// unbounded-task problem, and search is retry-driven anyway. A shed pattern
 /// query behaves exactly like one that matched nothing.
 ///
+/// `ctx` is the caller's [`RequestContext`](crate::request_ctx::RequestContext),
+/// captured on the task that still holds the request's task-local. A spawned
+/// task does **not** inherit task-locals, and `SourceRegistry::names()` is an
+/// access-aware call: the gateway's status source filters its own listing with
+/// `decide_local(Op::Get, name, &current_identity())`, so an enumeration that
+/// runs with no identity silently stops matching every host-qualified pvlist
+/// rule — `DENY … FROM host` leaks names it should hide, and `ALLOW … FROM
+/// host` hides names from a legitimate operator. Reinstalled below with
+/// `scope_with`, exactly as
+/// [`SearchResolver::enqueue`](crate::search_resolve::SearchResolver::enqueue)
+/// does for the same reason.
+///
 /// Returns `false` if no permit was free (nothing was spawned, and the caller
 /// keeps responsibility for the reply).
 fn spawn_pattern_query_reply<R, Fut>(
     state: &Arc<ServerState>,
+    ctx: Option<crate::request_ctx::RequestContext>,
     pattern_requests: Vec<(u32, String)>,
     reply: R,
 ) -> bool
@@ -302,19 +315,25 @@ where
     let state = state.clone();
     tokio::spawn(async move {
         let _permit = permit;
-        let all_names = state.sources.names().await;
-        let visible = collect_visible_pv_names(
-            &all_names,
-            state.pvlist_mode,
-            state.pvlist_allow_pattern.as_ref(),
-            state.pvlist_max,
-        );
-        let cids: Vec<u32> = pattern_requests
-            .iter()
-            .filter(|(_, name)| visible.iter().any(|pv| wildcard_match(name, pv)))
-            .map(|(cid, _)| *cid)
-            .collect();
-        reply(cids).await;
+        let enumerate = async move {
+            let all_names = state.sources.names().await;
+            let visible = collect_visible_pv_names(
+                &all_names,
+                state.pvlist_mode,
+                state.pvlist_allow_pattern.as_ref(),
+                state.pvlist_max,
+            );
+            let cids: Vec<u32> = pattern_requests
+                .iter()
+                .filter(|(_, name)| visible.iter().any(|pv| wildcard_match(name, pv)))
+                .map(|(cid, _)| *cid)
+                .collect();
+            reply(cids).await;
+        };
+        match ctx {
+            Some(ctx) => crate::request_ctx::scope_with(ctx, enumerate).await,
+            None => enumerate.await,
+        }
     });
     true
 }
@@ -801,7 +820,7 @@ pub async fn run_udp_search(
                     debug!("UDP search: no compatible protocol (tcp not accepted)");
                     continue;
                 }
-                let (cids, pattern_requests) = crate::request_ctx::scope(peer, async {
+                let (cids, pattern_requests, req_ctx) = crate::request_ctx::scope(peer, async {
                     let mut cids = Vec::new();
                     let mut pattern_requests: Vec<(u32, String)> = Vec::new();
                     for (cid, name) in &payload.pv_requests {
@@ -841,7 +860,10 @@ pub async fn run_udp_search(
                             pattern_requests.push((*cid, name.clone()));
                         }
                     }
-                    (cids, pattern_requests)
+                    // Captured *inside* the scope, on the task that holds the
+                    // request's task-local: the pattern enumeration is
+                    // spawned below, after this scope has already ended.
+                    (cids, pattern_requests, crate::request_ctx::current_request())
                 })
                 .await;
                 let response_required = (payload.mask & 0x01) != 0;
@@ -888,7 +910,7 @@ pub async fn run_udp_search(
                 let answer_negative = response_required && !found;
                 let deferred = !pattern_requests.is_empty() && {
                     let socket = socket.clone();
-                    spawn_pattern_query_reply(&state, pattern_requests, move |pattern_cids| async move {
+                    spawn_pattern_query_reply(&state, req_ctx, pattern_requests, move |pattern_cids| async move {
                         if pattern_cids.is_empty() && !answer_negative {
                             return;
                         }
@@ -2091,8 +2113,14 @@ pub async fn handle_connection(
                     let answer_negative = !found;
                     let deferred = !pattern_requests.is_empty() && {
                         let replier = state.clone();
+                        // `handle_connection` runs inside `request_ctx::scope`
+                        // and `set_credentials` has already installed the
+                        // validated `ca` user, so this is the full identity the
+                        // inline enumeration used to see.
+                        let req_ctx = crate::request_ctx::current_request();
                         spawn_pattern_query_reply(
                             &state,
+                            req_ctx,
                             pattern_requests,
                             move |pattern_cids| async move {
                                 let state = replier;
@@ -2953,6 +2981,98 @@ mod tests {
             found,
             "a wildcard search matched nothing; the visible-name list was not \
              computed for a datagram that reads it"
+        );
+    }
+
+    /// A source whose `names()` output depends on `request_identity()`, the
+    /// shape `spvirit-gateway`'s `GatewayStatusSource::names` has (it filters
+    /// with `decide_local(Op::Get, name, &current_identity())`).
+    struct IdentityFilteredNames;
+
+    impl crate::pvstore::Source for IdentityFilteredNames {
+        fn try_claim(&self, _name: &str) -> crate::pvstore::TryClaim {
+            // Decisive "no": the only route to a `found` here is the pattern
+            // path's enumeration.
+            crate::pvstore::TryClaim::No
+        }
+
+        fn claim(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &spvirit_codec::spvd_decode::DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Err("read-only".to_string()) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<tokio::sync::mpsc::Receiver<NtPayload>>> + Send + '_>>
+        {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            Box::pin(async {
+                let (peer_ip, _user) = crate::request_ctx::request_identity();
+                if peer_ip.is_some() {
+                    vec!["IDENT:WITHPEER".to_string()]
+                } else {
+                    vec!["IDENT:ANONYMOUS".to_string()]
+                }
+            })
+        }
+    }
+
+    /// V4 HIGH-1, UDP half. The enumeration is spawned *after* the datagram's
+    /// `request_ctx::scope` has ended, and a spawned task inherits no
+    /// task-local — so without an explicit `scope_with` the access-aware
+    /// `names()` sees no peer at all and every host-qualified pvlist rule
+    /// stops matching. Both directions are asserted: the peer-visible name
+    /// must be answered, and the anonymous-only name must not leak.
+    #[tokio::test]
+    async fn the_udp_pattern_enumeration_sees_the_requesting_peer() {
+        let sources = Arc::new(SourceRegistry::new());
+        sources.add("identity", 0, Arc::new(IdentityFilteredNames)).await;
+        let (server_addr, client, _state) = spawn_search_server(sources).await;
+
+        let found = search_finds(
+            &client,
+            server_addr,
+            61,
+            "IDENT:WITHPEER*",
+            StdDuration::from_secs(2),
+        )
+        .await;
+        assert!(
+            found,
+            "the spawned enumeration ran with no peer identity, so an \
+             `ALLOW … FROM <host>` rule would stop matching and hide names \
+             from a legitimate operator"
+        );
+
+        let leaked = search_finds(
+            &client,
+            server_addr,
+            62,
+            "IDENT:ANONYMOUS*",
+            StdDuration::from_secs(1),
+        )
+        .await;
+        assert!(
+            !leaked,
+            "a name only the identity-less branch produces was answered: the \
+             enumeration lost the request context, so `DENY … FROM <host>` \
+             stops matching and hidden names are disclosed"
         );
     }
 
