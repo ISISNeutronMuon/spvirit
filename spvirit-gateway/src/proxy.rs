@@ -408,12 +408,6 @@ impl Source for GatewaySource {
                     // there will never be another fan-out for this key, so
                     // nothing else will ever tear the entry down.
                     monitors.retire(&key, &entry);
-                    // Removing the map's `Arc` is not enough: this task holds
-                    // a clone, so the `Sender`s would survive and every
-                    // downstream receiver would stay open and silent forever.
-                    // Dropping them is what closes those receivers and makes
-                    // the server-side pump observe `rx.recv() == None`.
-                    entry.close_all();
                     // Without this, `try_claim` keeps answering `Yes` from the
                     // bindings map and a destroyed client hot-loops straight
                     // back into the dead upstream (design spec §4).
@@ -428,6 +422,29 @@ impl Source for GatewaySource {
                         client_name,
                         result.err(),
                     );
+                    // LAST, deliberately: dropping the `Sender`s is the
+                    // observable "upstream is gone" edge — it is what wakes
+                    // every downstream receiver with `rx.recv() == None` and,
+                    // once Layer 2 lands, what makes the server-side pump send
+                    // DESTROY_CHANNEL. Everything a woken client might
+                    // immediately observe (the retired cache entry, the retired
+                    // binding, the death count) must already be committed
+                    // before we signal, or a client re-searching the instant it
+                    // is woken can still be answered `Yes` from a binding we
+                    // were about to remove — the §4 hot loop.
+                    //
+                    // Honest note on why this call exists at all: today it is
+                    // *equivalent* to simply returning from this task, because
+                    // the only surviving `Arc<MonitorEntry>` clones are this
+                    // task's `entry` and the one the `pvmonitor` callback held
+                    // (already dropped with the callback), so the senders would
+                    // die microseconds later anyway. The call earns its place
+                    // by making the edge explicit and correctly ordered, and it
+                    // becomes strictly load-bearing the moment anything holds
+                    // an `Arc<MonitorEntry>` clone past this task's return.
+                    // Do not delete it on the grounds that a test still passes
+                    // without it.
+                    entry.close_all();
                 });
             });
 
