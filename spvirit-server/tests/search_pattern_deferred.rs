@@ -689,3 +689,60 @@ async fn a_udp_pattern_query_is_not_answered_when_pvlist_is_off() {
         seen[0].cids
     );
 }
+
+/// Kills `p10` — **discard a UDP datagram's pattern queries whenever the same
+/// datagram also matched an exact name**.
+///
+/// Both existing mixed-datagram tests (`a_fully_answered_datagram_gets_no_
+/// second_negative_frame` and, in `search_pattern_shed.rs`,
+/// `a_shed_pattern_does_not_suppress_an_exact_name_on_the_same_datagram`) are
+/// TCP. On UDP the interaction was unobserved, and dropping the pattern half
+/// of a mixed datagram survived the suite: the client gets its exact name,
+/// sees a perfectly normal reply, and never learns the wildcard was never
+/// looked at.
+///
+/// A pvget for one PV and one wildcard is a single datagram, so this is the
+/// ordinary case, not a contrived one. Both halves must be answered — the
+/// exact name inline, the pattern from the spawned enumeration — which is two
+/// frames carrying the same `seq` and disjoint cids.
+#[tokio::test]
+async fn a_udp_datagram_mixing_an_exact_name_and_a_pattern_gets_both_answers() {
+    // `UDPMIX:LISTED` is enumerated but claimed by nothing, so the only route
+    // from it to a `found` response is the pattern path.
+    let src = Arc::new(ListingSource::new(
+        &["UDPMIX:SERVED"],
+        &["UDPMIX:SERVED", "UDPMIX:LISTED"],
+    ));
+    let h = UdpHarness::start(vec![src]).await;
+
+    let req = encode_search_request(
+        120,
+        0x01,
+        0,
+        [0u8; 16],
+        &[(220, "UDPMIX:SERVED"), (221, "UDPMIX:*")],
+        VERSION,
+        IS_BE,
+    );
+    let seen = h.send_and_collect(&req, Duration::from_millis(800)).await;
+    let mine: Vec<_> = seen.iter().filter(|p| p.seq == 120).collect();
+    let summary: Vec<_> = mine.iter().map(|p| (p.found, p.cids.clone())).collect();
+
+    assert_eq!(
+        mine.len(),
+        2,
+        "a datagram carrying one exact name and one pattern must be answered \
+         twice — inline for the exact name, deferred for the pattern — got \
+         {summary:?}"
+    );
+    assert!(
+        mine.iter().any(|p| p.found && p.cids == vec![220]),
+        "the exact name's inline reply is missing: {summary:?}"
+    );
+    assert!(
+        mine.iter().any(|p| p.found && p.cids == vec![221]),
+        "the pattern half of a mixed datagram was never answered: {summary:?} \
+         — the client is told about its exact name and silently never learns \
+         the wildcard was dropped"
+    );
+}
