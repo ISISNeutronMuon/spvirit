@@ -279,6 +279,10 @@ struct UdpHarness {
 
 impl UdpHarness {
     async fn start(sources: Vec<Arc<dyn Source>>) -> Self {
+        Self::start_with(PvListMode::List, 1024, sources).await
+    }
+
+    async fn start_with(mode: PvListMode, max: usize, sources: Vec<Arc<dyn Source>>) -> Self {
         let registry = Arc::new(SourceRegistry::new());
         for (i, s) in sources.into_iter().enumerate() {
             registry
@@ -289,8 +293,8 @@ impl UdpHarness {
             registry,
             Arc::new(MonitorRegistry::new()),
             false,
-            PvListMode::List,
-            1024,
+            mode,
+            max,
             None,
             rand_guid(),
             5075,
@@ -616,6 +620,71 @@ async fn a_udp_wildcard_matching_nothing_is_answered_negative_once() {
         !seen[0].found && seen[0].cids.is_empty(),
         "a wildcard that matched no enumerated name was answered found={} \
          cids={:?}",
+        seen[0].found,
+        seen[0].cids
+    );
+}
+
+/// Kills `7u` — **drop the `pvlist_mode != Off` gate on the *UDP* pattern
+/// path** (`handler.rs`, the UDP search arm).
+///
+/// The gate's TCP twin is covered by
+/// `a_pattern_query_is_not_answered_when_pvlist_is_off`; deleting the
+/// identical UDP one survived the entire suite. That matters more on UDP than
+/// on TCP: an operator who sets `pvlist_mode = Off` specifically to stop
+/// wildcard enumeration would still have their whole name list enumerated and
+/// wildcards answered from a *single unauthenticated datagram*, with no
+/// connection and no ConnectionValidation in the way.
+///
+/// `collect_visible_pv_names` does not re-check the mode for anything but the
+/// `__pvlist` entry, so this gate is the only thing enforcing it.
+#[tokio::test]
+async fn a_udp_pattern_query_is_not_answered_when_pvlist_is_off() {
+    let src = Arc::new(ListingSource::new(&["UDPOFF:SERVED"], &["UDPOFF:SERVED"]));
+    let h = UdpHarness::start_with(PvListMode::Off, 1024, vec![src]).await;
+
+    // Anti-vacuity: the exact name is served by this very server, over this
+    // very socket, with pvlist off.
+    let exact = encode_search_request(
+        110,
+        0x01,
+        0,
+        [0u8; 16],
+        &[(210, "UDPOFF:SERVED")],
+        VERSION,
+        IS_BE,
+    );
+    let seen = h.send_and_collect(&exact, Duration::from_millis(800)).await;
+    assert_eq!(seen.len(), 1, "the served name produced {seen:?}");
+    assert!(
+        seen[0].found && seen[0].cids == vec![210],
+        "the served name was not found with pvlist_mode = Off; the test proves nothing"
+    );
+
+    // The wildcard matches that same served-and-listed name, so the *only*
+    // thing that can keep it unanswered is the mode gate.
+    let wild = encode_search_request(
+        111,
+        0x01,
+        0,
+        [0u8; 16],
+        &[(211, "UDPOFF:*")],
+        VERSION,
+        IS_BE,
+    );
+    let seen = h.send_and_collect(&wild, Duration::from_millis(800)).await;
+    assert_eq!(
+        seen.len(),
+        1,
+        "a `response_required` wildcard must still get exactly one (negative) \
+         reply with pvlist off, got {:?}",
+        seen.iter().map(|p| (p.seq, p.found, p.cids.clone())).collect::<Vec<_>>()
+    );
+    assert!(
+        !seen[0].found && seen[0].cids.is_empty(),
+        "a wildcard was enumerated and answered over one unauthenticated \
+         datagram with pvlist_mode = Off (found={}, cids={:?}); the UDP mode \
+         gate is not being applied",
         seen[0].found,
         seen[0].cids
     );
