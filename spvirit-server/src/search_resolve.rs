@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use tokio::sync::Semaphore;
@@ -131,6 +131,22 @@ pub struct SearchResolver {
     stats: Arc<Stats>,
 }
 
+/// Take the `inflight` lock, recovering from poisoning rather than panicking.
+///
+/// Same ruling, and for the same reason, as
+/// [`SourceRegistry::lock_resolved`](crate::pvstore): treating a poison as
+/// fatal here would make every subsequent `enqueue` panic *on the search
+/// task* — which is precisely the total search denial this module exists to
+/// prevent. Worse, one of the two callers is `InflightGuard::drop`, where a
+/// panic during unwind aborts the process.
+///
+/// The set is only ever `insert`ed into and `remove`d from, neither of which
+/// can panic, so poisoning is not currently reachable — but the recovery is
+/// free and the failure mode it averts is not.
+fn lock_inflight(inflight: &Mutex<HashSet<Arc<str>>>) -> MutexGuard<'_, HashSet<Arc<str>>> {
+    inflight.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Removes `name` from `inflight` when dropped — on normal completion, and,
 /// crucially, on unwind if `claim` panics. Constructed before the `claim`
 /// await so the removal runs unconditionally.
@@ -141,7 +157,7 @@ struct InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.inflight.lock().unwrap().remove(&self.name);
+        lock_inflight(&self.inflight).remove(&self.name);
     }
 }
 
@@ -175,7 +191,7 @@ impl SearchResolver {
         // spawned task via cheap `Arc` clones (refcount bumps, not copies).
         let name: Arc<str> = Arc::from(name);
         {
-            let mut inflight = self.inflight.lock().unwrap();
+            let mut inflight = lock_inflight(&self.inflight);
             if !inflight.insert(name.clone()) {
                 self.stats.deduped.fetch_add(1, Ordering::Relaxed);
                 GLOBAL.deduped.fetch_add(1, Ordering::Relaxed);
@@ -485,6 +501,47 @@ mod tests {
         assert_eq!(
             stats.started, 2,
             "name was stranded in `inflight` after the first claim panicked"
+        );
+        assert_eq!(stats.deduped, 0);
+    }
+
+    /// A-F5: a poisoned `inflight` mutex must not disable the resolver.
+    ///
+    /// `.lock().unwrap()` here would panic on the *search task* for every
+    /// subsequent `enqueue` — the total search denial this module exists to
+    /// prevent — and in `InflightGuard::drop` it would panic during unwind,
+    /// aborting the process. Same ruling as `SourceRegistry::lock_resolved`.
+    #[tokio::test]
+    async fn a_poisoned_inflight_lock_does_not_disable_the_resolver() {
+        let src = SlowSource::new(Duration::from_millis(10));
+        let resolver = SearchResolver::new(registry_with(src.clone()).await);
+
+        // Poison the mutex the only way it can be poisoned: unwind while
+        // holding the guard.
+        let inflight = resolver.inflight.clone();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = inflight.lock().unwrap();
+            panic!("deliberate poison");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(inflight.is_poisoned(), "test failed to poison the mutex");
+
+        // The enqueue path must still take the lock and start the work...
+        resolver.enqueue("POISON:PV");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(resolver.stats().started, 1, "enqueue refused to run");
+        assert_eq!(src.calls.load(Ordering::SeqCst), 1);
+
+        // ...and `InflightGuard::drop` must still have released the name, or
+        // this second enqueue dedups instead of starting.
+        resolver.enqueue("POISON:PV");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let stats = resolver.stats();
+        assert_eq!(
+            stats.started, 2,
+            "the guard did not release the name under a poisoned lock"
         );
         assert_eq!(stats.deduped, 0);
     }
