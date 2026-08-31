@@ -275,6 +275,12 @@ impl Runtime {
                         })?;
                         let bound = listener.local_addr().map_err(|e| e.to_string())?;
                         tracing::info!("spgateway: metrics endpoint on http://{bound}{path}");
+                        // Covered end-to-end by
+                        // `spvirit-gateway/tests/it_metrics.rs`, which stands
+                        // up this `Runtime` and scrapes the endpoint over a
+                        // real socket. Two earlier attempts tested a helper
+                        // one frame up instead, and both left this line free
+                        // to be replaced by a provider that reports zeros.
                         let provider = build_snapshot_provider(
                             pool,
                             sources,
