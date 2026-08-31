@@ -635,19 +635,57 @@ mod tests {
 
     /// The `/metrics` endpoint reads a process-global rather than a
     /// per-resolver handle (see the plan's Task 6 ruling), so the global must
-    /// actually advance when work happens. Deliberately asserts on deltas:
-    /// other tests in this binary share the global.
+    /// actually advance when work happens.
+    ///
+    /// The global is shared with every other test in this binary, so a bare
+    /// `after > before` proves nothing — it stayed true with this test's own
+    /// enqueues deleted, and true under a mutant that removed the increment
+    /// from `enqueue` entirely. Two things fix that. The per-resolver
+    /// counters are *exact* and private to this resolver, so only this test's
+    /// own work can satisfy them. And the global deltas are asserted against
+    /// counts greater than one: neighbours can only push a delta up, never
+    /// down, so if the production increment is gone the delta is zero no
+    /// matter who else is running.
     #[tokio::test]
     async fn the_global_counters_advance_with_real_work() {
+        const DISTINCT: u64 = 5; // under RESOLVE_CONCURRENCY, so none are shed
+        const DUPES: u64 = 3;
+
         let before = global_stats();
-        let src = SlowSource::new(Duration::from_millis(20));
-        let resolver = SearchResolver::new(registry_with(src).await);
-        resolver.enqueue("GLOBAL:PV");
-        resolver.enqueue("GLOBAL:PV"); // deduped
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let src = SlowSource::new(Duration::from_millis(50));
+        let resolver = SearchResolver::new(registry_with(src.clone()).await);
+        for i in 0..DISTINCT {
+            resolver.enqueue(&format!("GLOBAL:PV{i}"));
+        }
+        for _ in 0..DUPES {
+            resolver.enqueue("GLOBAL:PV0"); // already inflight
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Exact, and attributable to nothing but this test.
+        let own = resolver.stats();
+        assert_eq!(own.started, DISTINCT, "own started");
+        assert_eq!(own.deduped, DUPES, "own deduped");
+        assert_eq!(own.dropped_full, 0, "own dropped_full");
+        assert_eq!(own.completed_missing, DISTINCT, "own completed_missing");
+        assert_eq!(src.calls.load(Ordering::SeqCst), DISTINCT as usize);
+
+        // And the global carried at least that much through.
         let after = global_stats();
-        assert!(after.started > before.started);
-        assert!(after.deduped > before.deduped);
+        for (label, delta, expected) in [
+            ("started", after.started - before.started, DISTINCT),
+            ("deduped", after.deduped - before.deduped, DUPES),
+            (
+                "completed_missing",
+                after.completed_missing - before.completed_missing,
+                DISTINCT,
+            ),
+        ] {
+            assert!(
+                delta >= expected,
+                "global {label} advanced by {delta}, but this test alone did {expected}"
+            );
+        }
     }
 
     #[test]
