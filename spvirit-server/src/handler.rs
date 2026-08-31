@@ -245,6 +245,39 @@ pub fn collect_visible_pv_names(
     names
 }
 
+/// The pvlist-visible name list for one search datagram — computed only when
+/// that datagram can actually read it.
+///
+/// `SourceRegistry::names()` awaits *every* registered source's `names()`,
+/// which for a proxying or Python-backed source is unbounded third-party
+/// work, and both search loops run on a single task shared by every client.
+/// Paying it unconditionally per datagram therefore reinstates exactly the
+/// head-of-line stall that [`Source::try_claim`](crate::pvstore::Source::try_claim)
+/// exists to remove — and it is nearly always wasted, because `visible_names`
+/// is read only for a pattern query, and only while pvlist is enabled.
+///
+/// The guard here must stay in lockstep with the condition on the only
+/// consumer of the returned list (the `pvlist_mode != Off && is_pattern_query`
+/// branch in both search loops): a datagram that would read the list must
+/// never be handed the empty one.
+async fn visible_names_for_search(
+    state: &ServerState,
+    pv_requests: &[(u32, String)],
+) -> Vec<String> {
+    if state.pvlist_mode == PvListMode::Off
+        || !pv_requests.iter().any(|(_, name)| is_pattern_query(name))
+    {
+        return Vec::new();
+    }
+    let all_names = state.sources.names().await;
+    collect_visible_pv_names(
+        &all_names,
+        state.pvlist_mode,
+        state.pvlist_allow_pattern.as_ref(),
+        state.pvlist_max,
+    )
+}
+
 fn build_pvlist_structure(names: &[String]) -> StructureDesc {
     use spvirit_codec::spvd_decode::{FieldDesc, FieldType, TypeCode};
     StructureDesc {
@@ -725,14 +758,9 @@ pub async fn run_udp_search(
                     debug!("UDP search: no compatible protocol (tcp not accepted)");
                     continue;
                 }
-                let all_names = state.sources.names().await;
+                let visible_names =
+                    visible_names_for_search(&state, &payload.pv_requests).await;
                 let cids = crate::request_ctx::scope(peer, async {
-                    let visible_names = collect_visible_pv_names(
-                        &all_names,
-                        state.pvlist_mode,
-                        state.pvlist_allow_pattern.as_ref(),
-                        state.pvlist_max,
-                    );
                     let mut cids = Vec::new();
                     for (cid, name) in &payload.pv_requests {
                         if is_virtual_event_pv(name)
@@ -1925,13 +1953,8 @@ pub async fn handle_connection(
                         .iter()
                         .any(|p| p.eq_ignore_ascii_case("tcp"));
                 if accepts_tcp {
-                    let all_names = state.sources.names().await;
-                    let visible_names = collect_visible_pv_names(
-                        &all_names,
-                        state.pvlist_mode,
-                        state.pvlist_allow_pattern.as_ref(),
-                        state.pvlist_max,
-                    );
+                    let visible_names =
+                        visible_names_for_search(&state, &payload.pv_requests).await;
                     let mut cids = Vec::new();
                     for (cid, name) in &payload.pv_requests {
                         if is_virtual_event_pv(name)
@@ -2223,9 +2246,29 @@ mod tests {
 
     /// Stands in for a gateway whose upstream never answers: `claim` hangs,
     /// and `try_claim` cannot decide without doing the I/O.
+    ///
+    /// `names()` hangs for the same duration, and deliberately so. An upstream
+    /// that cannot answer `claim` cannot answer an enumeration either, and a
+    /// fixture whose `names()` returned instantly made both head-of-line tests
+    /// blind to the `sources.names().await` that the search loops used to run
+    /// unconditionally per datagram, three lines above the `try_claim` they
+    /// were certifying.
     struct HangingSource {
         hang: StdDuration,
         claims: Arc<AtomicUsize>,
+        /// Bumped by `names()`, so a test can prove the enumeration was (or
+        /// was not) reached.
+        name_calls: Arc<AtomicUsize>,
+    }
+
+    impl HangingSource {
+        fn new(hang: StdDuration, claims: Arc<AtomicUsize>) -> Self {
+            Self {
+                hang,
+                claims,
+                name_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
 
     impl crate::pvstore::Source for HangingSource {
@@ -2264,7 +2307,12 @@ mod tests {
         }
 
         fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
-            Box::pin(async { Vec::new() })
+            self.name_calls.fetch_add(1, Ordering::SeqCst);
+            let hang = self.hang;
+            Box::pin(async move {
+                tokio::time::sleep(hang).await;
+                Vec::new()
+            })
         }
     }
 
@@ -2495,10 +2543,10 @@ mod tests {
             .add(
                 "hanging",
                 1,
-                Arc::new(HangingSource {
-                    hang: StdDuration::from_secs(5),
-                    claims: claims.clone(),
-                }),
+                Arc::new(HangingSource::new(
+                    StdDuration::from_secs(5),
+                    claims.clone(),
+                )),
             )
             .await;
         let (server_addr, client, _state) = spawn_search_server(sources).await;
@@ -2539,6 +2587,100 @@ mod tests {
         );
     }
 
+    /// The same head-of-line defect one level up: `run_udp_search` used to
+    /// `await state.sources.names()` unconditionally on every datagram,
+    /// *before* the first `try_claim`. A source that hangs in `names()` then
+    /// wedges the responder exactly as a hanging `claim` used to, and neither
+    /// of the two tests above could see it, because the fixture's `names()`
+    /// returned instantly (reviewer B's probe M50).
+    ///
+    /// The enumeration is only ever read to answer a pattern query under
+    /// pvlist, so this datagram — an exact name — must not pay for it at all.
+    #[tokio::test]
+    async fn a_source_that_hangs_in_names_does_not_delay_a_local_name() {
+        let claims = Arc::new(AtomicUsize::new(0));
+        let hanging = Arc::new(HangingSource::new(
+            StdDuration::from_secs(5),
+            claims.clone(),
+        ));
+        let name_calls = hanging.name_calls.clone();
+        let sources = Arc::new(SourceRegistry::new());
+        sources
+            .add("local", 0, Arc::new(DecisiveSource::new("LOCAL:PV")))
+            .await;
+        sources.add("hanging", 1, hanging).await;
+        let (server_addr, client, _state) = spawn_search_server(sources).await;
+
+        // Anti-vacuity, and it absorbs the free_udp_port rebind race: prove
+        // the hanging source is really registered and really on the search
+        // path before timing anything.
+        let request =
+            encode_search_request(1, 0x01, 0, [0u8; 16], &[(1, "UNRESOLVABLE:PV")], 2, false);
+        for _ in 0..50 {
+            client.send_to(&request, server_addr).await.unwrap();
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+            if claims.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+        assert!(
+            claims.load(Ordering::SeqCst) > 0,
+            "the hanging source was never consulted; the test proves nothing"
+        );
+
+        let before = std::time::Instant::now();
+        let found = search_finds(
+            &client,
+            server_addr,
+            2,
+            "LOCAL:PV",
+            StdDuration::from_secs(2),
+        )
+        .await;
+        assert!(
+            found,
+            "a local name went unanswered while a source hung in names()"
+        );
+        assert!(
+            before.elapsed() < StdDuration::from_millis(500),
+            "local name took {:?}; the search task is blocked enumerating names",
+            before.elapsed()
+        );
+        assert_eq!(
+            name_calls.load(Ordering::SeqCst),
+            0,
+            "the search loop enumerated every source's names for a datagram \
+             that carries no pattern query and could never read the result"
+        );
+    }
+
+    /// The other half of the laziness contract: a datagram that *does* carry
+    /// a pattern query, with pvlist enabled, must still get the enumerated
+    /// name list. Without this, "compute it only when needed" could be
+    /// satisfied by never computing it at all.
+    #[tokio::test]
+    async fn a_pattern_query_still_matches_against_the_enumerated_names() {
+        let sources = Arc::new(SourceRegistry::new());
+        sources
+            .add("local", 0, Arc::new(DecisiveSource::new("LOCAL:PV")))
+            .await;
+        let (server_addr, client, _state) = spawn_search_server(sources).await;
+
+        let found = search_finds(
+            &client,
+            server_addr,
+            11,
+            "LOCAL:*",
+            StdDuration::from_secs(2),
+        )
+        .await;
+        assert!(
+            found,
+            "a wildcard search matched nothing; the visible-name list was not \
+             computed for a datagram that reads it"
+        );
+    }
+
     /// The self-sustaining part: a flood of distinct unresolvable names must
     /// be shed, not queued. If each one costs the responder an await, service
     /// never recovers while any client is still searching.
@@ -2562,10 +2704,10 @@ mod tests {
             .add(
                 "hanging",
                 1,
-                Arc::new(HangingSource {
-                    hang: StdDuration::from_secs(5),
-                    claims: claims.clone(),
-                }),
+                Arc::new(HangingSource::new(
+                    StdDuration::from_secs(5),
+                    claims.clone(),
+                )),
             )
             .await;
         let (server_addr, client, state) = spawn_search_server(sources).await;

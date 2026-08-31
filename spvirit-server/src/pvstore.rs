@@ -639,12 +639,23 @@ impl SourceRegistry {
     }
 
     /// Collect all PV names from every registered source.
+    ///
+    /// The sources list is snapshotted and the read guard released *before*
+    /// any source's `names()` is awaited, for the same reason
+    /// [`claim`](Self::claim) does it: a source's `names()` may be arbitrary
+    /// third-party work (a Python coroutine under the GIL, say), and holding
+    /// the registry lock across one blocks every concurrent add/remove — and
+    /// every other `try_read`-based reader, since tokio's `RwLock` is
+    /// writer-fair — for that whole duration.
     pub async fn names(&self) -> Vec<String> {
-        let sources = self.sources.read().await;
+        let snapshot: Vec<Arc<dyn Source>> = {
+            let sources = self.sources.read().await;
+            sources.iter().map(|e| e.source.clone()).collect()
+        };
         let mut seen = HashSet::new();
         let mut all = Vec::new();
-        for entry in sources.iter() {
-            for name in entry.source.names().await {
+        for source in &snapshot {
+            for name in source.names().await {
                 if seen.insert(name.clone()) {
                     all.push(name);
                 }
@@ -720,6 +731,85 @@ mod tests {
             let names = self.names.clone();
             Box::pin(async move { names })
         }
+    }
+
+    /// A source whose `names()` future takes `delay` to resolve — the shape
+    /// of a proxying or Python-backed source enumerating over the network.
+    struct SlowNamesSource {
+        delay: Duration,
+    }
+
+    impl Source for SlowNamesSource {
+        fn claim(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                vec!["SLOW:PV".to_string()]
+            })
+        }
+    }
+
+    /// `names()` must snapshot the source handles and release the read guard
+    /// before awaiting any source's future, exactly as `claim` does. Holding
+    /// it means one slow enumeration blocks every registration — and, because
+    /// tokio's `RwLock` is writer-fair, the queued writer then also fails
+    /// every `try_read` the search path depends on.
+    #[tokio::test]
+    async fn names_does_not_hold_the_sources_lock_across_a_source_future() {
+        let reg = Arc::new(SourceRegistry::new());
+        reg.add(
+            "slow",
+            0,
+            Arc::new(SlowNamesSource {
+                delay: Duration::from_millis(400),
+            }),
+        )
+        .await;
+
+        let enumerating = {
+            let reg = reg.clone();
+            tokio::spawn(async move { reg.names().await })
+        };
+        // Let the enumeration get as far as its source future.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let before = Instant::now();
+        reg.add("late", 1, Arc::new(StubSource::new(&["B"]))).await;
+        let blocked = before.elapsed();
+        assert!(
+            blocked < Duration::from_millis(200),
+            "registering a source waited {blocked:?} behind a slow names()"
+        );
+
+        // Anti-vacuity: the slow enumeration really was still in flight, and
+        // really did produce its names.
+        // (The snapshot predates the `late` registration, so `B` is correctly
+        // absent from it.)
+        assert_eq!(enumerating.await.unwrap(), vec!["SLOW:PV".to_string()]);
     }
 
     #[tokio::test]
