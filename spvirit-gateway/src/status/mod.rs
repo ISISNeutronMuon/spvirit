@@ -40,24 +40,6 @@ use crate::proxy::GatewaySource;
 /// How often the `subscribe` ticker refreshes a live PV's value.
 const TICK_PERIOD: Duration = Duration::from_secs(1);
 
-/// Snapshots the current downstream connection's identity (socket peer host,
-/// and decoded `ca` user if any) into an [`Identity`] for
-/// [`AccessControl::decide_local`].
-///
-/// The peer IP is authoritative for `host` (the self-asserted `ca` host is
-/// advisory only and never used for a decision), while `user` is the
-/// self-asserted `ca` value, matching p4p's posture. Returns a default
-/// (all-`None`) [`Identity`] when called outside a
-/// [`spvirit_server::request_ctx`] scope (e.g. a unit test that calls
-/// `put`/`get` directly): a permissive `AccessControl` still behaves
-/// correctly, and a restrictive one fails closed. In particular, for a pure
-/// `readOnly` config `decide` short-circuits before any host/user match, so
-/// enforcement holds even with a default `Identity`.
-///
-/// Delegates to [`spvirit_server::request_ctx::request_identity`] rather than
-/// reading `current_request` itself, mirroring `proxy::current_identity`, so
-/// this crate's notion of "who is asking" and `SourceRegistry`'s
-/// resolver-memo key can never drift apart.
 /// The current wall-clock time as an [`NtTimeStamp`] of UNIX seconds (NOT the
 /// EPICS 1990-01-01 epoch — see the "1990 timestamp" gateway bug this helper
 /// closes). Falls back to the zero duration (seconds/nanoseconds `0`) if the
@@ -140,6 +122,24 @@ fn clear_stamp(payload: &NtPayload) -> NtPayload {
     p
 }
 
+/// Snapshots the current downstream connection's identity (socket peer host,
+/// and decoded `ca` user if any) into an [`Identity`] for
+/// [`AccessControl::decide_local`].
+///
+/// The peer IP is authoritative for `host` (the self-asserted `ca` host is
+/// advisory only and never used for a decision), while `user` is the
+/// self-asserted `ca` value, matching p4p's posture. Returns a default
+/// (all-`None`) [`Identity`] when called outside a
+/// [`spvirit_server::request_ctx`] scope (e.g. a unit test that calls
+/// `put`/`get` directly): a permissive `AccessControl` still behaves
+/// correctly, and a restrictive one fails closed. In particular, for a pure
+/// `readOnly` config `decide` short-circuits before any host/user match, so
+/// enforcement holds even with a default `Identity`.
+///
+/// Delegates to [`spvirit_server::request_ctx::request_identity`] rather than
+/// reading `current_request` itself, mirroring `proxy::current_identity`, so
+/// this crate's notion of "who is asking" and `SourceRegistry`'s
+/// resolver-memo key can never drift apart.
 fn current_identity() -> Identity {
     let (peer, user) = spvirit_server::request_ctx::request_identity();
     Identity {
@@ -362,19 +362,41 @@ impl StatusSource {
     /// The whole of `claim`, synchronously — nothing in it does I/O.
     ///
     /// `claim` and `try_claim` both delegate here so they cannot drift apart.
+    /// Cheap membership + access check, with no payload construction —
+    /// exactly what `try_claim` needs, and the first check `claim_sync` runs
+    /// too, so the two can never structurally diverge on *whether* a name is
+    /// served (only `claim_sync` goes on to build the value).
+    ///
+    /// Sound only because `value_payload`'s `_ => return None` arm is
+    /// unreachable for every suffix this predicate admits: `claim_sync`'s
+    /// non-RPC branch calls `value_payload` only for a `LIVE` suffix (an
+    /// `RPC_NAMES` suffix is handled in its own branch before
+    /// `value_payload` is ever reached), and `value_payload` has an explicit
+    /// match arm — or a `BANDWIDTH_SUFFIXES` guard arm — for all 13 `LIVE`
+    /// entries. Pinned by `every_live_suffix_produces_a_value_payload`: if a
+    /// future `LIVE` addition ever lacked a `value_payload` arm, that test
+    /// fails, not this predicate silently reporting `Yes` for a name `claim`
+    /// then fails on.
+    fn serves(&self, name: &str) -> bool {
+        self.suffix(name).is_some_and(|s| served_suffixes().any(|x| x == s))
+            && !matches!(
+                self.access.decide_local(Op::Get, name, &current_identity()),
+                Decision::Deny
+            )
+    }
+
     fn claim_sync(&self, name: &str) -> Option<PvInfo> {
+        if !self.serves(name) {
+            return None;
+        }
+        // `serves` already confirmed `self.suffix(name)` is `Some`.
         let suffix = self.suffix(name)?;
-        if !served_suffixes().any(|s| s == suffix) {
-            return None;
-        }
-        // Hardening: a pvlist DENY hides the status PV entirely (claim
-        // fails, so it is never registered for this identity). readOnly
-        // does not affect Get, so this only bites on an explicit DENY.
-        if let Decision::Deny = self.access.decide_local(Op::Get, name, &current_identity()) {
-            return None;
-        }
         let payload = if RPC_NAMES.contains(&suffix) {
+            // RPC-only PVs still advertise a result descriptor at claim
+            // time, each in its own shape.
             match suffix {
+                // `threads` is both a value PV and an RPC target; advertise
+                // the get/subscribe value shape (identical NTScalar('s')).
                 "threads" => Self::threads_static_value(),
                 _ => Self::astest_response("", "", "", &Decision::Deny, &Decision::Deny),
             }
@@ -638,7 +660,7 @@ impl StatusSource {
 
 impl Source for StatusSource {
     fn try_claim(&self, name: &str) -> TryClaim {
-        if self.claim_sync(name).is_some() {
+        if self.serves(name) {
             TryClaim::Yes
         } else {
             TryClaim::No
@@ -897,12 +919,40 @@ mod tests {
             checked += 1;
         }
         // 13 LIVE suffixes (incl. the 8 bandwidth tables) + 2 RPC_NAMES.
-        assert!(checked >= 15, "expected the full status set, saw {checked}");
+        // Exact, not a lower bound: an unintended *addition* to either list
+        // without a matching `value_payload`/RPC arm should fail this test
+        // too, not just a deletion.
+        assert_eq!(checked, 15, "expected the full status set, saw {checked}");
         assert_eq!(src.try_claim("NOT:OURS"), TryClaim::No);
         assert_eq!(
             src.try_claim(&format!("{PREFIX}nosuchsuffix")),
             TryClaim::No
         );
+    }
+
+    /// Pins the premise `StatusSource::serves` relies on to skip building a
+    /// payload: every `LIVE` suffix — the only ones `claim_sync`'s non-RPC
+    /// branch ever hands to `value_payload` (an `RPC_NAMES` suffix is
+    /// intercepted before `value_payload` is called) — must actually produce
+    /// one. If a `LIVE` suffix were ever added without a matching
+    /// `value_payload` arm, `serves`/`try_claim` would report `Yes` for a
+    /// name `claim` then fails on (`value_payload`'s `_ => return None`
+    /// firing after `serves` already said yes) — exactly the split-predicate
+    /// unsoundness the review flagged. This test would catch that the moment
+    /// the suffix was added, independent of `status_try_claim_agrees_with_claim_on_every_served_suffix`
+    /// (which only proves current agreement, not that a bare `value_payload`
+    /// call cannot fail for a `LIVE` name).
+    #[test]
+    fn every_live_suffix_produces_a_value_payload() {
+        let handles = StatusHandles::test();
+        let generation = AtomicU64::new(0);
+        for suffix in LIVE {
+            assert!(
+                StatusSource::value_payload(suffix, &handles, &generation).is_some(),
+                "LIVE suffix '{suffix}' has no value_payload arm — the `serves` \
+                 cheap-path premise (finding 2) would be unsound"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1208,6 +1258,17 @@ mod tests {
                 src.claim(&name).await.is_some(),
                 "status PV {name} must be claimed (and so answer search) even \
                  though the proxy pvlist does not mention it"
+            );
+            // Pin this directly on the search path too: this is the exact
+            // shape of the bug the gate was written for (status PVs
+            // invisible to search whenever any pvlist is configured), and
+            // that protection would otherwise only hold "for free" as long
+            // as `try_claim` happens to share a body with `claim`.
+            assert_eq!(
+                src.try_claim(&name),
+                TryClaim::Yes,
+                "status PV {name} must also be try_claim-able (search path) \
+                 even though the proxy pvlist does not mention it"
             );
         }
     }

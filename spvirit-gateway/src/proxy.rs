@@ -448,10 +448,84 @@ mod tests {
         assert!(src.claim("ANY:PV").await.is_none());
     }
 
+    /// Before a binding exists, `try_claim` cannot say `Yes` (that would be a
+    /// search reply for a name that isn't actually bound yet); once one is
+    /// inserted directly, it must. This before/after shape is what makes the
+    /// test actually exercise the `bindings.contains_key` branch — the prior
+    /// "unknown before a binding exists" test on its own would still pass
+    /// even if that branch (the entire performance point of the task) were
+    /// deleted.
     #[tokio::test]
-    async fn gateway_try_claim_is_unknown_before_a_binding_exists() {
+    async fn gateway_try_claim_is_yes_once_a_binding_exists() {
         let src = test_source(open_neg(), allow_all());
-        assert_eq!(src.try_claim("UPSTREAM:PV"), TryClaim::Unknown);
+        assert_eq!(
+            src.try_claim("BOUND:PV"),
+            TryClaim::Unknown,
+            "before: no binding yet"
+        );
+
+        src.bindings.lock().unwrap().insert(
+            "BOUND:PV".to_string(),
+            Binding {
+                client_name: "c".into(),
+                real_name: "BOUND:PV".into(),
+                struct_id: None,
+                last_get: Mutex::new(None),
+            },
+        );
+
+        assert_eq!(
+            src.try_claim("BOUND:PV"),
+            TryClaim::Yes,
+            "after: a binding now exists"
+        );
+    }
+
+    /// Pins the documented precedence inside `try_claim`: the negative cache
+    /// and an access `Deny` must both outrank an existing binding, exactly as
+    /// they do in `claim`. Without this, a future reordering could report a
+    /// negatively-cached or denied name as `Yes` just because a stale binding
+    /// still sits in the map.
+    #[tokio::test]
+    async fn gateway_try_claim_negative_cache_and_deny_outrank_an_existing_binding() {
+        let neg = open_neg();
+        let src = test_source(neg.clone(), allow_all());
+        src.bindings.lock().unwrap().insert(
+            "BOUND:PV".to_string(),
+            Binding {
+                client_name: "c".into(),
+                real_name: "BOUND:PV".into(),
+                struct_id: None,
+                last_get: Mutex::new(None),
+            },
+        );
+        neg.record_miss("BOUND:PV", Instant::now());
+        assert_eq!(
+            src.try_claim("BOUND:PV"),
+            TryClaim::No,
+            "a negative-cache hit must outrank an existing binding"
+        );
+
+        let access = Arc::new(AccessControl::new(
+            false,
+            Some(crate::access::pvlist::parse_pvlist("SECRET:.*  DENY\n.*  ALLOW\n").unwrap()),
+            None,
+        ));
+        let src2 = test_source(open_neg(), access);
+        src2.bindings.lock().unwrap().insert(
+            "SECRET:PV".to_string(),
+            Binding {
+                client_name: "c".into(),
+                real_name: "SECRET:PV".into(),
+                struct_id: None,
+                last_get: Mutex::new(None),
+            },
+        );
+        assert_eq!(
+            src2.try_claim("SECRET:PV"),
+            TryClaim::No,
+            "an access Deny must outrank an existing binding"
+        );
     }
 
     #[tokio::test]
