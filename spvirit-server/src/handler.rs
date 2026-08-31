@@ -2028,6 +2028,7 @@ mod tests {
     use spvirit_types::NtPayload;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket as TokioUdpSocket;
@@ -2214,5 +2215,390 @@ mod tests {
         let ctx = recorded
             .expect("ProbeSource::claim saw no RequestContext (current_request() was None)");
         assert_eq!(ctx.peer, client_addr);
+    }
+
+    /// Stands in for a gateway whose upstream never answers: `claim` hangs,
+    /// and `try_claim` cannot decide without doing the I/O.
+    struct HangingSource {
+        hang: StdDuration,
+        claims: Arc<AtomicUsize>,
+    }
+
+    impl crate::pvstore::Source for HangingSource {
+        fn try_claim(&self, _name: &str) -> crate::pvstore::TryClaim {
+            crate::pvstore::TryClaim::Unknown
+        }
+
+        fn claim(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            self.claims.fetch_add(1, Ordering::SeqCst);
+            let hang = self.hang;
+            Box::pin(async move {
+                tokio::time::sleep(hang).await;
+                None
+            })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &spvirit_codec::spvd_decode::DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Err("read-only".to_string()) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<tokio::sync::mpsc::Receiver<NtPayload>>> + Send + '_>>
+        {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            Box::pin(async { Vec::new() })
+        }
+    }
+
+    /// A source that becomes decisive only after its first `claim` completes —
+    /// the shape a gateway has once a binding exists. Proves the resolver's
+    /// no-reply design actually delivers: the retry is what gets answered.
+    struct LateSource {
+        name: String,
+        resolved: Arc<AtomicBool>,
+    }
+
+    impl crate::pvstore::Source for LateSource {
+        fn try_claim(&self, name: &str) -> crate::pvstore::TryClaim {
+            if name != self.name {
+                return crate::pvstore::TryClaim::No;
+            }
+            if self.resolved.load(Ordering::SeqCst) {
+                crate::pvstore::TryClaim::Yes
+            } else {
+                crate::pvstore::TryClaim::Unknown
+            }
+        }
+
+        fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            let owned = name == self.name;
+            let resolved = self.resolved.clone();
+            Box::pin(async move {
+                tokio::time::sleep(StdDuration::from_millis(100)).await;
+                if !owned {
+                    return None;
+                }
+                resolved.store(true, Ordering::SeqCst);
+                Some(PvInfo {
+                    descriptor: StructureDesc::default(),
+                    writable: false,
+                })
+            })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &spvirit_codec::spvd_decode::DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Err("read-only".to_string()) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<tokio::sync::mpsc::Receiver<NtPayload>>> + Send + '_>>
+        {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            Box::pin(async { Vec::new() })
+        }
+    }
+
+    /// Answers instantly and decisively for one name — the shape of a purely
+    /// local source that needs no upstream. `ProbeSource` cannot serve here:
+    /// it takes the trait's default `try_claim`, which is `Unknown`.
+    struct DecisiveSource {
+        name: String,
+    }
+
+    impl DecisiveSource {
+        fn new(name: &str) -> Self {
+            Self { name: name.to_string() }
+        }
+    }
+
+    impl crate::pvstore::Source for DecisiveSource {
+        fn try_claim(&self, name: &str) -> crate::pvstore::TryClaim {
+            if name == self.name {
+                crate::pvstore::TryClaim::Yes
+            } else {
+                crate::pvstore::TryClaim::No
+            }
+        }
+
+        fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            let owned = name == self.name;
+            Box::pin(async move {
+                owned.then(|| PvInfo {
+                    descriptor: StructureDesc::default(),
+                    writable: false,
+                })
+            })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &spvirit_codec::spvd_decode::DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Err("read-only probe".to_string()) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<tokio::sync::mpsc::Receiver<NtPayload>>> + Send + '_>>
+        {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            let name = self.name.clone();
+            Box::pin(async move { vec![name] })
+        }
+    }
+
+    /// Stand up a search responder over `sources` on a free loopback port,
+    /// returning the server address and a bound client socket.
+    async fn spawn_search_server(
+        sources: Arc<SourceRegistry>,
+    ) -> (SocketAddr, TokioUdpSocket) {
+        let state = Arc::new(ServerState::new(
+            sources,
+            Arc::new(MonitorRegistry::new()),
+            false,
+            PvListMode::List,
+            1024,
+            None,
+            rand_guid(),
+            5075,
+            None,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ));
+        let server_port = free_udp_port().await;
+        let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+        tokio::spawn(async move {
+            let _ = run_udp_search(state, server_addr, 5075, rand_guid(), None, None).await;
+        });
+        let client = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        (server_addr, client)
+    }
+
+    /// Send one search for `name` under `cid` and wait up to `budget` for a
+    /// response that names it, returning whether one arrived. Retries the send
+    /// (like `udp_search_scopes_the_peer_identity` does) to absorb the
+    /// port-rebind race, and ignores any response that does not carry `cid` —
+    /// a discovery-ping reply may arrive first.
+    async fn search_finds(
+        client: &TokioUdpSocket,
+        server_addr: SocketAddr,
+        cid: u32,
+        name: &str,
+        budget: StdDuration,
+    ) -> bool {
+        let request = encode_search_request(cid, 0x01, 0, [0u8; 16], &[(cid, name)], 2, false);
+        let deadline = std::time::Instant::now() + budget;
+        let mut buf = [0u8; 2048];
+        while std::time::Instant::now() < deadline {
+            client.send_to(&request, server_addr).await.unwrap();
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let wait = remaining.min(StdDuration::from_millis(20));
+            if let Ok(Ok((n, _))) =
+                tokio::time::timeout(wait, client.recv_from(&mut buf)).await
+                && response_names_cid(&buf[..n], cid)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True if `buf` is a search response that reports `cid` found.
+    ///
+    /// Uses the real decoder (`PvaPacket::try_new` + `decode_payload`) rather
+    /// than scanning for cid bytes — a byte scan would also match the echoed
+    /// cid in a *request*, and this socket's own retries are in flight.
+    fn response_names_cid(buf: &[u8], cid: u32) -> bool {
+        let Some(mut pkt) = spvirit_codec::epics_decode::PvaPacket::try_new(buf) else {
+            return false;
+        };
+        match pkt.decode_payload() {
+            Some(spvirit_codec::epics_decode::PvaPacketCommand::SearchResponse(p)) => {
+                p.found && p.cids.contains(&cid)
+            }
+            _ => false,
+        }
+    }
+
+    /// The defect: `run_udp_search` is a single task, so awaiting a slow
+    /// `claim` inside it stopped the responder reading datagrams for *every*
+    /// client and *every* name — including purely local ones needing no
+    /// upstream at all. Measured in the field as total search denial within
+    /// 4s at 1.4 miss-searches/s, sustained indefinitely by the blocked
+    /// clients' own ~5Hz retries, with the gateway at 0.06 cores.
+    ///
+    /// The bound is on latency, not reachability: `LOCAL:PV` was always
+    /// findable, it just took as long as an unrelated hanging claim.
+    #[tokio::test]
+    async fn a_hanging_source_does_not_delay_a_local_name() {
+        let claims = Arc::new(AtomicUsize::new(0));
+        let sources = Arc::new(SourceRegistry::new());
+        sources
+            .add("local", 0, Arc::new(DecisiveSource::new("LOCAL:PV")))
+            .await;
+        sources
+            .add(
+                "hanging",
+                1,
+                Arc::new(HangingSource {
+                    hang: StdDuration::from_secs(5),
+                    claims: claims.clone(),
+                }),
+            )
+            .await;
+        let (server_addr, client) = spawn_search_server(sources).await;
+
+        // Put the responder under a claim that will not return for 5s.
+        let request =
+            encode_search_request(1, 0x01, 0, [0u8; 16], &[(1, "UNRESOLVABLE:PV")], 2, false);
+        client.send_to(&request, server_addr).await.unwrap();
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        assert!(
+            claims.load(Ordering::SeqCst) > 0,
+            "the hanging source was never consulted; the test proves nothing"
+        );
+
+        let before = std::time::Instant::now();
+        let found = search_finds(
+            &client,
+            server_addr,
+            2,
+            "LOCAL:PV",
+            StdDuration::from_secs(2),
+        )
+        .await;
+        assert!(found, "a local name went unanswered while a source hung");
+        assert!(
+            before.elapsed() < StdDuration::from_millis(500),
+            "local name took {:?}; the search task is blocked on the hanging source",
+            before.elapsed()
+        );
+    }
+
+    /// The self-sustaining part: a flood of distinct unresolvable names must
+    /// be shed, not queued. If each one costs the responder an await, service
+    /// never recovers while any client is still searching.
+    #[tokio::test]
+    async fn a_flood_of_unresolvable_names_does_not_deny_a_local_name() {
+        let sources = Arc::new(SourceRegistry::new());
+        sources
+            .add("local", 0, Arc::new(DecisiveSource::new("LOCAL:PV")))
+            .await;
+        sources
+            .add(
+                "hanging",
+                1,
+                Arc::new(HangingSource {
+                    hang: StdDuration::from_secs(5),
+                    claims: Arc::new(AtomicUsize::new(0)),
+                }),
+            )
+            .await;
+        let (server_addr, client) = spawn_search_server(sources).await;
+
+        for i in 0..200u32 {
+            let name = format!("FLOOD:{i}");
+            let req =
+                encode_search_request(1000 + i, 0x01, 0, [0u8; 16], &[(1000 + i, &name)], 2, false);
+            client.send_to(&req, server_addr).await.unwrap();
+        }
+
+        let before = std::time::Instant::now();
+        let found = search_finds(
+            &client,
+            server_addr,
+            7,
+            "LOCAL:PV",
+            StdDuration::from_secs(3),
+        )
+        .await;
+        assert!(found, "a local name was denied under a search flood");
+        assert!(
+            before.elapsed() < StdDuration::from_secs(1),
+            "local name took {:?} under flood",
+            before.elapsed()
+        );
+    }
+
+    /// The resolver replies to nothing, so resolution has to reach the client
+    /// through its own retry. First search misses; once the background claim
+    /// lands, a retry finds it.
+    ///
+    /// Since Task 3b there are two routes by which the retry can now be
+    /// answered: `LateSource::try_claim` flipping to `Yes`, and the registry's
+    /// resolver-outcome memo. The test asserts the end-to-end property and
+    /// does not care which one fires. Do not "simplify" `LateSource` into a
+    /// source that never becomes decisive — that would test only the memo and
+    /// would silently stop covering the cache-warming route.
+    /// The memo is keyed on the peer address, so the retry must come from the
+    /// same client socket as the first search. `search_finds` does that.
+    #[tokio::test]
+    async fn an_unresolvable_name_is_answered_after_its_background_resolution() {
+        let sources = Arc::new(SourceRegistry::new());
+        sources
+            .add(
+                "late",
+                0,
+                Arc::new(LateSource {
+                    name: "LATE:PV".to_string(),
+                    resolved: Arc::new(AtomicBool::new(false)),
+                }),
+            )
+            .await;
+        let (server_addr, client) = spawn_search_server(sources).await;
+
+        // `search_finds` retries for the whole budget, which is exactly the
+        // client behaviour this design relies on: the first datagram is
+        // unanswered, a later one is answered once resolution has landed.
+        let found = search_finds(
+            &client,
+            server_addr,
+            3,
+            "LATE:PV",
+            StdDuration::from_secs(3),
+        )
+        .await;
+        assert!(
+            found,
+            "background resolution never made the name findable; the \
+             no-reply resolver design does not deliver"
+        );
     }
 }
