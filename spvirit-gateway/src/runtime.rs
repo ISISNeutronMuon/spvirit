@@ -275,29 +275,12 @@ impl Runtime {
                         })?;
                         let bound = listener.local_addr().map_err(|e| e.to_string())?;
                         tracing::info!("spgateway: metrics endpoint on http://{bound}{path}");
-                        let provider: crate::metrics::SnapshotProvider = Arc::new(move || {
-                            // Read at scrape time, not cached: `upstream_monitors`
-                            // was once found reporting a stale value straight
-                            // through a total outage, which is exactly the
-                            // failure a counter is supposed to make visible.
-                            let r = spvirit_server::search_resolve::global_stats();
-                            let mut snap = crate::metrics::MetricsSnapshot {
-                                clients: pool.names().len() as u64,
-                                upstream_monitors: sources
-                                    .iter()
-                                    .map(|s| s.upstream_monitor_count() as u64)
-                                    .sum(),
-                                ..crate::metrics::snapshot_from_bandwidth(
-                                    &bandwidth_counters,
-                                    &client_registry,
-                                )
-                            };
-                            // Field-by-field in `metrics::apply_resolve_stats`,
-                            // where a test can reach it — this closure cannot be
-                            // called from one.
-                            crate::metrics::apply_resolve_stats(&mut snap, &r);
-                            snap
-                        });
+                        let provider = build_snapshot_provider(
+                            pool,
+                            sources,
+                            bandwidth_counters,
+                            client_registry,
+                        );
                         crate::metrics::serve(listener, path, provider).await;
                         Ok(())
                     }
@@ -348,6 +331,38 @@ impl Runtime {
     }
 }
 
+/// Build the `/metrics` scrape callback.
+///
+/// A named function rather than a closure written inline in [`Runtime::run`]:
+/// inline, the only thing a test could reach was the pure
+/// [`metrics::apply_resolve_stats`](crate::metrics::apply_resolve_stats)
+/// helper it calls, so *deleting the call* left every resolver counter
+/// reading zero on a live `/metrics` with the whole suite green. The call site
+/// is the deliverable; this makes it the thing under test.
+fn build_snapshot_provider(
+    pool: Arc<UpstreamPool>,
+    sources: Vec<Arc<GatewaySource>>,
+    bandwidth_counters: Arc<BandwidthCounters>,
+    client_registry: Arc<ClientRegistry>,
+) -> crate::metrics::SnapshotProvider {
+    Arc::new(move || {
+        // Read at scrape time, not cached: `upstream_monitors` was once found
+        // reporting a stale value straight through a total outage, which is
+        // exactly the failure a counter is supposed to make visible.
+        let r = spvirit_server::search_resolve::global_stats();
+        let mut snap = crate::metrics::MetricsSnapshot {
+            clients: pool.names().len() as u64,
+            upstream_monitors: sources
+                .iter()
+                .map(|s| s.upstream_monitor_count() as u64)
+                .sum(),
+            ..crate::metrics::snapshot_from_bandwidth(&bandwidth_counters, &client_registry)
+        };
+        crate::metrics::apply_resolve_stats(&mut snap, &r);
+        snap
+    })
+}
+
 /// Drain `set`, returning the first error encountered (from either a failed
 /// server or a panicked/cancelled task), or `Ok(())` once every server's
 /// `run()` has returned successfully.
@@ -369,6 +384,54 @@ mod tests {
     use super::*;
 
     const BIDI: &str = include_str!("../tests/fixtures/p4p_bidirectional.json");
+
+    /// V2-3: the `/metrics` scrape callback must actually *call*
+    /// `apply_resolve_stats`. Testing the helper alone left the call site
+    /// uncovered — deleting it made every resolver counter on a live
+    /// `/metrics` read zero with a green suite, which is the original
+    /// "nothing can call this closure" finding moved rather than closed.
+    ///
+    /// The counters are process-wide and monotonic, so this asserts on a
+    /// *delta* the test itself produces; a neighbour bumping them concurrently
+    /// can only make the delta larger.
+    #[test]
+    fn the_metrics_provider_reports_the_resolver_counters() {
+        use spvirit_server::pvstore::TryClaim;
+        use spvirit_server::search_resolve::note_try_claim;
+
+        let cfg = GatewayConfig::from_json_str(r#"{ "version":2 }"#).unwrap();
+        let provider = build_snapshot_provider(
+            Arc::new(UpstreamPool::from_config(&cfg)),
+            Vec::new(),
+            Arc::new(BandwidthCounters::new()),
+            Arc::new(ClientRegistry::new()),
+        );
+
+        let before = provider();
+        for _ in 0..7 {
+            note_try_claim(TryClaim::Yes);
+        }
+        for _ in 0..3 {
+            note_try_claim(TryClaim::No);
+        }
+        let after = provider();
+
+        assert!(
+            after.search_try_claim_yes >= before.search_try_claim_yes + 7,
+            "/metrics did not carry the resolver's try_claim_yes counter \
+             (before={}, after={}); the snapshot provider is not applying \
+             `apply_resolve_stats`",
+            before.search_try_claim_yes,
+            after.search_try_claim_yes
+        );
+        assert!(
+            after.search_try_claim_no >= before.search_try_claim_no + 3,
+            "/metrics did not carry the resolver's try_claim_no counter \
+             (before={}, after={})",
+            before.search_try_claim_no,
+            after.search_try_claim_no
+        );
+    }
 
     #[test]
     fn from_config_rejects_invalid_config() {
