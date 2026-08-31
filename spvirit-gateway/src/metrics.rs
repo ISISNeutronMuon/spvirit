@@ -125,6 +125,15 @@ pub struct MetricsSnapshot {
     /// miss traffic: `started` alone cannot tell them apart, because both
     /// look like a steady stream of resolutions.
     pub search_resolve_completed_missing: u64,
+    /// Pattern/wildcard enumerations shed without being answered because the
+    /// enumeration cap was saturated.
+    ///
+    /// A shed pattern query is answered with silence, so this is the *only*
+    /// visible trace of one. A sustained non-zero rate means wildcard/pvlist
+    /// queries are being dropped; a rate that never returns to zero means
+    /// upstreams are hung in `names()` holding every permit, in which case
+    /// pattern queries stay disabled until they recover.
+    pub search_pattern_enum_shed: u64,
 }
 
 /// Copy the resolver's counters into a [`MetricsSnapshot`].
@@ -144,6 +153,7 @@ pub fn apply_resolve_stats(
     snap.search_resolve_dropped_full = r.dropped_full;
     snap.search_resolve_completed_found = r.completed_found;
     snap.search_resolve_completed_missing = r.completed_missing;
+    snap.search_pattern_enum_shed = r.pattern_enum_shed;
 }
 
 /// Sum a `ByteMap`/`ClientRegistry::byhost` style snapshot's byte counts
@@ -341,6 +351,12 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
         "spgateway_search_resolve_completed_missing_total",
         "Background name resolutions that concluded the PV is absent.",
         s.search_resolve_completed_missing,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_pattern_enum_shed_total",
+        "Pattern/wildcard enumerations shed without being answered.",
+        s.search_pattern_enum_shed,
     );
 
     out
@@ -740,6 +756,7 @@ mod tests {
             search_resolve_dropped_full: 66,
             search_resolve_completed_found: 77,
             search_resolve_completed_missing: 88,
+            search_pattern_enum_shed: 99,
             ..Default::default()
         };
         let body = render_prometheus(&snap);
@@ -752,6 +769,7 @@ mod tests {
             ("spgateway_search_resolve_dropped_full_total", 66),
             ("spgateway_search_resolve_completed_found_total", 77),
             ("spgateway_search_resolve_completed_missing_total", 88),
+            ("spgateway_search_pattern_enum_shed_total", 99),
         ] {
             // These only ever increase, so they must be declared `counter` —
             // a gauge would let a scraper compute meaningless rates.
@@ -769,7 +787,7 @@ mod tests {
     /// B-3/MEDIUM-3: the runtime's `SnapshotProvider` closure was the only
     /// place the resolver counters were copied into the snapshot, and nothing
     /// could call it — every field could have been wired to zero, or to the
-    /// wrong source field, and the suite stayed green. Eight distinct values
+    /// wrong source field, and the suite stayed green. Nine distinct values
     /// pin the mapping: a dropped field reports 0 and a swapped pair reports
     /// its neighbour's value, and both fail here.
     #[test]
@@ -783,6 +801,7 @@ mod tests {
             try_claim_yes: 6,
             try_claim_no: 7,
             try_claim_unknown: 8,
+            pattern_enum_shed: 9,
         };
         let mut snap = MetricsSnapshot::default();
         apply_resolve_stats(&mut snap, &stats);
@@ -795,6 +814,7 @@ mod tests {
         assert_eq!(snap.search_try_claim_yes, 6);
         assert_eq!(snap.search_try_claim_no, 7);
         assert_eq!(snap.search_try_claim_unknown, 8);
+        assert_eq!(snap.search_pattern_enum_shed, 9);
 
         // And the rendered body actually carries them, so a bridge that fills
         // the struct but a `render_prometheus` that forgets a line still

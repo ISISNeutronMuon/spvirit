@@ -260,6 +260,42 @@ pub fn collect_visible_pv_names(
 /// and every one of these may be unbounded third-party work in `names()`.
 pub const PATTERN_ENUM_CONCURRENCY: usize = 4;
 
+/// What a search loop must do about the negative half of its reply, after
+/// handing this datagram's pattern queries to [`spawn_pattern_query_reply`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternDispatch {
+    /// The datagram carried no pattern queries; this loop answers as usual.
+    None,
+    /// A spawned task owns the pattern half of the reply, including the duty
+    /// to answer a `response_required` datagram this loop found nothing for.
+    Deferred,
+    /// The enumeration cap was reached and the query was dropped.
+    /// **Nothing** answers the pattern half.
+    Shed,
+}
+
+impl PatternDispatch {
+    /// Whether this loop must withhold a `found=false` response.
+    ///
+    /// `Deferred` withholds it because the spawned task will send the real
+    /// answer. `Shed` withholds it because the query is *undecided*: the
+    /// server may well serve a name matching that pattern, it simply declined
+    /// to look. Answering `found=false` there would be an authoritative "I do
+    /// not serve that" for a name the server does serve, and — unlike
+    /// silence — a retry cannot correct it, because every retry gets the same
+    /// confident lie while the cap stays saturated. Staying silent is exactly
+    /// what [`TryClaim::Unknown`](crate::pvstore::TryClaim::Unknown) does on
+    /// the exact-name path, and search is retry-driven precisely so that an
+    /// undecided query costs a round trip rather than a wrong answer.
+    ///
+    /// Exact names on the same datagram are unaffected: they are answered
+    /// inline, and only the negative-because-nothing-matched response is
+    /// suppressed.
+    fn withholds_negative(self) -> bool {
+        matches!(self, Self::Deferred | Self::Shed)
+    }
+}
+
 /// Answer a datagram's pattern queries on a *separate* task, and tell the
 /// caller whether that task now owns the reply.
 ///
@@ -293,24 +329,27 @@ pub const PATTERN_ENUM_CONCURRENCY: usize = 4;
 /// [`SearchResolver::enqueue`](crate::search_resolve::SearchResolver::enqueue)
 /// does for the same reason.
 ///
-/// Returns `false` if no permit was free (nothing was spawned, and the caller
-/// keeps responsibility for the reply).
+/// See [`PatternDispatch`] for what the return value obliges the caller to do.
 fn spawn_pattern_query_reply<R, Fut>(
     state: &Arc<ServerState>,
     ctx: Option<crate::request_ctx::RequestContext>,
     pattern_requests: Vec<(u32, String)>,
     reply: R,
-) -> bool
+) -> PatternDispatch
 where
     R: FnOnce(Vec<u32>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    if pattern_requests.is_empty() {
+        return PatternDispatch::None;
+    }
     let Ok(permit) = state.pattern_enum_permits.clone().try_acquire_owned() else {
         debug!(
             "search: shedding {} pattern quer(ies); enumeration cap reached",
             pattern_requests.len()
         );
-        return false;
+        crate::search_resolve::note_pattern_enum_shed();
+        return PatternDispatch::Shed;
     };
     let state = state.clone();
     tokio::spawn(async move {
@@ -335,7 +374,7 @@ where
             None => enumerate.await,
         }
     });
-    true
+    PatternDispatch::Deferred
 }
 
 fn build_pvlist_structure(names: &[String]) -> StructureDesc {
@@ -908,7 +947,7 @@ pub async fn run_udp_search(
                 // carrying exactly the cids it used to carry.
                 let seq = payload.seq;
                 let answer_negative = response_required && !found;
-                let deferred = !pattern_requests.is_empty() && {
+                let dispatch = {
                     let socket = socket.clone();
                     spawn_pattern_query_reply(&state, req_ctx, pattern_requests, move |pattern_cids| async move {
                         if pattern_cids.is_empty() && !answer_negative {
@@ -930,8 +969,8 @@ pub async fn run_udp_search(
                         }
                     })
                 };
-                if !found && (deferred || !response_required) {
-                    debug!("UDP search: no immediate matches (deferred={deferred})");
+                if !found && (dispatch.withholds_negative() || !response_required) {
+                    debug!("UDP search: no immediate matches (pattern dispatch={dispatch:?})");
                     continue;
                 }
                 if let Err(e) = socket.send_to(&response, reply_target).await {
@@ -2111,7 +2150,7 @@ pub async fn handle_connection(
                     // one response with exactly the cids it used to carry.
                     let seq = payload.seq;
                     let answer_negative = !found;
-                    let deferred = !pattern_requests.is_empty() && {
+                    let dispatch = {
                         let replier = state.clone();
                         // `handle_connection` runs inside `request_ctx::scope`
                         // and `set_credentials` has already installed the
@@ -2142,7 +2181,7 @@ pub async fn handle_connection(
                             },
                         )
                     };
-                    if found || !deferred {
+                    if found || !dispatch.withholds_negative() {
                         state.registry.send_msg(conn_id, response).await;
                         debug!(
                             "Conn {}: TCP search responded found={} matches={}",

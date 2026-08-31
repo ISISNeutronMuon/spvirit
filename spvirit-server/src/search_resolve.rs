@@ -54,6 +54,17 @@ pub struct ResolveStatsSnapshot {
     pub try_claim_no: u64,
     /// Search names that needed a background resolution.
     pub try_claim_unknown: u64,
+    /// Pattern/wildcard enumerations shed without being answered, because
+    /// [`PATTERN_ENUM_CONCURRENCY`](crate::handler::PATTERN_ENUM_CONCURRENCY)
+    /// permits were all in use.
+    ///
+    /// A shed pattern query is answered with *silence* (the client's retry is
+    /// what gets a decisive answer), so without this counter a wildcard flood
+    /// — or a single upstream hung in `names()` holding every permit — is
+    /// completely invisible in production. Global-only, like the
+    /// `try_claim_*` counters: it is recorded by a free function on the
+    /// search path, which has no per-resolver handle.
+    pub pattern_enum_shed: u64,
 }
 
 #[derive(Debug, Default)]
@@ -66,6 +77,7 @@ struct Stats {
     try_claim_yes: AtomicU64,
     try_claim_no: AtomicU64,
     try_claim_unknown: AtomicU64,
+    pattern_enum_shed: AtomicU64,
 }
 
 impl Stats {
@@ -79,6 +91,7 @@ impl Stats {
             try_claim_yes: AtomicU64::new(0),
             try_claim_no: AtomicU64::new(0),
             try_claim_unknown: AtomicU64::new(0),
+            pattern_enum_shed: AtomicU64::new(0),
         }
     }
 }
@@ -107,6 +120,15 @@ pub fn note_try_claim(outcome: crate::pvstore::TryClaim) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record one shed pattern-query enumeration.
+///
+/// Called from both search paths whenever a pattern query is dropped rather
+/// than answered — no permit was free. Shedding is silent on the wire by
+/// design, so this counter is the only way an operator can see it happening.
+pub fn note_pattern_enum_shed() {
+    GLOBAL.pattern_enum_shed.fetch_add(1, Ordering::Relaxed);
+}
+
 fn snapshot(s: &Stats) -> ResolveStatsSnapshot {
     ResolveStatsSnapshot {
         started: s.started.load(Ordering::Relaxed),
@@ -117,6 +139,7 @@ fn snapshot(s: &Stats) -> ResolveStatsSnapshot {
         try_claim_yes: s.try_claim_yes.load(Ordering::Relaxed),
         try_claim_no: s.try_claim_no.load(Ordering::Relaxed),
         try_claim_unknown: s.try_claim_unknown.load(Ordering::Relaxed),
+        pattern_enum_shed: s.pattern_enum_shed.load(Ordering::Relaxed),
     }
 }
 
