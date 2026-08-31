@@ -5,15 +5,28 @@
 //! registered sources, allowing different backends (in-memory records, hardware
 //! drivers, proxies, etc.) to coexist in a single PVA server. basically what pvxs does with its provider registry.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_types::NtPayload;
 use tokio::sync::{RwLock, mpsc};
 use tracing::debug;
+
+/// How long a resolver outcome stays authoritative.
+///
+/// Short on purpose. The memo exists to make the client's *next* search
+/// decisive, not to be a durable name cache: a PV that appears after the
+/// server started must still become discoverable promptly, and a name whose
+/// upstream has gone must stop being advertised.
+const RESOLVED_TTL: Duration = Duration::from_secs(10);
+
+/// Upper bound on remembered outcomes, so an unbounded stream of distinct
+/// miss-names cannot grow the memo without limit.
+const RESOLVED_CAPACITY: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // PvInfo — metadata returned by Source::claim
@@ -88,6 +101,11 @@ pub trait Source: Send + Sync {
     /// The default does exactly that, so a source that has no cheap answer
     /// needs no implementation. A source that *can* answer from memory should,
     /// because `Yes` is what lets a search be answered on the first datagram.
+    /// This holds even for a source with no cache of its own: an `Unknown`
+    /// still triggers [`SearchResolver`](crate::search_resolve::SearchResolver)
+    /// to resolve the name in the background, and `SourceRegistry` remembers
+    /// the outcome so the requester's retry is answered without another
+    /// round trip.
     ///
     /// A source whose `claim` does no I/O should implement both in terms of
     /// one shared synchronous helper rather than duplicating the predicate —
@@ -234,6 +252,13 @@ pub struct SourceRegistry {
     /// the number of distinct names clients search for, and only ever grown
     /// by a claim that a non-store source won.
     shadow_checked: RwLock<HashSet<String>>,
+    /// Outcomes of background resolutions, keyed by identity as well as name.
+    ///
+    /// `std::sync::Mutex`, never held across an `.await`, and only ever
+    /// `try_lock`ed from the search path — the whole point of this type is
+    /// that the search task cannot block.
+    resolved: Mutex<HashMap<String, (Instant, bool)>>,
+    memo_ttl: Duration,
 }
 
 impl SourceRegistry {
@@ -242,7 +267,67 @@ impl SourceRegistry {
         Self {
             sources: RwLock::new(Vec::new()),
             shadow_checked: RwLock::new(HashSet::new()),
+            resolved: Mutex::new(HashMap::new()),
+            memo_ttl: RESOLVED_TTL,
         }
+    }
+
+    /// Create an empty registry whose resolver memo expires after `ttl`
+    /// instead of the default [`RESOLVED_TTL`]. Test-only knob.
+    #[cfg(test)]
+    pub(crate) fn new_with_memo_ttl(ttl: Duration) -> Self {
+        let mut reg = Self::new();
+        reg.memo_ttl = ttl;
+        reg
+    }
+
+    /// Number of outcomes currently held in the resolver memo. Test-only.
+    #[cfg(test)]
+    pub(crate) fn memo_len(&self) -> usize {
+        self.resolved.lock().unwrap().len()
+    }
+
+    /// Memo key: the identity that asked, plus the name. Keying on the bare
+    /// name would let one client's successful resolution tell a *different*
+    /// client that a PV it may not see exists.
+    fn memo_key(name: &str) -> String {
+        let (user, host) = match crate::request_ctx::current_request() {
+            Some(ctx) => (ctx.user.unwrap_or_default(), ctx.host.unwrap_or_default()),
+            None => (String::new(), String::new()),
+        };
+        format!("{user}\u{1}{host}\u{1}{name}")
+    }
+
+    /// Record the outcome of a background resolution for the current identity.
+    pub fn note_resolved(&self, name: &str, found: bool) {
+        let key = Self::memo_key(name);
+        let now = Instant::now();
+        let Ok(mut memo) = self.resolved.lock() else {
+            return;
+        };
+        if memo.len() >= RESOLVED_CAPACITY {
+            memo.retain(|_, (at, _)| now.duration_since(*at) < self.memo_ttl);
+            if memo.len() >= RESOLVED_CAPACITY {
+                // Still full of live entries: drop the oldest rather than grow.
+                if let Some(oldest) = memo
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(k, _)| k.clone())
+                {
+                    memo.remove(&oldest);
+                }
+            }
+        }
+        memo.insert(key, (now, found));
+    }
+
+    /// The remembered outcome for `name` under the current identity, if it has
+    /// not expired. `try_lock` — a contended memo answers `None`, never blocks.
+    fn recall(&self, name: &str) -> Option<bool> {
+        let key = Self::memo_key(name);
+        let memo = self.resolved.try_lock().ok()?;
+        let (at, found) = memo.get(&key)?;
+        (Instant::now().duration_since(*at) < self.memo_ttl).then_some(*found)
     }
 
     /// Register an ordinary source. Sources may shadow stores and each other.
@@ -344,9 +429,13 @@ impl SourceRegistry {
     ///
     /// `Yes` as soon as any source owns the name (matching `claim`'s
     /// first-wins order). `No` only when *every* source is decisive that it
-    /// does not. Any single `Unknown`, or contention on the sources lock,
-    /// makes the whole answer `Unknown` — the registry must never assert a
-    /// name is absent when a source it did not consult might serve it.
+    /// does not. Otherwise the sources are collectively `Unknown` — a state
+    /// this method resolves further by consulting the resolver memo (see
+    /// [`note_resolved`](Self::note_resolved)) before finally answering
+    /// `Unknown` itself. A source that actually knows always outranks the
+    /// memo. Contention on the sources lock also answers `Unknown` — the
+    /// registry must never assert a name is absent when a source it did not
+    /// consult might serve it.
     ///
     /// Synchronous by design: this is called from the search responder, and
     /// the entire point is that it cannot await.
@@ -365,7 +454,11 @@ impl SourceRegistry {
         if all_decisive {
             TryClaim::No
         } else {
-            TryClaim::Unknown
+            match self.recall(name) {
+                Some(true) => TryClaim::Yes,
+                Some(false) => TryClaim::No,
+                None => TryClaim::Unknown,
+            }
         }
     }
 
@@ -773,5 +866,99 @@ mod tests {
     async fn an_empty_registry_is_decisive_that_it_has_nothing() {
         let reg = SourceRegistry::new();
         assert_eq!(reg.try_claim("ANYTHING"), TryClaim::No);
+    }
+
+    #[tokio::test]
+    async fn a_resolved_name_becomes_decisive_even_for_a_source_that_never_probes() {
+        // StubSource does not override try_claim, so it always answers Unknown —
+        // the same shape as RecordFieldSource, GroupSource and IocSource.
+        let reg = SourceRegistry::new();
+        reg.add("stub", 0, Arc::new(StubSource::new(&["REAL:PV"]))).await;
+
+        assert_eq!(reg.try_claim("REAL:PV"), TryClaim::Unknown);
+        let found = reg.claim("REAL:PV").await.is_some();
+        assert!(found, "control: claim must find it");
+        reg.note_resolved("REAL:PV", found);
+
+        assert_eq!(
+            reg.try_claim("REAL:PV"),
+            TryClaim::Yes,
+            "a resolved name must be answerable without another round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resolved_miss_is_remembered_as_no() {
+        let reg = SourceRegistry::new();
+        reg.add("stub", 0, Arc::new(StubSource::new(&["REAL:PV"]))).await;
+        reg.note_resolved("GONE:PV", false);
+        assert_eq!(reg.try_claim("GONE:PV"), TryClaim::No);
+    }
+
+    #[tokio::test]
+    async fn a_decisive_source_outranks_the_memo() {
+        // DecisiveSource (already in this module) answers Yes for its names.
+        let reg = SourceRegistry::new();
+        reg.add("dec", 0, Arc::new(DecisiveSource::new(&["LIVE:PV"]))).await;
+        reg.note_resolved("LIVE:PV", false); // stale, contradicted by the source
+        assert_eq!(reg.try_claim("LIVE:PV"), TryClaim::Yes);
+    }
+
+    #[tokio::test]
+    async fn a_memo_entry_expires() {
+        let reg = SourceRegistry::new_with_memo_ttl(Duration::from_millis(40));
+        reg.add("stub", 0, Arc::new(StubSource::new(&["REAL:PV"]))).await;
+        reg.note_resolved("REAL:PV", true);
+        assert_eq!(reg.try_claim("REAL:PV"), TryClaim::Yes);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert_eq!(
+            reg.try_claim("REAL:PV"),
+            TryClaim::Unknown,
+            "an expired memo must fall back to Unknown, never to a stale answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_memo_is_bounded() {
+        let reg = SourceRegistry::new();
+        for i in 0..(RESOLVED_CAPACITY * 2) {
+            reg.note_resolved(&format!("MISS:{i}"), false);
+        }
+        assert!(
+            reg.memo_len() <= RESOLVED_CAPACITY,
+            "memo grew past its bound: {}",
+            reg.memo_len()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_memo_does_not_leak_a_pv_across_identities() {
+        use crate::request_ctx::RequestContext;
+
+        let reg = Arc::new(SourceRegistry::new());
+        reg.add("stub", 0, Arc::new(StubSource::new(&["SECRET:PV"]))).await;
+
+        let a = RequestContext {
+            peer: "10.0.0.1:5075".parse().unwrap(),
+            user: Some("alice".into()),
+            host: Some("hosta".into()),
+        };
+        let b = RequestContext {
+            peer: "10.0.0.2:5075".parse().unwrap(),
+            user: Some("bob".into()),
+            host: Some("hostb".into()),
+        };
+
+        let r = reg.clone();
+        crate::request_ctx::scope_with(a, async move { r.note_resolved("SECRET:PV", true) }).await;
+
+        let r = reg.clone();
+        let seen_by_bob =
+            crate::request_ctx::scope_with(b, async move { r.try_claim("SECRET:PV") }).await;
+        assert_eq!(
+            seen_by_bob,
+            TryClaim::Unknown,
+            "alice's resolution must not tell bob the PV exists"
+        );
     }
 }

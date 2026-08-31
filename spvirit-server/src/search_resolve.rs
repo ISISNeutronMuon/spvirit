@@ -140,17 +140,28 @@ impl SearchResolver {
                 name: name.clone(),
             };
             let started = Instant::now();
+            let log_name = name.clone();
+            // `note_resolved` must run under the same identity `try_claim` will
+            // later be read under — inside `scope_with`, not after it. Called
+            // after the scope ends, the memo key would derive from an empty
+            // identity and the searching client's own `try_claim` (evaluated
+            // under its real identity) would never see the entry.
+            let resolve = async move {
+                let found = sources.claim(&name).await.is_some();
+                sources.note_resolved(&name, found);
+                found
+            };
             let found = match ctx {
-                Some(ctx) => request_ctx::scope_with(ctx, sources.claim(&name)).await,
-                None => sources.claim(&name).await,
-            }
-            .is_some();
+                Some(ctx) => request_ctx::scope_with(ctx, resolve).await,
+                None => resolve.await,
+            };
 
             if found {
                 stats.completed_found.fetch_add(1, Ordering::Relaxed);
             } else {
                 stats.completed_missing.fetch_add(1, Ordering::Relaxed);
             }
+            let name = log_name;
             tracing::debug!(
                 "search resolve: '{name}' found={found} in {:?}",
                 started.elapsed()
@@ -417,5 +428,79 @@ mod tests {
             "name was stranded in `inflight` after the first claim panicked"
         );
         assert_eq!(stats.deduped, 0);
+    }
+
+    #[tokio::test]
+    async fn a_completed_resolve_records_its_outcome_in_the_registry() {
+        // SlowSource never answers try_claim (always Unknown), the same shape
+        // as an uncached in-tree source. Build one that actually finds the
+        // name so the memo has something true to remember.
+        struct FoundSlowSource(Arc<SlowSource>);
+
+        impl Source for FoundSlowSource {
+            fn try_claim(&self, name: &str) -> TryClaim {
+                self.0.try_claim(name)
+            }
+
+            fn claim(
+                &self,
+                _name: &str,
+            ) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+                self.0.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    tokio::time::sleep(self.0.delay).await;
+                    Some(PvInfo {
+                        descriptor: spvirit_codec::spvd_decode::StructureDesc::default(),
+                        writable: false,
+                    })
+                })
+            }
+
+            fn get(&self, n: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+                self.0.get(n)
+            }
+
+            fn put(
+                &self,
+                n: &str,
+                v: &DecodedValue,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+            {
+                self.0.put(n, v)
+            }
+
+            fn subscribe(
+                &self,
+                n: &str,
+            ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+                self.0.subscribe(n)
+            }
+
+            fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+                self.0.names()
+            }
+        }
+
+        let inner = SlowSource::new(Duration::from_millis(20));
+        let reg = Arc::new(SourceRegistry::new());
+        reg.add("found-slow", 0, Arc::new(FoundSlowSource(inner.clone())))
+            .await;
+
+        assert_eq!(
+            reg.try_claim("FOUND:PV"),
+            TryClaim::Unknown,
+            "control: the source cannot answer without I/O"
+        );
+
+        let resolver = SearchResolver::new(reg.clone());
+        resolver.enqueue("FOUND:PV");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(resolver.stats().completed_found, 1);
+        assert_eq!(
+            reg.try_claim("FOUND:PV"),
+            TryClaim::Yes,
+            "the resolver's outcome must be readable without another round trip"
+        );
     }
 }
