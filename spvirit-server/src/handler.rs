@@ -2330,6 +2330,43 @@ mod tests {
     use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket as TokioUdpSocket;
 
+    /// V6 LOW-1. The bound's *magnitude* was unpinned: `from_secs(30)` →
+    /// `from_millis(30)`, the classic units slip, survived the whole suite.
+    /// The paused-clock test asserts only that *some* bound exists, and it
+    /// sleeps `PATTERN_ENUM_TIMEOUT + 1s`, so it stays green whatever the
+    /// constant says.
+    ///
+    /// The constant is load-bearing in both directions, which is why a range
+    /// rather than an equality: too small and a legitimately slow enumeration
+    /// — the proxying source the doc comment names, bounded by an EPICS
+    /// client's few-second search budget — is abandoned and counted as a stuck
+    /// source, turning a slow gateway into one that answers no wildcards at
+    /// all. Too large and a hung source holds its permit long enough that
+    /// `PATTERN_ENUM_CONCURRENCY` of them disable pattern queries for what an
+    /// operator experiences as forever, which is the defect the bound exists
+    /// to remove.
+    #[test]
+    fn the_pattern_enumeration_bound_is_seconds_not_milliseconds() {
+        assert!(
+            PATTERN_ENUM_TIMEOUT >= StdDuration::from_secs(5),
+            "PATTERN_ENUM_TIMEOUT is {PATTERN_ENUM_TIMEOUT:?}: shorter than the \
+             few-second search/connect budget of the slowest legitimate \
+             enumeration, so an ordinary slow source would be abandoned and \
+             counted as a stuck one. A `from_secs`/`from_millis` slip lands \
+             exactly here."
+        );
+        assert!(
+            PATTERN_ENUM_TIMEOUT <= StdDuration::from_secs(120),
+            "PATTERN_ENUM_TIMEOUT is {PATTERN_ENUM_TIMEOUT:?}: long enough that \
+             {PATTERN_ENUM_CONCURRENCY} hung sources disable pattern queries \
+             for what an operator experiences as forever, which is the defect \
+             the bound exists to remove."
+        );
+        // The documented value, so a deliberate retune is a visible edit here
+        // and not a silent one.
+        assert_eq!(PATTERN_ENUM_TIMEOUT, StdDuration::from_secs(30));
+    }
+
     /// V6 MEDIUM-2. `collect_visible_pv_names` sorts and *then* truncates, so
     /// `pvlist_max` discloses the alphabetically-first names. Swapping the two
     /// steps discloses a different set entirely — the names that happened to
