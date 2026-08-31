@@ -276,12 +276,23 @@ impl Runtime {
                         let bound = listener.local_addr().map_err(|e| e.to_string())?;
                         tracing::info!("spgateway: metrics endpoint on http://{bound}{path}");
                         let provider: crate::metrics::SnapshotProvider = Arc::new(move || {
+                            // Read at scrape time, not cached: `upstream_monitors`
+                            // was once found reporting a stale value straight
+                            // through a total outage, which is exactly the
+                            // failure a counter is supposed to make visible.
+                            let r = spvirit_server::search_resolve::global_stats();
                             crate::metrics::MetricsSnapshot {
                                 clients: pool.names().len() as u64,
                                 upstream_monitors: sources
                                     .iter()
                                     .map(|s| s.upstream_monitor_count() as u64)
                                     .sum(),
+                                search_try_claim_yes: r.try_claim_yes,
+                                search_try_claim_no: r.try_claim_no,
+                                search_try_claim_unknown: r.try_claim_unknown,
+                                search_resolve_started: r.started,
+                                search_resolve_deduped: r.deduped,
+                                search_resolve_dropped_full: r.dropped_full,
                                 ..crate::metrics::snapshot_from_bandwidth(
                                     &bandwidth_counters,
                                     &client_registry,

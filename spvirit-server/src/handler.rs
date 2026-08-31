@@ -747,7 +747,9 @@ pub async fn run_udp_search(
                         // client's next search retry — awaiting resolution here
                         // would stop this task reading datagrams for every
                         // other client, which is the whole defect.
-                        match state.sources.try_claim(name) {
+                        let outcome = state.sources.try_claim(name);
+                        crate::search_resolve::note_try_claim(outcome);
+                        match outcome {
                             TryClaim::Yes => {
                                 cids.push(*cid);
                                 continue;
@@ -1939,7 +1941,9 @@ pub async fn handle_connection(
                             cids.push(*cid);
                             continue;
                         }
-                        match state.sources.try_claim(name) {
+                        let outcome = state.sources.try_claim(name);
+                        crate::search_resolve::note_try_claim(outcome);
+                        match outcome {
                             TryClaim::Yes => {
                                 cids.push(*cid);
                                 continue;

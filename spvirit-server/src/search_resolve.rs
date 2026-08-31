@@ -48,6 +48,12 @@ pub struct ResolveStatsSnapshot {
     pub completed_found: u64,
     /// Resolutions that concluded the PV is absent.
     pub completed_missing: u64,
+    /// Search names answered outright from memory.
+    pub try_claim_yes: u64,
+    /// Search names known to be absent without any I/O.
+    pub try_claim_no: u64,
+    /// Search names that needed a background resolution.
+    pub try_claim_unknown: u64,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +63,61 @@ struct Stats {
     dropped_full: AtomicU64,
     completed_found: AtomicU64,
     completed_missing: AtomicU64,
+    try_claim_yes: AtomicU64,
+    try_claim_no: AtomicU64,
+    try_claim_unknown: AtomicU64,
+}
+
+impl Stats {
+    const fn new() -> Self {
+        Self {
+            started: AtomicU64::new(0),
+            deduped: AtomicU64::new(0),
+            dropped_full: AtomicU64::new(0),
+            completed_found: AtomicU64::new(0),
+            completed_missing: AtomicU64::new(0),
+            try_claim_yes: AtomicU64::new(0),
+            try_claim_no: AtomicU64::new(0),
+            try_claim_unknown: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Process-wide totals, read by the `/metrics` endpoint.
+///
+/// Global rather than per-resolver because the only consumer aggregates
+/// across every server in the process anyway, and reaching a per-server
+/// resolver from the gateway runtime would mean threading a handle through
+/// three layers for diagnostics alone. Per-resolver counters still exist and
+/// are what the unit tests assert on, so tests never contend on this.
+static GLOBAL: Stats = Stats::new();
+
+/// Snapshot the process-wide counters.
+pub fn global_stats() -> ResolveStatsSnapshot {
+    snapshot(&GLOBAL)
+}
+
+/// Record one `try_claim` outcome from the search path.
+pub fn note_try_claim(outcome: crate::pvstore::TryClaim) {
+    let counter = match outcome {
+        crate::pvstore::TryClaim::Yes => &GLOBAL.try_claim_yes,
+        crate::pvstore::TryClaim::No => &GLOBAL.try_claim_no,
+        crate::pvstore::TryClaim::Unknown => &GLOBAL.try_claim_unknown,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+fn snapshot(s: &Stats) -> ResolveStatsSnapshot {
+    ResolveStatsSnapshot {
+        started: s.started.load(Ordering::Relaxed),
+        deduped: s.deduped.load(Ordering::Relaxed),
+        dropped_full: s.dropped_full.load(Ordering::Relaxed),
+        completed_found: s.completed_found.load(Ordering::Relaxed),
+        completed_missing: s.completed_missing.load(Ordering::Relaxed),
+        try_claim_yes: s.try_claim_yes.load(Ordering::Relaxed),
+        try_claim_no: s.try_claim_no.load(Ordering::Relaxed),
+        try_claim_unknown: s.try_claim_unknown.load(Ordering::Relaxed),
+    }
 }
 
 /// Resolves PV names off the search task, under a hard concurrency cap.
@@ -90,7 +151,7 @@ impl SearchResolver {
             sources,
             permits: Arc::new(Semaphore::new(RESOLVE_CONCURRENCY)),
             inflight: Arc::new(Mutex::new(HashSet::new())),
-            stats: Arc::new(Stats::default()),
+            stats: Arc::new(Stats::new()),
         }
     }
 
@@ -107,6 +168,7 @@ impl SearchResolver {
         // job that will not run.
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             self.stats.dropped_full.fetch_add(1, Ordering::Relaxed);
+            GLOBAL.dropped_full.fetch_add(1, Ordering::Relaxed);
             return;
         };
         // A single allocation, shared between the `inflight` set and the
@@ -116,10 +178,12 @@ impl SearchResolver {
             let mut inflight = self.inflight.lock().unwrap();
             if !inflight.insert(name.clone()) {
                 self.stats.deduped.fetch_add(1, Ordering::Relaxed);
+                GLOBAL.deduped.fetch_add(1, Ordering::Relaxed);
                 return; // `permit` drops here, releasing it.
             }
         }
         self.stats.started.fetch_add(1, Ordering::Relaxed);
+        GLOBAL.started.fetch_add(1, Ordering::Relaxed);
 
         // Captured now, on the task that holds the request's task-local; a
         // spawned task does not inherit it.
@@ -158,8 +222,10 @@ impl SearchResolver {
 
             if found {
                 stats.completed_found.fetch_add(1, Ordering::Relaxed);
+                GLOBAL.completed_found.fetch_add(1, Ordering::Relaxed);
             } else {
                 stats.completed_missing.fetch_add(1, Ordering::Relaxed);
+                GLOBAL.completed_missing.fetch_add(1, Ordering::Relaxed);
             }
             tracing::debug!(
                 "search resolve: '{name}' found={found} in {:?}",
@@ -169,13 +235,7 @@ impl SearchResolver {
     }
 
     pub fn stats(&self) -> ResolveStatsSnapshot {
-        ResolveStatsSnapshot {
-            started: self.stats.started.load(Ordering::Relaxed),
-            deduped: self.stats.deduped.load(Ordering::Relaxed),
-            dropped_full: self.stats.dropped_full.load(Ordering::Relaxed),
-            completed_found: self.stats.completed_found.load(Ordering::Relaxed),
-            completed_missing: self.stats.completed_missing.load(Ordering::Relaxed),
-        }
+        snapshot(&self.stats)
     }
 }
 
@@ -514,5 +574,35 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// The `/metrics` endpoint reads a process-global rather than a
+    /// per-resolver handle (see the plan's Task 6 ruling), so the global must
+    /// actually advance when work happens. Deliberately asserts on deltas:
+    /// other tests in this binary share the global.
+    #[tokio::test]
+    async fn the_global_counters_advance_with_real_work() {
+        let before = global_stats();
+        let src = SlowSource::new(Duration::from_millis(20));
+        let resolver = SearchResolver::new(registry_with(src).await);
+        resolver.enqueue("GLOBAL:PV");
+        resolver.enqueue("GLOBAL:PV"); // deduped
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = global_stats();
+        assert!(after.started >= before.started + 1);
+        assert!(after.deduped >= before.deduped + 1);
+    }
+
+    #[test]
+    fn note_try_claim_counts_each_outcome_separately() {
+        let before = global_stats();
+        note_try_claim(TryClaim::Yes);
+        note_try_claim(TryClaim::No);
+        note_try_claim(TryClaim::No);
+        note_try_claim(TryClaim::Unknown);
+        let after = global_stats();
+        assert!(after.try_claim_yes >= before.try_claim_yes + 1);
+        assert!(after.try_claim_no >= before.try_claim_no + 2);
+        assert!(after.try_claim_unknown >= before.try_claim_unknown + 1);
     }
 }

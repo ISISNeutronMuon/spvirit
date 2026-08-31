@@ -102,6 +102,20 @@ pub struct MetricsSnapshot {
     pub us_bypv_tx_bytes: u64,
     pub us_byhost_rx_bytes: u64,
     pub us_byhost_tx_bytes: u64,
+    /// Search names answered from memory, needing no I/O.
+    pub search_try_claim_yes: u64,
+    /// Search names known absent without any I/O.
+    pub search_try_claim_no: u64,
+    /// Search names that required a background resolution.
+    pub search_try_claim_unknown: u64,
+    /// Background resolutions started.
+    pub search_resolve_started: u64,
+    /// Resolutions suppressed because the name was already resolving.
+    pub search_resolve_deduped: u64,
+    /// Resolutions shed because the concurrency cap was exhausted. A
+    /// non-zero rate here means searches are being dropped under load —
+    /// the signal that was entirely invisible during the observed outage.
+    pub search_resolve_dropped_full: u64,
 }
 
 /// Sum a `ByteMap`/`ClientRegistry::byhost` style snapshot's byte counts
@@ -149,7 +163,7 @@ pub type SnapshotProvider = Arc<dyn Fn() -> MetricsSnapshot + Send + Sync>;
 pub fn render_prometheus(s: &MetricsSnapshot) -> String {
     let mut out = String::with_capacity(2048);
 
-    fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
+    fn metric(out: &mut String, name: &str, help: &str, kind: &str, value: u64) {
         out.push_str("# HELP ");
         out.push_str(name);
         out.push(' ');
@@ -157,11 +171,21 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
         out.push('\n');
         out.push_str("# TYPE ");
         out.push_str(name);
-        out.push_str(" gauge\n");
+        out.push(' ');
+        out.push_str(kind);
+        out.push('\n');
         out.push_str(name);
         out.push(' ');
         out.push_str(&value.to_string());
         out.push('\n');
+    }
+
+    fn gauge(out: &mut String, name: &str, help: &str, value: u64) {
+        metric(out, name, help, "gauge", value);
+    }
+
+    fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+        metric(out, name, help, "counter", value);
     }
 
     gauge(
@@ -241,6 +265,42 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
         "spgateway_us_byhost_tx_bytes",
         "Cumulative upstream bytes sent, summed across all hosts.",
         s.us_byhost_tx_bytes,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_try_claim_yes_total",
+        "Search names answered from memory with no I/O.",
+        s.search_try_claim_yes,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_try_claim_no_total",
+        "Search names known to be absent with no I/O.",
+        s.search_try_claim_no,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_try_claim_unknown_total",
+        "Search names that required a background resolution.",
+        s.search_try_claim_unknown,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_started_total",
+        "Background name resolutions started.",
+        s.search_resolve_started,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_deduped_total",
+        "Resolutions suppressed because the name was already resolving.",
+        s.search_resolve_deduped,
+    );
+    counter(
+        &mut out,
+        "spgateway_search_resolve_dropped_full_total",
+        "Resolutions shed because the concurrency cap was exhausted.",
+        s.search_resolve_dropped_full,
     );
 
     out
@@ -627,5 +687,38 @@ mod tests {
             "resp was: {resp}"
         );
         server.abort();
+    }
+
+    #[test]
+    fn render_emits_the_search_resolver_counters_as_counters_not_gauges() {
+        let snap = MetricsSnapshot {
+            search_try_claim_yes: 11,
+            search_try_claim_no: 22,
+            search_try_claim_unknown: 33,
+            search_resolve_started: 44,
+            search_resolve_deduped: 55,
+            search_resolve_dropped_full: 66,
+            ..Default::default()
+        };
+        let body = render_prometheus(&snap);
+        for (name, expected) in [
+            ("spgateway_search_try_claim_yes_total", 11),
+            ("spgateway_search_try_claim_no_total", 22),
+            ("spgateway_search_try_claim_unknown_total", 33),
+            ("spgateway_search_resolve_started_total", 44),
+            ("spgateway_search_resolve_deduped_total", 55),
+            ("spgateway_search_resolve_dropped_full_total", 66),
+        ] {
+            // These only ever increase, so they must be declared `counter` —
+            // a gauge would let a scraper compute meaningless rates.
+            assert!(
+                body.contains(&format!("# TYPE {name} counter\n")),
+                "expected {name} to be a counter"
+            );
+            assert!(
+                body.contains(&format!("\n{name} {expected}\n")),
+                "expected `{name} {expected}` in body, got:\n{body}"
+            );
+        }
     }
 }
