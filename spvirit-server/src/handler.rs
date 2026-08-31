@@ -115,6 +115,9 @@ pub struct ServerState {
     /// only constructor and every server wants one; there is no configuration
     /// to thread through.
     pub search_resolver: Arc<crate::search_resolve::SearchResolver>,
+    /// Permits for [`spawn_pattern_query_reply`] — the concurrency bound on
+    /// pattern-query enumerations running off the search task.
+    pub pattern_enum_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl ServerState {
@@ -149,6 +152,7 @@ impl ServerState {
             client_registry,
             bandwidth_counters,
             search_resolver,
+            pattern_enum_permits: Arc::new(tokio::sync::Semaphore::new(PATTERN_ENUM_CONCURRENCY)),
         }
     }
 }
@@ -245,37 +249,74 @@ pub fn collect_visible_pv_names(
     names
 }
 
-/// The pvlist-visible name list for one search datagram — computed only when
-/// that datagram can actually read it.
+/// Maximum simultaneous pattern-query enumerations, per server.
+///
+/// Deliberately its own budget rather than a share of
+/// [`RESOLVE_CONCURRENCY`](crate::search_resolve::RESOLVE_CONCURRENCY): the
+/// two are independent failure domains. A wildcard flood must not be able to
+/// consume the permits that exact-name resolution needs, and eight upstreams
+/// hung in `claim` must not stop pattern queries being answered. Four is
+/// ample — a pattern query is a rare, non-latency-critical operator action,
+/// and every one of these may be unbounded third-party work in `names()`.
+pub const PATTERN_ENUM_CONCURRENCY: usize = 4;
+
+/// Answer a datagram's pattern queries on a *separate* task, and tell the
+/// caller whether that task now owns the reply.
 ///
 /// `SourceRegistry::names()` awaits *every* registered source's `names()`,
 /// which for a proxying or Python-backed source is unbounded third-party
 /// work, and both search loops run on a single task shared by every client.
-/// Paying it unconditionally per datagram therefore reinstates exactly the
-/// head-of-line stall that [`Source::try_claim`](crate::pvstore::Source::try_claim)
-/// exists to remove — and it is nearly always wasted, because `visible_names`
-/// is read only for a pattern query, and only while pvlist is enabled.
+/// Doing it inline reinstates exactly the head-of-line stall that
+/// [`Source::try_claim`](crate::pvstore::Source::try_claim) exists to remove,
+/// and — because `is_pattern_query` tests bytes the remote peer chooses — it
+/// is reachable from one unauthenticated datagram naming `"*"`. No predicate
+/// over attacker-controlled input can gate it safely, so the enumeration and
+/// the reply it feeds both move off the search task entirely; the loop
+/// continues to the next datagram immediately.
 ///
-/// The guard here must stay in lockstep with the condition on the only
-/// consumer of the returned list (the `pvlist_mode != Off && is_pattern_query`
-/// branch in both search loops): a datagram that would read the list must
-/// never be handed the empty one.
-async fn visible_names_for_search(
-    state: &ServerState,
-    pv_requests: &[(u32, String)],
-) -> Vec<String> {
-    if state.pvlist_mode == PvListMode::Off
-        || !pv_requests.iter().any(|(_, name)| is_pattern_query(name))
-    {
-        return Vec::new();
-    }
-    let all_names = state.sources.names().await;
-    collect_visible_pv_names(
-        &all_names,
-        state.pvlist_mode,
-        state.pvlist_allow_pattern.as_ref(),
-        state.pvlist_max,
-    )
+/// A permit is taken *before* spawning and the work is shed rather than
+/// queued if none is free — the same ruling, for the same reason, as
+/// [`SearchResolver::enqueue`](crate::search_resolve::SearchResolver::enqueue):
+/// under a flood, delaying the work only converts a CPU problem into an
+/// unbounded-task problem, and search is retry-driven anyway. A shed pattern
+/// query behaves exactly like one that matched nothing.
+///
+/// Returns `false` if no permit was free (nothing was spawned, and the caller
+/// keeps responsibility for the reply).
+fn spawn_pattern_query_reply<R, Fut>(
+    state: &Arc<ServerState>,
+    pattern_requests: Vec<(u32, String)>,
+    reply: R,
+) -> bool
+where
+    R: FnOnce(Vec<u32>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let Ok(permit) = state.pattern_enum_permits.clone().try_acquire_owned() else {
+        debug!(
+            "search: shedding {} pattern quer(ies); enumeration cap reached",
+            pattern_requests.len()
+        );
+        return false;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let all_names = state.sources.names().await;
+        let visible = collect_visible_pv_names(
+            &all_names,
+            state.pvlist_mode,
+            state.pvlist_allow_pattern.as_ref(),
+            state.pvlist_max,
+        );
+        let cids: Vec<u32> = pattern_requests
+            .iter()
+            .filter(|(_, name)| visible.iter().any(|pv| wildcard_match(name, pv)))
+            .map(|(cid, _)| *cid)
+            .collect();
+        reply(cids).await;
+    });
+    true
 }
 
 fn build_pvlist_structure(names: &[String]) -> StructureDesc {
@@ -708,7 +749,9 @@ pub async fn run_udp_search(
     advertise_ip: Option<IpAddr>,
     multicast_iface: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let socket = bind_udp_search_socket(addr)?;
+    // `Arc` so a pattern-query reply can be sent from the task that computed
+    // it, without that computation ever running on this loop.
+    let socket = Arc::new(bind_udp_search_socket(addr)?);
     socket.set_broadcast(true)?;
     if let Some(iface) = multicast_iface {
         const PVA_MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
@@ -758,10 +801,9 @@ pub async fn run_udp_search(
                     debug!("UDP search: no compatible protocol (tcp not accepted)");
                     continue;
                 }
-                let visible_names =
-                    visible_names_for_search(&state, &payload.pv_requests).await;
-                let cids = crate::request_ctx::scope(peer, async {
+                let (cids, pattern_requests) = crate::request_ctx::scope(peer, async {
                     let mut cids = Vec::new();
+                    let mut pattern_requests: Vec<(u32, String)> = Vec::new();
                     for (cid, name) in &payload.pv_requests {
                         if is_virtual_event_pv(name)
                             || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
@@ -793,23 +835,18 @@ pub async fn run_udp_search(
                             }
                             TryClaim::No => {}
                         }
-                        if state.pvlist_mode != PvListMode::Off
-                            && is_pattern_query(name)
-                            && visible_names.iter().any(|pv| wildcard_match(name, pv))
-                        {
-                            cids.push(*cid);
+                        // Answered off this task: matching needs the full
+                        // enumeration, which is unbounded third-party work.
+                        if state.pvlist_mode != PvListMode::Off && is_pattern_query(name) {
+                            pattern_requests.push((*cid, name.clone()));
                         }
                     }
-                    cids
+                    (cids, pattern_requests)
                 })
                 .await;
                 let response_required = (payload.mask & 0x01) != 0;
                 let server_discovery_ping = payload.pv_requests.is_empty();
                 let found = server_discovery_ping || !cids.is_empty();
-                if !found && !response_required {
-                    debug!("UDP search: no matches and response not required");
-                    continue;
-                }
                 // `Some(0.0.0.0)` (all-interface bind, no explicit advertise IP)
                 // is treated as unset so we fall through to the bound socket
                 // address and finally to inferring the local IP toward this
@@ -842,6 +879,39 @@ pub async fn run_udp_search(
                     is_be,
                 );
                 let reply_target = search_reply_target(&payload.addr, payload.port, peer);
+                // Hand the pattern queries to their own task. If it takes
+                // them, it also inherits the duty to answer a
+                // `response_required` datagram this loop found nothing for —
+                // so a wildcard-only search still gets exactly one reply,
+                // carrying exactly the cids it used to carry.
+                let seq = payload.seq;
+                let answer_negative = response_required && !found;
+                let deferred = !pattern_requests.is_empty() && {
+                    let socket = socket.clone();
+                    spawn_pattern_query_reply(&state, pattern_requests, move |pattern_cids| async move {
+                        if pattern_cids.is_empty() && !answer_negative {
+                            return;
+                        }
+                        let response = encode_search_response(
+                            guid,
+                            seq,
+                            addr_bytes,
+                            tcp_port,
+                            "tcp",
+                            !pattern_cids.is_empty(),
+                            &pattern_cids,
+                            version,
+                            is_be,
+                        );
+                        if let Err(e) = socket.send_to(&response, reply_target).await {
+                            debug!("UDP search: failed sending pattern reply to {reply_target}: {e}");
+                        }
+                    })
+                };
+                if !found && (deferred || !response_required) {
+                    debug!("UDP search: no immediate matches (deferred={deferred})");
+                    continue;
+                }
                 if let Err(e) = socket.send_to(&response, reply_target).await {
                     debug!(
                         "UDP search: failed sending {} matches to {}: {}",
@@ -1953,9 +2023,8 @@ pub async fn handle_connection(
                         .iter()
                         .any(|p| p.eq_ignore_ascii_case("tcp"));
                 if accepts_tcp {
-                    let visible_names =
-                        visible_names_for_search(&state, &payload.pv_requests).await;
                     let mut cids = Vec::new();
+                    let mut pattern_requests: Vec<(u32, String)> = Vec::new();
                     for (cid, name) in &payload.pv_requests {
                         if is_virtual_event_pv(name)
                             || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
@@ -1978,11 +2047,14 @@ pub async fn handle_connection(
                             }
                             TryClaim::No => {}
                         }
-                        if state.pvlist_mode != PvListMode::Off
-                            && is_pattern_query(name)
-                            && visible_names.iter().any(|pv| wildcard_match(name, pv))
-                        {
-                            cids.push(*cid);
+                        // Same ruling as the UDP loop: the enumeration a
+                        // pattern query needs is unbounded third-party work
+                        // and must not run on a task that serves other names.
+                        // This one serves a whole name-server connection —
+                        // the `EPICS_PVA_NAME_SERVERS` route the gateway is
+                        // deployed on.
+                        if state.pvlist_mode != PvListMode::Off && is_pattern_query(name) {
+                            pattern_requests.push((*cid, name.clone()));
                         }
                     }
                     let server_discovery_ping = payload.pv_requests.is_empty();
@@ -2010,13 +2082,47 @@ pub async fn handle_connection(
                         version,
                         is_be,
                     );
-                    state.registry.send_msg(conn_id, response).await;
-                    debug!(
-                        "Conn {}: TCP search responded found={} matches={}",
-                        conn_id,
-                        found,
-                        cids.len()
-                    );
+                    // As on UDP: the spawned enumeration owns the reply for
+                    // the pattern half, and inherits the duty to answer at
+                    // all when this loop found nothing — so a wildcard-only
+                    // search over a name-server connection still gets exactly
+                    // one response with exactly the cids it used to carry.
+                    let seq = payload.seq;
+                    let answer_negative = !found;
+                    let deferred = !pattern_requests.is_empty() && {
+                        let replier = state.clone();
+                        spawn_pattern_query_reply(
+                            &state,
+                            pattern_requests,
+                            move |pattern_cids| async move {
+                                let state = replier;
+                                if pattern_cids.is_empty() && !answer_negative {
+                                    return;
+                                }
+                                let response = encode_search_response(
+                                    state.guid,
+                                    seq,
+                                    addr_bytes,
+                                    state.tcp_port,
+                                    "tcp",
+                                    !pattern_cids.is_empty(),
+                                    &pattern_cids,
+                                    version,
+                                    is_be,
+                                );
+                                state.registry.send_msg(conn_id, response).await;
+                            },
+                        )
+                    };
+                    if found || !deferred {
+                        state.registry.send_msg(conn_id, response).await;
+                        debug!(
+                            "Conn {}: TCP search responded found={} matches={}",
+                            conn_id,
+                            found,
+                            cids.len()
+                        );
+                    }
                 } else {
                     debug!("Conn {}: TCP search: no compatible protocol", conn_id);
                 }
@@ -2651,6 +2757,72 @@ mod tests {
             0,
             "the search loop enumerated every source's names for a datagram \
              that carries no pattern query and could never read the result"
+        );
+    }
+
+    /// V1's HIGH-1, inverted into an acceptance test.
+    ///
+    /// Making the enumeration lazy narrowed the head-of-line vector to
+    /// "any datagram carrying a pattern query", but `is_pattern_query` tests
+    /// bytes the *remote peer* chooses and `PvListMode::List` is every
+    /// server's default — so one unauthenticated datagram naming `"*"` still
+    /// wedged the shared search task for the full duration of a hanging
+    /// `names()`, denying search to every other client and every other name.
+    /// V1 measured exactly that: `LOCAL:PV` unanswered for a whole 2s budget.
+    ///
+    /// The fix is not a narrower predicate — any predicate over attacker
+    /// input just moves the trigger — but moving the enumeration, and the
+    /// reply it feeds, onto their own task.
+    #[tokio::test]
+    async fn a_wildcard_datagram_does_not_delay_a_local_name() {
+        let claims = Arc::new(AtomicUsize::new(0));
+        let hanging = Arc::new(HangingSource::new(
+            StdDuration::from_secs(5),
+            claims.clone(),
+        ));
+        let name_calls = hanging.name_calls.clone();
+        let sources = Arc::new(SourceRegistry::new());
+        sources
+            .add("local", 0, Arc::new(DecisiveSource::new("LOCAL:PV")))
+            .await;
+        sources.add("hanging", 1, hanging).await;
+        let (server_addr, client, _state) = spawn_search_server(sources).await;
+
+        // One wildcard datagram is enough to trigger the enumeration; the
+        // loop absorbs the free_udp_port rebind race and gives the spawned
+        // task time to actually enter the hanging `names()`.
+        let wildcard = encode_search_request(1, 0x01, 0, [0u8; 16], &[(1, "*")], 2, false);
+        for _ in 0..50 {
+            client.send_to(&wildcard, server_addr).await.unwrap();
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+            if name_calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+        assert!(
+            name_calls.load(Ordering::SeqCst) > 0,
+            "the wildcard never reached the enumeration; the test proves nothing"
+        );
+
+        let before = std::time::Instant::now();
+        let found = search_finds(
+            &client,
+            server_addr,
+            2,
+            "LOCAL:PV",
+            StdDuration::from_secs(2),
+        )
+        .await;
+        assert!(
+            found,
+            "a local name went unanswered while a wildcard query enumerated a \
+             hanging source — one attacker-chosen '*' still denies search"
+        );
+        assert!(
+            before.elapsed() < StdDuration::from_millis(500),
+            "local name took {:?}; the search task is blocked enumerating names \
+             for someone else's wildcard",
+            before.elapsed()
         );
     }
 
