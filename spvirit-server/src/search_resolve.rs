@@ -66,8 +66,22 @@ pub struct SearchResolver {
     /// Names currently being resolved. Suppresses duplicate work from a
     /// client's own search retries — the property that stops a flood from
     /// feeding itself.
-    inflight: Arc<Mutex<HashSet<String>>>,
+    inflight: Arc<Mutex<HashSet<Arc<str>>>>,
     stats: Arc<Stats>,
+}
+
+/// Removes `name` from `inflight` when dropped — on normal completion, and,
+/// crucially, on unwind if `claim` panics. Constructed before the `claim`
+/// await so the removal runs unconditionally.
+struct InflightGuard {
+    inflight: Arc<Mutex<HashSet<Arc<str>>>>,
+    name: Arc<str>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap().remove(&self.name);
+    }
 }
 
 impl SearchResolver {
@@ -95,9 +109,12 @@ impl SearchResolver {
             self.stats.dropped_full.fetch_add(1, Ordering::Relaxed);
             return;
         };
+        // A single allocation, shared between the `inflight` set and the
+        // spawned task via cheap `Arc` clones (refcount bumps, not copies).
+        let name: Arc<str> = Arc::from(name);
         {
             let mut inflight = self.inflight.lock().unwrap();
-            if !inflight.insert(name.to_string()) {
+            if !inflight.insert(name.clone()) {
                 self.stats.deduped.fetch_add(1, Ordering::Relaxed);
                 return; // `permit` drops here, releasing it.
             }
@@ -110,10 +127,18 @@ impl SearchResolver {
         let sources = self.sources.clone();
         let inflight = self.inflight.clone();
         let stats = self.stats.clone();
-        let name = name.to_string();
 
         tokio::spawn(async move {
             let _permit = permit;
+            // RAII: guarantees the `inflight` entry is released even if
+            // `claim` panics (plausible for a proxying source parsing
+            // untrusted upstream bytes). Without this, a panicking claim
+            // would strand the name in `inflight` forever, silently
+            // deduping every future `enqueue` for it until process restart.
+            let _guard = InflightGuard {
+                inflight,
+                name: name.clone(),
+            };
             let started = Instant::now();
             let found = match ctx {
                 Some(ctx) => request_ctx::scope_with(ctx, sources.claim(&name)).await,
@@ -121,7 +146,6 @@ impl SearchResolver {
             }
             .is_some();
 
-            inflight.lock().unwrap().remove(&name);
             if found {
                 stats.completed_found.fetch_add(1, Ordering::Relaxed);
             } else {
@@ -231,6 +255,50 @@ mod tests {
         reg
     }
 
+    /// A source whose `claim` always panics — stands in for a proxying
+    /// source choking on malformed upstream bytes.
+    struct PanicSource;
+
+    impl Source for PanicSource {
+        fn try_claim(&self, _name: &str) -> TryClaim {
+            TryClaim::Unknown
+        }
+
+        fn claim(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            Box::pin(async { panic!("PanicSource always panics") })
+        }
+
+        fn get(&self, _n: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _n: &str,
+            _v: &DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Err("no".to_string()) })
+        }
+
+        fn subscribe(
+            &self,
+            _n: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            Box::pin(async { Vec::new() })
+        }
+    }
+
+    async fn registry_with_panic() -> Arc<SourceRegistry> {
+        let reg = Arc::new(SourceRegistry::new());
+        reg.add("panic", 0, Arc::new(PanicSource)).await;
+        reg
+    }
+
     #[tokio::test]
     async fn enqueue_returns_immediately_and_resolves_in_the_background() {
         let src = SlowSource::new(Duration::from_millis(150));
@@ -329,5 +397,25 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(src.calls.load(Ordering::SeqCst), 1);
         assert!(src.seen_ctx.lock().unwrap()[0].is_none());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_resolve_still_frees_its_inflight_slot() {
+        let resolver = SearchResolver::new(registry_with_panic().await);
+
+        resolver.enqueue("PANIC:PV");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // If the `inflight` guard didn't run on unwind, this second enqueue
+        // would dedup forever instead of starting a fresh resolution.
+        resolver.enqueue("PANIC:PV");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stats = resolver.stats();
+        assert_eq!(
+            stats.started, 2,
+            "name was stranded in `inflight` after the first claim panicked"
+        );
+        assert_eq!(stats.deduped, 0);
     }
 }
