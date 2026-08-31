@@ -2368,7 +2368,7 @@ mod tests {
             _value: &spvirit_codec::spvd_decode::DecodedValue,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
         {
-            Box::pin(async { Err("read-only probe".to_string()) })
+            Box::pin(async { Err("read-only".to_string()) })
         }
 
         fn subscribe(
@@ -2386,10 +2386,15 @@ mod tests {
     }
 
     /// Stand up a search responder over `sources` on a free loopback port,
-    /// returning the server address and a bound client socket.
+    /// returning the server address, a bound client socket, and the shared
+    /// `ServerState` (so a test can inspect `search_resolver.stats()` after
+    /// driving traffic through it). A bind or I/O failure inside
+    /// `run_udp_search` is logged rather than silently dropped, so a dead
+    /// responder shows up as a diagnosable log line instead of a `found`
+    /// assertion that misleadingly points at the head-of-line defect.
     async fn spawn_search_server(
         sources: Arc<SourceRegistry>,
-    ) -> (SocketAddr, TokioUdpSocket) {
+    ) -> (SocketAddr, TokioUdpSocket, Arc<ServerState>) {
         let state = Arc::new(ServerState::new(
             sources,
             Arc::new(MonitorRegistry::new()),
@@ -2404,11 +2409,16 @@ mod tests {
         ));
         let server_port = free_udp_port().await;
         let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+        let state_for_task = state.clone();
         tokio::spawn(async move {
-            let _ = run_udp_search(state, server_addr, 5075, rand_guid(), None, None).await;
+            if let Err(e) =
+                run_udp_search(state_for_task, server_addr, 5075, rand_guid(), None, None).await
+            {
+                eprintln!("test search responder on {server_addr} exited early: {e}");
+            }
         });
         let client = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
-        (server_addr, client)
+        (server_addr, client, state)
     }
 
     /// Send one search for `name` under `cid` and wait up to `budget` for a
@@ -2464,8 +2474,12 @@ mod tests {
     /// 4s at 1.4 miss-searches/s, sustained indefinitely by the blocked
     /// clients' own ~5Hz retries, with the gateway at 0.06 cores.
     ///
-    /// The bound is on latency, not reachability: `LOCAL:PV` was always
-    /// findable, it just took as long as an unrelated hanging claim.
+    /// Against the pre-fix loop this is total unreachability, not merely
+    /// slow reachability: with a 5s hang and a 2s search budget, `found`
+    /// itself fails (the budget expires before the wedged responder ever
+    /// answers) — the latency assertion below never even gets reached in
+    /// that case. It still earns its place for a *partial* wedge (a
+    /// sub-budget hang that would satisfy `found` but blow the 500ms bound).
     #[tokio::test]
     async fn a_hanging_source_does_not_delay_a_local_name() {
         let claims = Arc::new(AtomicUsize::new(0));
@@ -2483,13 +2497,22 @@ mod tests {
                 }),
             )
             .await;
-        let (server_addr, client) = spawn_search_server(sources).await;
+        let (server_addr, client, _state) = spawn_search_server(sources).await;
 
-        // Put the responder under a claim that will not return for 5s.
+        // Put the responder under a claim that will not return for 5s. Poll
+        // (send + short sleep) rather than one-shot-send-then-sleep, so this
+        // absorbs the same free_udp_port rebind race that free_udp_port's own
+        // doc comment warns about instead of risking the first datagram
+        // landing on a not-yet-bound port.
         let request =
             encode_search_request(1, 0x01, 0, [0u8; 16], &[(1, "UNRESOLVABLE:PV")], 2, false);
-        client.send_to(&request, server_addr).await.unwrap();
-        tokio::time::sleep(StdDuration::from_millis(50)).await;
+        for _ in 0..50 {
+            client.send_to(&request, server_addr).await.unwrap();
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+            if claims.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
         assert!(
             claims.load(Ordering::SeqCst) > 0,
             "the hanging source was never consulted; the test proves nothing"
@@ -2515,8 +2538,18 @@ mod tests {
     /// The self-sustaining part: a flood of distinct unresolvable names must
     /// be shed, not queued. If each one costs the responder an await, service
     /// never recovers while any client is still searching.
+    ///
+    /// The 200-name flood size and the 1s bound below are coupled: the
+    /// responder answers `found = false` to every flood datagram (mask 0x01
+    /// requests a reply), so `search_finds` must drain ~200 queued negative
+    /// responses before it sees the `LOCAL:PV` reply, at one datagram (and
+    /// one fresh retry) per loop iteration. Raising the flood size without
+    /// raising the bound will make this fail on a perfectly healthy
+    /// responder — that is a cost-of-the-harness effect, not evidence of a
+    /// regression.
     #[tokio::test]
     async fn a_flood_of_unresolvable_names_does_not_deny_a_local_name() {
+        let claims = Arc::new(AtomicUsize::new(0));
         let sources = Arc::new(SourceRegistry::new());
         sources
             .add("local", 0, Arc::new(DecisiveSource::new("LOCAL:PV")))
@@ -2527,11 +2560,11 @@ mod tests {
                 1,
                 Arc::new(HangingSource {
                     hang: StdDuration::from_secs(5),
-                    claims: Arc::new(AtomicUsize::new(0)),
+                    claims: claims.clone(),
                 }),
             )
             .await;
-        let (server_addr, client) = spawn_search_server(sources).await;
+        let (server_addr, client, state) = spawn_search_server(sources).await;
 
         for i in 0..200u32 {
             let name = format!("FLOOD:{i}");
@@ -2555,11 +2588,39 @@ mod tests {
             "local name took {:?} under flood",
             before.elapsed()
         );
+
+        // Anti-vacuity: prove the burst actually reached the responder and
+        // was shed rather than queued. UDP gives no delivery guarantee, so
+        // without this a fully dropped burst would pass this test against an
+        // effectively idle server and certify nothing. `claims > 0` shows at
+        // least one flood name was dispatched to a source; `dropped_full > 0`
+        // shows the RESOLVE_CONCURRENCY=8 permit cap actually shed some of
+        // the other ~192 rather than queuing them (which is the property the
+        // test's name promises). Both are asserted directionally, not to an
+        // exact count, so this does not flake on scheduling.
+        assert!(
+            claims.load(Ordering::SeqCst) > 0,
+            "the flood never reached the responder; the test proves nothing"
+        );
+        let stats = state.search_resolver.stats();
+        assert!(
+            stats.dropped_full > 0,
+            "no flood names were shed (dropped_full={}); the permit cap was \
+             never exercised, so this test does not prove shedding happened",
+            stats.dropped_full
+        );
     }
 
     /// The resolver replies to nothing, so resolution has to reach the client
     /// through its own retry. First search misses; once the background claim
     /// lands, a retry finds it.
+    ///
+    /// This is not a head-of-line regression test — it exercises the
+    /// Task-3b no-reply resolver design, not the Task-3 defect. It would
+    /// (correctly) still pass against the pre-fix loop: `has_pv` there
+    /// awaits `LateSource::claim` inline and answers the very first search
+    /// once it resolves 100ms later, no retry needed. It was not run through
+    /// Step 5's revert for that reason.
     ///
     /// Since Task 3b there are two routes by which the retry can now be
     /// answered: `LateSource::try_claim` flipping to `Yes`, and the registry's
@@ -2582,7 +2643,28 @@ mod tests {
                 }),
             )
             .await;
-        let (server_addr, client) = spawn_search_server(sources).await;
+        let (server_addr, client, _state) = spawn_search_server(sources).await;
+
+        // Negative first: an immediate search (well inside the 100ms claim
+        // delay) must miss. Without this, a future change that made
+        // `try_claim` resolve inline again — i.e. reintroduced the
+        // head-of-line defect at this call site — would leave this test
+        // green, since it only checks that *some* search eventually
+        // succeeds.
+        let immediate = search_finds(
+            &client,
+            server_addr,
+            2,
+            "LATE:PV",
+            StdDuration::from_millis(30),
+        )
+        .await;
+        assert!(
+            !immediate,
+            "LATE:PV was found before its background claim (100ms) could \
+             have completed; the miss/retry path this test exists to prove \
+             is not being exercised"
+        );
 
         // `search_finds` retries for the whole budget, which is exactly the
         // client behaviour this design relies on: the first datagram is
