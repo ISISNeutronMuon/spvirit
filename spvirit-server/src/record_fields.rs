@@ -18,7 +18,7 @@ use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue};
 
 use crate::field_provider::{RecordFieldProvider, resolve_field_info, resolve_field_payload};
-use crate::pvstore::{PvInfo, Source};
+use crate::pvstore::{PvInfo, Source, TryClaim};
 use crate::types::{RecordInstance, RecordType, ScalarValue};
 
 /// A parsed `<base>.<FIELD>[$]` channel-name reference.
@@ -351,6 +351,30 @@ impl RecordFieldSource {
 }
 
 impl Source for RecordFieldSource {
+    /// Half of `claim`'s predicate is a pure string parse, and it is the half
+    /// that matters: `claim` is `resolve_field_info`, whose very first step is
+    /// `parse_field_ref(name)?`. A name that is not a `<base>.<FIELD>[$]`
+    /// reference — every ordinary record name — can therefore be declined
+    /// with certainty, synchronously, with no provider round trip.
+    ///
+    /// That certainty is what this source owes the registry. It is registered
+    /// unconditionally on *every* server, so while it answered the trait
+    /// default the registry's aggregate could never be decisive at all: one
+    /// `Unknown` makes the whole answer `Unknown`, and a purely local record
+    /// that `SimplePvStore` or `IocSource` could have answered from memory
+    /// instead went unfound on the first datagram and round-tripped through
+    /// the background resolver.
+    ///
+    /// A name that *does* parse stays `Unknown`: whether the provider carries
+    /// the field is only knowable by awaiting `field_descriptor`, and the
+    /// provider is an arbitrary implementor.
+    fn try_claim(&self, name: &str) -> TryClaim {
+        match parse_field_ref(name) {
+            None => TryClaim::No,
+            Some(_) => TryClaim::Unknown,
+        }
+    }
+
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move { resolve_field_info(self.provider.as_ref(), &name).await })
@@ -683,5 +707,25 @@ record(ai, "PV:A") {
             field_value(record, "EGU"),
             Some(ScalarValue::Str("mm".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn try_claim_agrees_with_claim_for_the_record_field_source() {
+        let src = test_source();
+
+        // Not a field reference at all: `claim` can never succeed, so the
+        // synchronous answer must be a decisive `No`, not `Unknown`.
+        for name in ["SIM:AO", "SIM:AO.", "SIM:AO.rtyp", "a.record.like.this"] {
+            assert_eq!(src.try_claim(name), TryClaim::No, "for {name}");
+            assert!(Source::claim(&src, name).await.is_none(), "for {name}");
+        }
+
+        // A well-formed field reference: only the provider knows, so the
+        // answer must stay `Unknown` — including for one that really is
+        // served, which is exactly why `Yes` is not available here.
+        assert_eq!(src.try_claim("SIM:AO.RTYP"), TryClaim::Unknown);
+        assert!(Source::claim(&src, "SIM:AO.RTYP").await.is_some());
+        assert_eq!(src.try_claim("SIM:MISSING.RTYP"), TryClaim::Unknown);
+        assert!(Source::claim(&src, "SIM:MISSING.RTYP").await.is_none());
     }
 }

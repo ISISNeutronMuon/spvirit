@@ -18,13 +18,13 @@ use crate::spec::{RecordSpec, unmodelled_fields};
 use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_server::db::{DbRecord, load_db_records, parse_db_records};
 use spvirit_server::field_provider::{
-    RecordFieldDesc, RecordFieldProvider, field_is_writable, resolve_field_info,
-    resolve_field_payload,
+    RecordFieldDesc, RecordFieldProvider, descriptor_for_kind, field_is_writable,
+    resolve_field_info, resolve_field_payload,
 };
 use spvirit_server::events::EventSink;
 use spvirit_server::monitor::MonitorRegistry;
 use spvirit_server::record_fields::parse_field_ref;
-use spvirit_server::pvstore::{PvInfo, Source, StoreSource};
+use spvirit_server::pvstore::{PvInfo, Source, StoreSource, TryClaim};
 use spvirit_server::simple_store::descriptor_for_payload;
 use spvirit_types::{NtPayload, ScalarValue};
 use std::collections::HashMap;
@@ -574,6 +574,30 @@ impl ProcSink for EgressSink {
     }
 }
 
+impl IocSource {
+    /// The synchronous core of the field-PV half of [`Source::claim`].
+    ///
+    /// Everything `resolve_field_info` does for *this* provider is already
+    /// pure: `parse_field_ref` is a string split, `kinds` and the static
+    /// field table are plain maps fixed at construction, and
+    /// `descriptor_for_kind` builds from a probe value. Nothing awaits and
+    /// nothing takes a lock set — the whole point of the
+    /// `dbNameToAddr`/`dbGetField` split.
+    ///
+    /// `claim` and `try_claim` both go through this one helper rather than
+    /// each spelling the predicate out, so the answer a search gives and the
+    /// answer a channel-create gives cannot drift apart.
+    fn field_claim_sync(&self, name: &str) -> Option<PvInfo> {
+        let field_ref = parse_field_ref(name)?;
+        let kind = *self.kinds.get(&field_ref.base)?;
+        let field_kind = record_field_kind(kind, &field_ref.field)?;
+        Some(PvInfo {
+            descriptor: descriptor_for_kind(field_kind, field_ref.long_string)?,
+            writable: field_is_writable(&field_ref.field),
+        })
+    }
+}
+
 impl RecordFieldProvider for IocSource {
     fn field_value(
         &self,
@@ -621,13 +645,32 @@ impl Source for IocSource {
         true
     }
 
+    /// Decisive both ways, with no I/O and no lock set.
+    ///
+    /// The record set is immutable after construction (see
+    /// [`IocSource::LOCK_SET_IMMUTABILITY_REASON`]), and so is `kinds`, so a
+    /// name absent from both the name index and the field table can never
+    /// later be served by this source — `No` is safe. `Yes` deliberately
+    /// stops at `db.lookup`: `claim`'s remaining work
+    /// (`with_set(..).to_payload()`) always yields a `PvInfo`, and taking a
+    /// lock set a processing pass may hold is exactly what a search must
+    /// never do.
+    fn try_claim(&self, name: &str) -> TryClaim {
+        // Same order as `claim`: a record name wins over a field reference.
+        if self.db.lookup(name).is_some() || self.field_claim_sync(name).is_some() {
+            TryClaim::Yes
+        } else {
+            TryClaim::No
+        }
+    }
+
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
             // A record name wins over a field reference: an exact record
             // called `A.B` is still that record, not `A`'s `B` field.
             let Some(id) = self.db.lookup(&name) else {
-                return resolve_field_info(self, &name).await;
+                return self.field_claim_sync(&name);
             };
             let payload = self.db.with_set(id.set, |set| set.get(id).to_payload());
             Some(PvInfo {
@@ -1117,5 +1160,31 @@ mod tests {
             err.contains("no record named"),
             "an unmodelled field must not be treated as a (read-only) field PV, got: {err}"
         );
+    }
+
+    /// `try_claim` must answer exactly what `claim` would, for every shape of
+    /// name this source sees: an existing record, one of its modelled field
+    /// PVs, an unmodelled field on an existing record, a field on a record
+    /// that does not exist, and a plain unknown name.
+    #[tokio::test]
+    async fn try_claim_agrees_with_claim_for_the_ioc_source() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+
+        for yes in ["PV:A", "PV:A.EGU", "PV:A.SCAN"] {
+            assert_eq!(Source::try_claim(&source, yes), TryClaim::Yes, "for {yes}");
+            assert!(
+                Source::claim(&source, yes).await.is_some(),
+                "claim disagrees for {yes}"
+            );
+        }
+
+        for no in ["PV:MISSING", "PV:MISSING.EGU", "PV:A.NOTAFIELD", "PV:A."] {
+            assert_eq!(Source::try_claim(&source, no), TryClaim::No, "for {no}");
+            assert!(
+                Source::claim(&source, no).await.is_none(),
+                "claim disagrees for {no}"
+            );
+        }
     }
 }
