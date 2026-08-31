@@ -12,7 +12,7 @@ use tracing::debug;
 use std::future::Future;
 use std::pin::Pin;
 
-use spvirit_codec::spvd_decode::{DecodedValue, FieldDesc, FieldType, StructureDesc, TypeCode};
+use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 use crate::monitor::MonitorRegistry;
@@ -592,274 +592,142 @@ fn should_post_update(entry: &mut PvEntry, prev_severity: i32) -> bool {
 
 // ── NtPayload → StructureDesc ────────────────────────────────────────────
 
+/// The descriptor the server advertises at GET/MONITOR INIT.
+///
+/// This delegates to the codec for every payload shape. It used to
+/// reimplement the NTScalar and NTScalarArray trees locally, and the two
+/// copies drifted: the local one spelled a string value
+/// `Scalar(TypeCode::String)` where the codec spells it `String`, and gave
+/// `timeStamp`/`display` struct ids the codec omitted. Both spellings put the
+/// same byte on the wire, but the descriptor is not only advertised — it is
+/// also what PUT bodies are decoded against, and `decode_scalar` rejects
+/// `TypeCode::String` because it has no fixed size. The result was that a PUT
+/// to any string-valued PV failed to decode. Keeping one builder is what stops
+/// that class of drift.
 pub fn descriptor_for_payload(payload: &NtPayload) -> StructureDesc {
-    match payload {
-        NtPayload::Scalar(nt) => nt_scalar_desc(&nt.value),
-        NtPayload::ScalarArray(arr) => nt_scalar_array_desc(&arr.value),
-        // Table / NdArray / Enum / Generic: the codec knows how to build the
-        // full structure descriptor. An empty descriptor here makes GET and
-        // MONITOR init hand clients an empty structure, so every read of
-        // these PV types decodes as {}.
-        _ => spvirit_codec::spvd_encode::nt_payload_desc(payload),
-    }
-}
-
-fn value_type_code(sv: &ScalarValue) -> TypeCode {
-    match sv {
-        ScalarValue::Bool(_) => TypeCode::Boolean,
-        ScalarValue::I8(_) => TypeCode::Int8,
-        ScalarValue::I16(_) => TypeCode::Int16,
-        ScalarValue::I32(_) => TypeCode::Int32,
-        ScalarValue::I64(_) => TypeCode::Int64,
-        ScalarValue::U8(_) => TypeCode::UInt8,
-        ScalarValue::U16(_) => TypeCode::UInt16,
-        ScalarValue::U32(_) => TypeCode::UInt32,
-        ScalarValue::U64(_) => TypeCode::UInt64,
-        ScalarValue::F32(_) => TypeCode::Float32,
-        ScalarValue::F64(_) => TypeCode::Float64,
-        ScalarValue::Str(_) => TypeCode::String,
-    }
-}
-
-fn array_type_code(sav: &ScalarArrayValue) -> TypeCode {
-    match sav {
-        ScalarArrayValue::Bool(_) => TypeCode::Boolean,
-        ScalarArrayValue::I8(_) => TypeCode::Int8,
-        ScalarArrayValue::I16(_) => TypeCode::Int16,
-        ScalarArrayValue::I32(_) => TypeCode::Int32,
-        ScalarArrayValue::I64(_) => TypeCode::Int64,
-        ScalarArrayValue::U8(_) => TypeCode::UInt8,
-        ScalarArrayValue::U16(_) => TypeCode::UInt16,
-        ScalarArrayValue::U32(_) => TypeCode::UInt32,
-        ScalarArrayValue::U64(_) => TypeCode::UInt64,
-        ScalarArrayValue::F32(_) => TypeCode::Float32,
-        ScalarArrayValue::F64(_) => TypeCode::Float64,
-        ScalarArrayValue::Str(_) => TypeCode::String,
-    }
-}
-
-fn nt_scalar_desc(sv: &ScalarValue) -> StructureDesc {
-    let tc = value_type_code(sv);
-    StructureDesc {
-        struct_id: Some("epics:nt/NTScalar:1.0".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "value".to_string(),
-                field_type: FieldType::Scalar(tc),
-            },
-            FieldDesc {
-                name: "alarm".to_string(),
-                field_type: FieldType::Structure(alarm_desc()),
-            },
-            FieldDesc {
-                name: "timeStamp".to_string(),
-                field_type: FieldType::Structure(timestamp_desc()),
-            },
-            FieldDesc {
-                name: "display".to_string(),
-                field_type: FieldType::Structure(display_desc()),
-            },
-            FieldDesc {
-                name: "control".to_string(),
-                field_type: FieldType::Structure(control_desc()),
-            },
-            FieldDesc {
-                name: "valueAlarm".to_string(),
-                field_type: FieldType::Structure(value_alarm_desc()),
-            },
-        ],
-    }
-}
-
-fn nt_scalar_array_desc(sav: &ScalarArrayValue) -> StructureDesc {
-    let tc = array_type_code(sav);
-    StructureDesc {
-        struct_id: Some("epics:nt/NTScalarArray:1.0".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "value".to_string(),
-                field_type: FieldType::ScalarArray(tc),
-            },
-            FieldDesc {
-                name: "alarm".to_string(),
-                field_type: FieldType::Structure(alarm_desc()),
-            },
-            FieldDesc {
-                name: "timeStamp".to_string(),
-                field_type: FieldType::Structure(timestamp_desc()),
-            },
-            FieldDesc {
-                name: "display".to_string(),
-                field_type: FieldType::Structure(display_desc()),
-            },
-            FieldDesc {
-                name: "control".to_string(),
-                field_type: FieldType::Structure(control_desc()),
-            },
-        ],
-    }
-}
-
-fn alarm_desc() -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("alarm_t".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "severity".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "status".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "message".to_string(),
-                field_type: FieldType::String,
-            },
-        ],
-    }
-}
-
-fn timestamp_desc() -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("time_t".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "secondsPastEpoch".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int64),
-            },
-            FieldDesc {
-                name: "nanoseconds".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "userTag".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-        ],
-    }
-}
-
-fn display_desc() -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("display_t".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "limitLow".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Float64),
-            },
-            FieldDesc {
-                name: "limitHigh".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Float64),
-            },
-            FieldDesc {
-                name: "description".to_string(),
-                field_type: FieldType::String,
-            },
-            FieldDesc {
-                name: "units".to_string(),
-                field_type: FieldType::String,
-            },
-            FieldDesc {
-                name: "precision".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "form".to_string(),
-                field_type: FieldType::Structure(StructureDesc {
-                    struct_id: Some("enum_t".to_string()),
-                    fields: vec![
-                        FieldDesc {
-                            name: "index".to_string(),
-                            field_type: FieldType::Scalar(TypeCode::Int32),
-                        },
-                        FieldDesc {
-                            name: "choices".to_string(),
-                            field_type: FieldType::StringArray,
-                        },
-                    ],
-                }),
-            },
-        ],
-    }
-}
-
-fn control_desc() -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("control_t".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "limitLow".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Float64),
-            },
-            FieldDesc {
-                name: "limitHigh".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Float64),
-            },
-            FieldDesc {
-                name: "minStep".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Float64),
-            },
-        ],
-    }
-}
-
-fn value_alarm_desc() -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("valueAlarm_t".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "active".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Boolean),
-            },
-            FieldDesc {
-                name: "lowAlarmLimit".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Float64),
-            },
-            FieldDesc {
-                name: "lowWarningLimit".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Float64),
-            },
-            FieldDesc {
-                name: "highWarningLimit".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Float64),
-            },
-            FieldDesc {
-                name: "highAlarmLimit".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Float64),
-            },
-            FieldDesc {
-                name: "lowAlarmSeverity".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "lowWarningSeverity".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "highWarningSeverity".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "highAlarmSeverity".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "hysteresis".to_string(),
-                field_type: FieldType::Scalar(TypeCode::UInt8),
-            },
-        ],
-    }
+    spvirit_codec::spvd_encode::nt_payload_desc(payload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{DbCommonState, RecordType};
+    use spvirit_codec::spvd_decode::{FieldType, TypeCode};
     use spvirit_types::{
         NdCodec, NdDimension, NtNdArray, NtPayload, NtScalar, NtScalarArray, NtTable,
         NtTableColumn, ScalarArrayValue, ScalarValue,
     };
+
+    /// Every payload shape the server can advertise a descriptor for.
+    fn descriptor_payload_samples() -> Vec<(&'static str, NtPayload)> {
+        vec![
+            (
+                "NTScalar/f64",
+                NtPayload::Scalar(NtScalar::from_value(ScalarValue::F64(1.5))),
+            ),
+            (
+                "NTScalar/i32",
+                NtPayload::Scalar(NtScalar::from_value(ScalarValue::I32(7))),
+            ),
+            (
+                "NTScalar/bool",
+                NtPayload::Scalar(NtScalar::from_value(ScalarValue::Bool(true))),
+            ),
+            (
+                "NTScalar/string",
+                NtPayload::Scalar(NtScalar::from_value(ScalarValue::Str("hi".to_string()))),
+            ),
+            (
+                "NTScalarArray/f64",
+                NtPayload::ScalarArray(NtScalarArray::from_value(ScalarArrayValue::F64(vec![
+                    1.0, 2.0,
+                ]))),
+            ),
+            (
+                "NTScalarArray/string",
+                NtPayload::ScalarArray(NtScalarArray::from_value(ScalarArrayValue::Str(vec![
+                    "a".to_string(),
+                    "b".to_string(),
+                ]))),
+            ),
+        ]
+    }
+
+    /// The server advertises `descriptor_for_payload` at GET/MONITOR INIT, but
+    /// the value bytes come from the codec. `simple_store` reimplements the
+    /// NTScalar and NTScalarArray descriptors instead of calling the codec, so
+    /// the two trees can drift apart — and when they do, a strict client
+    /// (pvxs) decodes past the end of the frame and drops the whole TCP
+    /// connection. That is exactly how the missing `display.form` shipped.
+    ///
+    /// Assert the two descriptor trees are identical, so a future edit to
+    /// either one cannot silently reintroduce that class of defect.
+    #[test]
+    fn server_descriptor_matches_the_codec_descriptor() {
+        for (label, payload) in descriptor_payload_samples() {
+            let ours = descriptor_for_payload(&payload);
+            let codec = spvirit_codec::spvd_encode::nt_payload_desc(&payload);
+            assert_eq!(
+                ours, codec,
+                "server and codec descriptors disagree for {label}"
+            );
+        }
+    }
+
+    /// The bytes we put on the wire must decode against the descriptor we
+    /// advertised, consuming it exactly — no more, no less.
+    #[test]
+    fn advertised_descriptor_decodes_the_encoded_bytes_exactly() {
+        for (label, payload) in descriptor_payload_samples() {
+            for is_be in [false, true] {
+                let desc = descriptor_for_payload(&payload);
+                let bytes = spvirit_codec::spvd_encode::encode_nt_payload_values_for_desc(
+                    &payload, &desc, is_be,
+                );
+                let decoder = spvirit_codec::spvd_decode::PvdDecoder::new(is_be);
+                let (decoded, consumed) = decoder
+                    .decode_structure(&bytes, &desc)
+                    .unwrap_or_else(|e| panic!("{label} (be={is_be}): decode failed: {e:?}"));
+                assert_eq!(
+                    consumed,
+                    bytes.len(),
+                    "{label} (be={is_be}): advertised descriptor consumed {consumed} of {} bytes",
+                    bytes.len()
+                );
+                let DecodedValue::Structure(fields) = &decoded else {
+                    panic!("{label}: top level is not a structure");
+                };
+                assert_eq!(
+                    fields.len(),
+                    desc.fields.len(),
+                    "{label} (be={is_be}): decoded {} fields, descriptor declares {}",
+                    fields.len(),
+                    desc.fields.len()
+                );
+            }
+        }
+    }
+
+    /// A PUT body is decoded against the descriptor the server advertised at
+    /// INIT (`ioid_to_desc`), so that descriptor has to be one our own decoder
+    /// can read. When `simple_store` built its own tree it spelled a string
+    /// value `Scalar(TypeCode::String)`, which `decode_scalar` rejects because
+    /// that type code has no fixed size — so every PUT to a string-valued PV
+    /// silently failed to decode while numeric PVs worked.
+    #[test]
+    fn put_bodies_decode_against_the_advertised_descriptor() {
+        for (label, payload) in descriptor_payload_samples() {
+            let desc = descriptor_for_payload(&payload);
+            let (bits, vals) =
+                spvirit_codec::spvd_encode::encode_nt_payload_bitset_parts(&payload, false);
+            let mut body = bits;
+            body.extend_from_slice(&vals);
+            assert!(
+                crate::decode::decode_put_body(&body, &desc, false).is_some(),
+                "{label}: PUT body did not decode against the advertised descriptor"
+            );
+        }
+    }
 
     fn make_ai(name: &str, val: f64) -> RecordInstance {
         RecordInstance {
