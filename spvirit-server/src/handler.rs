@@ -229,7 +229,13 @@ pub fn collect_visible_pv_names(
     allow_pattern: Option<&Regex>,
     max_items: usize,
 ) -> Vec<String> {
-    let mut names: Vec<String> = all_names
+    // Sort and truncate *references*, and clone only what survives. The
+    // caller's `max_items` is typically a few hundred while `all_names` is
+    // whatever every registered source put together — on a large gateway,
+    // tens of thousands of strings — so cloning first and discarding after
+    // meant a heap allocation per name for names that were then thrown away.
+    // Reference-sized elements also make the sort itself cheaper to move.
+    let mut refs: Vec<&String> = all_names
         .iter()
         .filter(|name| {
             allow_pattern
@@ -237,12 +243,12 @@ pub fn collect_visible_pv_names(
                 .map(|re| re.is_match(name))
                 .unwrap_or(true)
         })
-        .cloned()
         .collect();
-    names.sort();
-    if names.len() > max_items {
-        names.truncate(max_items);
+    refs.sort();
+    if refs.len() > max_items {
+        refs.truncate(max_items);
     }
+    let mut names: Vec<String> = refs.into_iter().cloned().collect();
     if mode == PvListMode::List && names.len() < max_items {
         names.push("__pvlist".to_string());
     }
