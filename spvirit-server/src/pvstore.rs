@@ -28,6 +28,25 @@ pub struct PvInfo {
     pub writable: bool,
 }
 
+/// What a [`Source`] can say about a name **without doing I/O**.
+///
+/// This is the search path's question. `claim` is the authoritative one, but
+/// it is allowed to be slow — for a proxying source it is a full upstream
+/// round trip — and the search responder is a single task shared by every
+/// client, so it must never await one. `try_claim` is the answer a source can
+/// give from memory alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryClaim {
+    /// This source serves the name. A search may answer `found=true` now.
+    Yes,
+    /// This source definitively does not serve it — an exhaustive local map
+    /// that lacks the key, a live negative-cache entry, an access `Deny`.
+    No,
+    /// Cannot say without work that might block. The caller must not wait;
+    /// it should start a background resolution and answer the retry.
+    Unknown,
+}
+
 // ---------------------------------------------------------------------------
 // Source — the object-safe provider trait
 // ---------------------------------------------------------------------------
@@ -57,6 +76,25 @@ pub trait Source: Send + Sync {
     ///
     /// Return `None` to let the registry try the next source.
     fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>>;
+
+    /// Non-blocking counterpart to [`claim`](Self::claim), for the search path.
+    ///
+    /// Implementations **must not** perform network I/O, **must not** block on
+    /// a lock, and **must** return promptly. Use `try_read`/`try_lock` and
+    /// fall back to [`TryClaim::Unknown`] on contention.
+    ///
+    /// Returning `Unknown` is always correct and always safe: it costs one
+    /// background resolution and one client search retry, never correctness.
+    /// The default does exactly that, so a source that has no cheap answer
+    /// needs no implementation. A source that *can* answer from memory should,
+    /// because `Yes` is what lets a search be answered on the first datagram.
+    ///
+    /// A source whose `claim` does no I/O should implement both in terms of
+    /// one shared synchronous helper rather than duplicating the predicate —
+    /// two copies of the same rule drift, and nothing here would catch it.
+    fn try_claim(&self, _name: &str) -> TryClaim {
+        TryClaim::Unknown
+    }
 
     /// Read the current value of a PV.
     ///
@@ -245,13 +283,23 @@ impl SourceRegistry {
     // ── Delegating operations ────────────────────────────────────────
 
     /// Find the first source that claims `name` and return its metadata.
+    ///
+    /// The sources list is snapshotted and the read guard released *before*
+    /// any source's `claim` is awaited. A proxying source's `claim` is a full
+    /// upstream round trip; holding the registry lock across one would block
+    /// every concurrent add/remove for that long.
     pub async fn claim(&self, name: &str) -> Option<PvInfo> {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if let Some(info) = entry.source.claim(name).await {
-                if !entry.is_store {
-                    self.warn_if_shadowing_a_store(&sources, &entry.label, name)
-                        .await;
+        let snapshot: Vec<(String, Arc<dyn Source>, bool)> = {
+            let sources = self.sources.read().await;
+            sources
+                .iter()
+                .map(|e| (e.label.clone(), e.source.clone(), e.is_store))
+                .collect()
+        };
+        for (label, source, is_store) in &snapshot {
+            if let Some(info) = source.claim(name).await {
+                if !is_store {
+                    self.warn_if_shadowing_a_store(&snapshot, label, name).await;
                 }
                 return Some(info);
             }
@@ -268,7 +316,12 @@ impl SourceRegistry {
     /// Only `claim` calls this. `get`/`put`/`subscribe`/`rpc` re-resolve the
     /// same name through the same ordered list, and a client always searches
     /// before operating, so the first claim is where the diagnostic belongs.
-    async fn warn_if_shadowing_a_store(&self, sources: &[SourceEntry], winner: &str, name: &str) {
+    async fn warn_if_shadowing_a_store(
+        &self,
+        snapshot: &[(String, Arc<dyn Source>, bool)],
+        winner: &str,
+        name: &str,
+    ) {
         if self.shadow_checked.read().await.contains(name) {
             return;
         }
@@ -276,15 +329,43 @@ impl SourceRegistry {
             // Another task got there between the read and the write.
             return;
         }
-        for entry in sources.iter().filter(|e| e.is_store) {
-            if entry.source.claim(name).await.is_some() {
+        for (label, source, _) in snapshot.iter().filter(|(_, _, is_store)| *is_store) {
+            if source.claim(name).await.is_some() {
                 tracing::warn!(
-                    "source '{winner}' shadows store '{}' for PV '{name}': the store's \
-                     value will never be served",
-                    entry.label
+                    "source '{winner}' shadows store '{label}' for PV '{name}': the store's \
+                     value will never be served"
                 );
                 return;
             }
+        }
+    }
+
+    /// Non-blocking aggregate of [`Source::try_claim`] across all sources.
+    ///
+    /// `Yes` as soon as any source owns the name (matching `claim`'s
+    /// first-wins order). `No` only when *every* source is decisive that it
+    /// does not. Any single `Unknown`, or contention on the sources lock,
+    /// makes the whole answer `Unknown` — the registry must never assert a
+    /// name is absent when a source it did not consult might serve it.
+    ///
+    /// Synchronous by design: this is called from the search responder, and
+    /// the entire point is that it cannot await.
+    pub fn try_claim(&self, name: &str) -> TryClaim {
+        let Ok(sources) = self.sources.try_read() else {
+            return TryClaim::Unknown;
+        };
+        let mut all_decisive = true;
+        for entry in sources.iter() {
+            match entry.source.try_claim(name) {
+                TryClaim::Yes => return TryClaim::Yes,
+                TryClaim::No => {}
+                TryClaim::Unknown => all_decisive = false,
+            }
+        }
+        if all_decisive {
+            TryClaim::No
+        } else {
+            TryClaim::Unknown
         }
     }
 
@@ -590,5 +671,107 @@ mod tests {
         assert!(warnings[0].contains("PV:X"), "missing PV name: {captured:?}");
         assert!(warnings[0].contains("override"), "missing source label: {captured:?}");
         assert!(warnings[0].contains("builtin"), "missing store label: {captured:?}");
+    }
+
+    /// A source that answers `try_claim` decisively from a fixed name set —
+    /// the shape every local (non-proxying) source is expected to have.
+    struct DecisiveSource {
+        names: Vec<String>,
+    }
+
+    impl DecisiveSource {
+        fn new(names: &[&str]) -> Self {
+            Self {
+                names: names.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+    }
+
+    impl Source for DecisiveSource {
+        fn try_claim(&self, name: &str) -> TryClaim {
+            if self.names.iter().any(|n| n == name) {
+                TryClaim::Yes
+            } else {
+                TryClaim::No
+            }
+        }
+
+        fn claim(&self, name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            let hit = self.names.iter().any(|n| n == name);
+            Box::pin(async move {
+                hit.then(|| PvInfo {
+                    descriptor: StructureDesc::default(),
+                    writable: false,
+                })
+            })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Err("read-only".to_string()) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            let names = self.names.clone();
+            Box::pin(async move { names })
+        }
+    }
+
+    #[tokio::test]
+    async fn try_claim_says_yes_when_a_source_owns_the_name() {
+        let reg = SourceRegistry::new();
+        reg.add("decisive", 0, Arc::new(DecisiveSource::new(&["A"])))
+            .await;
+        assert_eq!(reg.try_claim("A"), TryClaim::Yes);
+    }
+
+    #[tokio::test]
+    async fn try_claim_says_no_only_when_every_source_is_decisive_about_it() {
+        let reg = SourceRegistry::new();
+        reg.add("decisive", 0, Arc::new(DecisiveSource::new(&["A"])))
+            .await;
+        assert_eq!(reg.try_claim("MISSING"), TryClaim::No);
+    }
+
+    #[tokio::test]
+    async fn one_undecided_source_makes_the_whole_answer_unknown() {
+        let reg = SourceRegistry::new();
+        reg.add("decisive", 0, Arc::new(DecisiveSource::new(&["A"])))
+            .await;
+        // StubSource does not override try_claim, so it answers Unknown.
+        reg.add("undecided", 1, Arc::new(StubSource::new(&["B"]))).await;
+        // "A" is owned outright, so the undecided source never gets a say.
+        assert_eq!(reg.try_claim("A"), TryClaim::Yes);
+        // "MISSING" is unowned by the decisive source, but the undecided one
+        // might still serve it — the registry must not claim it knows.
+        assert_eq!(reg.try_claim("MISSING"), TryClaim::Unknown);
+    }
+
+    #[tokio::test]
+    async fn an_undecided_source_that_owns_the_name_still_yields_unknown() {
+        let reg = SourceRegistry::new();
+        reg.add("undecided", 0, Arc::new(StubSource::new(&["B"]))).await;
+        assert_eq!(reg.try_claim("B"), TryClaim::Unknown);
+    }
+
+    #[tokio::test]
+    async fn an_empty_registry_is_decisive_that_it_has_nothing() {
+        let reg = SourceRegistry::new();
+        assert_eq!(reg.try_claim("ANYTHING"), TryClaim::No);
     }
 }
