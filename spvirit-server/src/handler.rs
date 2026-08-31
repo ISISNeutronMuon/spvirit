@@ -260,6 +260,32 @@ pub fn collect_visible_pv_names(
 /// and every one of these may be unbounded third-party work in `names()`.
 pub const PATTERN_ENUM_CONCURRENCY: usize = 4;
 
+/// How long one pattern-query enumeration may run before it is abandoned.
+///
+/// Without this, a single source whose `names()` never returns holds its
+/// permit forever. Four such sources — or four datagrams naming `"*"` while
+/// one hung source is registered — retire the whole budget permanently, and
+/// from then on *every* pattern query is shed. The permit is only ever
+/// released by the spawned task finishing, so an enumeration that cannot
+/// finish must be made to.
+///
+/// Thirty seconds is chosen to be far longer than any legitimate enumeration
+/// and far shorter than "forever". `SourceRegistry::names()` is a fan-out over
+/// registered sources: an in-process store answers in microseconds, and even a
+/// Python-backed source walking a large listing is a sub-second operation. The
+/// slowest realistic case is a proxying source waiting on a network peer,
+/// which is bounded by that peer's own timeouts — an EPICS client's default
+/// search/connect budget is a few seconds. Thirty seconds clears all of that
+/// by an order of magnitude, so a trip of this timeout is not a slow source,
+/// it is a stuck one. It also stays well under the interval at which a real
+/// operator would retry, so the permit is back before the retry needs it.
+///
+/// A timed-out enumeration is treated as a shed, not as "matched nothing": it
+/// sends no reply and increments the same counter (see
+/// [`PatternDispatch::withholds_negative`] for why silence beats a confident
+/// `found=false`).
+pub const PATTERN_ENUM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What a search loop must do about the negative half of its reply, after
 /// handing this datagram's pattern queries to [`spawn_pattern_query_reply`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,8 +340,11 @@ impl PatternDispatch {
 /// queued if none is free — the same ruling, for the same reason, as
 /// [`SearchResolver::enqueue`](crate::search_resolve::SearchResolver::enqueue):
 /// under a flood, delaying the work only converts a CPU problem into an
-/// unbounded-task problem, and search is retry-driven anyway. A shed pattern
-/// query behaves exactly like one that matched nothing.
+/// unbounded-task problem, and search is retry-driven anyway.
+///
+/// The spawned enumeration is bounded by [`PATTERN_ENUM_TIMEOUT`] so that the
+/// permit is returned even when a source's `names()` never is. A timed-out
+/// enumeration is a shed: no reply goes out, and the shed counter moves.
 ///
 /// `ctx` is the caller's [`RequestContext`](crate::request_ctx::RequestContext),
 /// captured on the task that still holds the request's task-local. A spawned
@@ -362,16 +391,31 @@ where
                 state.pvlist_allow_pattern.as_ref(),
                 state.pvlist_max,
             );
-            let cids: Vec<u32> = pattern_requests
+            pattern_requests
                 .iter()
                 .filter(|(_, name)| visible.iter().any(|pv| wildcard_match(name, pv)))
                 .map(|(cid, _)| *cid)
-                .collect();
-            reply(cids).await;
+                .collect::<Vec<u32>>()
         };
-        match ctx {
-            Some(ctx) => crate::request_ctx::scope_with(ctx, enumerate).await,
-            None => enumerate.await,
+        // Only the enumeration is under the timeout; sending the reply is not,
+        // so a slow socket can never turn a completed enumeration into a
+        // silent one.
+        let enumerate = async move {
+            match ctx {
+                Some(ctx) => crate::request_ctx::scope_with(ctx, enumerate).await,
+                None => enumerate.await,
+            }
+        };
+        match tokio::time::timeout(PATTERN_ENUM_TIMEOUT, enumerate).await {
+            Ok(cids) => reply(cids).await,
+            Err(_) => {
+                debug!(
+                    "search: abandoning pattern enumeration after {:?}; a source's names() is \
+                     not returning",
+                    PATTERN_ENUM_TIMEOUT
+                );
+                crate::search_resolve::note_pattern_enum_shed();
+            }
         }
     });
     PatternDispatch::Deferred
@@ -3112,6 +3156,128 @@ mod tests {
             "a name only the identity-less branch produces was answered: the \
              enumeration lost the request context, so `DENY … FROM <host>` \
              stops matching and hidden names are disclosed"
+        );
+    }
+
+    /// A source whose `names()` never returns — the case
+    /// [`PATTERN_ENUM_TIMEOUT`] exists for.
+    struct NeverReturnsNames;
+
+    impl crate::pvstore::Source for NeverReturnsNames {
+        fn try_claim(&self, _name: &str) -> crate::pvstore::TryClaim {
+            crate::pvstore::TryClaim::No
+        }
+
+        fn claim(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &spvirit_codec::spvd_decode::DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Err("read-only".to_string()) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<tokio::sync::mpsc::Receiver<NtPayload>>> + Send + '_>>
+        {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn bare_state(sources: Arc<SourceRegistry>) -> Arc<ServerState> {
+        Arc::new(ServerState::new(
+            sources,
+            Arc::new(MonitorRegistry::new()),
+            false,
+            PvListMode::Discover,
+            100,
+            None,
+            [0u8; 12],
+            5075,
+            None,
+            "127.0.0.1".parse().unwrap(),
+        ))
+    }
+
+    /// V4 LOW-2. A source stuck in `names()` used to hold its permit for the
+    /// life of the process; four of those retired the whole budget and every
+    /// later pattern query was shed forever. The enumeration is now bounded,
+    /// and a timed-out one is a shed: the permit comes back, no reply is sent,
+    /// and the counter moves.
+    ///
+    /// Runs on a paused clock, so the 30s bound costs no wall time — and the
+    /// assertion is therefore about the timeout firing, not about the test
+    /// being slow. No sockets are involved, so nothing else can be woken by
+    /// the auto-advance.
+    #[tokio::test(start_paused = true)]
+    async fn an_enumeration_that_never_finishes_is_shed_and_returns_its_permit() {
+        let sources = Arc::new(SourceRegistry::new());
+        sources.add("hung", 0, Arc::new(NeverReturnsNames)).await;
+        let state = bare_state(sources);
+
+        let before = crate::search_resolve::global_stats().pattern_enum_shed;
+        let replied = Arc::new(AtomicUsize::new(0));
+        let seen = replied.clone();
+        let dispatch = spawn_pattern_query_reply(
+            &state,
+            None,
+            vec![(7, "HUNG:*".to_string())],
+            move |_cids| async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(
+            dispatch,
+            PatternDispatch::Deferred,
+            "a permit was free, so the query must have been spawned"
+        );
+
+        // The permit is held while the enumeration runs...
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state.pattern_enum_permits.available_permits(),
+            PATTERN_ENUM_CONCURRENCY - 1,
+            "the spawned enumeration is not holding its permit"
+        );
+
+        // ...and must be released once the bound expires. The paused clock
+        // auto-advances only when every task is idle, which is exactly the
+        // situation a hung `names()` creates.
+        tokio::time::sleep(PATTERN_ENUM_TIMEOUT + StdDuration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            state.pattern_enum_permits.available_permits(),
+            PATTERN_ENUM_CONCURRENCY,
+            "the permit was never returned: a source hung in names() still \
+             retires one permit permanently, and {PATTERN_ENUM_CONCURRENCY} of \
+             them disable pattern queries for the life of the process"
+        );
+        assert_eq!(
+            replied.load(Ordering::SeqCst),
+            0,
+            "a timed-out enumeration answered anyway; it knows nothing about \
+             what the server serves, so any answer it sends is a guess"
+        );
+        assert!(
+            crate::search_resolve::global_stats().pattern_enum_shed > before,
+            "the abandoned enumeration was not counted as a shed, so the one \
+             failure mode that is silent on the wire is also invisible to an \
+             operator"
         );
     }
 

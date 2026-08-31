@@ -123,8 +123,11 @@ pub fn note_try_claim(outcome: crate::pvstore::TryClaim) {
 /// Record one shed pattern-query enumeration.
 ///
 /// Called from both search paths whenever a pattern query is dropped rather
-/// than answered — no permit was free. Shedding is silent on the wire by
-/// design, so this counter is the only way an operator can see it happening.
+/// than answered: either no permit was free, or the enumeration that held one
+/// ran past
+/// [`PATTERN_ENUM_TIMEOUT`](crate::handler::PATTERN_ENUM_TIMEOUT) and was
+/// abandoned. Shedding is silent on the wire by design, so this counter is the
+/// only way an operator can see it happening.
 pub fn note_pattern_enum_shed() {
     GLOBAL.pattern_enum_shed.fetch_add(1, Ordering::Relaxed);
 }

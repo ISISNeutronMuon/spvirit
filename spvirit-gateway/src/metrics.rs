@@ -131,8 +131,9 @@ pub struct MetricsSnapshot {
     /// A shed pattern query is answered with silence, so this is the *only*
     /// visible trace of one. A sustained non-zero rate means wildcard/pvlist
     /// queries are being dropped; a rate that never returns to zero means
-    /// upstreams are hung in `names()` holding every permit, in which case
-    /// pattern queries stay disabled until they recover.
+    /// upstreams are hung in `names()` and every enumeration is running out
+    /// its timeout, so pattern queries are answered only intermittently until
+    /// they recover.
     pub search_pattern_enum_shed: u64,
 }
 
