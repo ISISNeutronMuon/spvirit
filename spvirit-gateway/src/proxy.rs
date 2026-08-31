@@ -96,8 +96,19 @@ pub struct GatewaySource {
     /// [`GatewaySource::claim`].
     guard: Arc<LoopGuard>,
     getholdoff_ms: u32,
-    bindings: Mutex<HashMap<String, Binding>>,
+    /// Downstream name -> upstream binding.
+    ///
+    /// `Arc`-wrapped so `subscribe`'s spawned upstream-monitor task (a
+    /// `'static` task that cannot borrow `&self`) can retire this PV's binding
+    /// when its upstream dies. Every other call site dereferences through the
+    /// `Arc` unchanged.
+    bindings: Arc<Mutex<HashMap<String, Binding>>>,
     monitors: Arc<MonitorCache>,
+    /// How many upstream monitors this source has torn down because their
+    /// upstream connection ended (error or clean EOF) — NOT the normal
+    /// last-subscriber-left retirement, which is not a fault. `Arc` so the
+    /// spawned upstream task can bump it; surfaced on `/metrics`.
+    deaths: Arc<std::sync::atomic::AtomicU64>,
     /// The readOnly/pvlist/ACF gate consulted at `claim` (`Op::Get`), `put`
     /// (`Op::Put`), and `rpc` (`Op::Rpc`). Precedence (readOnly > pvlist >
     /// ACF) lives entirely inside `AccessControl::decide` — this source only
@@ -124,8 +135,9 @@ impl GatewaySource {
             neg,
             guard,
             getholdoff_ms,
-            bindings: Mutex::new(HashMap::new()),
+            bindings: Arc::new(Mutex::new(HashMap::new())),
             monitors: Arc::new(MonitorCache::new()),
+            deaths: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             access,
         }
     }
@@ -142,6 +154,29 @@ impl GatewaySource {
     /// cache summary"). Cheap snapshot; no lock held across an await.
     pub fn upstream_monitor_names(&self) -> Vec<String> {
         self.monitors.names()
+    }
+
+    /// Forget the binding for downstream `name`.
+    ///
+    /// Called on the upstream-death teardown path. Leaving the binding in
+    /// place would make `try_claim` keep answering `Yes` from memory (it
+    /// consults the bindings map without contacting upstream), so a client
+    /// that just received DESTROY_CHANNEL would re-search, be answered `Yes`,
+    /// create a channel, hit the still-dead upstream and be destroyed again —
+    /// an unbounded hot loop between client and gateway (design spec §4).
+    /// With the binding gone `try_claim` returns `Unknown`, the background
+    /// resolve runs a real `claim`, `pvinfo_full` fails, the negative cache
+    /// records the miss, and the search simply goes unanswered — so the client
+    /// falls back to normal PVA search backoff and recovers on its own when
+    /// the IOC returns.
+    pub fn retire_binding(&self, name: &str) {
+        self.bindings.lock().unwrap().remove(name);
+    }
+
+    /// Number of upstream monitors torn down because their upstream ended.
+    /// Mirrored onto `/metrics` as `spgateway_upstream_monitor_deaths_total`.
+    pub fn upstream_monitor_deaths(&self) -> u64 {
+        self.deaths.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
