@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -352,16 +353,31 @@ impl Source for GatewaySource {
             };
 
             let client = self.pool.client(&client_name)?;
-            let key: MonitorKey = (client_name, real_name.clone());
+            let key: MonitorKey = (client_name.clone(), real_name.clone());
             let monitors = self.monitors.clone();
+            let bindings = self.bindings.clone();
+            let deaths = self.deaths.clone();
+            let down_name = name.clone();
 
             let rx = self.monitors.subscribe(key.clone(), move |entry| {
                 tokio::spawn(async move {
                     let mut last_full = DecodedValue::Null;
+                    // Set by the callback IMMEDIATELY BEFORE it returns
+                    // `Break`, i.e. ONLY on the "last subscriber left" path.
+                    //
+                    // This flag is load-bearing and cannot be replaced by
+                    // inspecting `pvmonitor`'s `Result`: a clean upstream EOF
+                    // and a callback-requested stop BOTH surface as `Ok(())`,
+                    // so a Result-based test would either miss real upstream
+                    // deaths or double-retire an entry `dispatch_or_retire`
+                    // has already removed (and possibly clobber a replacement
+                    // entry created for the same key in the meantime).
+                    let stopped_by_callback = Arc::new(AtomicBool::new(false));
+                    let callback_stopped = stopped_by_callback.clone();
                     let callback_entry = entry.clone();
                     let callback_monitors = monitors.clone();
                     let callback_key = key.clone();
-                    let _ = client
+                    let result = client
                         .pvmonitor(&real_name, move |update| {
                             merge_monitor_delta(&mut last_full, update);
                             let payload = nt_payload_from_decoded(&last_full, struct_id.clone());
@@ -372,14 +388,46 @@ impl Source for GatewaySource {
                             ) {
                                 ControlFlow::Continue(())
                             } else {
+                                callback_stopped.store(true, Ordering::SeqCst);
                                 ControlFlow::Break(())
                             }
                         })
                         .await;
-                    // `dispatch_or_retire` already removed this key's entry
-                    // from the map (atomically, under the map lock) the
-                    // moment it decided the upstream loop should end, so
-                    // there is nothing left to clean up here.
+
+                    if stopped_by_callback.load(Ordering::SeqCst) {
+                        // Last subscriber left. `dispatch_or_retire` already
+                        // removed this key's entry from the map (atomically,
+                        // under the map lock) the moment it decided the
+                        // upstream loop should end. This is the existing,
+                        // correct shutdown path: nothing to clean up, and no
+                        // fault to report.
+                        return;
+                    }
+
+                    // Upstream ended — an error, or a clean EOF. Either way
+                    // there will never be another fan-out for this key, so
+                    // nothing else will ever tear the entry down.
+                    monitors.retire(&key, &entry);
+                    // Removing the map's `Arc` is not enough: this task holds
+                    // a clone, so the `Sender`s would survive and every
+                    // downstream receiver would stay open and silent forever.
+                    // Dropping them is what closes those receivers and makes
+                    // the server-side pump observe `rx.recv() == None`.
+                    entry.close_all();
+                    // Without this, `try_claim` keeps answering `Yes` from the
+                    // bindings map and a destroyed client hot-loops straight
+                    // back into the dead upstream (design spec §4).
+                    bindings.lock().unwrap().remove(&down_name);
+                    deaths.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        "upstream monitor ended for real='{}' downstream='{}' via client='{}' \
+                         ({:?}); retired the cache entry and binding and closed every \
+                         downstream subscriber",
+                        real_name,
+                        down_name,
+                        client_name,
+                        result.err(),
+                    );
                 });
             });
 
