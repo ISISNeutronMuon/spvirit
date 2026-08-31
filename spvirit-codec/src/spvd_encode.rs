@@ -560,6 +560,22 @@ fn display_desc() -> StructureDesc {
                 name: "precision".to_string(),
                 field_type: FieldType::Scalar(TypeCode::Int32),
             },
+            FieldDesc {
+                name: "form".to_string(),
+                field_type: FieldType::Structure(StructureDesc {
+                    struct_id: Some("enum_t".to_string()),
+                    fields: vec![
+                        FieldDesc {
+                            name: "index".to_string(),
+                            field_type: FieldType::Scalar(TypeCode::Int32),
+                        },
+                        FieldDesc {
+                            name: "choices".to_string(),
+                            field_type: FieldType::StringArray,
+                        },
+                    ],
+                }),
+            },
         ],
     }
 }
@@ -703,6 +719,12 @@ fn encode_nt_display(display: &NtDisplay, is_be: bool) -> Vec<u8> {
     out.extend_from_slice(&encode_string_pvd(&display.description, is_be));
     out.extend_from_slice(&encode_string_pvd(&display.units, is_be));
     out.extend_from_slice(&encode_i32(display.precision, is_be));
+    // `display_t` carries a `form` enum. `NtDisplay` has no field for it, so
+    // emit the standard choices at index 0 — the same bytes `encode_display`
+    // produces for a default `NtScalar`. Omitting it here left the value
+    // stream one enum short of the descriptor, and a strict client (pvxs)
+    // read past the end of the frame and dropped the whole connection.
+    out.extend_from_slice(&encode_enum(0, &STANDARD_FORM_CHOICES[..], is_be));
     out
 }
 
@@ -1816,7 +1838,9 @@ fn dv_scalar_timestamp(nt: &NtScalar) -> DecodedValue {
 }
 
 /// display_t with the 5 common fields (used by NTScalarArray / NTNDArray).
-fn dv_display5(d: &NtDisplay) -> DecodedValue {
+/// The `display_t` tree for an [`NtDisplay`]. Mirrors `encode_nt_display`,
+/// including the standard `form` enum that `NtDisplay` has no field for.
+fn dv_display(d: &NtDisplay) -> DecodedValue {
     DecodedValue::Structure(vec![
         ("limitLow".to_string(), DecodedValue::Float64(d.limit_low)),
         ("limitHigh".to_string(), DecodedValue::Float64(d.limit_high)),
@@ -1826,6 +1850,13 @@ fn dv_display5(d: &NtDisplay) -> DecodedValue {
         ),
         ("units".to_string(), DecodedValue::String(d.units.clone())),
         ("precision".to_string(), DecodedValue::Int32(d.precision)),
+        (
+            "form".to_string(),
+            DecodedValue::Structure(vec![
+                ("index".to_string(), DecodedValue::Int32(0)),
+                ("choices".to_string(), dv_form_choices(&[])),
+            ]),
+        ),
     ])
 }
 
@@ -1977,7 +2008,7 @@ fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
                 dv_alarm(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
             ),
             ("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)),
-            ("display".to_string(), dv_display5(&nt.display)),
+            ("display".to_string(), dv_display(&nt.display)),
             (
                 "control".to_string(),
                 DecodedValue::Structure(vec![
@@ -2105,7 +2136,7 @@ fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
                     dv_alarm(alarm.severity, alarm.status, &alarm.message),
                 ),
                 ("timeStamp".to_string(), dv_nt_timestamp(&ts)),
-                ("display".to_string(), dv_display5(&display)),
+                ("display".to_string(), dv_display(&display)),
             ])
         }
         NtPayload::Enum(nt) => DecodedValue::Structure(vec![
@@ -3041,6 +3072,50 @@ mod tests {
             &DecodedValue::Float64(1.0),
             &DecodedValue::Float64(2.0)
         ));
+    }
+
+    /// The encoded value bytes must line up EXACTLY with the descriptor the
+    /// server advertises at GET/MONITOR init — same leaf count, whole buffer
+    /// consumed.
+    ///
+    /// This is not pedantry. `Decoder::decode_structure` stops silently when it
+    /// runs out of bytes, so spvirit's own client happily accepted a stream one
+    /// field short of its descriptor. A strict client does not: pvxs read past
+    /// the end of the frame, declared the message invalid, and dropped the TCP
+    /// connection — taking every other channel on it down too. That is how a
+    /// missing `display.form` in the NTScalarArray encoder made the gateway's
+    /// `clients`/`cache` status PVs permanently unreadable to p4p and pvget.
+    #[test]
+    fn encoded_payload_bytes_match_the_advertised_descriptor() {
+        for payload in all_payload_samples() {
+            for is_be in [false, true] {
+                let desc = nt_payload_desc(&payload);
+                let bytes = encode_nt_payload_full(&payload, is_be);
+                let decoder = crate::spvd_decode::PvdDecoder::new(is_be);
+                let (decoded, consumed) = decoder
+                    .decode_structure(&bytes, &desc)
+                    .expect("descriptor-driven decode of our own bytes");
+
+                assert_eq!(
+                    consumed,
+                    bytes.len(),
+                    "descriptor/encoder disagree for {desc:?} (be={is_be}): consumed \
+                     {consumed} of {} bytes",
+                    bytes.len()
+                );
+                let DecodedValue::Structure(fields) = &decoded else {
+                    panic!("expected a structure for {desc:?}");
+                };
+                assert_eq!(
+                    fields.len(),
+                    desc.fields.len(),
+                    "descriptor declares {} top-level fields but only {} decoded \
+                     for {desc:?} (be={is_be})",
+                    desc.fields.len(),
+                    fields.len()
+                );
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
