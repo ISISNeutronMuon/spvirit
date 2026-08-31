@@ -350,7 +350,8 @@ impl PatternDispatch {
 ///
 /// The spawned enumeration is bounded by [`PATTERN_ENUM_TIMEOUT`] so that the
 /// permit is returned even when a source's `names()` never is. A timed-out
-/// enumeration is a shed: no reply goes out, and the shed counter moves.
+/// enumeration is a shed: no reply goes out, and the shed counter moves. So is
+/// a *panicking* one — see [`ShedUnlessAnswered`].
 ///
 /// `ctx` is the caller's [`RequestContext`](crate::request_ctx::RequestContext),
 /// captured on the task that still holds the request's task-local. A spawned
@@ -365,6 +366,45 @@ impl PatternDispatch {
 /// does for the same reason.
 ///
 /// See [`PatternDispatch`] for what the return value obliges the caller to do.
+/// Counts a shed unless the enumeration reached an answer.
+///
+/// Every way a spawned enumeration can end without replying must move
+/// `pattern_enum_shed`, because shedding is silent on the wire and the counter
+/// is an operator's only trace of a query that went unanswered. The timeout
+/// arm is one such way; a source whose `names()` **panics** is the other, and
+/// it used to be invisible: the task unwinds, the permit comes back by RAII,
+/// but neither arm of the `match` on `timeout` runs, so nothing is counted and
+/// the client's wildcard is never answered. That is the failure mode that
+/// produces the most confusing silence, so it is the last one that should be
+/// missing from the counter.
+///
+/// A drop guard rather than `catch_unwind` because the future is not
+/// `UnwindSafe` and we do not want to swallow the panic — it should still
+/// reach tokio's task-panic reporting. This only makes the panic *countable*.
+struct ShedUnlessAnswered {
+    armed: bool,
+}
+
+impl ShedUnlessAnswered {
+    fn new() -> Self {
+        Self { armed: true }
+    }
+
+    /// The enumeration produced cids; whatever the reply does from here is not
+    /// a shed.
+    fn answered(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ShedUnlessAnswered {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::search_resolve::note_pattern_enum_shed();
+        }
+    }
+}
+
 fn spawn_pattern_query_reply<R, Fut>(
     state: &Arc<ServerState>,
     ctx: Option<crate::request_ctx::RequestContext>,
@@ -412,15 +452,22 @@ where
                 None => enumerate.await,
             }
         };
+        // Armed across the enumeration so that *every* way of ending without
+        // an answer — the timeout below, and a panic out of a source's
+        // `names()` — is counted. Disarmed the moment cids exist.
+        let mut shed = ShedUnlessAnswered::new();
         match tokio::time::timeout(PATTERN_ENUM_TIMEOUT, enumerate).await {
-            Ok(cids) => reply(cids).await,
+            Ok(cids) => {
+                shed.answered();
+                reply(cids).await
+            }
             Err(_) => {
                 debug!(
                     "search: abandoning pattern enumeration after {:?}; a source's names() is \
                      not returning",
                     PATTERN_ENUM_TIMEOUT
                 );
-                crate::search_resolve::note_pattern_enum_shed();
+                // Left armed: the guard counts this shed on the way out.
             }
         }
     });
