@@ -132,8 +132,11 @@ pub struct MetricsSnapshot {
     /// visible trace of one. A sustained non-zero rate means wildcard/pvlist
     /// queries are being dropped; a rate that never returns to zero means
     /// upstreams are hung in `names()` and every enumeration is running out
-    /// its timeout, so pattern queries are answered only intermittently until
-    /// they recover.
+    /// its timeout, in which case pattern queries are not answered at all for
+    /// as long as the hang lasts — the enumeration bound returns the permits,
+    /// but the next queries to take them hang in turn. Retries do not help,
+    /// and the client sees an unresponsive wildcard rather than an error, so
+    /// this counter is what distinguishes it from "no one is asking".
     pub search_pattern_enum_shed: u64,
 }
 
