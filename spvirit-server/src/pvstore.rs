@@ -7,8 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
@@ -16,17 +17,35 @@ use spvirit_types::NtPayload;
 use tokio::sync::{RwLock, mpsc};
 use tracing::debug;
 
-/// How long a resolver outcome stays authoritative.
+/// How long a *positive* resolver outcome stays authoritative.
 ///
 /// Short on purpose. The memo exists to make the client's *next* search
 /// decisive, not to be a durable name cache: a PV that appears after the
 /// server started must still become discoverable promptly, and a name whose
-/// upstream has gone must stop being advertised.
+/// upstream has gone must stop being advertised. Worst-case discovery
+/// latency for a brand-new PV that a client happened to search for just
+/// before it was registered is one [`RESOLVED_NEGATIVE_TTL`], not this one —
+/// see that constant.
 const RESOLVED_TTL: Duration = Duration::from_secs(10);
+
+/// How long a *negative* resolver outcome stays authoritative.
+///
+/// Deliberately much shorter than [`RESOLVED_TTL`]: a miss is cheap to
+/// re-probe, and the negative memo's only job is to damp a retry storm, not
+/// to hide a PV that appears moments later for up to ten seconds. This is
+/// also the worst-case added discovery latency for a newly-registered PV
+/// that a client's search already raced past once.
+const RESOLVED_NEGATIVE_TTL: Duration = Duration::from_secs(2);
 
 /// Upper bound on remembered outcomes, so an unbounded stream of distinct
 /// miss-names cannot grow the memo without limit.
 const RESOLVED_CAPACITY: usize = 4096;
+
+/// Fraction of [`RESOLVED_CAPACITY`] evicted at once when the memo is full of
+/// still-live entries, so the O(n) eviction scan is amortised over many
+/// inserts instead of paid on every single one while the map sits at
+/// capacity (as it will under a sustained flood of distinct miss-names).
+const RESOLVED_EVICT_BATCH: usize = RESOLVED_CAPACITY / 4;
 
 // ---------------------------------------------------------------------------
 // PvInfo — metadata returned by Source::claim
@@ -105,7 +124,9 @@ pub trait Source: Send + Sync {
     /// still triggers [`SearchResolver`](crate::search_resolve::SearchResolver)
     /// to resolve the name in the background, and `SourceRegistry` remembers
     /// the outcome so the requester's retry is answered without another
-    /// round trip.
+    /// round trip. Under a resolution flood the name may instead be shed
+    /// (the resolver has a hard concurrency cap) and answered on a later
+    /// retry — still never incorrect, just not always the very next one.
     ///
     /// A source whose `claim` does no I/O should implement both in terms of
     /// one shared synchronous helper rather than duplicating the predicate —
@@ -246,6 +267,30 @@ struct SourceEntry {
 ///
 /// PV name resolution iterates sources from lowest `order` to highest and
 /// delegates to the first source that claims the name.
+/// Memo key: the identity that asked, plus the name.
+///
+/// Keying on the bare name would let one client's successful resolution tell
+/// a *different* client that a PV it may not see exists. `peer` and `user`
+/// are the same two fields [`crate::request_ctx::request_identity`] exposes
+/// — the ones `AccessControl::decide` in `spvirit-gateway` actually matches
+/// on — so this memo can never disagree with the access policy about who is
+/// asking. The client-asserted `ca` *host* string is deliberately not part
+/// of the key: it is never trusted for an access decision either, so
+/// including it would only fragment the memo without adding security.
+///
+/// A struct key (rather than a delimited `String`) means two different
+/// identities can never collide by way of a crafted separator character in
+/// a user-supplied field.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MemoKey {
+    /// `None` only outside a request scope (e.g. a unit test calling
+    /// `note_resolved`/`try_claim` directly). Whenever a request scope is
+    /// present, the peer is always present too.
+    peer: Option<IpAddr>,
+    user: Option<String>,
+    name: String,
+}
+
 pub struct SourceRegistry {
     sources: RwLock<Vec<SourceEntry>>,
     /// PVs whose shadowing status has already been determined. Bounded by
@@ -257,8 +302,9 @@ pub struct SourceRegistry {
     /// `std::sync::Mutex`, never held across an `.await`, and only ever
     /// `try_lock`ed from the search path — the whole point of this type is
     /// that the search task cannot block.
-    resolved: Mutex<HashMap<String, (Instant, bool)>>,
-    memo_ttl: Duration,
+    resolved: Mutex<HashMap<MemoKey, (Instant, bool)>>,
+    positive_ttl: Duration,
+    negative_ttl: Duration,
 }
 
 impl SourceRegistry {
@@ -268,53 +314,75 @@ impl SourceRegistry {
             sources: RwLock::new(Vec::new()),
             shadow_checked: RwLock::new(HashSet::new()),
             resolved: Mutex::new(HashMap::new()),
-            memo_ttl: RESOLVED_TTL,
+            positive_ttl: RESOLVED_TTL,
+            negative_ttl: RESOLVED_NEGATIVE_TTL,
         }
     }
 
-    /// Create an empty registry whose resolver memo expires after `ttl`
-    /// instead of the default [`RESOLVED_TTL`]. Test-only knob.
+    /// Create an empty registry whose resolver memo expires after `ttl`,
+    /// for both positive and negative outcomes, instead of the defaults
+    /// [`RESOLVED_TTL`] / [`RESOLVED_NEGATIVE_TTL`]. Test-only knob.
     #[cfg(test)]
     pub(crate) fn new_with_memo_ttl(ttl: Duration) -> Self {
         let mut reg = Self::new();
-        reg.memo_ttl = ttl;
+        reg.positive_ttl = ttl;
+        reg.negative_ttl = ttl;
         reg
     }
 
     /// Number of outcomes currently held in the resolver memo. Test-only.
     #[cfg(test)]
     pub(crate) fn memo_len(&self) -> usize {
-        self.resolved.lock().unwrap().len()
+        self.lock_resolved().len()
     }
 
-    /// Memo key: the identity that asked, plus the name. Keying on the bare
-    /// name would let one client's successful resolution tell a *different*
-    /// client that a PV it may not see exists.
-    fn memo_key(name: &str) -> String {
-        let (user, host) = match crate::request_ctx::current_request() {
-            Some(ctx) => (ctx.user.unwrap_or_default(), ctx.host.unwrap_or_default()),
-            None => (String::new(), String::new()),
-        };
-        format!("{user}\u{1}{host}\u{1}{name}")
+    /// Lock the resolver memo, recovering from poisoning rather than
+    /// propagating it.
+    ///
+    /// The memo has no invariant a panicking holder could leave broken — the
+    /// worst a poisoned lock could contain is a slightly stale entry — so
+    /// treating a poison as fatal would silently and permanently disable the
+    /// memo for the rest of the process, resurrecting the exact regression
+    /// this task exists to fix.
+    fn lock_resolved(&self) -> std::sync::MutexGuard<'_, HashMap<MemoKey, (Instant, bool)>> {
+        self.resolved.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Memo key for `name` under the current request identity. The one
+    /// builder both `note_resolved` and `recall` go through, so the two can
+    /// never derive the identity differently.
+    fn memo_key(name: &str) -> MemoKey {
+        let (peer, user) = crate::request_ctx::request_identity();
+        MemoKey {
+            peer,
+            user,
+            name: name.to_string(),
+        }
     }
 
     /// Record the outcome of a background resolution for the current identity.
     pub fn note_resolved(&self, name: &str, found: bool) {
         let key = Self::memo_key(name);
         let now = Instant::now();
-        let Ok(mut memo) = self.resolved.lock() else {
-            return;
-        };
+        let mut memo = self.lock_resolved();
         if memo.len() >= RESOLVED_CAPACITY {
-            memo.retain(|_, (at, _)| now.duration_since(*at) < self.memo_ttl);
+            let positive_ttl = self.positive_ttl;
+            let negative_ttl = self.negative_ttl;
+            memo.retain(|_, (at, found)| {
+                now.duration_since(*at) < if *found { positive_ttl } else { negative_ttl }
+            });
             if memo.len() >= RESOLVED_CAPACITY {
-                // Still full of live entries: drop the oldest rather than grow.
-                if let Some(oldest) = memo
-                    .iter()
-                    .min_by_key(|(_, (at, _))| *at)
-                    .map(|(k, _)| k.clone())
-                {
-                    memo.remove(&oldest);
+                // Still full of live entries: evict a batch of the oldest
+                // rather than one entry per insert. One-at-a-time eviction
+                // here would mean every insert pays a full O(n) scan for as
+                // long as the map stays saturated — exactly the shape of a
+                // sustained distinct-name flood.
+                let mut by_age: Vec<(MemoKey, Instant)> =
+                    memo.iter().map(|(k, (at, _))| (k.clone(), *at)).collect();
+                by_age.sort_by_key(|(_, at)| *at);
+                let evict = RESOLVED_EVICT_BATCH.max(1).min(by_age.len());
+                for (k, _) in by_age.into_iter().take(evict) {
+                    memo.remove(&k);
                 }
             }
         }
@@ -322,12 +390,20 @@ impl SourceRegistry {
     }
 
     /// The remembered outcome for `name` under the current identity, if it has
-    /// not expired. `try_lock` — a contended memo answers `None`, never blocks.
+    /// not expired. `try_lock` — a contended memo answers `None`, never
+    /// blocks. A poisoned lock is treated like an uncontended one (see
+    /// [`lock_resolved`](Self::lock_resolved)) rather than answering `None`
+    /// forever.
     fn recall(&self, name: &str) -> Option<bool> {
         let key = Self::memo_key(name);
-        let memo = self.resolved.try_lock().ok()?;
+        let memo = match self.resolved.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
         let (at, found) = memo.get(&key)?;
-        (Instant::now().duration_since(*at) < self.memo_ttl).then_some(*found)
+        let ttl = if *found { self.positive_ttl } else { self.negative_ttl };
+        (Instant::now().duration_since(*at) < ttl).then_some(*found)
     }
 
     /// Register an ordinary source. Sources may shadow stores and each other.
@@ -356,6 +432,7 @@ impl SourceRegistry {
             is_store,
         });
         sources.sort_by_key(|e| e.order);
+        self.invalidate_memo();
     }
 
     /// Remove all sources with the given label.
@@ -363,6 +440,19 @@ impl SourceRegistry {
         debug!("SourceRegistry: removing source '{}'", label);
         let mut sources = self.sources.write().await;
         sources.retain(|e| e.label != label);
+        self.invalidate_memo();
+    }
+
+    /// Drop every remembered resolver outcome.
+    ///
+    /// The source set just changed, so any memo entry — positive or negative
+    /// — may now be stale: a newly-added source can serve a name the memo
+    /// says `No`, and a removed one can no longer serve a name the memo says
+    /// `Yes`. The registry knows exactly when this happens; without this the
+    /// memo would have no way to find out and a name could stay wrong for a
+    /// full TTL after `add`/`add_store`/`remove`.
+    fn invalidate_memo(&self) {
+        self.lock_resolved().clear();
     }
 
     // ── Delegating operations ────────────────────────────────────────
@@ -441,7 +531,15 @@ impl SourceRegistry {
     /// the entire point is that it cannot await.
     pub fn try_claim(&self, name: &str) -> TryClaim {
         let Ok(sources) = self.sources.try_read() else {
-            return TryClaim::Unknown;
+            // Contention on the sources lock, not on a source's own state:
+            // the memo can only turn this `Unknown` into a previously-
+            // observed answer, never assert something no source has vouched
+            // for, so consulting it here is strictly better than not.
+            return match self.recall(name) {
+                Some(true) => TryClaim::Yes,
+                Some(false) => TryClaim::No,
+                None => TryClaim::Unknown,
+            };
         };
         let mut all_decisive = true;
         for entry in sources.iter() {
@@ -906,6 +1004,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_memo_entry_expires() {
+        // Wall-clock, not `tokio::time::pause`/`advance`: the memo's
+        // expiry check is built on `std::time::Instant`, which a paused
+        // Tokio clock does not affect (only `tokio::time::Instant` is
+        // virtualised), so switching this test to the virtual clock without
+        // also changing the memo's timestamp type would make it pass
+        // vacuously — actual real time is what has to elapse here.
         let reg = SourceRegistry::new_with_memo_ttl(Duration::from_millis(40));
         reg.add("stub", 0, Arc::new(StubSource::new(&["REAL:PV"]))).await;
         reg.note_resolved("REAL:PV", true);
@@ -931,6 +1035,13 @@ mod tests {
         );
     }
 
+    /// This is the shape that actually occurs on the dominant discovery path:
+    /// UDP search installs the peer (`request_ctx::scope`) but never any `ca`
+    /// credentials, so `user` and `host` are `None` for every UDP searcher
+    /// and only the peer IP tells two clients apart. A version of this test
+    /// that also varied `user` (or `host`) would pass on that field alone
+    /// and prove nothing about the peer-only case — which is exactly the gap
+    /// the round-1 review found.
     #[tokio::test]
     async fn the_memo_does_not_leak_a_pv_across_identities() {
         use crate::request_ctx::RequestContext;
@@ -940,13 +1051,13 @@ mod tests {
 
         let a = RequestContext {
             peer: "10.0.0.1:5075".parse().unwrap(),
-            user: Some("alice".into()),
-            host: Some("hosta".into()),
+            user: None,
+            host: None,
         };
         let b = RequestContext {
             peer: "10.0.0.2:5075".parse().unwrap(),
-            user: Some("bob".into()),
-            host: Some("hostb".into()),
+            user: None,
+            host: None,
         };
 
         let r = reg.clone();
@@ -958,7 +1069,47 @@ mod tests {
         assert_eq!(
             seen_by_bob,
             TryClaim::Unknown,
-            "alice's resolution must not tell bob the PV exists"
+            "a different peer's resolution must not tell this one the PV exists"
         );
+    }
+
+    /// The companion positive case to the leak test above: an identity must
+    /// be able to read back its *own* memo entry. Without this, a `memo_key`
+    /// that never agreed with itself (e.g. one that hashed something
+    /// non-deterministic, or that the leak test's negative assertion would
+    /// pass against by accident) would go undetected — a negative-only test
+    /// suite is satisfied by a memo that is simply inert for everyone.
+    #[tokio::test]
+    async fn an_identity_can_read_back_its_own_resolution() {
+        use crate::request_ctx::RequestContext;
+
+        let reg = Arc::new(SourceRegistry::new());
+        reg.add("stub", 0, Arc::new(StubSource::new(&["OWN:PV"]))).await;
+
+        let alice = RequestContext {
+            peer: "10.0.0.1:5075".parse().unwrap(),
+            user: Some("alice".into()),
+            host: None,
+        };
+
+        let r = reg.clone();
+        let seen_by_alice = crate::request_ctx::scope_with(alice.clone(), async move {
+            r.note_resolved("OWN:PV", true);
+            r.try_claim("OWN:PV")
+        })
+        .await;
+        assert_eq!(
+            seen_by_alice,
+            TryClaim::Yes,
+            "an identity must be able to read back its own resolution"
+        );
+
+        // And a second, separate scope with the same identity fields must
+        // see it too — the memo key must be a pure function of identity plus
+        // name, not tied to the particular task instance that wrote it.
+        let r = reg.clone();
+        let seen_again =
+            crate::request_ctx::scope_with(alice, async move { r.try_claim("OWN:PV") }).await;
+        assert_eq!(seen_again, TryClaim::Yes);
     }
 }

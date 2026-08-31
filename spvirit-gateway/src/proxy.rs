@@ -47,11 +47,15 @@ use crate::upstream::UpstreamPool;
 /// one fails closed (no host/user to match against). Whenever a request
 /// scope *is* present, the peer IP is always present too, so `host` is only
 /// `None` in that out-of-scope case.
+///
+/// Delegates to [`spvirit_server::request_ctx::request_identity`] rather than
+/// reading `current_request` itself, so this crate's notion of "who is
+/// asking" and `SourceRegistry`'s resolver-memo key can never drift apart.
 fn current_identity() -> Identity {
-    let rc = spvirit_server::request_ctx::current_request();
+    let (peer, user) = spvirit_server::request_ctx::request_identity();
     Identity {
-        host: rc.as_ref().map(|c| c.peer.ip().to_string()),
-        user: rc.and_then(|c| c.user),
+        host: peer.map(|ip| ip.to_string()),
+        user,
     }
 }
 

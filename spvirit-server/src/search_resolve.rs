@@ -140,15 +140,15 @@ impl SearchResolver {
                 name: name.clone(),
             };
             let started = Instant::now();
-            let log_name = name.clone();
             // `note_resolved` must run under the same identity `try_claim` will
             // later be read under — inside `scope_with`, not after it. Called
             // after the scope ends, the memo key would derive from an empty
             // identity and the searching client's own `try_claim` (evaluated
             // under its real identity) would never see the entry.
+            let n = name.clone();
             let resolve = async move {
-                let found = sources.claim(&name).await.is_some();
-                sources.note_resolved(&name, found);
+                let found = sources.claim(&n).await.is_some();
+                sources.note_resolved(&n, found);
                 found
             };
             let found = match ctx {
@@ -161,7 +161,6 @@ impl SearchResolver {
             } else {
                 stats.completed_missing.fetch_add(1, Ordering::Relaxed);
             }
-            let name = log_name;
             tracing::debug!(
                 "search resolve: '{name}' found={found} in {:?}",
                 started.elapsed()
@@ -492,15 +491,28 @@ mod tests {
             "control: the source cannot answer without I/O"
         );
 
+        // Exercised inside a real request scope, not unscoped: an unscoped
+        // enqueue takes the `ctx == None` arm in the resolver's spawned task
+        // and never proves the `Some(ctx)` / `scope_with` arm actually writes
+        // a memo entry readable back under that same identity. Every other
+        // test in this module (bar `the_worker_sees_the_identity_...`, which
+        // doesn't touch the memo at all) runs unscoped, so without this the
+        // suite would stay green even if `scope_with`'s memo write were
+        // silently inert for every credentialed client.
+        let peer: std::net::SocketAddr = "10.9.9.9:5075".parse().unwrap();
         let resolver = SearchResolver::new(reg.clone());
-        resolver.enqueue("FOUND:PV");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        crate::request_ctx::scope(peer, async {
+            resolver.enqueue("FOUND:PV");
+            tokio::time::sleep(Duration::from_millis(200)).await;
 
-        assert_eq!(resolver.stats().completed_found, 1);
-        assert_eq!(
-            reg.try_claim("FOUND:PV"),
-            TryClaim::Yes,
-            "the resolver's outcome must be readable without another round trip"
-        );
+            assert_eq!(resolver.stats().completed_found, 1);
+            assert_eq!(
+                reg.try_claim("FOUND:PV"),
+                TryClaim::Yes,
+                "the resolver's outcome must be readable, under the same identity, \
+                 without another round trip"
+            );
+        })
+        .await;
     }
 }

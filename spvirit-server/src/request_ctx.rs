@@ -14,7 +14,7 @@
 //! after `ConnectionValidation` decodes the peer's `ca` credentials.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 /// Snapshot of the current connection's identity, as seen by a [`Source`](crate::pvstore::Source).
@@ -100,6 +100,29 @@ pub fn current_request() -> Option<RequestContext> {
             }
         })
         .ok()
+}
+
+/// The identity fields that are actually trustworthy for an access decision:
+/// the peer IP (never spoofable — it is the TCP/UDP source address, not a
+/// client-asserted string) and the self-asserted `ca` user.
+///
+/// This is the **single** source of truth for "who is asking" outside of
+/// `current_request` itself. [`crate::pvstore::SourceRegistry`]'s resolver
+/// memo and `spvirit-gateway`'s `AccessControl::decide` identity must derive
+/// from the same two fields — two independent readings of "the requester's
+/// identity" that can drift is exactly the defect class this crate has
+/// already shipped twice (the display.form and NT-descriptor bugs). The
+/// client-asserted `ca` *host* string is deliberately excluded: it grants no
+/// security (a client can claim anything) and including it would only
+/// fragment identity keys that should collide.
+///
+/// Returns `(None, None)` outside a [`scope`]d task, matching
+/// `current_request`'s `None`.
+pub fn request_identity() -> (Option<IpAddr>, Option<String>) {
+    match current_request() {
+        Some(ctx) => (Some(ctx.peer.ip()), ctx.user),
+        None => (None, None),
+    }
 }
 
 #[cfg(test)]
