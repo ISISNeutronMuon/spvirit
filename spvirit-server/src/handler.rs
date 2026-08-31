@@ -999,7 +999,20 @@ pub async fn run_udp_search(
                     // Captured *inside* the scope, on the task that holds the
                     // request's task-local: the pattern enumeration is
                     // spawned below, after this scope has already ended.
-                    (cids, pattern_requests, crate::request_ctx::current_request())
+                    //
+                    // Only when there is something to spawn. `current_request`
+                    // takes a mutex and clones up to two `String`s, and the
+                    // overwhelming majority of datagrams carry no pattern
+                    // query at all — for those `spawn_pattern_query_reply`
+                    // returns `PatternDispatch::None` without ever looking at
+                    // the context. This is the search read loop, the very path
+                    // this branch exists to keep clear.
+                    let req_ctx = if pattern_requests.is_empty() {
+                        None
+                    } else {
+                        crate::request_ctx::current_request()
+                    };
+                    (cids, pattern_requests, req_ctx)
                 })
                 .await;
                 let response_required = (payload.mask & 0x01) != 0;
@@ -2253,7 +2266,19 @@ pub async fn handle_connection(
                         // and `set_credentials` has already installed the
                         // validated `ca` user, so this is the full identity the
                         // inline enumeration used to see.
-                        let req_ctx = crate::request_ctx::current_request();
+                        //
+                        // Skipped entirely when there is no pattern query:
+                        // `current_request` takes a mutex and clones up to two
+                        // `String`s, and this is the hot path of a name-server
+                        // connection, where almost every Search is exact names
+                        // only. `spawn_pattern_query_reply` returns
+                        // `PatternDispatch::None` without reading the context
+                        // in that case.
+                        let req_ctx = if pattern_requests.is_empty() {
+                            None
+                        } else {
+                            crate::request_ctx::current_request()
+                        };
                         spawn_pattern_query_reply(
                             &state,
                             req_ctx,
