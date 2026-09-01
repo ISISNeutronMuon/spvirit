@@ -173,10 +173,14 @@ impl SensorBackend {
             // merely behind — drop the *update*, never the sender. `Closed`
             // means the receiver is genuinely gone, so the sender can never
             // deliver again and is pruned. Dropping a sender on `Full` would
-            // close the stream, and for a source the server pumps
-            // (`pushes_own_updates() == false`) a closed stream MEANS "this PV
-            // is dead": one episode of ordinary backpressure would send
-            // DESTROY_CHANNEL to every subscriber of the PV.
+            // close the stream, and for a source the server pumps a closed
+            // stream MEANS "this PV is dead": one episode of ordinary
+            // backpressure would send DESTROY_CHANNEL to every subscriber of
+            // the PV. This store self-notifies (`pushes_own_updates() == true`
+            // below), so the server never pumps it and never sees these
+            // channels — but copy the pattern, because the moment a template
+            // leaves that flag at its `false` default the hazard is real. See
+            // `wildcard_source.rs` for the pumped case.
             let mut subscribers = self.subscribers.write().await;
             for (pv_name, payload) in updates {
                 if let Some(senders) = subscribers.get_mut(&pv_name) {
