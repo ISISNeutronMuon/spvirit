@@ -111,6 +111,54 @@ where
     panic!("expected command never arrived");
 }
 
+/// The tables must be registered for the *whole* life of the connection, from
+/// before the first frame — not merely by the time a channel exists.
+///
+/// Task 7 fires teardown from the registry against whatever connections are
+/// live at that moment, including ones still mid-handshake; if registration
+/// were deferred until after validation, such a connection would be invisible
+/// to it. This test connects, reads the server's `ConnectionValidation`, and
+/// then deliberately **never replies** — so the handshake is provably
+/// incomplete — yet the tables must already be reachable.
+#[tokio::test]
+async fn tables_are_registered_before_the_handshake_completes() {
+    let (addr, registry) = spawn_server().await;
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    read_until(&mut stream, |cmd| {
+        matches!(cmd, PvaPacketCommand::ConnectionValidation(_))
+    })
+    .await;
+    // No client ConnectionValidation is sent: the connection is unvalidated and
+    // has no channels, and will stay that way for the rest of the test.
+
+    let mut registered = false;
+    for _ in 0..50 {
+        if registry.channel_tables(1).await.is_some() {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        registered,
+        "a connection's tables must be registered before the handshake completes, \
+         not only once a channel has been created"
+    );
+
+    // Guard against the assertion above passing for the wrong reason: confirm
+    // the connection really is still unvalidated and channel-less.
+    let tables = registry.channel_tables(1).await.expect("registered");
+    let t = tables.lock().unwrap();
+    assert!(
+        t.cid_to_sid.is_empty() && t.sid_to_pv.is_empty(),
+        "the handshake was never completed, so no channel can exist yet"
+    );
+    drop(t);
+
+    drop(stream);
+}
+
 #[tokio::test]
 async fn a_created_channel_is_visible_through_the_registrys_channel_tables() {
     let (addr, registry) = spawn_server().await;

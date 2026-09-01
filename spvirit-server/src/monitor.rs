@@ -29,6 +29,25 @@ pub struct MonitorRegistry {
     /// connection task, so it needs a way to forget the destroyed channel in
     /// the owning connection's tables. Registered when the connection is
     /// accepted, removed by [`Self::cleanup_connection`].
+    ///
+    /// **Invariant the caller must uphold:** `conn_id` must be unique for the
+    /// lifetime of this registry. That is *not* something the server
+    /// guarantees on its own — [`run_tcp_server`](crate::handler::run_tcp_server)
+    /// allocates its connection counter inside the function, starting at 1, so
+    /// it numbers per *invocation*, not per registry. Because
+    /// [`run_pva_server_with_registry`](crate::server::run_pva_server_with_registry)
+    /// is public and lets a caller share one `Arc<MonitorRegistry>` across
+    /// several accept loops, two listeners on one registry would both hand out
+    /// conn_id 1: the second registration silently replaces the first
+    /// connection's tables, and whichever connection ends first evicts the
+    /// survivor's entry.
+    ///
+    /// No production caller does this today (each server owns one listener),
+    /// and the sibling `conns` map has always carried the same hazard — but
+    /// this map is worse to alias, because upstream-death teardown resolves a
+    /// `MonitorSub`'s `conn_id` through it to choose which socket receives
+    /// DESTROY_CHANNEL. An aliased id there is a frame sent to the wrong
+    /// client, not merely a dropped one.
     chan_tables: Mutex<HashMap<u64, SharedChannelTables>>,
     /// PV name → the task draining a subscribe-only source's update stream
     /// into `notify_monitors`. One pump per PV, shared by every subscriber of
@@ -182,6 +201,20 @@ impl MonitorRegistry {
 
     /// Share a connection's channel tables with the registry, so
     /// upstream-death teardown can retract channels it destroys.
+    ///
+    /// **Last writer wins.** Registering a `conn_id` that is already present
+    /// replaces the stored handle; it does not keep the incumbent. That is the
+    /// right way round for the only case that can legitimately reach it — an id
+    /// reused after the previous owner has gone — because keeping a stale
+    /// handle would have teardown mutate tables nobody reads while the live
+    /// connection's channels are never retracted.
+    ///
+    /// It is **not** a licence to alias ids: see the invariant on the private
+    /// `chan_tables` field. `conn_id` must be unique for the lifetime of this
+    /// registry, and a caller that shares one registry across two
+    /// `run_tcp_server` accept loops breaks that — with last-writer-wins the
+    /// consequence is that the second listener's connection silently takes over
+    /// the first's entry.
     pub async fn register_channel_tables(&self, conn_id: u64, tables: SharedChannelTables) {
         self.chan_tables.lock().await.insert(conn_id, tables);
     }
@@ -500,6 +533,16 @@ impl MonitorRegistry {
             let mut tables = self.chan_tables.lock().await;
             tables.remove(&conn_id);
         }
+        // ORDERING (Task 3 principle): `cr.disconnect` is the observable "this
+        // connection is gone" signal, so it must stay AFTER every internal
+        // state change above — `monitors`, `conns`, and `chan_tables`. Do not
+        // move it up, and do not move any of them down past it.
+        //
+        // Deliberately not covered by a test: there is no `.await` between the
+        // `chan_tables` removal and this call, so no other task can ever
+        // observe the intermediate state, and any test claiming to check the
+        // relative order would be asserting nothing. Keep the constraint here,
+        // where a reorder is made.
         if let Some(cr) = self.client_registry() {
             cr.disconnect(conn_id);
         }
@@ -963,6 +1006,28 @@ mod tests {
         assert!(
             reg.channel_tables(3).await.is_none(),
             "an unregistered conn_id must not resolve to someone else's tables"
+        );
+
+        // Re-registering a live conn_id is last-writer-wins, not
+        // first-writer-sticks. Only a reused id can legitimately reach this,
+        // and keeping the incumbent there would have teardown mutate a dead
+        // connection's tables while the live connection's channels are never
+        // retracted — a DESTROY_CHANNEL aimed at nothing.
+        let replacement: crate::state::SharedChannelTables = Default::default();
+        replacement.lock().unwrap().insert_channel(9, 10, "PV:NEW");
+        reg.register_channel_tables(1, Arc::clone(&replacement)).await;
+        let after = reg.channel_tables(1).await.expect("still registered");
+        assert!(
+            Arc::ptr_eq(&after, &replacement),
+            "re-registering a conn_id must replace the stored handle, not keep the stale one"
+        );
+        assert!(
+            !Arc::ptr_eq(&after, &tables),
+            "the superseded handle must no longer be reachable through the registry"
+        );
+        assert!(
+            Arc::ptr_eq(&reg.channel_tables(2).await.unwrap(), &other),
+            "replacing one conn_id must not disturb another"
         );
 
         reg.cleanup_connection(1).await;
