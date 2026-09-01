@@ -166,11 +166,25 @@ impl SensorBackend {
                 }
             }
 
-            // Also notify internal subscribers via mpsc channels
+            // Also notify internal subscribers via mpsc channels.
+            //
+            // NOTE for anyone copying this template: distinguish the two
+            // `try_send` failures. `Full` means the receiver is alive and
+            // merely behind — drop the *update*, never the sender. `Closed`
+            // means the receiver is genuinely gone, so the sender can never
+            // deliver again and is pruned. Dropping a sender on `Full` would
+            // close the stream, and for a source the server pumps
+            // (`pushes_own_updates() == false`) a closed stream MEANS "this PV
+            // is dead": one episode of ordinary backpressure would send
+            // DESTROY_CHANNEL to every subscriber of the PV.
             let mut subscribers = self.subscribers.write().await;
             for (pv_name, payload) in updates {
                 if let Some(senders) = subscribers.get_mut(&pv_name) {
-                    senders.retain(|tx| tx.try_send(payload.clone()).is_ok());
+                    senders.retain(|tx| match tx.try_send(payload.clone()) {
+                        Ok(()) => true,
+                        Err(mpsc::error::TrySendError::Full(_)) => true,
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    });
                 }
             }
         }
@@ -295,6 +309,15 @@ impl Source for SensorBackend {
             println!("[subscribe] '{}' -> subscribed", name);
             Some(rx)
         })
+    }
+
+    /// This backend pushes its own updates: `run_updates` calls
+    /// `MonitorRegistry::notify_monitors` for every change. Saying so is what
+    /// stops the server *also* pumping `subscribe` into the registry, which
+    /// would deliver every update to a PVA client twice. The `subscribe`
+    /// stream above stays available for in-process consumers.
+    fn pushes_own_updates(&self) -> bool {
+        true
     }
 
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {

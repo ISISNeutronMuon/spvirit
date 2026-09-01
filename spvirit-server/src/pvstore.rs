@@ -159,8 +159,13 @@ pub trait Source: Send + Sync {
     /// [`pushes_own_updates`](Self::pushes_own_updates) (`false`), the server
     /// pumps this receiver; when the last sender drops, the pump treats it as
     /// the death of the PV's backing data and sends DESTROY_CHANNEL to every
-    /// subscriber (see
-    /// [`MonitorRegistry::destroy_channels_for_pv`](crate::monitor::MonitorRegistry::destroy_channels_for_pv)).
+    /// subscriber. (That is the pump's own end-of-stream path — it takes the
+    /// subscriber set atomically via `begin_pump_teardown` and destroys it via
+    /// `destroy_subs`, both private to
+    /// [`MonitorRegistry`](crate::monitor::MonitorRegistry). The `pub`
+    /// [`destroy_channels_for_pv`](crate::monitor::MonitorRegistry::destroy_channels_for_pv)
+    /// is the opt-in embedder entry point to the same teardown; nothing in the
+    /// server calls it, so it is not what runs when your stream closes.)
     /// PVA carries no frame that distinguishes "the stream ended but the
     /// channel is still valid" from "the source died", and clients react to a
     /// destroy by re-searching.

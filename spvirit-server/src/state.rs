@@ -44,6 +44,34 @@ impl ChannelTables {
         self.ioid_to_sid.retain(|_, s| *s != sid);
     }
 
+    /// Forget destroyed channel `sid`, but leave `cid`'s row alone if that cid
+    /// has since been re-bound to a *newer* channel. Returns whether `cid` did
+    /// still point back at `sid` — i.e. whether the destroy names a channel the
+    /// client still has under that cid.
+    ///
+    /// A client may re-create a channel on the same cid without first sending
+    /// DestroyChannel; `cid_to_sid[cid]` then belongs to the newer sid while
+    /// our `sid_to_cid[sid]` row lives on. The plain [`Self::remove_channel`]
+    /// strips that cid row unconditionally, after which
+    /// `MonitorRegistry::destroy_subs` sees no owner for the cid, declines to
+    /// send, and the client is silently skipped on the next upstream death —
+    /// the exact silence the destroy path exists to remove. Every caller that
+    /// removes a channel it was *told about by the client* (whose sid may
+    /// therefore be stale) must come through here.
+    pub fn remove_channel_if_current(&mut self, cid: u32, sid: u32) -> bool {
+        let current_owner = self.cid_to_sid.get(&cid).copied();
+        self.remove_channel(cid, sid);
+        if current_owner == Some(sid) {
+            return true;
+        }
+        // `remove_channel` also dropped the cid row, which belongs to the newer
+        // channel: put it back.
+        if let Some(other) = current_owner {
+            self.cid_to_sid.insert(cid, other);
+        }
+        false
+    }
+
     /// Record that monitor `ioid` runs on channel `sid`.
     pub fn bind_monitor(&mut self, ioid: u32, sid: u32) {
         self.ioid_to_sid.insert(ioid, sid);
@@ -133,6 +161,50 @@ mod tests {
             "a destroyed channel must take its monitor bindings with it"
         );
         assert_eq!(t.cid_for_sid(22), None);
+    }
+
+    /// A client's *echoed* DestroyChannel names a sid the client chose, so it
+    /// may be stale: the client can re-create a channel on the same cid (after
+    /// a server-initiated destroy, which is now the designed recovery path)
+    /// and only then send the destroy for the old sid. Stripping `cid_to_sid`
+    /// unconditionally there loses the live channel's row, after which
+    /// `MonitorRegistry::destroy_subs` finds no owner for that cid, declines to
+    /// send, and the client goes silent on the next upstream death.
+    #[test]
+    fn a_stale_destroy_must_not_evict_the_cid_row_of_a_newer_channel() {
+        let mut t = ChannelTables::default();
+        t.insert_channel(9, 7, "PV:X");
+        t.bind_monitor(42, 7);
+        // Client re-creates on the same cid, then echoes the old destroy.
+        t.insert_channel(9, 8, "PV:X");
+        t.bind_monitor(43, 8);
+
+        assert!(
+            !t.remove_channel_if_current(9, 7),
+            "cid 9 no longer belongs to sid 7, so this destroy is stale"
+        );
+        assert_eq!(
+            t.cid_to_sid.get(&9).copied(),
+            Some(8),
+            "the live channel's cid row must survive a stale destroy"
+        );
+        assert_eq!(
+            t.channel_for_monitor(43),
+            Some((8, 9)),
+            "the live monitor must still resolve, or its DESTROY_CHANNEL is \
+             never sent"
+        );
+        assert!(
+            !t.sid_to_cid.contains_key(&7)
+                && !t.sid_to_pv.contains_key(&7)
+                && !t.ioid_to_sid.contains_key(&42),
+            "the stale channel's own rows must still be retracted"
+        );
+
+        // The ordinary, non-stale case still removes everything.
+        assert!(t.remove_channel_if_current(9, 8));
+        assert!(t.cid_to_sid.is_empty() && t.sid_to_cid.is_empty());
+        assert!(t.sid_to_pv.is_empty() && t.ioid_to_sid.is_empty());
     }
 
     /// `channel_for_monitor` is how Layer 2 turns a `MonitorSub` (which knows

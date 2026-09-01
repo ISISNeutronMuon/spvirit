@@ -2152,11 +2152,17 @@ pub async fn handle_connection(
             PvaPacketCommand::DestroyChannel(payload) => {
                 let sid = payload.sid;
                 let cid = payload.cid;
+                // The client names the sid, so it may be stale: a client that
+                // re-created a channel on the same cid and only then echoes a
+                // DestroyChannel for the old sid must not strip the *new*
+                // channel's `cid_to_sid` row. Losing it makes
+                // `MonitorRegistry::destroy_subs` decline to send that client a
+                // DESTROY_CHANNEL on the next upstream death.
                 conn_state
                     .channels
                     .lock()
                     .unwrap()
-                    .remove_channel(cid, sid);
+                    .remove_channel_if_current(cid, sid);
                 info!(
                     "Conn {}: channel destroyed sid={} cid={}",
                     conn_id, sid, cid

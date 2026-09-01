@@ -28,6 +28,20 @@ use spvirit_gateway::upstream::UpstreamPool;
 use spvirit_server::PvaServer;
 use spvirit_server::pvstore::{Source, TryClaim};
 
+/// Why a failed port probe is a FAILURE here and not a skip.
+///
+/// This file is the end-to-end proof of the whole upstream-disconnect branch.
+/// A test that `eprintln!`s "skipping" and returns `Ok` reports success while
+/// having asserted nothing — the exact "passing for the wrong reason" this
+/// file exists to rule out, and invisible in a green run. Binding a loopback
+/// port is not a legitimate environmental variation for a test suite that
+/// already spawns servers on every other line; if it fails, the environment is
+/// broken and the suite must say so out loud.
+const PORT_BIND_NOTE: &str = "binding 127.0.0.1:0 failed, so this environment \
+    cannot run the upstream-disconnect proofs. This is deliberately a FAILURE, \
+    not a skip: a silent skip here would report the branch's end-to-end proof \
+    as green without running it.";
+
 fn free_tcp_port() -> Option<u16> {
     TcpListener::bind("127.0.0.1:0")
         .ok()
@@ -181,8 +195,7 @@ async fn claim_within(src: &Arc<GatewaySource>, pv: &str) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upstream_death_closes_subscribers_and_retires_the_entry_and_binding() {
     let (Some(tcp), Some(udp)) = (free_tcp_port(), free_udp_port()) else {
-        eprintln!("Skipping test: cannot bind a free port in this environment");
-        return;
+        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
     };
     let mut backend = spawn_backend("GW:DIE", tcp, udp);
     let (src, _pool) = gateway_source(udp);
@@ -287,8 +300,7 @@ async fn a_downstream_monitor_subscription_is_torn_down_when_the_upstream_dies()
     use spvirit_client::{PvOptions, pvmonitor};
 
     let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
-        eprintln!("Skipping test: cannot bind a free port in this environment");
-        return;
+        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
     };
     let mut backend = spawn_backend("GW:E2E", up_tcp, up_udp);
     let (src, _pool) = gateway_source(up_udp);
@@ -394,16 +406,13 @@ async fn a_live_metrics_endpoint_reports_the_upstream_death() {
     use spvirit_gateway::runtime::Runtime;
 
     let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
-        eprintln!("Skipping test: cannot bind a free port in this environment");
-        return;
+        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
     };
     let (Some(gw_tcp), Some(gw_udp)) = (free_tcp_port(), free_udp_port()) else {
-        eprintln!("Skipping test: cannot bind a free gateway port");
-        return;
+        panic!("cannot bind a free gateway port: {PORT_BIND_NOTE}");
     };
     let Some(metrics_port) = free_tcp_port() else {
-        eprintln!("Skipping test: cannot bind a free metrics port");
-        return;
+        panic!("cannot bind a free metrics port: {PORT_BIND_NOTE}");
     };
     const PATH: &str = "/metrics";
 
@@ -677,8 +686,7 @@ async fn a_real_client_receives_destroy_channel_naming_its_own_channel() {
     const PV: &str = "GW:WIRE";
 
     let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
-        eprintln!("Skipping test: cannot bind a free port in this environment");
-        return;
+        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
     };
     let mut backend = spawn_backend(PV, up_tcp, up_udp);
     let (src, _pool) = gateway_source(up_udp);
@@ -727,8 +735,7 @@ async fn a_real_client_re_searches_and_gets_data_again_after_destroy_channel() {
     const PV: &str = "GW:REVIVE";
 
     let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
-        eprintln!("Skipping test: cannot bind a free port in this environment");
-        return;
+        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
     };
     let mut backend = spawn_backend(PV, up_tcp, up_udp);
     let (src, _pool) = gateway_source(up_udp);

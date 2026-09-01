@@ -144,10 +144,24 @@ impl Source for WildcardSource {
 
             let payload = NtPayload::Scalar(NtScalar::from_value(new_val));
 
-            // Notify subscribers
+            // Notify subscribers.
+            //
+            // NOTE for anyone copying this template: distinguish the two
+            // `try_send` failures. `Full` means the receiver is alive and
+            // merely behind — drop the *update*, never the sender. `Closed`
+            // means the receiver is genuinely gone, so the sender can never
+            // deliver again and is pruned. Dropping a sender on `Full` would
+            // close the stream, and for a source the server pumps (this one
+            // keeps the default `pushes_own_updates() == false`) a closed
+            // stream MEANS "this PV is dead": one episode of ordinary
+            // backpressure would send DESTROY_CHANNEL to every subscriber.
             let mut subs = self.subscribers.write().await;
             if let Some(senders) = subs.get_mut(&name) {
-                senders.retain(|tx| tx.try_send(payload.clone()).is_ok());
+                senders.retain(|tx| match tx.try_send(payload.clone()) {
+                    Ok(()) => true,
+                    Err(mpsc::error::TrySendError::Full(_)) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                });
             }
 
             Ok(vec![(name, payload)])

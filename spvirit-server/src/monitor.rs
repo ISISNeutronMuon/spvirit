@@ -727,13 +727,26 @@ impl MonitorRegistry {
     /// **What is *not* cleaned up.** Only the *shared* tables are reachable
     /// from here. The connection task's private
     /// [`ConnState`](crate::state::ConnState) — `ioid_to_pv`, `ioid_to_desc`,
-    /// `ioid_to_monitor` — is cleared only when the client sends a
-    /// `DestroyRequest`, which a client reacting to a server-initiated destroy
-    /// by re-searching will never send for that ioid. On a long-lived
-    /// connection against a flapping upstream those three maps therefore grow
-    /// one entry per flap. Closing that needs the connection task to be
-    /// reachable from the registry (the Task 5 treatment applied to the rest of
-    /// `ConnState`), which is deliberately out of scope here.
+    /// `ioid_to_monitor` — is cleared at exactly two sites, `handler.rs`'s
+    /// monitor-destroy and `DestroyRequest` arms, and a client reacting to a
+    /// server-initiated destroy exercises neither: it drops its channel state
+    /// and re-searches.
+    ///
+    /// **This is on the designed recovery path, not a corner.** Re-search *is*
+    /// the recovery mechanism this teardown exists to trigger — there is no
+    /// server-side reconnect loop — so on a long-lived connection against a
+    /// flapping upstream those three maps grow roughly three entries per PV,
+    /// per flap, unbounded. Do not read the paragraph above as an
+    /// unreachability argument; the growth is reachable by ordinary,
+    /// as-designed use, and it is accepted here only because the alternative is
+    /// a bigger change than this function can make: nothing in `ConnState` but
+    /// `channels` is shared with the registry, the rest is owned outright by
+    /// the connection task, so closing this needs the Task 5 `SharedChannelTables`
+    /// treatment applied to the remaining maps (or an equivalent
+    /// registry→connection channel). That is a structural change to
+    /// `ConnState`'s ownership and is deliberately out of scope for this
+    /// branch. The bound in practice is the lifetime of one TCP connection: a
+    /// client that reconnects releases all of it.
     ///
     /// **Caller contract.** Safe to call from *inside* the PV's own pump task
     /// (the end-of-stream path does). From anywhere else, call it only when the
@@ -813,16 +826,9 @@ impl MonitorRegistry {
                         // the client to drop its *new* channel, so when the cid
                         // no longer points back at our sid we send nothing and
                         // only retract our own rows.
-                        let current_owner = t.cid_to_sid.get(&cid).copied();
-                        t.remove_channel(cid, sid);
-                        if current_owner == Some(sid) {
+                        if t.remove_channel_if_current(cid, sid) {
                             Some((sid, cid))
                         } else {
-                            // `remove_channel` also dropped the cid row, which
-                            // belongs to the newer channel: put it back.
-                            if let Some(other) = current_owner {
-                                t.cid_to_sid.insert(cid, other);
-                            }
                             None
                         }
                     }
@@ -2511,6 +2517,56 @@ mod tests {
         assert!(
             !reg.pumps.lock().await.contains_key("PV:N"),
             "an idle PV's pump must still actually be retired"
+        );
+        drop(tx);
+    }
+
+    /// `begin_pump_teardown` must take `monitors` **before** `pumps`, the
+    /// established order in this module. Inverting those two adjacent
+    /// statements introduces the only `pumps → monitors` path in the crate and
+    /// with it a deadlock against `retire_pump_if_idle`, which nests the other
+    /// way.
+    ///
+    /// Pinned with the file's `try_lock` idiom (also used at the sink in
+    /// `a_pump_teardown_never_retires_the_replacement_it_caused` and in
+    /// `an_idle_retirement_holds_the_monitors_lock_while_it_removes_the_pump`)
+    /// so the assertion FAILS under an inversion instead of hanging: hold
+    /// `monitors`, park the call on it, and check that `pumps` is still free.
+    /// Under the inverted order the parked call would be holding `pumps` while
+    /// it waits for `monitors`, and the `try_lock` returns `Err`.
+    #[tokio::test]
+    async fn a_pump_teardown_takes_monitors_before_pumps() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let (tx, rx) = mpsc::channel::<NtPayload>(4);
+        reg.ensure_pump("PV:LO", rx).await;
+        let id = reg
+            .pumps
+            .lock()
+            .await
+            .get("PV:LO")
+            .expect("fixture regression: no pump was installed")
+            .id;
+
+        // Park the teardown on whichever lock it takes first.
+        let gate = reg.monitors.lock().await;
+        let r = Arc::clone(&reg);
+        let tearing = tokio::spawn(async move { r.begin_pump_teardown("PV:LO", id).await });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let pumps_free = reg.pumps.try_lock().is_ok();
+        drop(gate);
+        let doomed = tearing.await.expect("teardown task");
+
+        assert!(
+            pumps_free,
+            "begin_pump_teardown holds `pumps` while it waits for `monitors`: \
+             that is the inverted lock order, and it deadlocks against \
+             retire_pump_if_idle's `monitors` → `pumps`"
+        );
+        assert!(
+            doomed.is_empty(),
+            "fixture regression: this PV had no subscribers"
         );
         drop(tx);
     }
