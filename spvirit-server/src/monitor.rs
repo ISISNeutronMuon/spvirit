@@ -2148,75 +2148,27 @@ mod tests {
         drop((tx1, tx2));
     }
 
-    /// A sink that adds a *different* connection's subscriber to the PV from
-    /// inside the teardown write — the MONITOR INIT that lands after the pump
-    /// flagged itself exiting. That subscriber's upstream is alive (a
-    /// replacement pump is what `ensure_pump` gives it), so the outgoing
-    /// teardown must not touch it.
-    #[derive(Clone)]
-    struct SubscribeOtherConnOnWrite {
-        reg: Weak<MonitorRegistry>,
-        pv: String,
-        fired: Arc<std::sync::atomic::AtomicBool>,
-    }
-    impl tokio::io::AsyncWrite for SubscribeOtherConnOnWrite {
-        fn poll_write(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<std::io::Result<usize>> {
-            if !self
-                .fired
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-                && let Some(reg) = self.reg.upgrade()
-            {
-                let mut monitors = reg
-                    .monitors
-                    .try_lock()
-                    .expect("teardown must not hold the monitors lock while writing");
-                monitors
-                    .entry(self.pv.clone())
-                    .or_default()
-                    .push(make_sub_on(2, 43, 2, false));
-            }
-            std::task::Poll::Ready(Ok(buf.len()))
-        }
-        fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-        fn poll_shutdown(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-    }
-
     /// A subscriber that arrives *after* the pump began exiting was never served
     /// by that pump, and `ensure_pump` hands it a live replacement. Destroying
     /// it would send DESTROY_CHANNEL for an upstream that is alive: the client
     /// loses a working channel and has to re-search for no reason. The teardown
-    /// must therefore act on the subscriber set fixed at
-    /// `begin_pump_teardown`, not on whatever `monitors` holds when it gets
-    /// round to looking.
+    /// must therefore act on the subscriber set fixed at `begin_pump_teardown`,
+    /// not on whatever `monitors` holds when it gets round to looking.
+    ///
+    /// The window is the whole of the teardown, and its *first* instant — after
+    /// the flag, before the snapshot — is the one that matters, because that is
+    /// the only place a re-read would still see the newcomer. There is no
+    /// observation point in there to hook a sink into (the flag and the snapshot
+    /// are one critical section, which is the fix), so the test drives the two
+    /// halves by hand and lands the newcomer between them.
     #[tokio::test]
     async fn a_subscriber_arriving_mid_teardown_is_never_destroyed_by_it() {
         let reg = Arc::new(MonitorRegistry::new());
-        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink_a = PlainRec::new();
         let sink_b = PlainRec::new();
         {
             let mut conns = reg.conns.lock().await;
-            conns.insert(
-                1,
-                ConnWriter::new(SubscribeOtherConnOnWrite {
-                    reg: Arc::downgrade(&reg),
-                    pv: "PV:T".to_string(),
-                    fired: Arc::clone(&fired),
-                }),
-            );
+            conns.insert(1, ConnWriter::new(sink_a.clone()));
             conns.insert(2, ConnWriter::new(sink_b.clone()));
         }
         let tables_a: crate::state::SharedChannelTables = Default::default();
@@ -2240,24 +2192,45 @@ mod tests {
             let mut monitors = reg.monitors.lock().await;
             monitors.insert("PV:T".to_string(), vec![make_sub(None)]);
         }
-        let (tx, rx) = mpsc::channel::<NtPayload>(4);
+        // `_tx` is held to the end of the test: the real pump task must stay
+        // parked on `rx.recv()` while the teardown is driven by hand, so it
+        // cannot run a second, concurrent teardown of its own.
+        let (_tx, rx) = mpsc::channel::<NtPayload>(4);
         reg.ensure_pump("PV:T", rx).await;
+        let id = reg.pumps.lock().await.get("PV:T").expect("pump").id;
 
-        // Upstream dies; the write of A's DESTROY_CHANNEL injects B.
-        drop(tx);
-        for _ in 0..200 {
-            if fired.load(std::sync::atomic::Ordering::SeqCst)
-                && !reg.pumps.lock().await.contains_key("PV:T")
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        // Upstream dies: the pump opens its teardown window.
+        let doomed = reg.begin_pump_teardown("PV:T", id).await;
+        assert_eq!(
+            doomed
+                .iter()
+                .map(|s| (s.conn_id, s.ioid))
+                .collect::<Vec<_>>(),
+            vec![(1u64, 42u32)],
+            "the pump must take custody of exactly the subscribers it served"
+        );
         assert!(
-            fired.load(std::sync::atomic::Ordering::SeqCst),
-            "fixture regression: the mid-teardown subscribe never ran"
+            !reg.monitors.lock().await.contains_key("PV:T"),
+            "the doomed list must be *taken*, not merely read: a MONITOR INIT \
+             landing from here on must start a fresh entry the teardown cannot see"
         );
 
+        // The racing MONITOR INIT lands inside the window.
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors
+                .entry("PV:T".to_string())
+                .or_default()
+                .push(make_sub_on(2, 43, 2, false));
+        }
+
+        reg.destroy_subs("PV:T", doomed).await;
+
+        assert!(
+            !sink_a.writes.lock().unwrap().is_empty(),
+            "fixture regression: the subscriber the pump *did* serve must still \
+             be told its channel is gone"
+        );
         assert_eq!(
             reg.monitors
                 .lock()
@@ -2277,6 +2250,121 @@ mod tests {
             tables_b.lock().unwrap().channel_for_monitor(43),
             Some((21, 33)),
             "the mid-teardown subscriber's channel must not be retracted"
+        );
+    }
+
+    /// A sink that installs a *replacement* pump for the PV from inside the
+    /// teardown write, simulating the `ensure_pump` a mid-teardown MONITOR INIT
+    /// triggers (it sees `exiting` and spawns a successor). Installing the
+    /// handle directly is what makes the moment controllable: `ensure_pump`
+    /// itself is `async` and a sink's `poll_write` is not. The `try_lock` is
+    /// deterministic: `destroy_subs` holds no `pumps` guard while it writes.
+    #[derive(Clone)]
+    struct InstallReplacementPumpOnWrite {
+        reg: Weak<MonitorRegistry>,
+        pv: String,
+        installed: Arc<std::sync::Mutex<Option<u64>>>,
+    }
+    impl tokio::io::AsyncWrite for InstallReplacementPumpOnWrite {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let mut slot = self.installed.lock().unwrap();
+            if slot.is_none()
+                && let Some(reg) = self.reg.upgrade()
+            {
+                let mut pumps = reg
+                    .pumps
+                    .try_lock()
+                    .expect("teardown must not hold the pumps lock while writing");
+                let id = PUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (shutdown, _shutdown_rx) = oneshot::channel::<()>();
+                pumps.insert(
+                    self.pv.clone(),
+                    PumpHandle {
+                        id,
+                        exiting: false,
+                        shutdown,
+                        handle: tokio::spawn(async {}),
+                    },
+                );
+                *slot = Some(id);
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The other half of the mid-teardown race: the outgoing pump must not shut
+    /// down the replacement its own `exiting` flag caused to be spawned. Its
+    /// teardown empties `monitors` for the PV, so a **name-based**
+    /// `retire_pump_if_idle` at the end of it would find "idle" and remove
+    /// whatever handle is in `pumps` — which by then is the successor's. The
+    /// pump path must retire by *id* from its exit and nothing else.
+    #[tokio::test]
+    async fn a_pump_teardown_never_retires_the_replacement_it_caused() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let installed = Arc::new(std::sync::Mutex::new(None));
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(
+                1,
+                ConnWriter::new(InstallReplacementPumpOnWrite {
+                    reg: Arc::downgrade(&reg),
+                    pv: "PV:V".to_string(),
+                    installed: Arc::clone(&installed),
+                }),
+            );
+        }
+        let tables: crate::state::SharedChannelTables = Default::default();
+        {
+            let mut t = tables.lock().unwrap();
+            t.insert_channel(9, 7, "PV:V");
+            t.bind_monitor(42, 7);
+        }
+        reg.register_channel_tables(1, Arc::clone(&tables)).await;
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors.insert("PV:V".to_string(), vec![make_sub(None)]);
+        }
+        let (tx, rx) = mpsc::channel::<NtPayload>(4);
+        reg.ensure_pump("PV:V", rx).await;
+
+        // Upstream dies; the DESTROY_CHANNEL write installs the successor.
+        drop(tx);
+
+        // The successor must still be there once the outgoing pump is done. A
+        // bounded wait: the outgoing pump has no completion signal, and the
+        // failure mode (a name-based retirement at the end of the teardown)
+        // fires immediately after the write.
+        let mut new_id = None;
+        let mut survived = true;
+        for _ in 0..60 {
+            new_id = *installed.lock().unwrap();
+            if new_id.is_some() && reg.pumps.lock().await.get("PV:V").map(|p| p.id) != new_id {
+                survived = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let new_id = new_id.expect("fixture regression: no replacement pump was installed");
+        assert!(
+            survived,
+            "the outgoing pump retired the replacement (id {new_id}) its own \
+             teardown caused to be spawned; that PV is now unpumped"
         );
     }
 
