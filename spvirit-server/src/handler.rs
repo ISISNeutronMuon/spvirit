@@ -1214,6 +1214,10 @@ pub async fn handle_connection(
     }
 
     let mut conn_state = ConnState::default();
+    state
+        .registry
+        .register_channel_tables(conn_id, Arc::clone(&conn_state.channels))
+        .await;
 
     // Per EPICS PVA protocol: send SET_BYTE_ORDER control message before validation.
     let set_byte_order = encode_control_message(true, false, 2, 2, 0);

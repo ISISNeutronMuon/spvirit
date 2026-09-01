@@ -15,7 +15,7 @@ use spvirit_codec::spvirit_encode::{
 use spvirit_types::NtPayload;
 
 use crate::conn_writer::ConnWriter;
-use crate::state::MonitorSub;
+use crate::state::{MonitorSub, SharedChannelTables};
 
 /// Active connection channels and monitor subscriptions managed by the server.
 pub struct MonitorRegistry {
@@ -23,6 +23,13 @@ pub struct MonitorRegistry {
     pub monitors: Mutex<HashMap<String, Vec<MonitorSub>>>,
     /// Connection id → its flat-combining writer.
     pub conns: Mutex<HashMap<u64, Arc<ConnWriter>>>,
+    /// Connection id → that connection's channel tables.
+    ///
+    /// Upstream-death teardown sends DESTROY_CHANNEL from *here*, not from the
+    /// connection task, so it needs a way to forget the destroyed channel in
+    /// the owning connection's tables. Registered when the connection is
+    /// accepted, removed by [`Self::cleanup_connection`].
+    chan_tables: Mutex<HashMap<u64, SharedChannelTables>>,
     /// PV name → the task draining a subscribe-only source's update stream
     /// into `notify_monitors`. One pump per PV, shared by every subscriber of
     /// that PV; retired once the last subscriber goes away. Sources that
@@ -62,6 +69,7 @@ impl MonitorRegistry {
         Self {
             monitors: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
+            chan_tables: Mutex::new(HashMap::new()),
             pumps: Mutex::new(HashMap::new()),
             client_registry: std::sync::Mutex::new(None),
             bandwidth_counters: std::sync::Mutex::new(None),
@@ -170,6 +178,17 @@ impl MonitorRegistry {
     /// Look up a connection's flat-combining writer.
     async fn conn_writer(&self, conn_id: u64) -> Option<Arc<ConnWriter>> {
         self.conns.lock().await.get(&conn_id).cloned()
+    }
+
+    /// Share a connection's channel tables with the registry, so
+    /// upstream-death teardown can retract channels it destroys.
+    pub async fn register_channel_tables(&self, conn_id: u64, tables: SharedChannelTables) {
+        self.chan_tables.lock().await.insert(conn_id, tables);
+    }
+
+    /// A connection's channel tables, if it is still registered.
+    pub async fn channel_tables(&self, conn_id: u64) -> Option<SharedChannelTables> {
+        self.chan_tables.lock().await.get(&conn_id).cloned()
     }
 
     /// Send a raw control/one-shot frame to a connection (priority lane,
@@ -476,6 +495,10 @@ impl MonitorRegistry {
         {
             let mut conns = self.conns.lock().await;
             conns.remove(&conn_id);
+        }
+        {
+            let mut tables = self.chan_tables.lock().await;
+            tables.remove(&conn_id);
         }
         if let Some(cr) = self.client_registry() {
             cr.disconnect(conn_id);
@@ -898,6 +921,93 @@ mod tests {
             writes.len(),
             3,
             "pipelined monitor frames must be delivered losslessly, not coalesced; got {writes:?}"
+        );
+    }
+
+    /// The registry must be able to reach a connection's channel tables, and
+    /// must let go of them when the connection dies — otherwise every
+    /// connection the server ever accepted leaks an Arc for the process's
+    /// lifetime.
+    #[tokio::test]
+    async fn registered_channel_tables_are_reachable_and_dropped_with_the_connection() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let tables: crate::state::SharedChannelTables = Default::default();
+        tables.lock().unwrap().insert_channel(5, 6, "PV:Q");
+        reg.register_channel_tables(1, Arc::clone(&tables)).await;
+
+        let found = reg.channel_tables(1).await.expect("tables registered");
+        assert_eq!(
+            found.lock().unwrap().sid_to_pv.get(&6).map(String::as_str),
+            Some("PV:Q")
+        );
+        assert!(
+            Arc::ptr_eq(&found, &tables),
+            "must be the same handle, not a copy"
+        );
+
+        // A second connection: the map must be keyed, not a single slot.
+        // Task 7 resolves a `MonitorSub` (conn_id + ioid) through this lookup,
+        // so returning some *other* connection's tables would have it destroy
+        // a channel on the wrong socket.
+        let other: crate::state::SharedChannelTables = Default::default();
+        other.lock().unwrap().insert_channel(5, 6, "PV:OTHER");
+        reg.register_channel_tables(2, Arc::clone(&other)).await;
+        assert!(
+            Arc::ptr_eq(&reg.channel_tables(2).await.unwrap(), &other),
+            "each conn_id must resolve to its own tables"
+        );
+        assert!(
+            Arc::ptr_eq(&reg.channel_tables(1).await.unwrap(), &tables),
+            "registering a second connection must not displace the first"
+        );
+        assert!(
+            reg.channel_tables(3).await.is_none(),
+            "an unregistered conn_id must not resolve to someone else's tables"
+        );
+
+        reg.cleanup_connection(1).await;
+        assert!(
+            reg.channel_tables(1).await.is_none(),
+            "cleanup_connection must unregister the tables"
+        );
+        assert!(
+            reg.channel_tables(2).await.is_some(),
+            "cleanup_connection must unregister only the connection that died"
+        );
+    }
+
+    /// The non-vacuous half of the leak proof: Task 5's `Arc::downgrade` check
+    /// could not fail, because the only strong reference was the one being
+    /// dropped. Here the registry genuinely holds a second strong reference —
+    /// asserted while the connection's own handle is gone — so the final
+    /// `upgrade().is_none()` can only pass if `cleanup_connection` actually
+    /// released it.
+    #[tokio::test]
+    async fn cleanup_connection_releases_the_registry_reference_to_the_tables() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let weak = {
+            let conn = crate::state::ConnState::default();
+            let weak = Arc::downgrade(&conn.channels);
+            reg.register_channel_tables(7, Arc::clone(&conn.channels))
+                .await;
+            // Connection task ends: its own handle goes away.
+            drop(conn);
+            weak
+        };
+        // Non-vacuity: with the connection gone, the tables are still alive
+        // *only* because the registry is holding them.
+        let alive = weak.upgrade().expect("registry must still hold the tables");
+        assert_eq!(
+            Arc::strong_count(&alive),
+            2,
+            "exactly the registry's handle plus this test's temporary upgrade"
+        );
+        drop(alive);
+
+        reg.cleanup_connection(7).await;
+        assert!(
+            weak.upgrade().is_none(),
+            "cleanup_connection must drop the registry's handle, not just hide it"
         );
     }
 }
