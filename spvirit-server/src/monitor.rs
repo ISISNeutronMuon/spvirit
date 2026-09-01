@@ -199,15 +199,19 @@ impl MonitorRegistry {
                             // running task — and we break immediately
                             // afterwards.
                             if let Some(reg) = Weak::upgrade(&weak) {
-                                // Mark first, tear down second. The teardown
-                                // below awaits a socket write per subscriber, so
-                                // a MONITOR INIT can land inside it and call
-                                // `ensure_pump`; unless this handle is already
-                                // flagged as exiting, that call would defer to a
-                                // task that is on its way out and drop the new
-                                // subscriber's receiver.
-                                reg.mark_pump_exiting(&pv, id).await;
-                                reg.destroy_channels_for_pv(&pv).await;
+                                // One atomic step flags this handle *and* takes
+                                // custody of exactly the subscribers this pump
+                                // was serving. The teardown below awaits a
+                                // socket write per subscriber, so a MONITOR INIT
+                                // can land inside it: the flag makes the racing
+                                // `ensure_pump` spawn a replacement instead of
+                                // deferring to a task on its way out, and the
+                                // snapshot means that newcomer is *not* in the
+                                // list we destroy. Re-reading `monitors` here
+                                // instead would sweep it up and send it a
+                                // DESTROY_CHANNEL for an upstream that is alive.
+                                let doomed = reg.begin_pump_teardown(&pv, id).await;
+                                reg.destroy_subs(&pv, doomed).await;
                             }
                             break;
                         };
@@ -221,11 +225,12 @@ impl MonitorRegistry {
             // is not flagged as exiting, drop its fresh `rx`, and return — the
             // new subscriber then holds an established monitor that never
             // speaks again, which is the exact defect class this branch exists
-            // to remove. That is reachable through `destroy_channels_for_pv`
-            // alone, because its trailing `retire_pump_if_idle` bails out if a
-            // MONITOR INIT re-populated `monitors` after the teardown emptied
-            // it. (The `exiting` flag covers the *window*; this covers what is
-            // left in the map after it.)
+            // to remove. This is the *only* retirement on the pump path: the
+            // teardown above deliberately does not call the name-based
+            // `retire_pump_if_idle`, which would shut down a replacement pump
+            // spawned for this PV while the teardown was running. (The `exiting`
+            // flag covers the *window*; this covers what is left in the map
+            // after it.)
             //
             // Retiring by *id* (not by name) is what makes this safe to do
             // unconditionally: if a successor pump was already spawned for this
@@ -245,22 +250,46 @@ impl MonitorRegistry {
         );
     }
 
-    /// Flag the `PumpHandle` for `pv_name` as on its way out — **only** if it is
-    /// still the one belonging to pump `id`.
+    /// Open pump `id`'s teardown window for `pv_name`: flag its `PumpHandle` as
+    /// on its way out and take custody of the subscribers it was serving, in one
+    /// atomic step. Returns the list the caller must now destroy.
     ///
     /// Called by a pump the instant its stream ends, before the teardown that
     /// follows. Between that moment and the handle's removal the pump is still
     /// in `pumps` but can no longer deliver anything, and the teardown awaits a
     /// socket write per subscriber, so the window is wide enough for a MONITOR
-    /// INIT to land in it. The flag is what lets [`Self::ensure_pump`] tell that
-    /// state apart from a healthy pump and start a replacement instead of
-    /// dropping the new subscriber's receiver.
-    async fn mark_pump_exiting(&self, pv_name: &str, id: u64) {
+    /// INIT to land in it. Two things follow, and both need this one function:
+    ///
+    /// - the flag is what lets [`Self::ensure_pump`] tell that state apart from
+    ///   a healthy pump and start a replacement instead of dropping the new
+    ///   subscriber's receiver;
+    /// - taking the subscriber list *here*, under the same critical section,
+    ///   fixes the set of subscribers the teardown may destroy. A newcomer that
+    ///   lands after this point goes into a fresh, untouched
+    ///   `monitors[pv_name]` entry and is never sent a DESTROY_CHANNEL for the
+    ///   live upstream it just subscribed to.
+    ///
+    /// **Generation guard.** If `pumps[pv_name]` holds a *different* generation,
+    /// this pump is a straggler: a successor already owns the PV, its
+    /// subscribers belong to a live upstream, and nothing is taken or flagged —
+    /// flagging a healthy successor would make the next `ensure_pump` replace it
+    /// mid-`select!`, producing two live pumps that both deliver. Covered by
+    /// `a_straggling_pump_never_flags_or_tears_down_its_successors_subscribers`.
+    /// A *missing* handle is not a straggler (nothing else claims the PV), so
+    /// the subscribers are still taken.
+    ///
+    /// Locks `monitors` then `pumps`, the established order; `pumps` is never
+    /// held while `monitors` is taken.
+    async fn begin_pump_teardown(&self, pv_name: &str, id: u64) -> Vec<MonitorSub> {
+        let mut monitors = self.monitors.lock().await;
         let mut pumps = self.pumps.lock().await;
-        if let Some(p) = pumps.get_mut(pv_name)
-            && p.id == id
-        {
-            p.exiting = true;
+        match pumps.get_mut(pv_name) {
+            Some(p) if p.id != id => Vec::new(),
+            Some(p) => {
+                p.exiting = true;
+                monitors.remove(pv_name).unwrap_or_default()
+            }
+            None => monitors.remove(pv_name).unwrap_or_default(),
         }
     }
 
@@ -290,16 +319,33 @@ impl MonitorRegistry {
     /// silences all of them. Covered by
     /// `one_subscriber_leaving_must_not_silence_the_others`.
     ///
+    /// **The idle check and the removal are one atomic step**, and that is
+    /// load-bearing: the `monitors` guard is deliberately held across the
+    /// `pumps` acquisition. Releasing it first leaves a gap in which a MONITOR
+    /// INIT can push its subscriber into `monitors` and have `ensure_pump` drop
+    /// its receiver — the pump is perfectly healthy at that instant, so
+    /// [`PumpHandle::exiting`] cannot help — after which this function removes
+    /// that pump anyway. The subscriber is then permanently silent **and gets no
+    /// DESTROY_CHANNEL**, so it never learns to re-search: strictly worse than
+    /// the defect this module's teardown path exists to remove. Holding the
+    /// guard forces the MONITOR INIT to land wholly before (we see it and
+    /// decline) or wholly after (its `ensure_pump` finds no pump and spawns
+    /// one). Covered by
+    /// `an_idle_retirement_holds_the_monitors_lock_while_it_removes_the_pump`.
+    ///
+    /// Lock order is `monitors` → `pumps`, the established one; nothing in this
+    /// module takes `pumps` before `monitors`, so there is no cycle.
+    ///
     /// Shutdown is cooperative (signal, not abort): the pump finishes any
     /// in-flight `notify_monitors` — including its socket write — before
     /// exiting, so a flush is never dropped mid-write to wedge the shared
-    /// [`ConnWriter`].
+    /// [`ConnWriter`]. That remains a *signal*: the retired task may still be
+    /// inside its `select!` when a later `ensure_pump` spawns a successor, so
+    /// two pumps can briefly coexist and one extra update can be delivered.
+    /// Duplicate delivery, never silence.
     async fn retire_pump_if_idle(&self, pv_name: &str) {
-        let still_active = {
-            let monitors = self.monitors.lock().await;
-            monitors.get(pv_name).is_some_and(|list| !list.is_empty())
-        };
-        if still_active {
+        let monitors = self.monitors.lock().await;
+        if monitors.get(pv_name).is_some_and(|list| !list.is_empty()) {
             return;
         }
         let mut pumps = self.pumps.lock().await;
@@ -686,13 +732,37 @@ impl MonitorRegistry {
     /// [`exiting`](PumpHandle::exiting) first; an out-of-pump caller has no such
     /// handle to flag.) There is no such caller today.
     ///
-    /// It **is** idempotent: a second call finds no subscription list for the
-    /// PV, sends nothing, and retires nothing.
+    /// **Idempotence — only on a quiescent PV.** A second call on a PV that
+    /// nothing has touched in between finds no subscription list, sends nothing,
+    /// and (the pump having gone with the first call) retires nothing. Under
+    /// concurrency none of the three holds: this function sweeps whatever is in
+    /// `monitors[pv_name]` at the moment it looks, and retires whatever
+    /// `PumpHandle` is in `pumps[pv_name]` at the moment it looks, **regardless
+    /// of generation** — so a subscriber that arrived between the two calls is
+    /// destroyed, and a replacement pump installed between them is shut down.
+    /// The pump's own end-of-stream path is not exposed to either: it goes
+    /// through [`Self::begin_pump_teardown`], which fixes the subscriber set
+    /// atomically, and it retires by id from its exit path instead of calling
+    /// [`Self::retire_pump_if_idle`] here.
     pub async fn destroy_channels_for_pv(&self, pv_name: &str) {
         let subs = {
             let mut monitors = self.monitors.lock().await;
             monitors.remove(pv_name).unwrap_or_default()
         };
+        self.destroy_subs(pv_name, subs).await;
+        // Best-effort, and name-based: see the idempotence paragraph above. The
+        // pump path does not come through here precisely because this call
+        // cannot tell a replacement pump from the one that is dying.
+        self.retire_pump_if_idle(pv_name).await;
+    }
+
+    /// Send DESTROY_CHANNEL to an already-taken set of subscribers and retract
+    /// their channels. Retires no pump — the caller owns that decision, because
+    /// only the caller knows whether the `PumpHandle` now in `pumps` is the one
+    /// that died ([`Self::destroy_channels_for_pv`], name-based and best-effort)
+    /// or possibly a live replacement (the pump path, which retires by id from
+    /// its own exit).
+    async fn destroy_subs(&self, pv_name: &str, subs: Vec<MonitorSub>) {
         let mut destroyed = 0usize;
         for sub in &subs {
             let Some(tables) = self.channel_tables(sub.conn_id).await else {
@@ -764,11 +834,6 @@ impl MonitorRegistry {
                 "upstream gone: destroyed downstream channels"
             );
         }
-        // Best-effort: `retire_pump_if_idle` bails out if a MONITOR INIT
-        // re-populated `monitors` for this PV after the removal above. The
-        // pump's own exit path (`retire_pump_generation`) is what actually
-        // guarantees no stale `PumpHandle` survives the task.
-        self.retire_pump_if_idle(pv_name).await;
     }
 
     /// Remove all subscriptions and connection entries for a given connection.
@@ -1680,10 +1745,10 @@ mod tests {
     }
 
     /// A sink that re-subscribes to the PV from inside the write, simulating a
-    /// MONITOR INIT that lands after `destroy_channels_for_pv` has emptied
-    /// `monitors` but before it reaches `retire_pump_if_idle`. The `try_lock`
-    /// is deterministic: `destroy_channels_for_pv` holds no `monitors` guard
-    /// while it writes.
+    /// MONITOR INIT that lands *inside* the teardown window — after
+    /// `begin_pump_teardown` has taken the doomed subscriber list and before the
+    /// pump has finished writing to it. The `try_lock` is deterministic:
+    /// `destroy_subs` holds no `monitors` guard while it writes.
     #[derive(Clone)]
     struct ResubscribeOnWrite {
         reg: Weak<MonitorRegistry>,
@@ -1726,12 +1791,12 @@ mod tests {
         }
     }
 
-    /// An exiting pump must never leave its `PumpHandle` behind. If a MONITOR
-    /// INIT re-populates `monitors` mid-teardown, the trailing
-    /// `retire_pump_if_idle` bails out — and a stale handle makes every later
-    /// `ensure_pump` drop its fresh receiver, so the new subscriber holds a
-    /// monitor that never speaks again. The pump retires its own generation on
-    /// the way out to close exactly that hole.
+    /// An exiting pump must never leave its `PumpHandle` behind, not even when a
+    /// MONITOR INIT re-populates `monitors` mid-teardown. A stale handle makes
+    /// every later `ensure_pump` drop its fresh receiver, so the new subscriber
+    /// holds a monitor that never speaks again. Retiring its own generation on
+    /// the way out is the pump's only retirement, and it is unconditional —
+    /// which is what closes that hole.
     #[tokio::test]
     async fn an_exiting_pump_never_strands_its_handle_even_if_a_new_subscriber_arrives() {
         let reg = Arc::new(MonitorRegistry::new());
@@ -1779,8 +1844,8 @@ mod tests {
         );
         assert!(
             reg.monitors.lock().await.contains_key("PV:S"),
-            "fixture regression: the injected subscriber must still be registered, \
-             otherwise `retire_pump_if_idle` would have retired the pump anyway"
+            "fixture regression: the injected subscriber must still be registered \
+             for this to be the mid-teardown race at all"
         );
         assert!(
             !stranded,
@@ -1894,7 +1959,8 @@ mod tests {
         let (old_tx, old_rx) = mpsc::channel::<NtPayload>(4);
         reg.ensure_pump("PV:R", old_rx).await;
         let old_id = reg.pumps.lock().await.get("PV:R").expect("pump").id;
-        reg.mark_pump_exiting("PV:R", old_id).await;
+        let doomed = reg.begin_pump_teardown("PV:R", old_id).await;
+        assert!(doomed.is_empty(), "fixture: no subscribers yet");
 
         // The racing MONITOR INIT: a new subscriber plus a fresh stream.
         {
@@ -2027,6 +2093,236 @@ mod tests {
              concurrent ensure_pump seeing anything else would drop the new \
              subscriber receiver"
         );
+    }
+
+    /// The generation guard on `begin_pump_teardown`, which is the mirror of
+    /// `a_late_exiting_pump_never_retires_its_successor` for the *other*
+    /// id-guarded function. Without it a straggling pump flags its successor's
+    /// handle as exiting — so the next `ensure_pump` replaces a perfectly
+    /// healthy pump while it is still inside `select!` and still delivering,
+    /// the one construction that yields two genuinely live pumps for one PV —
+    /// and it also hands that successor's subscribers to a teardown that would
+    /// send them DESTROY_CHANNEL for an upstream that is alive.
+    #[tokio::test]
+    async fn a_straggling_pump_never_flags_or_tears_down_its_successors_subscribers() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let (tx1, rx1) = mpsc::channel::<NtPayload>(4);
+        reg.ensure_pump("PV:Q", rx1).await;
+        let id1 = reg.pumps.lock().await.get("PV:Q").expect("pump 1").id;
+
+        // Pump 1's handle goes (the idle path removes it by name); a new
+        // subscriber then brings pump 2 in for the same PV.
+        reg.retire_pump_generation("PV:Q", id1).await;
+        let (tx2, rx2) = mpsc::channel::<NtPayload>(4);
+        reg.ensure_pump("PV:Q", rx2).await;
+        let id2 = reg.pumps.lock().await.get("PV:Q").expect("pump 2").id;
+        assert_ne!(id1, id2, "fixture: two distinct generations");
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors.insert("PV:Q".to_string(), vec![make_sub(None)]);
+        }
+
+        // Only now does pump 1's stream end.
+        let doomed = reg.begin_pump_teardown("PV:Q", id1).await;
+
+        assert!(
+            doomed.is_empty(),
+            "a straggling pump must not take custody of its successor's \
+             subscribers; they belong to a live upstream"
+        );
+        assert_eq!(
+            reg.pumps
+                .lock()
+                .await
+                .get("PV:Q")
+                .map(|p| (p.id, p.exiting)),
+            Some((id2, false)),
+            "a straggling pump must not flag its successor as exiting; the next \
+             ensure_pump would replace a live, delivering pump"
+        );
+        assert_eq!(
+            reg.monitors.lock().await.get("PV:Q").map(|l| l.len()),
+            Some(1),
+            "the successor's subscriber must still be registered"
+        );
+        drop((tx1, tx2));
+    }
+
+    /// A sink that adds a *different* connection's subscriber to the PV from
+    /// inside the teardown write — the MONITOR INIT that lands after the pump
+    /// flagged itself exiting. That subscriber's upstream is alive (a
+    /// replacement pump is what `ensure_pump` gives it), so the outgoing
+    /// teardown must not touch it.
+    #[derive(Clone)]
+    struct SubscribeOtherConnOnWrite {
+        reg: Weak<MonitorRegistry>,
+        pv: String,
+        fired: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl tokio::io::AsyncWrite for SubscribeOtherConnOnWrite {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if !self
+                .fired
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+                && let Some(reg) = self.reg.upgrade()
+            {
+                let mut monitors = reg
+                    .monitors
+                    .try_lock()
+                    .expect("teardown must not hold the monitors lock while writing");
+                monitors
+                    .entry(self.pv.clone())
+                    .or_default()
+                    .push(make_sub_on(2, 43, 2, false));
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A subscriber that arrives *after* the pump began exiting was never served
+    /// by that pump, and `ensure_pump` hands it a live replacement. Destroying
+    /// it would send DESTROY_CHANNEL for an upstream that is alive: the client
+    /// loses a working channel and has to re-search for no reason. The teardown
+    /// must therefore act on the subscriber set fixed at
+    /// `begin_pump_teardown`, not on whatever `monitors` holds when it gets
+    /// round to looking.
+    #[tokio::test]
+    async fn a_subscriber_arriving_mid_teardown_is_never_destroyed_by_it() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink_b = PlainRec::new();
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(
+                1,
+                ConnWriter::new(SubscribeOtherConnOnWrite {
+                    reg: Arc::downgrade(&reg),
+                    pv: "PV:T".to_string(),
+                    fired: Arc::clone(&fired),
+                }),
+            );
+            conns.insert(2, ConnWriter::new(sink_b.clone()));
+        }
+        let tables_a: crate::state::SharedChannelTables = Default::default();
+        {
+            let mut t = tables_a.lock().unwrap();
+            t.insert_channel(9, 7, "PV:T");
+            t.bind_monitor(42, 7);
+        }
+        reg.register_channel_tables(1, Arc::clone(&tables_a)).await;
+        // The newcomer's channel is fully resolvable, so if the teardown did
+        // sweep it up it *would* produce a frame — the assertion below is not
+        // vacuous.
+        let tables_b: crate::state::SharedChannelTables = Default::default();
+        {
+            let mut t = tables_b.lock().unwrap();
+            t.insert_channel(33, 21, "PV:T");
+            t.bind_monitor(43, 21);
+        }
+        reg.register_channel_tables(2, Arc::clone(&tables_b)).await;
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors.insert("PV:T".to_string(), vec![make_sub(None)]);
+        }
+        let (tx, rx) = mpsc::channel::<NtPayload>(4);
+        reg.ensure_pump("PV:T", rx).await;
+
+        // Upstream dies; the write of A's DESTROY_CHANNEL injects B.
+        drop(tx);
+        for _ in 0..200 {
+            if fired.load(std::sync::atomic::Ordering::SeqCst)
+                && !reg.pumps.lock().await.contains_key("PV:T")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "fixture regression: the mid-teardown subscribe never ran"
+        );
+
+        assert_eq!(
+            reg.monitors
+                .lock()
+                .await
+                .get("PV:T")
+                .map(|l| l.iter().map(|s| (s.conn_id, s.ioid)).collect::<Vec<_>>()),
+            Some(vec![(2u64, 43u32)]),
+            "the mid-teardown subscriber must survive the teardown that did not \
+             serve it"
+        );
+        assert!(
+            sink_b.writes.lock().unwrap().is_empty(),
+            "the mid-teardown subscriber was sent a DESTROY_CHANNEL for an \
+             upstream that is alive"
+        );
+        assert_eq!(
+            tables_b.lock().unwrap().channel_for_monitor(43),
+            Some((21, 33)),
+            "the mid-teardown subscriber's channel must not be retracted"
+        );
+    }
+
+    /// `retire_pump_if_idle` must hold the `monitors` guard across its `pumps`
+    /// acquisition. If it releases the guard first, a MONITOR INIT can land in
+    /// the gap: the subscriber is pushed into `monitors`, `ensure_pump` sees a
+    /// pump that is present and perfectly healthy (so `exiting` cannot help)
+    /// and drops the fresh receiver, and this function then removes that pump.
+    /// The subscriber is permanently silent **and gets no DESTROY_CHANNEL**, so
+    /// unlike every other failure on this branch it never learns to re-search.
+    ///
+    /// The interleaving itself is not deterministically constructible from a
+    /// test — on a current-thread runtime an uncontended `pumps.lock().await`
+    /// is not even a scheduling point, and contending it to force one makes
+    /// tokio's FIFO-fair mutex serve the retirement first. So this asserts the
+    /// invariant that removes the gap: while the retirement waits for `pumps`,
+    /// `monitors` must be unavailable to anyone else.
+    #[tokio::test]
+    async fn an_idle_retirement_holds_the_monitors_lock_while_it_removes_the_pump() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let (tx, rx) = mpsc::channel::<NtPayload>(4);
+        reg.ensure_pump("PV:N", rx).await;
+        assert!(reg.pumps.lock().await.contains_key("PV:N"));
+
+        // Park the retirement on `pumps`, exactly where the gap used to open.
+        let gate = reg.pumps.lock().await;
+        let r = Arc::clone(&reg);
+        let retiring = tokio::spawn(async move { r.retire_pump_if_idle("PV:N").await });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let monitors_held = reg.monitors.try_lock().is_err();
+        drop(gate);
+        retiring.await.expect("retirement task");
+
+        assert!(
+            monitors_held,
+            "retire_pump_if_idle released `monitors` before taking `pumps`; a \
+             MONITOR INIT landing in that gap goes permanently silent with no \
+             DESTROY_CHANNEL"
+        );
+        assert!(
+            !reg.pumps.lock().await.contains_key("PV:N"),
+            "an idle PV's pump must still actually be retired"
+        );
+        drop(tx);
     }
 
     /// A sink whose every write fails, to reach the `ConnWriter`'s dead path.
