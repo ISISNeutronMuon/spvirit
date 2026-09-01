@@ -9,8 +9,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::debug;
 
 use spvirit_codec::spvirit_encode::{
-    encode_monitor_data_response_delta, encode_monitor_data_response_filtered,
-    encode_monitor_data_response_payload,
+    encode_destroy_channel_response, encode_monitor_data_response_delta,
+    encode_monitor_data_response_filtered, encode_monitor_data_response_payload,
 };
 use spvirit_types::NtPayload;
 
@@ -157,7 +157,24 @@ impl MonitorRegistry {
                     // is never dropped mid-frame.
                     _ = &mut shutdown_rx => break,
                     maybe = rx.recv() => {
-                        let Some(payload) = maybe else { break };
+                        let Some(payload) = maybe else {
+                            // End of stream: the source dropped its sender,
+                            // i.e. the data behind this PV is gone. Breaking
+                            // silently here is the original defect — every
+                            // subscriber would sit on a live-looking monitor
+                            // that never speaks again. Tell them instead.
+                            //
+                            // Calling back into the registry from inside the
+                            // pump task is safe: `destroy_channels_for_pv`
+                            // ends in `retire_pump_if_idle`, which removes
+                            // this pump's `PumpHandle` and *detaches* (drops)
+                            // its `JoinHandle` — it never aborts the running
+                            // task — and we break immediately afterwards.
+                            if let Some(reg) = Weak::upgrade(&weak) {
+                                reg.destroy_channels_for_pv(&pv).await;
+                            }
+                            break;
+                        };
                         let Some(reg) = Weak::upgrade(&weak) else { break };
                         reg.notify_monitors(&pv, &payload).await;
                     }
@@ -506,6 +523,95 @@ impl MonitorRegistry {
             }
         }
         // Lock released above; retire the pump if this was the PV's last sub.
+        self.retire_pump_if_idle(pv_name).await;
+    }
+
+    /// Tear down every downstream channel monitoring `pv_name`, because the
+    /// data behind it is gone (its upstream closed).
+    ///
+    /// Sends DESTROY_CHANNEL to each subscriber, forgets the subscriptions,
+    /// retracts the channels from the owning connections' tables, and retires
+    /// the pump. Silence is not an option here: to a PVA client, "monitor
+    /// established, no updates" and "monitor established, source dead" look
+    /// identical, so it would wait forever. DESTROY_CHANNEL is the message
+    /// every client already handles by re-searching — which is the recovery
+    /// path (pvxs `Channel::disconnect`, p4p `channelDestroyedOnServer`, Java
+    /// DISCONNECTED), and the reason this design has no server-side reconnect
+    /// loop.
+    ///
+    /// The connection itself stays up: other channels on it are unaffected.
+    pub async fn destroy_channels_for_pv(&self, pv_name: &str) {
+        let subs = {
+            let mut monitors = self.monitors.lock().await;
+            monitors.remove(pv_name).unwrap_or_default()
+        };
+        let mut destroyed = 0usize;
+        for sub in &subs {
+            let Some(tables) = self.channel_tables(sub.conn_id).await else {
+                // The connection is already gone; nothing to send it and
+                // nothing to clean up.
+                continue;
+            };
+            // Resolve AND retract under one lock acquisition, then drop the
+            // guard before any `.await`: this is a `std::sync::Mutex`, and
+            // holding it across an await is the crate's hardest invariant to
+            // break (see the same discipline at every lock site in
+            // `handler.rs` and `gateway/src/proxy.rs`).
+            //
+            // Retracting before sending also follows the Task 3 teardown rule:
+            // every internal state change completes first, and the observable
+            // "it's gone" signal is last.
+            let to_send = {
+                let mut t = tables.lock().unwrap();
+                // A `MonitorSub` knows only conn_id and ioid, so the channel
+                // comes from the connection's tables. A miss means the channel
+                // was already destroyed (a DestroyChannel racing this teardown,
+                // or a connection being torn down): skip it. NEVER substitute a
+                // guessed sid — that would tell the client to drop an unrelated
+                // channel.
+                match t.channel_for_monitor(sub.ioid) {
+                    None => None,
+                    Some((sid, cid)) => {
+                        // `sid` is authoritative: it is never recycled and is
+                        // reached from the ioid, which uniquely identifies this
+                        // subscription. `cid` is only ADVISORY — a client that
+                        // re-creates a channel on the same cid without first
+                        // sending DestroyChannel rebinds `cid_to_sid[cid]` to a
+                        // newer sid while our stale `sid_to_cid[sid]` row lives
+                        // on. Sending DESTROY_CHANNEL with that cid would tell
+                        // the client to drop its *new* channel, so when the cid
+                        // no longer points back at our sid we send nothing and
+                        // only retract our own rows.
+                        let current_owner = t.cid_to_sid.get(&cid).copied();
+                        t.remove_channel(cid, sid);
+                        if current_owner == Some(sid) {
+                            Some((sid, cid))
+                        } else {
+                            // `remove_channel` also dropped the cid row, which
+                            // belongs to the newer channel: put it back.
+                            if let Some(other) = current_owner {
+                                t.cid_to_sid.insert(cid, other);
+                            }
+                            None
+                        }
+                    }
+                }
+            };
+            let Some((sid, cid)) = to_send else {
+                continue;
+            };
+            let msg = encode_destroy_channel_response(sid, cid, sub.version, sub.is_be);
+            self.send_msg(sub.conn_id, msg).await;
+            destroyed += 1;
+        }
+        if destroyed > 0 {
+            debug!(
+                pv = pv_name,
+                channels = destroyed,
+                "upstream gone: destroyed downstream channels"
+            );
+        }
+        // Subscriptions are already removed above, so this always retires.
         self.retire_pump_if_idle(pv_name).await;
     }
 
@@ -1073,6 +1179,228 @@ mod tests {
         assert!(
             weak.upgrade().is_none(),
             "cleanup_connection must drop the registry's handle, not just hide it"
+        );
+    }
+
+    /// Always-ready recording sink (unlike `TestGate`, no permits needed):
+    /// every write lands synchronously so the test can assert exact bytes.
+    #[derive(Clone)]
+    struct PlainRec {
+        writes: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl PlainRec {
+        fn new() -> Self {
+            Self {
+                writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+    impl tokio::io::AsyncWrite for PlainRec {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Spec section 2: when the PV's upstream is gone, a subscriber must be
+    /// told — a silent server looks identical to an idle PV and the client
+    /// waits forever. DESTROY_CHANNEL is the message every PVA client already
+    /// reacts to by re-searching.
+    #[tokio::test]
+    async fn destroy_channels_for_pv_sends_destroy_channel_and_clears_all_state() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let sink = PlainRec::new();
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(sink.clone()));
+        }
+        let tables: crate::state::SharedChannelTables = Default::default();
+        // make_sub uses conn_id 1, ioid 42, version 2, is_be false. The sid and
+        // cid come from the tables, not from the sub.
+        {
+            let mut t = tables.lock().unwrap();
+            t.insert_channel(9, 7, "PV:D");
+            t.bind_monitor(42, 7);
+        }
+        reg.register_channel_tables(1, Arc::clone(&tables)).await;
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors.insert("PV:D".to_string(), vec![make_sub(None)]);
+        }
+        let (tx, rx) = mpsc::channel::<NtPayload>(4);
+        reg.ensure_pump("PV:D", rx).await;
+        assert!(reg.pumps.lock().await.contains_key("PV:D"));
+
+        reg.destroy_channels_for_pv("PV:D").await;
+
+        let expected =
+            spvirit_codec::spvirit_encode::encode_destroy_channel_response(7, 9, 2, false);
+        assert_eq!(
+            *sink.writes.lock().unwrap(),
+            expected,
+            "subscriber must receive exactly one DESTROY_CHANNEL for sid=7 cid=9"
+        );
+        assert!(
+            !reg.monitors.lock().await.contains_key("PV:D"),
+            "the PV's subscription list must be gone"
+        );
+        {
+            let t = tables.lock().unwrap();
+            assert!(
+                t.cid_to_sid.is_empty()
+                    && t.sid_to_cid.is_empty()
+                    && t.sid_to_pv.is_empty()
+                    && t.ioid_to_sid.is_empty(),
+                "the destroyed channel and its monitor binding must both be gone"
+            );
+        }
+        assert!(
+            !reg.pumps.lock().await.contains_key("PV:D"),
+            "the pump must be retired once its last subscriber is destroyed"
+        );
+        drop(tx);
+    }
+
+    /// A subscription whose channel was already destroyed (a DestroyChannel
+    /// that raced this teardown) must be dropped silently. Guessing a sid
+    /// would tell the client to destroy an unrelated channel.
+    #[tokio::test]
+    async fn a_subscription_with_no_live_channel_is_skipped_not_guessed() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let sink = PlainRec::new();
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(sink.clone()));
+        }
+        let tables: crate::state::SharedChannelTables = Default::default();
+        // A DIFFERENT, unrelated channel is open on this connection, and the
+        // subscription's own ioid (42) is bound to nothing.
+        tables.lock().unwrap().insert_channel(500, 600, "PV:OTHER");
+        reg.register_channel_tables(1, Arc::clone(&tables)).await;
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors.insert("PV:D".to_string(), vec![make_sub(None)]);
+        }
+
+        reg.destroy_channels_for_pv("PV:D").await;
+
+        assert!(
+            sink.writes.lock().unwrap().is_empty(),
+            "nothing may be sent for a subscription with no live channel"
+        );
+        assert!(
+            !reg.monitors.lock().await.contains_key("PV:D"),
+            "the subscription is still dropped"
+        );
+        let t = tables.lock().unwrap();
+        assert_eq!(
+            t.sid_to_pv.get(&600).map(String::as_str),
+            Some("PV:OTHER"),
+            "the unrelated channel must be left completely alone"
+        );
+    }
+
+    /// The cid is advisory: a client that re-creates a channel on the same cid
+    /// without destroying the old one rebinds `cid_to_sid[cid]` to a newer sid.
+    /// Destroying the dead subscription must not tell that client to drop its
+    /// live channel, and must not evict the live cid row either.
+    #[tokio::test]
+    async fn a_cid_rebound_to_a_newer_channel_is_neither_destroyed_nor_evicted() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let sink = PlainRec::new();
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(sink.clone()));
+        }
+        let tables: crate::state::SharedChannelTables = Default::default();
+        {
+            let mut t = tables.lock().unwrap();
+            t.insert_channel(9, 7, "PV:D");
+            t.bind_monitor(42, 7);
+            // The client re-uses cid 9 for a brand new channel (sid 8) without
+            // ever destroying sid 7.
+            t.insert_channel(9, 8, "PV:D");
+        }
+        reg.register_channel_tables(1, Arc::clone(&tables)).await;
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors.insert("PV:D".to_string(), vec![make_sub(None)]);
+        }
+
+        reg.destroy_channels_for_pv("PV:D").await;
+
+        assert!(
+            sink.writes.lock().unwrap().is_empty(),
+            "no DESTROY_CHANNEL may be sent for a cid the client has re-bound"
+        );
+        let t = tables.lock().unwrap();
+        assert_eq!(
+            t.cid_to_sid.get(&9).copied(),
+            Some(8),
+            "the live channel's cid row must survive"
+        );
+        assert!(
+            !t.sid_to_cid.contains_key(&7)
+                && !t.sid_to_pv.contains_key(&7)
+                && t.ioid_to_sid.is_empty(),
+            "the dead channel's own rows must still be retracted"
+        );
+    }
+
+    /// The pump's end-of-stream arm must do the teardown, not `break`
+    /// silently: this is the actual defect at the `rx.recv()` `None` arm.
+    #[tokio::test]
+    async fn a_closed_upstream_stream_destroys_the_pvs_channels() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let sink = PlainRec::new();
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(sink.clone()));
+        }
+        let tables: crate::state::SharedChannelTables = Default::default();
+        {
+            let mut t = tables.lock().unwrap();
+            t.insert_channel(9, 7, "PV:D");
+            t.bind_monitor(42, 7);
+        }
+        reg.register_channel_tables(1, Arc::clone(&tables)).await;
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors.insert("PV:D".to_string(), vec![make_sub(None)]);
+        }
+        let (tx, rx) = mpsc::channel::<NtPayload>(4);
+        reg.ensure_pump("PV:D", rx).await;
+
+        // Upstream dies: the source drops its sender.
+        drop(tx);
+
+        let expected =
+            spvirit_codec::spvirit_encode::encode_destroy_channel_response(7, 9, 2, false);
+        for _ in 0..200 {
+            if *sink.writes.lock().unwrap() == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "pump closed without sending DESTROY_CHANNEL; got {:?}",
+            *sink.writes.lock().unwrap()
         );
     }
 }
