@@ -2001,8 +2001,8 @@ mod tests {
 
     /// A sink that samples the PV pump state from inside the teardown write,
     /// which is the only moment the `exiting` window is observable. The
-    /// `try_lock` is deterministic: `destroy_channels_for_pv` holds no `pumps`
-    /// guard while it writes.
+    /// `try_lock` is deterministic: `destroy_subs` holds no `pumps` guard while
+    /// it writes.
     #[derive(Clone)]
     struct SamplePumpStateOnWrite {
         reg: Weak<MonitorRegistry>,
