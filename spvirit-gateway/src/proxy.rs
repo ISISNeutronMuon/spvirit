@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,8 +97,19 @@ pub struct GatewaySource {
     /// [`GatewaySource::claim`].
     guard: Arc<LoopGuard>,
     getholdoff_ms: u32,
-    bindings: Mutex<HashMap<String, Binding>>,
+    /// Downstream name -> upstream binding.
+    ///
+    /// `Arc`-wrapped so `subscribe`'s spawned upstream-monitor task (a
+    /// `'static` task that cannot borrow `&self`) can retire this PV's binding
+    /// when its upstream dies. Every other call site dereferences through the
+    /// `Arc` unchanged.
+    bindings: Arc<Mutex<HashMap<String, Binding>>>,
     monitors: Arc<MonitorCache>,
+    /// How many upstream monitors this source has torn down because their
+    /// upstream connection ended (error or clean EOF) — NOT the normal
+    /// last-subscriber-left retirement, which is not a fault. `Arc` so the
+    /// spawned upstream task can bump it; surfaced on `/metrics`.
+    deaths: Arc<std::sync::atomic::AtomicU64>,
     /// The readOnly/pvlist/ACF gate consulted at `claim` (`Op::Get`), `put`
     /// (`Op::Put`), and `rpc` (`Op::Rpc`). Precedence (readOnly > pvlist >
     /// ACF) lives entirely inside `AccessControl::decide` — this source only
@@ -124,8 +136,9 @@ impl GatewaySource {
             neg,
             guard,
             getholdoff_ms,
-            bindings: Mutex::new(HashMap::new()),
+            bindings: Arc::new(Mutex::new(HashMap::new())),
             monitors: Arc::new(MonitorCache::new()),
+            deaths: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             access,
         }
     }
@@ -142,6 +155,29 @@ impl GatewaySource {
     /// cache summary"). Cheap snapshot; no lock held across an await.
     pub fn upstream_monitor_names(&self) -> Vec<String> {
         self.monitors.names()
+    }
+
+    /// Forget the binding for downstream `name`.
+    ///
+    /// Called on the upstream-death teardown path. Leaving the binding in
+    /// place would make `try_claim` keep answering `Yes` from memory (it
+    /// consults the bindings map without contacting upstream), so a client
+    /// that just received DESTROY_CHANNEL would re-search, be answered `Yes`,
+    /// create a channel, hit the still-dead upstream and be destroyed again —
+    /// an unbounded hot loop between client and gateway (design spec §4).
+    /// With the binding gone `try_claim` returns `Unknown`, the background
+    /// resolve runs a real `claim`, `pvinfo_full` fails, the negative cache
+    /// records the miss, and the search simply goes unanswered — so the client
+    /// falls back to normal PVA search backoff and recovers on its own when
+    /// the IOC returns.
+    pub fn retire_binding(&self, name: &str) {
+        self.bindings.lock().unwrap().remove(name);
+    }
+
+    /// Number of upstream monitors torn down because their upstream ended.
+    /// Mirrored onto `/metrics` as `spgateway_upstream_monitor_deaths_total`.
+    pub fn upstream_monitor_deaths(&self) -> u64 {
+        self.deaths.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -317,16 +353,31 @@ impl Source for GatewaySource {
             };
 
             let client = self.pool.client(&client_name)?;
-            let key: MonitorKey = (client_name, real_name.clone());
+            let key: MonitorKey = (client_name.clone(), real_name.clone());
             let monitors = self.monitors.clone();
+            let bindings = self.bindings.clone();
+            let deaths = self.deaths.clone();
+            let down_name = name.clone();
 
             let rx = self.monitors.subscribe(key.clone(), move |entry| {
                 tokio::spawn(async move {
                     let mut last_full = DecodedValue::Null;
+                    // Set by the callback IMMEDIATELY BEFORE it returns
+                    // `Break`, i.e. ONLY on the "last subscriber left" path.
+                    //
+                    // This flag is load-bearing and cannot be replaced by
+                    // inspecting `pvmonitor`'s `Result`: a clean upstream EOF
+                    // and a callback-requested stop BOTH surface as `Ok(())`,
+                    // so a Result-based test would either miss real upstream
+                    // deaths or double-retire an entry `dispatch_or_retire`
+                    // has already removed (and possibly clobber a replacement
+                    // entry created for the same key in the meantime).
+                    let stopped_by_callback = Arc::new(AtomicBool::new(false));
+                    let callback_stopped = stopped_by_callback.clone();
                     let callback_entry = entry.clone();
                     let callback_monitors = monitors.clone();
                     let callback_key = key.clone();
-                    let _ = client
+                    let result = client
                         .pvmonitor(&real_name, move |update| {
                             merge_monitor_delta(&mut last_full, update);
                             let payload = nt_payload_from_decoded(&last_full, struct_id.clone());
@@ -337,14 +388,63 @@ impl Source for GatewaySource {
                             ) {
                                 ControlFlow::Continue(())
                             } else {
+                                callback_stopped.store(true, Ordering::SeqCst);
                                 ControlFlow::Break(())
                             }
                         })
                         .await;
-                    // `dispatch_or_retire` already removed this key's entry
-                    // from the map (atomically, under the map lock) the
-                    // moment it decided the upstream loop should end, so
-                    // there is nothing left to clean up here.
+
+                    if stopped_by_callback.load(Ordering::SeqCst) {
+                        // Last subscriber left. `dispatch_or_retire` already
+                        // removed this key's entry from the map (atomically,
+                        // under the map lock) the moment it decided the
+                        // upstream loop should end. This is the existing,
+                        // correct shutdown path: nothing to clean up, and no
+                        // fault to report.
+                        return;
+                    }
+
+                    // Upstream ended — an error, or a clean EOF. Either way
+                    // there will never be another fan-out for this key, so
+                    // nothing else will ever tear the entry down.
+                    monitors.retire(&key, &entry);
+                    // Without this, `try_claim` keeps answering `Yes` from the
+                    // bindings map and a destroyed client hot-loops straight
+                    // back into the dead upstream (design spec §4).
+                    bindings.lock().unwrap().remove(&down_name);
+                    deaths.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        "upstream monitor ended for real='{}' downstream='{}' via client='{}' \
+                         ({:?}); retired the cache entry and binding and closed every \
+                         downstream subscriber",
+                        real_name,
+                        down_name,
+                        client_name,
+                        result.err(),
+                    );
+                    // LAST, deliberately: dropping the `Sender`s is the
+                    // observable "upstream is gone" edge — it is what wakes
+                    // every downstream receiver with `rx.recv() == None` and,
+                    // once Layer 2 lands, what makes the server-side pump send
+                    // DESTROY_CHANNEL. Everything a woken client might
+                    // immediately observe (the retired cache entry, the retired
+                    // binding, the death count) must already be committed
+                    // before we signal, or a client re-searching the instant it
+                    // is woken can still be answered `Yes` from a binding we
+                    // were about to remove — the §4 hot loop.
+                    //
+                    // Honest note on why this call exists at all: today it is
+                    // *equivalent* to simply returning from this task, because
+                    // the only surviving `Arc<MonitorEntry>` clones are this
+                    // task's `entry` and the one the `pvmonitor` callback held
+                    // (already dropped with the callback), so the senders would
+                    // die microseconds later anyway. The call earns its place
+                    // by making the edge explicit and correctly ordered, and it
+                    // becomes strictly load-bearing the moment anything holds
+                    // an `Arc<MonitorEntry>` clone past this task's return.
+                    // Do not delete it on the grounds that a test still passes
+                    // without it.
+                    entry.close_all();
                 });
             });
 

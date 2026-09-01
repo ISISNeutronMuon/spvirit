@@ -897,3 +897,43 @@ async fn uag_rule_gates_put_by_ca_user() {
         "expected the get to reflect the allowed put, got {value}"
     );
 }
+
+/// Spec §4's hot-loop breaker, in isolation: with a binding present
+/// `try_claim` answers `Yes` from the bindings map alone, without contacting
+/// upstream — so a client that was just told DESTROY_CHANNEL would re-search,
+/// be answered `Yes` immediately, and hit the same dead upstream again. After
+/// `retire_binding` the answer must fall back to `Unknown`, which routes the
+/// search through a real background `claim` instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retire_binding_turns_try_claim_from_yes_back_into_unknown() {
+    use spvirit_server::pvstore::TryClaim;
+
+    let Some((src, _pool)) = spawn_gateway(|b| b.ao("IT:RETIRE", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    assert!(src.claim("IT:RETIRE").await.is_some());
+    assert!(
+        matches!(src.try_claim("IT:RETIRE"), TryClaim::Yes),
+        "a claimed name must be answerable from the bindings map with no I/O"
+    );
+    assert_eq!(src.names().await, vec!["IT:RETIRE".to_string()]);
+    assert_eq!(
+        src.upstream_monitor_deaths(),
+        0,
+        "no upstream has died in this test"
+    );
+
+    src.retire_binding("IT:RETIRE");
+
+    assert!(
+        matches!(src.try_claim("IT:RETIRE"), TryClaim::Unknown),
+        "after the binding is retired the gateway must no longer answer Yes \
+         from memory; it must fall through to a real background resolve"
+    );
+    assert!(
+        src.names().await.is_empty(),
+        "a retired binding must also leave names()"
+    );
+}

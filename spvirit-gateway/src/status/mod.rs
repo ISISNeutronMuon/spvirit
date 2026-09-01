@@ -12,6 +12,12 @@
 //! `false`: live PVs are exposed only through `subscribe`'s
 //! `mpsc::Receiver`, fed by an internal `tokio::time::interval` ticker, and
 //! the server's per-PV pump drains it.
+//!
+//! Because these PVs are pumped, every producing task here must hold its
+//! `Sender` for as long as the subscription lives: dropping it tells the pump
+//! the PV's data is gone and it answers with DESTROY_CHANNEL (see
+//! `Source::subscribe`'s contract). The `threads` PV — one static value and
+//! then nothing — parks its sender on `tx.closed()` for exactly that reason.
 
 pub mod banner;
 pub mod sampler;
@@ -794,10 +800,20 @@ impl Source for StatusSource {
                     let mut out = Self::threads_static_value();
                     stamp(&mut out, now_ts());
                     let _ = tx.send(out).await;
-                    // Emit the static "RPC only" string once, then let `tx`
-                    // drop. p4p's `threads` SharedPV value never changes (its
-                    // RPC handler returns via `op.done` and never posts), so
-                    // there are no further updates to send.
+                    // Emit the static "RPC only" string once — p4p's `threads`
+                    // SharedPV value never changes (its RPC handler returns via
+                    // `op.done` and never posts), so there are no further
+                    // updates to send.
+                    //
+                    // Then PARK the sender instead of dropping it. Closing the
+                    // stream is the server's "this PV's data is gone" signal:
+                    // the per-PV pump answers it with DESTROY_CHANNEL
+                    // (`MonitorRegistry::destroy_channels_for_pv`), and a
+                    // client that re-searches would be served, given one value
+                    // and destroyed again, forever. `tx.closed()` resolves when
+                    // the pump drops its receiver, so this task ends with the
+                    // subscription and leaks nothing.
+                    tx.closed().await;
                 });
             } else {
                 return None;
@@ -1477,5 +1493,119 @@ mod tests {
             },
             other => panic!("threads RPC must return an NTScalar string, got {other:?}"),
         }
+    }
+
+    /// Recording sink: every write lands synchronously, so the test can assert
+    /// on exact bytes without polling for a flush.
+    #[derive(Clone)]
+    struct RecSink {
+        writes: Arc<Mutex<Vec<u8>>>,
+    }
+    impl tokio::io::AsyncWrite for RecSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// `threads` emits one static value and then has nothing more to say. It is
+    /// a *pumped* source (`pushes_own_updates()` stays `false`), so if its task
+    /// dropped the sender the pump would read that as "the PV's data is gone"
+    /// and answer with DESTROY_CHANNEL — putting every client into a
+    /// search → subscribe → one value → destroy treadmill on a shipped
+    /// p4p-parity PV. This drives the real `StatusSource::subscribe` receiver
+    /// through the real `MonitorRegistry` pump and asserts the update arrives
+    /// and no destroy ever follows it.
+    #[tokio::test]
+    async fn monitoring_threads_yields_its_value_and_is_never_destroyed() {
+        use spvirit_server::conn_writer::ConnWriter;
+        use spvirit_server::monitor::MonitorRegistry;
+        use spvirit_server::state::{MonitorSub, SharedChannelTables};
+
+        let name = format!("{PREFIX}threads");
+        let src = source(false);
+        let rx = Source::subscribe(&src, &name).await.expect("subscribed");
+
+        let sink = RecSink {
+            writes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let reg = Arc::new(MonitorRegistry::new());
+        reg.conns
+            .lock()
+            .await
+            .insert(1, ConnWriter::new(sink.clone()));
+        let tables: SharedChannelTables = Default::default();
+        {
+            let mut t = tables.lock().unwrap();
+            t.insert_channel(9, 7, &name);
+            t.bind_monitor(42, 7);
+        }
+        reg.register_channel_tables(1, Arc::clone(&tables)).await;
+        reg.monitors.lock().await.insert(
+            name.clone(),
+            vec![MonitorSub {
+                conn_id: 1,
+                ioid: 42,
+                version: 2,
+                is_be: false,
+                running: true,
+                pipeline_enabled: false,
+                nfree: 0,
+                filtered_desc: None,
+                last_snapshot: None,
+            }],
+        );
+        reg.ensure_pump(&name, rx).await;
+
+        // Wait for the one static update to reach the wire.
+        let mut delivered = Vec::new();
+        for _ in 0..200 {
+            delivered = sink.writes.lock().unwrap().clone();
+            if !delivered.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !delivered.is_empty(),
+            "the subscriber must receive the static threads value"
+        );
+
+        // Give a dropped sender every chance to be noticed, then prove nothing
+        // more was sent and the subscription is still established.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let after = sink.writes.lock().unwrap().clone();
+        let destroy =
+            spvirit_codec::spvirit_encode::encode_destroy_channel_response(7, 9, 2, false);
+        assert!(
+            !after.windows(destroy.len()).any(|w| w == destroy.as_slice()),
+            "threads must never be destroyed: it parks its sender instead of dropping it"
+        );
+        assert_eq!(after, delivered, "no further frames may follow the value");
+        assert!(
+            reg.monitors.lock().await.contains_key(&name),
+            "the subscription must still be established"
+        );
+        assert_eq!(
+            tables.lock().unwrap().channel_for_monitor(42),
+            Some((7, 9)),
+            "the channel must still be live in the connection's tables"
+        );
     }
 }

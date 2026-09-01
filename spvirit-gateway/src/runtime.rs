@@ -362,6 +362,10 @@ fn build_snapshot_provider(
                 .iter()
                 .map(|s| s.upstream_monitor_count() as u64)
                 .sum(),
+            upstream_monitor_deaths: sources
+                .iter()
+                .map(|s| s.upstream_monitor_deaths())
+                .sum(),
             ..crate::metrics::snapshot_from_bandwidth(&bandwidth_counters, &client_registry)
         };
         crate::metrics::apply_resolve_stats(&mut snap, &r);

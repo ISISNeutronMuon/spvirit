@@ -162,5 +162,16 @@ async fn the_running_gateway_serves_the_resolver_counters_on_its_metrics_endpoin
         before.pattern_enum_shed
     );
 
+    // Design spec section 5's counter must exist on a live scrape. A gateway
+    // with no upstream deaths reports 0 — the regression this catches is the
+    // line going missing entirely, which is indistinguishable from "nothing
+    // has died" to a scraper and hides the fault forever. (Task 8 asserts a
+    // real death actually moves this number.)
+    assert!(
+        metric(&body, "spgateway_upstream_monitor_deaths_total").is_some(),
+        "/metrics carried no `spgateway_upstream_monitor_deaths_total` line at \
+         all; an upstream that dies would then be invisible to monitoring:\n{body}"
+    );
+
     run.abort();
 }

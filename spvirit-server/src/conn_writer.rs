@@ -63,6 +63,16 @@ impl ConnWriter {
         })
     }
 
+    /// Whether a socket write has already failed on this connection, i.e. any
+    /// further deposit will be dropped rather than written.
+    ///
+    /// A snapshot, not a guarantee: the socket can fail immediately after this
+    /// returns `false`. Callers use it for reporting (did this frame have any
+    /// chance of reaching the peer?), never as a delivery receipt.
+    pub fn is_dead(&self) -> bool {
+        self.coalesce.lock().unwrap().dead
+    }
+
     /// Deposit a control/one-shot frame (priority lane, never coalesced) and
     /// flush if no flusher is currently active.
     pub async fn send_control(self: &Arc<Self>, bytes: Vec<u8>) {

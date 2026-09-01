@@ -153,6 +153,30 @@ pub trait Source: Send + Sync {
     /// Subscribe to value-change notifications on a PV.
     ///
     /// Returns `None` if the PV does not support subscription.
+    ///
+    /// **Closing the stream means "this PV's data is gone", not "no more
+    /// updates".** For a source that keeps the default
+    /// [`pushes_own_updates`](Self::pushes_own_updates) (`false`), the server
+    /// pumps this receiver; when the last sender drops, the pump treats it as
+    /// the death of the PV's backing data and sends DESTROY_CHANNEL to every
+    /// subscriber. (That is the pump's own end-of-stream path — it takes the
+    /// subscriber set atomically via `begin_pump_teardown` and destroys it via
+    /// `destroy_subs`, both private to
+    /// [`MonitorRegistry`](crate::monitor::MonitorRegistry). The `pub`
+    /// [`destroy_channels_for_pv`](crate::monitor::MonitorRegistry::destroy_channels_for_pv)
+    /// is the opt-in embedder entry point to the same teardown; nothing in the
+    /// server calls it, so it is not what runs when your stream closes.)
+    /// PVA carries no frame that distinguishes "the stream ended but the
+    /// channel is still valid" from "the source died", and clients react to a
+    /// destroy by re-searching.
+    ///
+    /// So a source with a value that never changes — one static snapshot, or a
+    /// PV that is otherwise complete after its first send — must **park** its
+    /// `Sender`: keep it alive until the receiver goes away, e.g. by ending the
+    /// producing task with `tx.closed().await`, or by storing the sender in a
+    /// map and pruning it on `is_closed()`. Dropping it instead puts every
+    /// client into a search → subscribe → destroy loop. Return `None` from
+    /// `subscribe` if the PV genuinely has nothing to push.
     fn subscribe(
         &self,
         name: &str,

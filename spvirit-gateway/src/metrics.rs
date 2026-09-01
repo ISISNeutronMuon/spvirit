@@ -79,6 +79,14 @@ pub struct MetricsSnapshot {
     /// Number of distinct upstream monitors currently running (the status
     /// source's "cache" count), summed across every server's source.
     pub upstream_monitors: u64,
+    /// Upstream monitors torn down because their upstream connection ended
+    /// (error or clean EOF), summed across every server's source.
+    ///
+    /// Deliberately distinct from the normal last-subscriber-left retirement,
+    /// which is routine and is not counted: this one is a fault, and a rising
+    /// rate here is the signal that upstream IOCs are vanishing under the
+    /// gateway. Monotonic, so it renders as a counter.
+    pub upstream_monitor_deaths: u64,
     /// Shape-complete stub: per-binding refcount (no M1 source).
     pub refs: u64,
     /// Shape-complete stub: thread-pool size (no M1 source).
@@ -241,6 +249,12 @@ pub fn render_prometheus(s: &MetricsSnapshot) -> String {
         "spgateway_upstream_monitors",
         "Number of distinct upstream monitors currently running.",
         s.upstream_monitors,
+    );
+    counter(
+        &mut out,
+        "spgateway_upstream_monitor_deaths_total",
+        "Upstream monitors torn down because their upstream connection ended.",
+        s.upstream_monitor_deaths,
     );
     gauge(
         &mut out,
@@ -831,6 +845,27 @@ mod tests {
         assert!(
             body.contains("\nspgateway_search_resolve_completed_missing_total 5\n"),
             "got:\n{body}"
+        );
+    }
+
+    /// Design spec section 5: upstream-loss teardowns are a fault and get
+    /// their own counter, kept distinct from the normal last-subscriber-left
+    /// retirement (which is not a fault and is not counted anywhere). It only
+    /// ever increases, so it must render as a `counter`, not a `gauge`.
+    #[test]
+    fn render_emits_the_upstream_monitor_death_counter() {
+        let snap = MetricsSnapshot {
+            upstream_monitor_deaths: 4,
+            ..Default::default()
+        };
+        let body = render_prometheus(&snap);
+        assert!(
+            body.contains("# TYPE spgateway_upstream_monitor_deaths_total counter\n"),
+            "upstream monitor deaths must be a counter, got:\n{body}"
+        );
+        assert!(
+            body.contains("\nspgateway_upstream_monitor_deaths_total 4\n"),
+            "expected the death count in the body, got:\n{body}"
         );
     }
 }
