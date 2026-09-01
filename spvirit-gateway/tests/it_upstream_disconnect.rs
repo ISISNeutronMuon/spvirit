@@ -8,9 +8,16 @@
 //! why that has to be done by dropping a whole `tokio::runtime::Runtime` and
 //! why `JoinHandle::abort()` is not an acceptable substitute.
 
-use std::net::{TcpListener, UdpSocket};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
+
+use spvirit_client::{
+    ChannelConn, PvOptions, establish_channel, read_until, resolve_pv_server,
+};
+use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_codec::spvirit_encode::encode_monitor_request;
+use tokio::io::AsyncWriteExt;
 
 use spvirit_gateway::access::AccessControl;
 use spvirit_gateway::cache::negative::NegativeCache;
@@ -102,6 +109,14 @@ fn spawn_backend(pv: &str, tcp_port: u16, udp_port: u16) -> Backend {
 /// A `GatewaySource` wired to reach a backend on `udp_port` over loopback.
 /// Mirrors `it_passthrough.rs`'s `spawn_gateway_with_access` (see that file's
 /// module doc for why `autoaddrlist` stays at its default `true`).
+///
+/// The negative cache is deliberately given a very short TTL. A failed resolve
+/// records a miss (`proxy.rs:255`) and every later `claim` short-circuits on it
+/// (`proxy.rs:209`), so with a production-length TTL a single dropped loopback
+/// search datagram — or one resolve attempted in the window while the IOC is
+/// down — would make the *recovery* half of these tests unrecoverable for the
+/// whole TTL, no matter how long they waited. That is a fixture artefact, not
+/// the behaviour under test.
 fn gateway_source(udp_port: u16) -> (Arc<GatewaySource>, Arc<UpstreamPool>) {
     let cfg_json = format!(
         r#"{{
@@ -120,7 +135,7 @@ fn gateway_source(udp_port: u16) -> (Arc<GatewaySource>, Arc<UpstreamPool>) {
     );
     let cfg = GatewayConfig::from_json_str(&cfg_json).expect("parse gateway config");
     let pool = Arc::new(UpstreamPool::from_config(&cfg));
-    let neg = Arc::new(NegativeCache::new(Duration::from_secs(30), 128));
+    let neg = Arc::new(NegativeCache::new(Duration::from_millis(100), 128));
     let guard = Arc::new(LoopGuard::build(
         &cfg,
         &cfg.servers[0],
@@ -136,6 +151,23 @@ fn gateway_source(udp_port: u16) -> (Arc<GatewaySource>, Arc<UpstreamPool>) {
         access,
     ));
     (src, pool)
+}
+
+/// Poll `claim` until it succeeds, for up to ~20s.
+///
+/// `claim` is a single UDP search with no retry of its own, so on a loaded
+/// loopback one lost datagram is one spurious failure. Retrying is the
+/// condition-based wait these tests need; it never turns "the PV is
+/// unresolvable" into a pass, it only refuses to draw that conclusion from a
+/// single attempt.
+async fn claim_within(src: &Arc<GatewaySource>, pv: &str) -> bool {
+    for _ in 0..100 {
+        if src.claim(pv).await.is_some() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    false
 }
 
 /// Layer 1, end to end: when the upstream IOC vanishes, the gateway must
@@ -155,7 +187,10 @@ async fn upstream_death_closes_subscribers_and_retires_the_entry_and_binding() {
     let mut backend = spawn_backend("GW:DIE", tcp, udp);
     let (src, _pool) = gateway_source(udp);
 
-    assert!(src.claim("GW:DIE").await.is_some(), "backend must be up");
+    assert!(
+        claim_within(&src, "GW:DIE").await,
+        "backend must be up"
+    );
     let mut rx = src.subscribe("GW:DIE").await.expect("subscribe");
     assert_eq!(src.upstream_monitor_count(), 1);
 
@@ -255,31 +290,14 @@ async fn a_downstream_monitor_subscription_is_torn_down_when_the_upstream_dies()
         eprintln!("Skipping test: cannot bind a free port in this environment");
         return;
     };
-    let (Some(down_tcp), Some(down_udp)) = (free_tcp_port(), free_udp_port()) else {
-        eprintln!("Skipping test: cannot bind a free downstream port");
-        return;
-    };
-
     let mut backend = spawn_backend("GW:E2E", up_tcp, up_udp);
     let (src, _pool) = gateway_source(up_udp);
-    assert!(src.claim("GW:E2E").await.is_some(), "backend must be up");
+    assert!(claim_within(&src, "GW:E2E").await, "backend must be up");
 
     // A downstream PvaServer publishing the gateway source — the same wiring
     // `spvirit_gateway::runtime` uses in production. Hold its registry so the
     // test can observe the teardown.
-    let published: Arc<dyn Source> = Arc::clone(&src) as Arc<dyn Source>;
-    let mut down = PvaServer::builder()
-        .listen_ip("127.0.0.1".parse().unwrap())
-        .advertise_ip("127.0.0.1".parse().unwrap())
-        .port(down_tcp)
-        .udp_port(down_udp)
-        .source("gateway", 0, published)
-        .build();
-    let registry = down.monitor_registry();
-    tokio::spawn(async move {
-        let _ = down.run().await;
-    });
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (down_tcp, down_udp, registry) = spawn_downstream(&src).await;
 
     // A real TCP monitor client. Explicit `server_addr` bypasses UDP search.
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -354,7 +372,7 @@ async fn a_downstream_monitor_subscription_is_torn_down_when_the_upstream_dies()
     // makes every later subscriber silent from birth.
     let _backend2 = spawn_backend("GW:E2E", up_tcp, up_udp);
     assert!(
-        src.claim("GW:E2E").await.is_some(),
+        claim_within(&src, "GW:E2E").await,
         "a re-resolved PV must be claimable again"
     );
     let mut rx2 = src.subscribe("GW:E2E").await.expect("re-subscribe");
@@ -467,4 +485,297 @@ async fn a_live_metrics_endpoint_reports_the_upstream_death() {
     );
 
     run.abort();
+}
+
+// ---------------------------------------------------------------------------
+// A genuine PVA client, on the real codec, over a real socket.
+//
+// The two tests above observe the teardown through the downstream server's own
+// `MonitorRegistry` — an internal read. Neither of them would notice if the
+// DESTROY_CHANNEL frame were never encoded, never addressed to the right
+// channel, or never written to the socket. `spvirit_client::pvmonitor` cannot
+// close that gap either: its monitor loop ignores command 8 (see the Task 8
+// brief). So the client below is hand-driven: real handshake, real
+// CREATE_CHANNEL, real MONITOR INIT/START, and a real read of whatever the
+// server sends after the IOC dies.
+// ---------------------------------------------------------------------------
+
+/// The pvRequest bytes for an empty `field()` selection — the same constant
+/// every raw client in this repo uses
+/// (`spvirit-tools/src/spvirit_client/explore.rs:18`).
+const PV_REQUEST_EMPTY: [u8; 6] = [0xfd, 0x02, 0x00, 0x80, 0x00, 0x00];
+
+/// The ioid this file's raw clients use for their single monitor.
+const MON_IOID: u32 = 1;
+
+/// `establish_channel` always creates its channel on cid 1
+/// (`spvirit-client/src/client.rs:136`), so that is the cid the server must
+/// name when it destroys this client's channel.
+const CLIENT_CID: u32 = 1;
+
+fn raw_opts(pv: &str, tcp: u16, udp: u16, server_addr: Option<SocketAddr>) -> PvOptions {
+    let mut opts = PvOptions::new(pv.to_string());
+    opts.server_addr = server_addr;
+    opts.tcp_port = tcp;
+    opts.udp_port = udp;
+    opts.search_addr = Some("127.0.0.1".parse().unwrap());
+    opts.bind_addr = Some("127.0.0.1".parse().unwrap());
+    opts.timeout = Duration::from_secs(15);
+    opts
+}
+
+/// Connect, handshake, create the channel, start a monitor, and return only
+/// once a real monitor DATA frame has arrived — so the caller knows the
+/// subscription is genuinely live before it kills anything.
+async fn open_monitor(addr: SocketAddr, opts: &PvOptions) -> ChannelConn {
+    // CREATE_CHANNEL is retried. The downstream server answers it out of the
+    // source's `try_claim`, which is momentarily `Unknown` (bindings lock held)
+    // or `No` (a just-recorded negative-cache miss) while a resolve is in
+    // flight — a real client retries a refusal rather than concluding the PV
+    // does not exist. Every attempt is a genuine, complete handshake; none of
+    // this can manufacture a channel the server refused.
+    let mut attempt_opts = opts.clone();
+    attempt_opts.timeout = Duration::from_secs(3);
+    let mut established = None;
+    let mut last_err = String::new();
+    for _ in 0..20 {
+        match establish_channel(addr, [0u8; 12], &attempt_opts).await {
+            Ok(c) => {
+                established = Some(c);
+                break;
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    let Some(mut conn) = established else {
+        panic!("a real client must be able to create the channel; last error: {last_err}");
+    };
+    let (version, is_be) = (conn.version, conn.is_be);
+
+    let init = encode_monitor_request(
+        conn.sid,
+        MON_IOID,
+        0x08,
+        &PV_REQUEST_EMPTY,
+        version,
+        is_be,
+    );
+    conn.stream
+        .write_all(&init)
+        .await
+        .expect("write monitor init");
+    read_until(
+        &mut conn.stream,
+        opts.timeout,
+        &mut conn.reassembler,
+        |cmd| {
+            matches!(cmd, PvaPacketCommand::Op(op)
+                if op.command == 13 && op.ioid == MON_IOID && (op.subcmd & 0x08) != 0)
+        },
+    )
+    .await
+    .expect("monitor init response");
+
+    let start = encode_monitor_request(conn.sid, MON_IOID, 0x44, &[], version, is_be);
+    conn.stream
+        .write_all(&start)
+        .await
+        .expect("write monitor start");
+    read_until(
+        &mut conn.stream,
+        opts.timeout,
+        &mut conn.reassembler,
+        |cmd| {
+            matches!(cmd, PvaPacketCommand::Op(op)
+                if op.command == 13 && op.ioid == MON_IOID && (op.subcmd & 0x08) == 0)
+        },
+    )
+    .await
+    .expect("the monitor must deliver real data while the backend is alive");
+
+    conn
+}
+
+/// Spawn a downstream `PvaServer` publishing `src`, and wait until it accepts
+/// TCP connections — no fixed sleep as the synchronisation mechanism.
+async fn spawn_downstream(
+    src: &Arc<GatewaySource>,
+) -> (u16, u16, Arc<spvirit_server::monitor::MonitorRegistry>) {
+    // The ports are chosen HERE, and a server that fails to come up on them is
+    // retried on fresh ones. `free_tcp_port` only proves a port was free at the
+    // instant it was probed: with several of these tests running concurrently
+    // another one can take it in between, `run()` then fails its bind, and the
+    // test that follows sees "connection refused" from a client that is
+    // perfectly correct. Retrying the *fixture* removes that whole failure mode
+    // without touching what is being asserted.
+    let mut last = String::from("no attempt was made");
+    for _ in 0..8 {
+        let (Some(tcp), Some(udp)) = (free_tcp_port(), free_udp_port()) else {
+            last = "cannot bind a free port in this environment".to_string();
+            continue;
+        };
+        let published: Arc<dyn Source> = Arc::clone(src) as Arc<dyn Source>;
+        let mut down = PvaServer::builder()
+            .listen_ip("127.0.0.1".parse().unwrap())
+            .advertise_ip("127.0.0.1".parse().unwrap())
+            .port(tcp)
+            .udp_port(udp)
+            .source("gateway", 0, published)
+            .build();
+        // The registry is handed back so a caller can watch the teardown from
+        // the inside as well as from the wire.
+        let registry = down.monitor_registry();
+        // Dropping the handle detaches the task, which is what the tests want:
+        // the server must outlive this function.
+        let handle = tokio::spawn(async move {
+            let _ = down.run().await;
+        });
+
+        let mut ready = false;
+        for _ in 0..200 {
+            if handle.is_finished() {
+                break;
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", tcp))
+                .await
+                .is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Re-check after the probe: a bind failure can land just after the
+        // first successful connect to whatever else holds the port.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if ready && !handle.is_finished() {
+            return (tcp, udp, registry);
+        }
+        last = match handle.is_finished() {
+            true => "the downstream server's run() returned early (port taken?)".to_string(),
+            false => "the downstream server never started listening".to_string(),
+        };
+    }
+    panic!("could not start a downstream server: {last}");
+}
+
+/// Proof that the teardown reaches a REAL client, addressed to the REAL
+/// channel: a hand-driven PVA client establishes a monitor through the
+/// gateway, the IOC dies, and the client must read a DESTROY_CHANNEL naming
+/// the very sid the server handed it and the cid it asked for.
+///
+/// This is what the registry-level assertions above cannot see. It fails if
+/// the monitor's ioid is never bound to its channel at MONITOR INIT
+/// (`spvirit-server/src/handler.rs:1910`), because then the teardown cannot
+/// resolve a sid and sends nothing at all; and it fails if the frame is
+/// encoded but never written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_client_receives_destroy_channel_naming_its_own_channel() {
+    const PV: &str = "GW:WIRE";
+
+    let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    let mut backend = spawn_backend(PV, up_tcp, up_udp);
+    let (src, _pool) = gateway_source(up_udp);
+    assert!(claim_within(&src, PV).await, "backend must be up");
+    let (down_tcp, down_udp, _registry) = spawn_downstream(&src).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{down_tcp}").parse().expect("loopback addr");
+    let opts = raw_opts(PV, down_tcp, down_udp, Some(addr));
+    let mut conn = open_monitor(addr, &opts).await;
+    let sid = conn.sid;
+
+    backend.kill();
+
+    let raw = read_until(
+        &mut conn.stream,
+        Duration::from_secs(30),
+        &mut conn.reassembler,
+        |cmd| matches!(cmd, PvaPacketCommand::DestroyChannel(_)),
+    )
+    .await
+    .expect(
+        "a real PVA client must be sent DESTROY_CHANNEL once its upstream dies; \
+         it got silence (or a dropped connection) instead",
+    );
+    let mut pkt = PvaPacket::new(&raw);
+    let Some(PvaPacketCommand::DestroyChannel(destroy)) = pkt.decode_payload() else {
+        panic!("the frame that matched DestroyChannel must decode as one");
+    };
+    assert_eq!(
+        destroy.sid, sid,
+        "DESTROY_CHANNEL must name the sid the server assigned this client's \
+         channel, resolved from the live subscription's ioid"
+    );
+    assert_eq!(
+        destroy.cid, CLIENT_CID,
+        "DESTROY_CHANNEL must name the cid the client created the channel with"
+    );
+}
+
+/// The recovery half, client-driven exactly as the spec intends: there is no
+/// gateway-side reconnect loop, so the client acts on the DESTROY_CHANNEL by
+/// re-searching. It must find the gateway over a real UDP search and get real
+/// data through a fresh channel once the IOC is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_client_re_searches_and_gets_data_again_after_destroy_channel() {
+    const PV: &str = "GW:REVIVE";
+
+    let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    let mut backend = spawn_backend(PV, up_tcp, up_udp);
+    let (src, _pool) = gateway_source(up_udp);
+    assert!(claim_within(&src, PV).await, "backend must be up");
+    let (down_tcp, down_udp, _registry) = spawn_downstream(&src).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{down_tcp}").parse().expect("loopback addr");
+    let opts = raw_opts(PV, down_tcp, down_udp, Some(addr));
+    let mut conn = open_monitor(addr, &opts).await;
+
+    backend.kill();
+
+    // The client learns its monitor is dead the only way a real PVA client
+    // can: the frame on the wire.
+    read_until(
+        &mut conn.stream,
+        Duration::from_secs(30),
+        &mut conn.reassembler,
+        |cmd| matches!(cmd, PvaPacketCommand::DestroyChannel(_)),
+    )
+    .await
+    .expect("the client must be told its channel is gone before it can recover");
+    drop(conn);
+
+    let _backend2 = spawn_backend(PV, up_tcp, up_udp);
+
+    // A genuine UDP search, retried: this is the re-search a real client does
+    // after a DESTROY_CHANNEL, and it must resolve to the gateway again.
+    let search_opts = raw_opts(PV, down_tcp, down_udp, None);
+    let mut resolved = None;
+    for _ in 0..60 {
+        if let Ok((found, _guid)) = resolve_pv_server(&search_opts).await {
+            resolved = Some(found);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let Some(found) = resolved else {
+        panic!("a re-searching client must find the gateway again after the IOC returns");
+    };
+    assert_eq!(
+        found.port(),
+        down_tcp,
+        "the re-search must resolve to the gateway's own downstream server"
+    );
+
+    // `open_monitor` only returns once a real DATA frame has arrived, so
+    // reaching the end of this test IS the proof that the client recovered.
+    let _recovered = open_monitor(found, &opts).await;
 }
