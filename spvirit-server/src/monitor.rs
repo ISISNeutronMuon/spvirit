@@ -275,8 +275,21 @@ impl MonitorRegistry {
     /// flagging a healthy successor would make the next `ensure_pump` replace it
     /// mid-`select!`, producing two live pumps that both deliver. Covered by
     /// `a_straggling_pump_never_flags_or_tears_down_its_successors_subscribers`.
-    /// A *missing* handle is not a straggler (nothing else claims the PV), so
-    /// the subscribers are still taken.
+    /// **Missing handle.** Nothing is taken either, and the reason is not the
+    /// generation guard's. A missing handle proves this pump was *retired by
+    /// name*: [`Self::ensure_pump`] holds the `pumps` guard from its lookup
+    /// across the spawn to the `insert`, so a pump can never observe its own
+    /// handle as absent, and [`Self::retire_pump_generation`] is this task's own
+    /// last statement — which leaves [`Self::retire_pump_if_idle`] as the only
+    /// way the entry can have gone. That function performs its idle check and
+    /// its removal under the *same* `monitors` guard, so `monitors[pv_name]` was
+    /// empty at the instant the handle vanished. Every subscriber present now
+    /// therefore post-dates the retirement, was never served by this pump, and
+    /// has (or will get) a pump of its own from its own `ensure_pump`. Taking
+    /// them would send a DESTROY_CHANNEL for a live upstream — the same defect
+    /// the snapshot above exists to prevent, reached through the arm the
+    /// generation guard does not cover. Covered by
+    /// `a_pump_whose_handle_was_already_retired_takes_no_subscribers`.
     ///
     /// Locks `monitors` then `pumps`, the established order; `pumps` is never
     /// held while `monitors` is taken.
@@ -289,7 +302,7 @@ impl MonitorRegistry {
                 p.exiting = true;
                 monitors.remove(pv_name).unwrap_or_default()
             }
-            None => monitors.remove(pv_name).unwrap_or_default(),
+            None => Vec::new(),
         }
     }
 
@@ -2146,6 +2159,95 @@ mod tests {
             "the successor's subscriber must still be registered"
         );
         drop((tx1, tx2));
+    }
+
+    /// A pump whose `PumpHandle` is already gone was retired *by name* by
+    /// `retire_pump_if_idle`, and that function does its idle check and its
+    /// removal under one `monitors` guard — so `monitors[pv]` was empty at that
+    /// instant. Anything sitting there when the pump finally notices its stream
+    /// ended arrived afterwards and belongs to a live upstream. Taking it would
+    /// be the mid-teardown defect reached through the one arm of
+    /// `begin_pump_teardown` the generation guard does not cover.
+    ///
+    /// Reachable without any new caller: the pump's shutdown signal and its
+    /// end-of-stream are both ready in the `select!`, and it picks
+    /// pseudo-randomly; on the end-of-stream branch the handle is already gone.
+    /// The test drives that branch directly rather than trying to force the coin
+    /// flip.
+    ///
+    /// The newcomer's channel is fully resolvable and its connection is
+    /// registered, so the "no frame" assertions are not vacuous: with the `None`
+    /// arm taking the list instead, `doomed` is non-empty and a DESTROY_CHANNEL
+    /// reaches the sink.
+    #[tokio::test]
+    async fn a_pump_whose_handle_was_already_retired_takes_no_subscribers() {
+        let reg = Arc::new(MonitorRegistry::new());
+        let sink = PlainRec::new();
+        reg.conns.lock().await.insert(2, ConnWriter::new(sink.clone()));
+        let tables: crate::state::SharedChannelTables = Default::default();
+        {
+            let mut t = tables.lock().unwrap();
+            t.insert_channel(33, 21, "PV:R");
+            t.bind_monitor(43, 21);
+        }
+        reg.register_channel_tables(2, Arc::clone(&tables)).await;
+
+        // `_tx` is held to the end: the real pump task stays parked on
+        // `rx.recv()` so it cannot run a teardown of its own while this one is
+        // driven by hand.
+        let (_tx, rx) = mpsc::channel::<NtPayload>(4);
+        reg.ensure_pump("PV:R", rx).await;
+        let id = reg.pumps.lock().await.get("PV:R").expect("pump").id;
+
+        // The handle goes while the pump is still parked — what
+        // `retire_pump_if_idle` does when the last subscriber leaves. (Removing
+        // it by id here has the same effect on `pumps` and needs no subscriber
+        // fixture to satisfy the idle check.)
+        reg.retire_pump_generation("PV:R", id).await;
+        assert!(
+            !reg.pumps.lock().await.contains_key("PV:R"),
+            "fixture: the pump's handle must be gone before the teardown runs"
+        );
+
+        // Only now does the newcomer subscribe — necessarily after the
+        // retirement, since the retirement required an empty list.
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors
+                .entry("PV:R".to_string())
+                .or_default()
+                .push(make_sub_on(2, 43, 2, false));
+        }
+
+        // The pump finally notices its stream ended.
+        let doomed = reg.begin_pump_teardown("PV:R", id).await;
+
+        assert!(
+            doomed.is_empty(),
+            "a pump whose handle was already retired must take no subscribers: \
+             every one present post-dates the retirement and belongs to a live \
+             upstream"
+        );
+        reg.destroy_subs("PV:R", doomed).await;
+        assert_eq!(
+            reg.monitors
+                .lock()
+                .await
+                .get("PV:R")
+                .map(|l| l.iter().map(|s| (s.conn_id, s.ioid)).collect::<Vec<_>>()),
+            Some(vec![(2u64, 43u32)]),
+            "the post-retirement subscriber must still be registered"
+        );
+        assert!(
+            sink.writes.lock().unwrap().is_empty(),
+            "the post-retirement subscriber was sent a DESTROY_CHANNEL for an \
+             upstream that is alive"
+        );
+        assert_eq!(
+            tables.lock().unwrap().channel_for_monitor(43),
+            Some((21, 33)),
+            "the post-retirement subscriber's channel must not be retracted"
+        );
     }
 
     /// A subscriber that arrives *after* the pump began exiting was never served
