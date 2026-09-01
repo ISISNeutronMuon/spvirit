@@ -747,8 +747,11 @@ async fn handle_connection(
                         || (is_server_rpc_pv(&pv_name) && state.pvlist_mode != PvListMode::Off)
                     {
                         let sid = state.sid_counter.fetch_add(1, Ordering::SeqCst);
-                        conn_state.cid_to_sid.insert(cid, sid);
-                        conn_state.sid_to_pv.insert(sid, pv_name.clone());
+                        conn_state
+                            .channels
+                            .lock()
+                            .unwrap()
+                            .insert_channel(cid, sid, &pv_name);
                         let resp = encode_create_channel_response(cid, sid, version, is_be);
                         send_msg(&state, conn_id, resp).await;
                         info!(
@@ -780,7 +783,14 @@ async fn handle_connection(
                     payload.subcmd,
                     payload.body.len()
                 );
-                let Some(pv_name) = conn_state.sid_to_pv.get(&sid).cloned() else {
+                let pv_lookup = conn_state
+                    .channels
+                    .lock()
+                    .unwrap()
+                    .sid_to_pv
+                    .get(&sid)
+                    .cloned();
+                let Some(pv_name) = pv_lookup else {
                     send_msg(
                         &state,
                         conn_id,
@@ -1321,8 +1331,11 @@ async fn handle_connection(
             PvaPacketCommand::DestroyChannel(payload) => {
                 let sid = payload.sid;
                 let cid = payload.cid;
-                conn_state.cid_to_sid.remove(&cid);
-                conn_state.sid_to_pv.remove(&sid);
+                conn_state
+                    .channels
+                    .lock()
+                    .unwrap()
+                    .remove_channel(cid, sid);
                 info!(
                     "Conn {}: channel destroyed sid={} cid={}",
                     conn_id, sid, cid
@@ -1865,23 +1878,28 @@ async fn handle_get_field_request(
 
     let request_id = payload.ioid.unwrap_or(payload.cid);
 
-    let sid = payload
-        .sid
-        .or_else(|| conn_state.cid_to_sid.get(&payload.cid).copied())
-        .or_else(|| {
-            conn_state
-                .sid_to_pv
-                .contains_key(&payload.cid)
-                .then_some(payload.cid)
-        })
-        .or_else(|| {
-            (payload.cid == 0 && conn_state.sid_to_pv.len() == 1)
-                .then(|| conn_state.sid_to_pv.keys().copied().next())
-                .flatten()
-        });
+    let (sid, resolved_pv) = {
+        let tables = conn_state.channels.lock().unwrap();
+        let sid = payload
+            .sid
+            .or_else(|| tables.cid_to_sid.get(&payload.cid).copied())
+            .or_else(|| {
+                tables
+                    .sid_to_pv
+                    .contains_key(&payload.cid)
+                    .then_some(payload.cid)
+            })
+            .or_else(|| {
+                (payload.cid == 0 && tables.sid_to_pv.len() == 1)
+                    .then(|| tables.sid_to_pv.keys().copied().next())
+                    .flatten()
+            });
+        let pv = sid.and_then(|s| tables.sid_to_pv.get(&s).cloned());
+        (sid, pv)
+    };
 
     if let Some(sid) = sid {
-        if let Some(pv_name) = conn_state.sid_to_pv.get(&sid) {
+        if let Some(pv_name) = resolved_pv.as_ref() {
             if let Some(nt) = get_nt_snapshot(state, pv_name).await {
                 let full_desc = nt_payload_desc(&nt);
                 // If a sub-field name was requested, filter the introspection

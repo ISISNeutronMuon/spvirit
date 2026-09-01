@@ -710,23 +710,30 @@ async fn handle_get_field_request(
 
     let request_id = payload.ioid.unwrap_or(payload.cid);
 
-    let sid = payload
-        .sid
-        .or_else(|| conn_state.cid_to_sid.get(&payload.cid).copied())
-        .or_else(|| {
-            conn_state
-                .sid_to_pv
-                .contains_key(&payload.cid)
-                .then_some(payload.cid)
-        })
-        .or_else(|| {
-            (payload.cid == 0 && conn_state.sid_to_pv.len() == 1)
-                .then(|| conn_state.sid_to_pv.keys().copied().next())
-                .flatten()
-        });
+    // One lock, one snapshot: resolve the sid and its PV name together, then
+    // release the tables before any `.await` below.
+    let (sid, resolved_pv) = {
+        let tables = conn_state.channels.lock().unwrap();
+        let sid = payload
+            .sid
+            .or_else(|| tables.cid_to_sid.get(&payload.cid).copied())
+            .or_else(|| {
+                tables
+                    .sid_to_pv
+                    .contains_key(&payload.cid)
+                    .then_some(payload.cid)
+            })
+            .or_else(|| {
+                (payload.cid == 0 && tables.sid_to_pv.len() == 1)
+                    .then(|| tables.sid_to_pv.keys().copied().next())
+                    .flatten()
+            });
+        let pv = sid.and_then(|s| tables.sid_to_pv.get(&s).cloned());
+        (sid, pv)
+    };
 
     if let Some(sid) = sid {
-        if let Some(pv_name) = conn_state.sid_to_pv.get(&sid) {
+        if let Some(pv_name) = resolved_pv.as_ref() {
             if let Some(nt) = get_nt_snapshot(state, pv_name).await {
                 let full_desc = nt_payload_desc(&nt);
                 let sub = payload.field_name.as_deref().filter(|s| !s.is_empty());
@@ -1378,8 +1385,11 @@ pub async fn handle_connection(
                 for (cid, pv_name) in payload.channels {
                     if has_pv(&state, &pv_name).await {
                         let sid = state.sid_counter.fetch_add(1, Ordering::SeqCst);
-                        conn_state.cid_to_sid.insert(cid, sid);
-                        conn_state.sid_to_pv.insert(sid, pv_name.clone());
+                        conn_state
+                            .channels
+                            .lock()
+                            .unwrap()
+                            .insert_channel(cid, sid, &pv_name);
                         let resp = encode_create_channel_response(cid, sid, version, is_be);
                         state.registry.send_msg(conn_id, resp).await;
                         info!(
@@ -1411,7 +1421,14 @@ pub async fn handle_connection(
                     payload.subcmd,
                     payload.body.len()
                 );
-                let Some(pv_name) = conn_state.sid_to_pv.get(&sid).cloned() else {
+                let pv_lookup = conn_state
+                    .channels
+                    .lock()
+                    .unwrap()
+                    .sid_to_pv
+                    .get(&sid)
+                    .cloned();
+                let Some(pv_name) = pv_lookup else {
                     state
                         .registry
                         .send_msg(
@@ -1881,6 +1898,12 @@ pub async fn handle_connection(
                                     nfree,
                                 },
                             );
+                            // DESTROY_CHANNEL needs this subscription's sid and
+                            // cid, and the registry cannot reach this
+                            // connection's tables at teardown time. Both
+                            // numbers are already in hand here, so record the
+                            // link.
+                            conn_state.channels.lock().unwrap().bind_monitor(ioid, sid);
                             {
                                 let mut monitors = state.registry.monitors.lock().await;
                                 monitors
@@ -1929,6 +1952,7 @@ pub async fn handle_connection(
                             conn_state.ioid_to_monitor.remove(&ioid);
                             conn_state.ioid_to_pv.remove(&ioid);
                             conn_state.ioid_to_desc.remove(&ioid);
+                            conn_state.channels.lock().unwrap().unbind_monitor(ioid);
                             info!("Conn {}: monitor end ioid={}", conn_id, ioid);
                         } else if (payload.subcmd & 0x04) != 0 || (payload.subcmd & 0x80) != 0 {
                             // Monitor start/stop/pipeline-ack
@@ -2124,8 +2148,11 @@ pub async fn handle_connection(
             PvaPacketCommand::DestroyChannel(payload) => {
                 let sid = payload.sid;
                 let cid = payload.cid;
-                conn_state.cid_to_sid.remove(&cid);
-                conn_state.sid_to_pv.remove(&sid);
+                conn_state
+                    .channels
+                    .lock()
+                    .unwrap()
+                    .remove_channel(cid, sid);
                 info!(
                     "Conn {}: channel destroyed sid={} cid={}",
                     conn_id, sid, cid
@@ -2140,6 +2167,7 @@ pub async fn handle_connection(
                         .await;
                     conn_state.ioid_to_desc.remove(&ioid);
                     conn_state.ioid_to_monitor.remove(&ioid);
+                    conn_state.channels.lock().unwrap().unbind_monitor(ioid);
                     info!("Conn {}: monitor unsubscribed ioid={}", conn_id, ioid);
                 }
             }
