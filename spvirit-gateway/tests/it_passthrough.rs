@@ -1057,3 +1057,154 @@ async fn the_getholdoff_cache_is_untouched_when_getholdoff_is_zero() {
         "getholdoff is on; the cache must be filled"
     );
 }
+
+/// An upstream IOC on caller-chosen loopback ports, running on its own runtime
+/// in its own thread so it can be killed and *replaced on the same ports*.
+/// Dropping the runtime is the kill: when [`kill`](Self::kill) returns the
+/// sockets are genuinely gone and a differently-shaped IOC can bind them.
+/// Modelled on `it_upstream_disconnect.rs`'s `Backend`.
+struct RestartableIoc {
+    kill: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RestartableIoc {
+    fn kill(&mut self) {
+        drop(self.kill.take());
+        if let Some(t) = self.thread.take() {
+            t.join()
+                .expect("ioc thread exits after dropping its runtime");
+        }
+    }
+}
+
+fn spawn_ioc_on(
+    tcp_port: u16,
+    udp_port: u16,
+    configure: impl FnOnce(spvirit_server::PvaServerBuilder) -> spvirit_server::PvaServerBuilder
+    + Send
+    + 'static,
+) -> RestartableIoc {
+    let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("ioc runtime builds");
+        rt.spawn(async move {
+            let builder = PvaServer::builder()
+                .listen_ip("127.0.0.1".parse().unwrap())
+                .advertise_ip("127.0.0.1".parse().unwrap())
+                .port(tcp_port)
+                .udp_port(udp_port);
+            let _ = configure(builder).build().run().await;
+        });
+        let _ = ready_tx.send(());
+        // Park until the test hangs up `kill_tx`, then DROP the runtime.
+        let _ = kill_rx.recv();
+        drop(rt);
+    });
+    ready_rx.recv().expect("ioc thread starts");
+    std::thread::sleep(Duration::from_millis(300));
+    RestartableIoc {
+        kill: Some(kill_tx),
+        thread: Some(thread),
+    }
+}
+
+/// The gateway half of [`spawn_gateway`] alone, pointed at an already-running
+/// IOC's `udp_port`. Needed because the descriptor-change test owns the IOC's
+/// lifetime (it kills and replaces it), which `spawn_gateway` does not allow.
+///
+/// The negative cache gets a deliberately short TTL: a claim that lands in the
+/// gap while the replacement IOC is binding would otherwise record a miss that
+/// short-circuits every later claim for 30 s.
+fn gateway_for_udp_port(udp_port: u16, getholdoff_ms: u32) -> GatewaySource {
+    let cfg_json = format!(
+        r#"{{
+            "version": 2,
+            "clients": [{{
+                "name": "it-client",
+                "addrlist": "127.0.0.1",
+                "bcastport": {udp_port},
+                "interface": ["127.0.0.1"]
+            }}],
+            "servers": [{{
+                "name": "it-server",
+                "clients": ["it-client"]
+            }}]
+        }}"#
+    );
+    let cfg = GatewayConfig::from_json_str(&cfg_json).expect("parse gateway config");
+    let pool = Arc::new(UpstreamPool::from_config(&cfg));
+    let neg = Arc::new(NegativeCache::new(Duration::from_millis(50), 128));
+    let guard = Arc::new(LoopGuard::build(
+        &cfg,
+        &cfg.servers[0],
+        std::collections::HashSet::new(),
+    ));
+    GatewaySource::new(
+        pool,
+        vec!["it-client".into()],
+        neg,
+        guard,
+        getholdoff_ms,
+        Arc::new(AccessControl::new(false, None, None)),
+    )
+}
+
+/// A binding refresh must drop the getholdoff cache when — and ONLY when — the
+/// upstream descriptor actually changed.
+///
+/// Both directions are asserted on purpose. An unconditional clear would pass
+/// the descriptor-changed half while silently destroying the getholdoff feature
+/// that this same task just brought to life; an unconditional preserve is the
+/// bug this test exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_binding_refresh_clears_the_getholdoff_cache_only_when_the_descriptor_changes() {
+    let (Some(tcp_port), Some(udp_port)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    // `ao` => an NTScalar of double.
+    let mut ioc = spawn_ioc_on(tcp_port, udp_port, |b| b.ao("IT:RESTRUCT", 1.0));
+
+    // A zero binding TTL forces every claim past the fast path into a real
+    // re-resolve, which is the only route that reaches the refresh branch.
+    let src = gateway_for_udp_port(udp_port, 10_000).with_binding_ttl(Duration::ZERO);
+
+    assert!(src.claim("IT:RESTRUCT").await.is_some());
+    assert!(src.get("IT:RESTRUCT").await.is_some());
+    assert_eq!(
+        src.getholdoff_cache_len(),
+        1,
+        "the first get must fill the getholdoff cache"
+    );
+
+    // Direction 1 — descriptor UNCHANGED: the cache must survive the refresh.
+    assert!(src.claim("IT:RESTRUCT").await.is_some());
+    assert_eq!(
+        src.getholdoff_cache_len(),
+        1,
+        "a refresh against an unchanged descriptor must keep the cached value"
+    );
+
+    // Direction 2 — descriptor CHANGED: the same PV name comes back as a
+    // string record on the same loopback ports, so the cached payload was
+    // encoded against a structure the binding no longer advertises.
+    ioc.kill();
+    let mut ioc2 = spawn_ioc_on(tcp_port, udp_port, |b| b.string_out("IT:RESTRUCT", "hi"));
+
+    assert!(src.claim("IT:RESTRUCT").await.is_some());
+    assert_eq!(
+        src.getholdoff_cache_len(),
+        0,
+        "the descriptor changed, so the payload cached against the superseded \
+         one must be dropped rather than served against the new structure"
+    );
+
+    ioc2.kill();
+}

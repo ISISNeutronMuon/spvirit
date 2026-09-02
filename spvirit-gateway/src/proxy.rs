@@ -354,6 +354,25 @@ impl Source for GatewaySource {
                                 if existing.client_name == *client_name
                                     && existing.real_name == target =>
                             {
+                                // An upstream that restructured invalidates the
+                                // cached value: `handler.rs` encodes whatever
+                                // `last_get` holds against the descriptor this
+                                // binding currently advertises, so serving a
+                                // payload cached against the superseded one
+                                // emits a frame whose data does not match its
+                                // own introspection — and in this protocol one
+                                // malformed frame takes the whole TCP
+                                // connection down, not just that value. Do NOT
+                                // simplify this to an unconditional refresh:
+                                // the equality check is what keeps a stale
+                                // payload from outliving its structure. It is
+                                // equally not an unconditional clear — that
+                                // would wipe the cache on every claim and so
+                                // disable getholdoff altogether, which is the
+                                // very bug the in-place refresh above fixes.
+                                if existing.descriptor != descriptor {
+                                    *existing.last_get.lock().unwrap() = None;
+                                }
                                 existing.descriptor = descriptor.clone();
                                 existing.bound_at = Instant::now();
                                 true
