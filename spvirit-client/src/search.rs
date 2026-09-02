@@ -587,7 +587,20 @@ where
         tokio::select! {
             recv = rx.recv() => {
                 let Some((buf, src)) = recv else { break };
-                let mut pkt = PvaPacket::new(&buf);
+                // Untrusted UDP ingress: anyone who can reach this ephemeral
+                // reply port can send a datagram shorter than the 8-byte PVA
+                // header. Drop it -- do NOT route it through
+                // `fail_on_decode_error`, or three bytes would still end the
+                // search, just via `Err` instead of a panic.
+                let Some(mut pkt) = PvaPacket::try_new(&buf) else {
+                    debug!(
+                        "{}: dropping short datagram ({} bytes) from {}",
+                        op,
+                        buf.len(),
+                        src
+                    );
+                    continue;
+                };
                 let cmd = match pkt.decode_payload() {
                     Some(cmd) => cmd,
                     None => {
@@ -1286,5 +1299,76 @@ mod tests {
         let src: SocketAddr = "192.168.1.20:5076".parse().unwrap();
         let decoded = decode_search_response_addr([0u8; 16], 5075, src);
         assert_eq!(decoded, "192.168.1.20:5075".parse().unwrap());
+    }
+
+    /// Site 3. The UDP receive loop used to feed a raw datagram to the
+    /// panicking `PvaPacket::new`. Any host that can reach the client's
+    /// ephemeral reply port could unwind the whole search task with three
+    /// bytes -- and inside the gateway that is the upstream resolution path.
+    ///
+    /// A truncated datagram is *noise*, not a protocol error: it must be
+    /// dropped and the loop must keep running. Turning it into a hard error
+    /// would hand the same denial of service back under a different name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_udp_datagram_does_not_panic_the_search_receive_loop() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // Stand in for a PVA server on the port the client will search.
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake server");
+        let server_port = server.local_addr().expect("server addr").port();
+
+        let search = tokio::spawn(async move {
+            search_pv(
+                "HOSTILE:PV",
+                server_port,
+                Duration::from_millis(800),
+                &[SearchTarget {
+                    target: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                }],
+                false,
+            )
+            .await
+        });
+
+        // The search request tells us the client's ephemeral reply address.
+        let mut buf = [0u8; 2048];
+        let (_, client_addr) =
+            tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+                .await
+                .expect("client never sent a search request")
+                .expect("recv_from");
+
+        // Three bytes: shorter than the 8-byte PVA header.
+        server
+            .send_to(&[0xCA, 0x02, 0x00], client_addr)
+            .await
+            .expect("send short datagram");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(3), search)
+            .await
+            .expect("search never finished -- the receive loop died");
+        let result = outcome.expect("the search receive loop panicked on a short datagram");
+        assert!(
+            result.is_err(),
+            "no server ever answered properly, so the search must time out"
+        );
+    }
+
+    /// Same defect class, public API surface: `decode_init_introspection`
+    /// takes an arbitrary byte slice and used to build a `PvaPacket` from it
+    /// unconditionally.
+    #[test]
+    fn decode_init_introspection_rejects_a_short_frame_without_panicking() {
+        let err = crate::pva_client::decode_init_introspection(&[0xCA, 0x02, 0x00, 0x0D], "monitor")
+            .expect_err("a sub-header frame must be a typed error");
+        match err {
+            PvGetError::Decode(msg) => {
+                assert!(msg.contains("monitor"), "error should name the caller: {msg}")
+            }
+            other => panic!("expected Decode, got {other:?}"),
+        }
     }
 }

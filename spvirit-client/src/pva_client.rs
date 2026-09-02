@@ -940,7 +940,12 @@ pub fn client_from_opts(opts: &PvOptions) -> PvaClient {
 
 /// Decode an INIT response to extract the introspection StructureDesc.
 pub fn decode_init_introspection(raw: &[u8], label: &str) -> Result<StructureDesc, PvGetError> {
-    let mut pkt = PvaPacket::new(raw);
+    let mut pkt = PvaPacket::try_new(raw).ok_or_else(|| {
+        PvGetError::Decode(format!(
+            "{label} init response is {} bytes, shorter than the 8-byte PVA header",
+            raw.len()
+        ))
+    })?;
     let cmd = pkt
         .decode_payload()
         .ok_or_else(|| PvGetError::Decode(format!("{label} init response decode failed")))?;
