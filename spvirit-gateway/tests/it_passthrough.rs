@@ -937,3 +937,53 @@ async fn retire_binding_turns_try_claim_from_yes_back_into_unknown() {
         "a retired binding must also leave names()"
     );
 }
+
+/// `SourceRegistry` calls `Source::claim` before EVERY delegated operation.
+/// Without a fast path over the binding map that means a full upstream
+/// resolution (UDP search + TCP connect + CreateChannel + GET_FIELD) per
+/// downstream get/put/subscribe — for a descriptor the binding already holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeat_claims_resolve_upstream_exactly_once() {
+    let Some((src, _pool)) = spawn_gateway(|b| b.ai("IT:FASTPATH", 7.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    let first = src.claim("IT:FASTPATH").await.expect("first claim resolves");
+    assert_eq!(src.upstream_resolve_count(), 1);
+
+    for _ in 0..5 {
+        let again = src.claim("IT:FASTPATH").await.expect("repeat claim");
+        assert_eq!(
+            again.descriptor, first.descriptor,
+            "the fast path must return the descriptor the first resolve produced"
+        );
+        assert!(again.writable);
+    }
+
+    assert_eq!(
+        src.upstream_resolve_count(),
+        1,
+        "five repeat claims went back to the wire; the binding map already had the descriptor"
+    );
+}
+
+/// The fast path must not outlive its usefulness: with the TTL exhausted the
+/// next claim re-resolves, so an upstream that restructured (or vanished)
+/// while nothing was monitoring it is picked up within a bounded window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_binding_is_re_resolved() {
+    let Some((src, _pool)) = spawn_gateway(|b| b.ai("IT:TTL", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    let src = src.with_binding_ttl(Duration::ZERO);
+
+    assert!(src.claim("IT:TTL").await.is_some());
+    assert!(src.claim("IT:TTL").await.is_some());
+    assert_eq!(
+        src.upstream_resolve_count(),
+        2,
+        "a zero TTL must expire every binding immediately, forcing a real re-resolve"
+    );
+}

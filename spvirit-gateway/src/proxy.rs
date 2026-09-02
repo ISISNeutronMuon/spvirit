@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::pvstore::{PvInfo, Source, TryClaim};
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
@@ -77,13 +77,18 @@ fn current_identity() -> Identity {
 pub struct Binding {
     pub client_name: String,
     pub real_name: String,
-    /// The upstream introspection's `StructureDesc.struct_id` (e.g.
-    /// `"epics:nt/NTScalar:1.0"`), captured at `claim` time so `subscribe`
-    /// can stamp monitored payloads with the same struct id `get` already
-    /// reports (`nt_payload_from_get` sources it from
-    /// `PvGetResult::introspection` directly; `subscribe` has no per-tick
-    /// introspection round-trip, so it must carry this forward from claim).
-    struct_id: Option<String>,
+    /// The upstream introspection captured at resolve time.
+    ///
+    /// Held in full (not just `struct_id`) so `claim` can answer a repeat call
+    /// straight from this map instead of going back to the wire, and so
+    /// `subscribe` can keep stamping monitored payloads with the same struct
+    /// id `get` reports (`nt_payload_from_get` sources it from
+    /// `PvGetResult::introspection`; `subscribe` has no per-tick introspection
+    /// round trip, so it must carry this forward from claim).
+    pub descriptor: StructureDesc,
+    /// When this binding was last confirmed against upstream. Bounds how long
+    /// the fast path in `claim` may answer from memory.
+    pub bound_at: Instant,
     last_get: Mutex<Option<(Instant, NtPayload)>>,
 }
 
@@ -115,6 +120,17 @@ pub struct GatewaySource {
     /// ACF) lives entirely inside `AccessControl::decide` — this source only
     /// calls it and applies the returned `Decision`.
     access: Arc<AccessControl>,
+    /// How long a binding may answer `claim` without going back upstream.
+    ///
+    /// A staleness bound, not an eviction policy: an expired binding is
+    /// re-resolved and refreshed in place, never dropped. 30 s is the order of
+    /// magnitude of a PVA client's own search backoff, so a genuinely
+    /// restructured IOC is picked up in roughly the time a direct client would
+    /// take to notice.
+    binding_ttl: Duration,
+    /// How many times this source has gone to the wire to resolve a name.
+    /// Exposed for tests proving the binding fast path actually short-circuits.
+    resolves: std::sync::atomic::AtomicU64,
 }
 
 impl GatewaySource {
@@ -140,6 +156,8 @@ impl GatewaySource {
             monitors: Arc::new(MonitorCache::new()),
             deaths: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             access,
+            binding_ttl: Duration::from_secs(30),
+            resolves: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -148,6 +166,20 @@ impl GatewaySource {
     /// onto a single upstream monitor task.
     pub fn upstream_monitor_count(&self) -> usize {
         self.monitors.upstream_count()
+    }
+
+    /// Override the binding staleness bound. Test-serving builder; production
+    /// takes the 30 s default from [`GatewaySource::new`].
+    pub fn with_binding_ttl(mut self, ttl: Duration) -> Self {
+        self.binding_ttl = ttl;
+        self
+    }
+
+    /// How many upstream resolutions (`pvinfo_full` attempts) this source has
+    /// issued. Exposed for tests proving repeat claims are answered from the
+    /// binding map rather than from the wire.
+    pub fn upstream_resolve_count(&self) -> u64 {
+        self.resolves.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Names of the upstream channels currently held in the monitor cache —
@@ -223,10 +255,47 @@ impl Source for GatewaySource {
                 Decision::AllowAliased(real) => real,
             };
 
+            // Fast path. `SourceRegistry` calls `claim` before EVERY
+            // get/put/subscribe/rpc/pushes_own_updates, so without this each
+            // downstream operation pays a fresh UDP search + TCP connect +
+            // CreateChannel + GET_FIELD whose only product — the
+            // `StructureDesc` — this map already holds.
+            //
+            // Three guards keep the shortcut honest, and their order matters:
+            //  * the negative cache and the access decision above already ran,
+            //    so a denied or negatively-cached name is never answered from a
+            //    stale binding (the same precedence `try_claim` uses);
+            //  * `real_name == target`, because the binding is keyed on the
+            //    *downstream* name while a pvlist ALIAS can map that name to a
+            //    different upstream target for a different identity —
+            //    answering with another identity's descriptor would be wrong;
+            //  * `bound_at` within `binding_ttl`, so an upstream that
+            //    restructured while nothing was monitoring it is re-resolved
+            //    within a bounded window rather than never.
+            //
+            // The loop guard needs no re-check here: a binding only ever
+            // exists because a resolve already passed
+            // `is_banned`/`is_guid_banned` below, and the address it passed
+            // for is the one this binding still routes to.
+            {
+                let bindings = self.bindings.lock().unwrap();
+                if let Some(binding) = bindings.get(&name)
+                    && binding.real_name == target
+                    && now.duration_since(binding.bound_at) < self.binding_ttl
+                {
+                    return Some(PvInfo {
+                        descriptor: binding.descriptor.clone(),
+                        writable: true,
+                    });
+                }
+            }
+
             for client_name in &self.client_order {
                 let Some(client) = self.pool.client(client_name) else {
                     continue;
                 };
+                self.resolves
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Ok((descriptor, server_addr, guid)) = client.pvinfo_full(&target).await {
                     // Loop / self-connection prevention: if this name resolved
                     // back into one of our own downstream server sockets (or an
@@ -241,7 +310,8 @@ impl Source for GatewaySource {
                         Binding {
                             client_name: client_name.clone(),
                             real_name: target.clone(),
-                            struct_id: descriptor.struct_id.clone(),
+                            descriptor: descriptor.clone(),
+                            bound_at: Instant::now(),
                             last_get: Mutex::new(None),
                         },
                     );
@@ -348,7 +418,7 @@ impl Source for GatewaySource {
                 (
                     binding.client_name.clone(),
                     binding.real_name.clone(),
-                    binding.struct_id.clone().unwrap_or_default(),
+                    binding.descriptor.struct_id.clone().unwrap_or_default(),
                 )
             };
 
@@ -569,7 +639,8 @@ mod tests {
             Binding {
                 client_name: "c".into(),
                 real_name: "BOUND:PV".into(),
-                struct_id: None,
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
@@ -595,7 +666,8 @@ mod tests {
             Binding {
                 client_name: "c".into(),
                 real_name: "BOUND:PV".into(),
-                struct_id: None,
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
@@ -617,7 +689,8 @@ mod tests {
             Binding {
                 client_name: "c".into(),
                 real_name: "SECRET:PV".into(),
-                struct_id: None,
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
