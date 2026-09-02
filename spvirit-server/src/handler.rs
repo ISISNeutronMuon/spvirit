@@ -1184,6 +1184,22 @@ pub async fn run_tcp_server(
 // Core TCP connection handler
 // ---------------------------------------------------------------------------
 
+/// Turn off Nagle's algorithm on an accepted connection.
+///
+/// PVA responses are typically far smaller than an MSS. With Nagle on, the
+/// kernel holds such a write until the previous segment is acknowledged, and
+/// the peer's delayed-ACK timer means that acknowledgement is itself deferred
+/// — a latency floor of roughly 40 ms on Linux and 200 ms on Windows under
+/// every single request/response round trip.
+///
+/// A failure here is not fatal: the connection still works, just slowly. Log
+/// it and carry on rather than dropping a client over a socket option.
+pub fn disable_nagle(stream: &TcpStream, conn_id: u64) {
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("Conn {}: could not set TCP_NODELAY: {}", conn_id, e);
+    }
+}
+
 /// Handle a single PVA TCP connection.
 ///
 /// This is the main protocol loop: handshake, then dispatch each command
@@ -1200,6 +1216,7 @@ pub async fn handle_connection(
     // making it the ideal thing to advertise in a search reply when no explicit
     // advertise IP is configured.
     let conn_local_addr = stream.local_addr().ok();
+    disable_nagle(&stream, conn_id);
     let (mut reader, writer) = stream.into_split();
 
     {
