@@ -1921,7 +1921,23 @@ pub async fn handle_connection(
                                         running: false,
                                         pipeline_enabled,
                                         nfree,
-                                        filtered_desc: conn_state.ioid_to_desc.get(&ioid).cloned(),
+                                        // Only a client that actually asked for
+                                        // a field filter needs a projection
+                                        // desc. Storing one unconditionally
+                                        // forces `build_monitor_frame` down the
+                                        // filtered branch, which encodes a
+                                        // throwaway delta as a change detector
+                                        // and then a full filtered frame — two
+                                        // full encodes per update for what is
+                                        // the identity projection. The bytes
+                                        // are unchanged either way:
+                                        // `encode_nt_payload_values_for_desc`
+                                        // short-circuits to
+                                        // `encode_nt_payload_full` when the
+                                        // desc equals the payload's own.
+                                        filtered_desc: pv_req_fields
+                                            .is_some()
+                                            .then(|| desc.clone()),
                                         last_snapshot: None,
                                     });
                             }
