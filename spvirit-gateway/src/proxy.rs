@@ -211,6 +211,18 @@ impl GatewaySource {
     pub fn upstream_monitor_deaths(&self) -> u64 {
         self.deaths.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// How many bindings currently hold a cached `get` value. Exposed for
+    /// tests proving the getholdoff cache is filled when the feature is on and
+    /// left completely alone when `getholdoff = 0`.
+    pub fn getholdoff_cache_len(&self) -> usize {
+        self.bindings
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.last_get.lock().unwrap().is_some())
+            .count()
+    }
 }
 
 impl Source for GatewaySource {
@@ -324,16 +336,46 @@ impl Source for GatewaySource {
                     if self.guard.is_banned(server_addr) || self.guard.is_guid_banned(&guid) {
                         continue;
                     }
-                    self.bindings.lock().unwrap().insert(
-                        name.clone(),
-                        Binding {
-                            client_name: client_name.clone(),
-                            real_name: target.clone(),
-                            descriptor: descriptor.clone(),
-                            bound_at: Instant::now(),
-                            last_get: Mutex::new(None),
-                        },
-                    );
+                    {
+                        let mut bindings = self.bindings.lock().unwrap();
+                        // Two statements, not one `match` with an `insert` in
+                        // its fallback arm: `get_mut`'s borrow of `bindings`
+                        // would still be live in that arm, and the borrow
+                        // checker rejects it (NLL problem case 3). Reducing
+                        // the match to a `bool` ends the borrow at the
+                        // semicolon.
+                        let refreshed = match bindings.get_mut(&name) {
+                            // Refresh in place. Replacing the whole `Binding`
+                            // (what this used to do) resets `last_get` to
+                            // `None` — and `SourceRegistry` claims immediately
+                            // before every `get`, so the getholdoff cache was
+                            // wiped before every read it was meant to serve.
+                            Some(existing)
+                                if existing.client_name == *client_name
+                                    && existing.real_name == target =>
+                            {
+                                existing.descriptor = descriptor.clone();
+                                existing.bound_at = Instant::now();
+                                true
+                            }
+                            // A different client or a different upstream target
+                            // is a different binding: the cached value came
+                            // from somewhere else and must not carry over.
+                            _ => false,
+                        };
+                        if !refreshed {
+                            bindings.insert(
+                                name.clone(),
+                                Binding {
+                                    client_name: client_name.clone(),
+                                    real_name: target.clone(),
+                                    descriptor: descriptor.clone(),
+                                    bound_at: Instant::now(),
+                                    last_get: Mutex::new(None),
+                                },
+                            );
+                        }
+                    }
                     return Some(PvInfo {
                         descriptor,
                         writable: true,
@@ -358,13 +400,18 @@ impl Source for GatewaySource {
                 let bindings = self.bindings.lock().unwrap();
                 let binding = bindings.get(&name)?;
 
-                let cache = binding.last_get.lock().unwrap();
-                if let Some((t_last, payload)) = cache.as_ref()
-                    && Instant::now() < *t_last + Duration::from_millis(self.getholdoff_ms as u64)
-                {
-                    return Some(payload.clone());
+                // `getholdoff = 0` (the default) means the feature is off: the
+                // window can never be satisfied, so do not even take the inner
+                // lock to compare against a zero-length window.
+                if self.getholdoff_ms > 0 {
+                    let cache = binding.last_get.lock().unwrap();
+                    if let Some((t_last, payload)) = cache.as_ref()
+                        && Instant::now()
+                            < *t_last + Duration::from_millis(self.getholdoff_ms as u64)
+                    {
+                        return Some(payload.clone());
+                    }
                 }
-                drop(cache);
 
                 (binding.client_name.clone(), binding.real_name.clone())
             };
@@ -373,7 +420,12 @@ impl Source for GatewaySource {
             match client.pvget(&real_name).await {
                 Ok(result) => {
                     let payload = nt_payload_from_get(&result);
-                    if let Some(binding) = self.bindings.lock().unwrap().get(&name) {
+                    // Only fill the cache when the feature is on: with the
+                    // default 0 the read above can never hit, so the clone and
+                    // the two locks would be pure cost on every read.
+                    if self.getholdoff_ms > 0
+                        && let Some(binding) = self.bindings.lock().unwrap().get(&name)
+                    {
                         *binding.last_get.lock().unwrap() = Some((Instant::now(), payload.clone()));
                     }
                     Some(payload)

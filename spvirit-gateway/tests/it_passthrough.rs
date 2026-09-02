@@ -225,38 +225,40 @@ async fn get_returns_the_upstream_value() {
     assert!((value - 22.5).abs() < 1e-6, "expected ~22.5, got {value}");
 }
 
+/// A second read inside the holdoff window is answered from cache, so an
+/// upstream change made in between is NOT visible yet.
+///
+/// Driven through a `SourceRegistry` because that is the only path production
+/// takes: the registry claims before every get, and a claim that does not
+/// refresh the binding in place silently disables this feature. The earlier
+/// version of this test called `GatewaySource::get` directly and so could not
+/// see that bug at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn getholdoff_holds_the_cached_value() {
-    let Some((src, pool)) = spawn_gateway(|b| b.ao("IT:SETPOINT", 1.0), 10_000).await else {
+    use spvirit_server::pvstore::{Source, SourceRegistry};
+
+    let Some((src, pool)) = spawn_gateway(|b| b.ao("IT:HOLD", 1.0), 10_000).await else {
         eprintln!("Skipping test: cannot bind a free port in this environment");
         return;
     };
+    let src: Arc<dyn Source> = Arc::new(src);
+    let reg = SourceRegistry::new();
+    reg.add("gateway", 0, src).await;
 
-    assert!(src.claim("IT:SETPOINT").await.is_some());
+    let first = reg.get("IT:HOLD").await.expect("first get");
+    assert!((extract_f64_value(&first) - 1.0).abs() < 1e-6);
 
-    // First get populates the getholdoff cache with the initial value.
-    let payload = src.get("IT:SETPOINT").await.expect("get should return Some");
-    let value = extract_f64_value(&payload);
-    assert!((value - 1.0).abs() < 1e-6, "expected ~1.0, got {value}");
-
-    // Change the upstream value directly, bypassing the gateway entirely.
-    let upstream_client = pool.client("it-client").expect("client in pool");
-    upstream_client
-        .pvput("IT:SETPOINT", 2.0f64)
+    pool.client("it-client")
+        .expect("client in pool")
+        .pvput("IT:HOLD", 2.0f64)
         .await
-        .expect("direct upstream pvput should succeed");
+        .expect("direct upstream pvput");
 
-    // A second get, still within the (large) getholdoff window, must
-    // return the cached value rather than round-tripping upstream again —
-    // this is the getholdoff proof.
-    let payload_again = src
-        .get("IT:SETPOINT")
-        .await
-        .expect("get should return Some");
-    let value_again = extract_f64_value(&payload_again);
+    let second = reg.get("IT:HOLD").await.expect("second get");
     assert!(
-        (value_again - 1.0).abs() < 1e-6,
-        "expected getholdoff to still return ~1.0 (cached), got {value_again}"
+        (extract_f64_value(&second) - 1.0).abs() < 1e-6,
+        "expected the cached 1.0 inside the 10 s holdoff window, got {}",
+        extract_f64_value(&second)
     );
 }
 
@@ -985,5 +987,73 @@ async fn an_expired_binding_is_re_resolved() {
         src.upstream_resolve_count(),
         2,
         "a zero TTL must expire every binding immediately, forcing a real re-resolve"
+    );
+}
+
+/// The real path is `SourceRegistry` -> claim -> get, and the claim used to
+/// replace the whole `Binding`, throwing `last_get` away immediately before
+/// the read it was meant to serve. Driving this through a `SourceRegistry`
+/// rather than calling `GatewaySource::get` directly is the point of the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn getholdoff_survives_a_binding_refresh_on_the_registry_path() {
+    use spvirit_server::pvstore::{Source, SourceRegistry};
+
+    let Some((src, pool)) = spawn_gateway(|b| b.ao("IT:HOLDREG", 1.0), 10_000).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    // A zero binding TTL forces every claim past Task 1's fast path and into a
+    // real re-resolution — precisely the case the unconditional `insert`
+    // used to corrupt.
+    let src: Arc<dyn Source> = Arc::new(src.with_binding_ttl(Duration::ZERO));
+
+    let reg = SourceRegistry::new();
+    reg.add("gateway", 0, src).await;
+
+    let first = reg.get("IT:HOLDREG").await.expect("first registry get");
+    assert!((extract_f64_value(&first) - 1.0).abs() < 1e-6);
+
+    pool.client("it-client")
+        .expect("client in pool")
+        .pvput("IT:HOLDREG", 2.0f64)
+        .await
+        .expect("direct upstream pvput");
+
+    let second = reg.get("IT:HOLDREG").await.expect("second registry get");
+    assert!(
+        (extract_f64_value(&second) - 1.0).abs() < 1e-6,
+        "the re-resolve before the second get must refresh the binding in place, \
+         not replace it and drop the getholdoff cache; got {}",
+        extract_f64_value(&second)
+    );
+}
+
+/// With `getholdoff = 0` the holdoff window can never be satisfied, so `get`
+/// must not pay a payload clone and two locks per read to fill a cache that
+/// can never hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_getholdoff_cache_is_untouched_when_getholdoff_is_zero() {
+    let Some((off, _pool)) = spawn_gateway(|b| b.ai("IT:HOLDOFF0", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    assert!(off.claim("IT:HOLDOFF0").await.is_some());
+    assert!(off.get("IT:HOLDOFF0").await.is_some());
+    assert_eq!(
+        off.getholdoff_cache_len(),
+        0,
+        "getholdoff is off; the cache must not be filled"
+    );
+
+    let Some((on, _pool2)) = spawn_gateway(|b| b.ai("IT:HOLDOFFN", 1.0), 10_000).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    assert!(on.claim("IT:HOLDOFFN").await.is_some());
+    assert!(on.get("IT:HOLDOFFN").await.is_some());
+    assert_eq!(
+        on.getholdoff_cache_len(),
+        1,
+        "getholdoff is on; the cache must be filled"
     );
 }
