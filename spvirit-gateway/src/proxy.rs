@@ -273,10 +273,29 @@ impl Source for GatewaySource {
             //    restructured while nothing was monitoring it is re-resolved
             //    within a bounded window rather than never.
             //
-            // The loop guard needs no re-check here: a binding only ever
-            // exists because a resolve already passed
-            // `is_banned`/`is_guid_banned` below, and the address it passed
-            // for is the one this binding still routes to.
+            // The loop guard is deliberately NOT re-checked here, and the
+            // honest reason is narrower than "the binding is already
+            // vetted". A binding exists only because some earlier resolve
+            // passed `is_banned`/`is_guid_banned` below — but `Binding` pins
+            // no address and no GUID, so that guarantee covers the address
+            // resolved *then*, not the address the next `pvget`/`pvput` will
+            // find: the data path re-searches every operation
+            // (`PvaClient::pvget` runs a fresh `low_level_pvget`). So a name
+            // that starts resolving to a banned address while a binding is
+            // live is answered unguarded until the binding expires.
+            //
+            // That TOCTOU is pre-existing — even before the fast path, claim
+            // validated the address *its own* search found, not the one the
+            // data path would re-resolve a moment later — but the fast path
+            // widens the window from roughly one search to `binding_ttl`.
+            // Accepted because `LoopGuard` is built once per server at
+            // startup (`runtime.rs`) and never replaced, so the ban set
+            // cannot change under a live binding; the only mover is upstream
+            // itself migrating onto a banned address, which the TTL bounds.
+            // Revisit this skip if either premise goes: a `LoopGuard` that
+            // can be reloaded, a `Binding` that pins its resolved address or
+            // GUID (then re-check it cheaply here), or client-side
+            // connection caching that makes the data path stop re-searching.
             {
                 let bindings = self.bindings.lock().unwrap();
                 if let Some(binding) = bindings.get(&name)
