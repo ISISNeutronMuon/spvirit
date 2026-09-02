@@ -589,12 +589,24 @@ impl SourceRegistry {
         self.claim(name).await.is_some()
     }
 
+    /// Snapshot the registered sources and release the read guard.
+    ///
+    /// Every delegating method goes through this rather than iterating under
+    /// the guard: a proxying source's `claim` is a full upstream round trip,
+    /// and tokio's `RwLock` is writer-fair, so one `add`/`remove` queued behind
+    /// a held read guard also fails every `try_read` the search path depends
+    /// on. [`claim`](Self::claim) and [`names`](Self::names) already did this;
+    /// these methods are catching up.
+    async fn source_snapshot(&self) -> Vec<Arc<dyn Source>> {
+        let sources = self.sources.read().await;
+        sources.iter().map(|e| e.source.clone()).collect()
+    }
+
     /// Get the value from the first source that claims the PV.
     pub async fn get(&self, name: &str) -> Option<NtPayload> {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.get(name).await;
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.get(name).await;
             }
         }
         None
@@ -616,10 +628,9 @@ impl SourceRegistry {
         name: &str,
         value: &DecodedValue,
     ) -> Result<Vec<(String, NtPayload)>, String> {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.put(name, value).await;
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.put(name, value).await;
             }
         }
         Err(format!("PV '{}' not found", name))
@@ -627,10 +638,9 @@ impl SourceRegistry {
 
     /// Subscribe via the first source that claims the PV.
     pub async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<NtPayload>> {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.subscribe(name).await;
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.subscribe(name).await;
             }
         }
         None
@@ -642,10 +652,9 @@ impl SourceRegistry {
     /// Returns `false` for an unclaimed PV — there is nothing to pump and no
     /// source to ask, so the caller's decision (pump vs. skip) is moot.
     pub async fn pushes_own_updates(&self, name: &str) -> bool {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.pushes_own_updates();
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.pushes_own_updates();
             }
         }
         false
@@ -653,10 +662,9 @@ impl SourceRegistry {
 
     /// Execute an RPC call via the first source that claims the channel.
     pub async fn rpc(&self, name: &str, args: &DecodedValue) -> Result<NtPayload, String> {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.rpc(name, args).await;
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.rpc(name, args).await;
             }
         }
         Err(format!("RPC channel '{}' not found", name))
@@ -672,10 +680,7 @@ impl SourceRegistry {
     /// every other `try_read`-based reader, since tokio's `RwLock` is
     /// writer-fair — for that whole duration.
     pub async fn names(&self) -> Vec<String> {
-        let snapshot: Vec<Arc<dyn Source>> = {
-            let sources = self.sources.read().await;
-            sources.iter().map(|e| e.source.clone()).collect()
-        };
+        let snapshot = self.source_snapshot().await;
         let mut seen = HashSet::new();
         let mut all = Vec::new();
         for source in &snapshot {
@@ -834,6 +839,114 @@ mod tests {
         // (The snapshot predates the `late` registration, so `B` is correctly
         // absent from it.)
         assert_eq!(enumerating.await.unwrap(), vec!["SLOW:PV".to_string()]);
+    }
+
+    /// A source whose `claim` is slow — the shape of every proxying source,
+    /// where a claim is an upstream search plus a TCP connect.
+    ///
+    /// `claim`, `get`, `put`, `subscribe` and `names` are all required methods
+    /// on `Source` (only `try_claim`, `pushes_own_updates` and `rpc` have
+    /// defaults), so all five are written out even though only `claim` matters
+    /// here — the same shape `SlowNamesSource` just above already uses.
+    struct SlowClaimSource {
+        delay: Duration,
+    }
+
+    impl Source for SlowClaimSource {
+        fn claim(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                None
+            })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            Box::pin(async { Vec::new() })
+        }
+    }
+
+    /// Drive one of the five delegating methods by name, so the test below can
+    /// cover all of them without five near-identical bodies.
+    async fn drive_registry_op(reg: Arc<SourceRegistry>, op: &'static str) {
+        // `let _ =` on every arm: `Option` and `Result` are `#[must_use]`, and
+        // it also keeps all five arms at type `()`.
+        match op {
+            "get" => {
+                let _ = reg.get("SLOW:PV").await;
+            }
+            "put" => {
+                let _ = reg.put("SLOW:PV", &DecodedValue::Int32(1)).await;
+            }
+            "subscribe" => {
+                let _ = reg.subscribe("SLOW:PV").await;
+            }
+            "rpc" => {
+                let _ = reg.rpc("SLOW:PV", &DecodedValue::Int32(1)).await;
+            }
+            "pushes_own_updates" => {
+                let _ = reg.pushes_own_updates("SLOW:PV").await;
+            }
+            other => panic!("unknown op {other}"),
+        }
+    }
+
+    /// The five delegating methods must snapshot the source list and release
+    /// the read guard before awaiting any `claim`, exactly as `claim` and
+    /// `names` already do. A proxying source's claim is an upstream round
+    /// trip; holding the registry lock across it blocks every add/remove — and,
+    /// because tokio's `RwLock` is writer-fair, every concurrent `try_read` the
+    /// search path depends on.
+    #[tokio::test]
+    async fn the_delegating_methods_do_not_hold_the_sources_lock_across_claim() {
+        for op in ["get", "put", "subscribe", "rpc", "pushes_own_updates"] {
+            let reg = Arc::new(SourceRegistry::new());
+            reg.add(
+                "slow",
+                0,
+                Arc::new(SlowClaimSource {
+                    delay: Duration::from_millis(400),
+                }),
+            )
+            .await;
+
+            let running = {
+                let reg = reg.clone();
+                tokio::spawn(async move { drive_registry_op(reg, op).await })
+            };
+            tokio::time::sleep(Duration::from_millis(80)).await;
+
+            let before = Instant::now();
+            reg.add("late", 1, Arc::new(StubSource::new(&["OTHER:PV"])))
+                .await;
+            let blocked = before.elapsed();
+
+            assert!(
+                blocked < Duration::from_millis(200),
+                "registering a source waited {blocked:?} behind {op}()'s in-flight claim"
+            );
+            running.await.unwrap();
+        }
     }
 
     #[tokio::test]
