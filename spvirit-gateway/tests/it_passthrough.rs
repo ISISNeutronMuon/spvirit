@@ -225,38 +225,40 @@ async fn get_returns_the_upstream_value() {
     assert!((value - 22.5).abs() < 1e-6, "expected ~22.5, got {value}");
 }
 
+/// A second read inside the holdoff window is answered from cache, so an
+/// upstream change made in between is NOT visible yet.
+///
+/// Driven through a `SourceRegistry` because that is the only path production
+/// takes: the registry claims before every get, and a claim that does not
+/// refresh the binding in place silently disables this feature. The earlier
+/// version of this test called `GatewaySource::get` directly and so could not
+/// see that bug at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn getholdoff_holds_the_cached_value() {
-    let Some((src, pool)) = spawn_gateway(|b| b.ao("IT:SETPOINT", 1.0), 10_000).await else {
+    use spvirit_server::pvstore::{Source, SourceRegistry};
+
+    let Some((src, pool)) = spawn_gateway(|b| b.ao("IT:HOLD", 1.0), 10_000).await else {
         eprintln!("Skipping test: cannot bind a free port in this environment");
         return;
     };
+    let src: Arc<dyn Source> = Arc::new(src);
+    let reg = SourceRegistry::new();
+    reg.add("gateway", 0, src).await;
 
-    assert!(src.claim("IT:SETPOINT").await.is_some());
+    let first = reg.get("IT:HOLD").await.expect("first get");
+    assert!((extract_f64_value(&first) - 1.0).abs() < 1e-6);
 
-    // First get populates the getholdoff cache with the initial value.
-    let payload = src.get("IT:SETPOINT").await.expect("get should return Some");
-    let value = extract_f64_value(&payload);
-    assert!((value - 1.0).abs() < 1e-6, "expected ~1.0, got {value}");
-
-    // Change the upstream value directly, bypassing the gateway entirely.
-    let upstream_client = pool.client("it-client").expect("client in pool");
-    upstream_client
-        .pvput("IT:SETPOINT", 2.0f64)
+    pool.client("it-client")
+        .expect("client in pool")
+        .pvput("IT:HOLD", 2.0f64)
         .await
-        .expect("direct upstream pvput should succeed");
+        .expect("direct upstream pvput");
 
-    // A second get, still within the (large) getholdoff window, must
-    // return the cached value rather than round-tripping upstream again —
-    // this is the getholdoff proof.
-    let payload_again = src
-        .get("IT:SETPOINT")
-        .await
-        .expect("get should return Some");
-    let value_again = extract_f64_value(&payload_again);
+    let second = reg.get("IT:HOLD").await.expect("second get");
     assert!(
-        (value_again - 1.0).abs() < 1e-6,
-        "expected getholdoff to still return ~1.0 (cached), got {value_again}"
+        (extract_f64_value(&second) - 1.0).abs() < 1e-6,
+        "expected the cached 1.0 inside the 10 s holdoff window, got {}",
+        extract_f64_value(&second)
     );
 }
 
@@ -936,4 +938,273 @@ async fn retire_binding_turns_try_claim_from_yes_back_into_unknown() {
         src.names().await.is_empty(),
         "a retired binding must also leave names()"
     );
+}
+
+/// `SourceRegistry` calls `Source::claim` before EVERY delegated operation.
+/// Without a fast path over the binding map that means a full upstream
+/// resolution (UDP search + TCP connect + CreateChannel + GET_FIELD) per
+/// downstream get/put/subscribe — for a descriptor the binding already holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeat_claims_resolve_upstream_exactly_once() {
+    let Some((src, _pool)) = spawn_gateway(|b| b.ai("IT:FASTPATH", 7.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    let first = src.claim("IT:FASTPATH").await.expect("first claim resolves");
+    assert_eq!(src.upstream_resolve_count(), 1);
+
+    for _ in 0..5 {
+        let again = src.claim("IT:FASTPATH").await.expect("repeat claim");
+        assert_eq!(
+            again.descriptor, first.descriptor,
+            "the fast path must return the descriptor the first resolve produced"
+        );
+        assert!(again.writable);
+    }
+
+    assert_eq!(
+        src.upstream_resolve_count(),
+        1,
+        "five repeat claims went back to the wire; the binding map already had the descriptor"
+    );
+}
+
+/// The fast path must not outlive its usefulness: with the TTL exhausted the
+/// next claim re-resolves, so an upstream that restructured (or vanished)
+/// while nothing was monitoring it is picked up within a bounded window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_binding_is_re_resolved() {
+    let Some((src, _pool)) = spawn_gateway(|b| b.ai("IT:TTL", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    let src = src.with_binding_ttl(Duration::ZERO);
+
+    assert!(src.claim("IT:TTL").await.is_some());
+    assert!(src.claim("IT:TTL").await.is_some());
+    assert_eq!(
+        src.upstream_resolve_count(),
+        2,
+        "a zero TTL must expire every binding immediately, forcing a real re-resolve"
+    );
+}
+
+/// The real path is `SourceRegistry` -> claim -> get, and the claim used to
+/// replace the whole `Binding`, throwing `last_get` away immediately before
+/// the read it was meant to serve. Driving this through a `SourceRegistry`
+/// rather than calling `GatewaySource::get` directly is the point of the test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn getholdoff_survives_a_binding_refresh_on_the_registry_path() {
+    use spvirit_server::pvstore::{Source, SourceRegistry};
+
+    let Some((src, pool)) = spawn_gateway(|b| b.ao("IT:HOLDREG", 1.0), 10_000).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    // A zero binding TTL forces every claim past Task 1's fast path and into a
+    // real re-resolution — precisely the case the unconditional `insert`
+    // used to corrupt.
+    let src: Arc<dyn Source> = Arc::new(src.with_binding_ttl(Duration::ZERO));
+
+    let reg = SourceRegistry::new();
+    reg.add("gateway", 0, src).await;
+
+    let first = reg.get("IT:HOLDREG").await.expect("first registry get");
+    assert!((extract_f64_value(&first) - 1.0).abs() < 1e-6);
+
+    pool.client("it-client")
+        .expect("client in pool")
+        .pvput("IT:HOLDREG", 2.0f64)
+        .await
+        .expect("direct upstream pvput");
+
+    let second = reg.get("IT:HOLDREG").await.expect("second registry get");
+    assert!(
+        (extract_f64_value(&second) - 1.0).abs() < 1e-6,
+        "the re-resolve before the second get must refresh the binding in place, \
+         not replace it and drop the getholdoff cache; got {}",
+        extract_f64_value(&second)
+    );
+}
+
+/// With `getholdoff = 0` the holdoff window can never be satisfied, so `get`
+/// must not pay a payload clone and two locks per read to fill a cache that
+/// can never hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_getholdoff_cache_is_untouched_when_getholdoff_is_zero() {
+    let Some((off, _pool)) = spawn_gateway(|b| b.ai("IT:HOLDOFF0", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    assert!(off.claim("IT:HOLDOFF0").await.is_some());
+    assert!(off.get("IT:HOLDOFF0").await.is_some());
+    assert_eq!(
+        off.getholdoff_cache_len(),
+        0,
+        "getholdoff is off; the cache must not be filled"
+    );
+
+    let Some((on, _pool2)) = spawn_gateway(|b| b.ai("IT:HOLDOFFN", 1.0), 10_000).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    assert!(on.claim("IT:HOLDOFFN").await.is_some());
+    assert!(on.get("IT:HOLDOFFN").await.is_some());
+    assert_eq!(
+        on.getholdoff_cache_len(),
+        1,
+        "getholdoff is on; the cache must be filled"
+    );
+}
+
+/// An upstream IOC on caller-chosen loopback ports, running on its own runtime
+/// in its own thread so it can be killed and *replaced on the same ports*.
+/// Dropping the runtime is the kill: when [`kill`](Self::kill) returns the
+/// sockets are genuinely gone and a differently-shaped IOC can bind them.
+/// Modelled on `it_upstream_disconnect.rs`'s `Backend`.
+struct RestartableIoc {
+    kill: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RestartableIoc {
+    fn kill(&mut self) {
+        drop(self.kill.take());
+        if let Some(t) = self.thread.take() {
+            t.join()
+                .expect("ioc thread exits after dropping its runtime");
+        }
+    }
+}
+
+fn spawn_ioc_on(
+    tcp_port: u16,
+    udp_port: u16,
+    configure: impl FnOnce(spvirit_server::PvaServerBuilder) -> spvirit_server::PvaServerBuilder
+    + Send
+    + 'static,
+) -> RestartableIoc {
+    let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("ioc runtime builds");
+        rt.spawn(async move {
+            let builder = PvaServer::builder()
+                .listen_ip("127.0.0.1".parse().unwrap())
+                .advertise_ip("127.0.0.1".parse().unwrap())
+                .port(tcp_port)
+                .udp_port(udp_port);
+            let _ = configure(builder).build().run().await;
+        });
+        let _ = ready_tx.send(());
+        // Park until the test hangs up `kill_tx`, then DROP the runtime.
+        let _ = kill_rx.recv();
+        drop(rt);
+    });
+    ready_rx.recv().expect("ioc thread starts");
+    std::thread::sleep(Duration::from_millis(300));
+    RestartableIoc {
+        kill: Some(kill_tx),
+        thread: Some(thread),
+    }
+}
+
+/// The gateway half of [`spawn_gateway`] alone, pointed at an already-running
+/// IOC's `udp_port`. Needed because the descriptor-change test owns the IOC's
+/// lifetime (it kills and replaces it), which `spawn_gateway` does not allow.
+///
+/// The negative cache gets a deliberately short TTL: a claim that lands in the
+/// gap while the replacement IOC is binding would otherwise record a miss that
+/// short-circuits every later claim for 30 s.
+fn gateway_for_udp_port(udp_port: u16, getholdoff_ms: u32) -> GatewaySource {
+    let cfg_json = format!(
+        r#"{{
+            "version": 2,
+            "clients": [{{
+                "name": "it-client",
+                "addrlist": "127.0.0.1",
+                "bcastport": {udp_port},
+                "interface": ["127.0.0.1"]
+            }}],
+            "servers": [{{
+                "name": "it-server",
+                "clients": ["it-client"]
+            }}]
+        }}"#
+    );
+    let cfg = GatewayConfig::from_json_str(&cfg_json).expect("parse gateway config");
+    let pool = Arc::new(UpstreamPool::from_config(&cfg));
+    let neg = Arc::new(NegativeCache::new(Duration::from_millis(50), 128));
+    let guard = Arc::new(LoopGuard::build(
+        &cfg,
+        &cfg.servers[0],
+        std::collections::HashSet::new(),
+    ));
+    GatewaySource::new(
+        pool,
+        vec!["it-client".into()],
+        neg,
+        guard,
+        getholdoff_ms,
+        Arc::new(AccessControl::new(false, None, None)),
+    )
+}
+
+/// A binding refresh must drop the getholdoff cache when — and ONLY when — the
+/// upstream descriptor actually changed.
+///
+/// Both directions are asserted on purpose. An unconditional clear would pass
+/// the descriptor-changed half while silently destroying the getholdoff feature
+/// that this same task just brought to life; an unconditional preserve is the
+/// bug this test exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_binding_refresh_clears_the_getholdoff_cache_only_when_the_descriptor_changes() {
+    let (Some(tcp_port), Some(udp_port)) = (free_tcp_port(), free_udp_port()) else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    // `ao` => an NTScalar of double.
+    let mut ioc = spawn_ioc_on(tcp_port, udp_port, |b| b.ao("IT:RESTRUCT", 1.0));
+
+    // A zero binding TTL forces every claim past the fast path into a real
+    // re-resolve, which is the only route that reaches the refresh branch.
+    let src = gateway_for_udp_port(udp_port, 10_000).with_binding_ttl(Duration::ZERO);
+
+    assert!(src.claim("IT:RESTRUCT").await.is_some());
+    assert!(src.get("IT:RESTRUCT").await.is_some());
+    assert_eq!(
+        src.getholdoff_cache_len(),
+        1,
+        "the first get must fill the getholdoff cache"
+    );
+
+    // Direction 1 — descriptor UNCHANGED: the cache must survive the refresh.
+    assert!(src.claim("IT:RESTRUCT").await.is_some());
+    assert_eq!(
+        src.getholdoff_cache_len(),
+        1,
+        "a refresh against an unchanged descriptor must keep the cached value"
+    );
+
+    // Direction 2 — descriptor CHANGED: the same PV name comes back as a
+    // string record on the same loopback ports, so the cached payload was
+    // encoded against a structure the binding no longer advertises.
+    ioc.kill();
+    let mut ioc2 = spawn_ioc_on(tcp_port, udp_port, |b| b.string_out("IT:RESTRUCT", "hi"));
+
+    assert!(src.claim("IT:RESTRUCT").await.is_some());
+    assert_eq!(
+        src.getholdoff_cache_len(),
+        0,
+        "the descriptor changed, so the payload cached against the superseded \
+         one must be dropped rather than served against the new structure"
+    );
+
+    ioc2.kill();
 }

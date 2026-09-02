@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::pvstore::{PvInfo, Source, TryClaim};
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
@@ -77,13 +77,18 @@ fn current_identity() -> Identity {
 pub struct Binding {
     pub client_name: String,
     pub real_name: String,
-    /// The upstream introspection's `StructureDesc.struct_id` (e.g.
-    /// `"epics:nt/NTScalar:1.0"`), captured at `claim` time so `subscribe`
-    /// can stamp monitored payloads with the same struct id `get` already
-    /// reports (`nt_payload_from_get` sources it from
-    /// `PvGetResult::introspection` directly; `subscribe` has no per-tick
-    /// introspection round-trip, so it must carry this forward from claim).
-    struct_id: Option<String>,
+    /// The upstream introspection captured at resolve time.
+    ///
+    /// Held in full (not just `struct_id`) so `claim` can answer a repeat call
+    /// straight from this map instead of going back to the wire, and so
+    /// `subscribe` can keep stamping monitored payloads with the same struct
+    /// id `get` reports (`nt_payload_from_get` sources it from
+    /// `PvGetResult::introspection`; `subscribe` has no per-tick introspection
+    /// round trip, so it must carry this forward from claim).
+    pub descriptor: StructureDesc,
+    /// When this binding was last confirmed against upstream. Bounds how long
+    /// the fast path in `claim` may answer from memory.
+    pub bound_at: Instant,
     last_get: Mutex<Option<(Instant, NtPayload)>>,
 }
 
@@ -115,6 +120,17 @@ pub struct GatewaySource {
     /// ACF) lives entirely inside `AccessControl::decide` — this source only
     /// calls it and applies the returned `Decision`.
     access: Arc<AccessControl>,
+    /// How long a binding may answer `claim` without going back upstream.
+    ///
+    /// A staleness bound, not an eviction policy: an expired binding is
+    /// re-resolved and refreshed in place, never dropped. 30 s is the order of
+    /// magnitude of a PVA client's own search backoff, so a genuinely
+    /// restructured IOC is picked up in roughly the time a direct client would
+    /// take to notice.
+    binding_ttl: Duration,
+    /// How many times this source has gone to the wire to resolve a name.
+    /// Exposed for tests proving the binding fast path actually short-circuits.
+    resolves: std::sync::atomic::AtomicU64,
 }
 
 impl GatewaySource {
@@ -140,6 +156,8 @@ impl GatewaySource {
             monitors: Arc::new(MonitorCache::new()),
             deaths: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             access,
+            binding_ttl: Duration::from_secs(30),
+            resolves: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -148,6 +166,20 @@ impl GatewaySource {
     /// onto a single upstream monitor task.
     pub fn upstream_monitor_count(&self) -> usize {
         self.monitors.upstream_count()
+    }
+
+    /// Override the binding staleness bound. Test-serving builder; production
+    /// takes the 30 s default from [`GatewaySource::new`].
+    pub fn with_binding_ttl(mut self, ttl: Duration) -> Self {
+        self.binding_ttl = ttl;
+        self
+    }
+
+    /// How many upstream resolutions (`pvinfo_full` attempts) this source has
+    /// issued. Exposed for tests proving repeat claims are answered from the
+    /// binding map rather than from the wire.
+    pub fn upstream_resolve_count(&self) -> u64 {
+        self.resolves.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Names of the upstream channels currently held in the monitor cache —
@@ -178,6 +210,18 @@ impl GatewaySource {
     /// Mirrored onto `/metrics` as `spgateway_upstream_monitor_deaths_total`.
     pub fn upstream_monitor_deaths(&self) -> u64 {
         self.deaths.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many bindings currently hold a cached `get` value. Exposed for
+    /// tests proving the getholdoff cache is filled when the feature is on and
+    /// left completely alone when `getholdoff = 0`.
+    pub fn getholdoff_cache_len(&self) -> usize {
+        self.bindings
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.last_get.lock().unwrap().is_some())
+            .count()
     }
 }
 
@@ -223,10 +267,66 @@ impl Source for GatewaySource {
                 Decision::AllowAliased(real) => real,
             };
 
+            // Fast path. `SourceRegistry` calls `claim` before EVERY
+            // get/put/subscribe/rpc/pushes_own_updates, so without this each
+            // downstream operation pays a fresh UDP search + TCP connect +
+            // CreateChannel + GET_FIELD whose only product — the
+            // `StructureDesc` — this map already holds.
+            //
+            // Three guards keep the shortcut honest, and their order matters:
+            //  * the negative cache and the access decision above already ran,
+            //    so a denied or negatively-cached name is never answered from a
+            //    stale binding (the same precedence `try_claim` uses);
+            //  * `real_name == target`, because the binding is keyed on the
+            //    *downstream* name while a pvlist ALIAS can map that name to a
+            //    different upstream target for a different identity —
+            //    answering with another identity's descriptor would be wrong;
+            //  * `bound_at` within `binding_ttl`, so an upstream that
+            //    restructured while nothing was monitoring it is re-resolved
+            //    within a bounded window rather than never.
+            //
+            // The loop guard is deliberately NOT re-checked here, and the
+            // honest reason is narrower than "the binding is already
+            // vetted". A binding exists only because some earlier resolve
+            // passed `is_banned`/`is_guid_banned` below — but `Binding` pins
+            // no address and no GUID, so that guarantee covers the address
+            // resolved *then*, not the address the next `pvget`/`pvput` will
+            // find: the data path re-searches every operation
+            // (`PvaClient::pvget` runs a fresh `low_level_pvget`). So a name
+            // that starts resolving to a banned address while a binding is
+            // live is answered unguarded until the binding expires.
+            //
+            // That TOCTOU is pre-existing — even before the fast path, claim
+            // validated the address *its own* search found, not the one the
+            // data path would re-resolve a moment later — but the fast path
+            // widens the window from roughly one search to `binding_ttl`.
+            // Accepted because `LoopGuard` is built once per server at
+            // startup (`runtime.rs`) and never replaced, so the ban set
+            // cannot change under a live binding; the only mover is upstream
+            // itself migrating onto a banned address, which the TTL bounds.
+            // Revisit this skip if either premise goes: a `LoopGuard` that
+            // can be reloaded, a `Binding` that pins its resolved address or
+            // GUID (then re-check it cheaply here), or client-side
+            // connection caching that makes the data path stop re-searching.
+            {
+                let bindings = self.bindings.lock().unwrap();
+                if let Some(binding) = bindings.get(&name)
+                    && binding.real_name == target
+                    && now.duration_since(binding.bound_at) < self.binding_ttl
+                {
+                    return Some(PvInfo {
+                        descriptor: binding.descriptor.clone(),
+                        writable: true,
+                    });
+                }
+            }
+
             for client_name in &self.client_order {
                 let Some(client) = self.pool.client(client_name) else {
                     continue;
                 };
+                self.resolves
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Ok((descriptor, server_addr, guid)) = client.pvinfo_full(&target).await {
                     // Loop / self-connection prevention: if this name resolved
                     // back into one of our own downstream server sockets (or an
@@ -236,15 +336,65 @@ impl Source for GatewaySource {
                     if self.guard.is_banned(server_addr) || self.guard.is_guid_banned(&guid) {
                         continue;
                     }
-                    self.bindings.lock().unwrap().insert(
-                        name.clone(),
-                        Binding {
-                            client_name: client_name.clone(),
-                            real_name: target.clone(),
-                            struct_id: descriptor.struct_id.clone(),
-                            last_get: Mutex::new(None),
-                        },
-                    );
+                    {
+                        let mut bindings = self.bindings.lock().unwrap();
+                        // Two statements, not one `match` with an `insert` in
+                        // its fallback arm: `get_mut`'s borrow of `bindings`
+                        // would still be live in that arm, and the borrow
+                        // checker rejects it (NLL problem case 3). Reducing
+                        // the match to a `bool` ends the borrow at the
+                        // semicolon.
+                        let refreshed = match bindings.get_mut(&name) {
+                            // Refresh in place. Replacing the whole `Binding`
+                            // (what this used to do) resets `last_get` to
+                            // `None` — and `SourceRegistry` claims immediately
+                            // before every `get`, so the getholdoff cache was
+                            // wiped before every read it was meant to serve.
+                            Some(existing)
+                                if existing.client_name == *client_name
+                                    && existing.real_name == target =>
+                            {
+                                // An upstream that restructured invalidates the
+                                // cached value: `handler.rs` encodes whatever
+                                // `last_get` holds against the descriptor this
+                                // binding currently advertises, so serving a
+                                // payload cached against the superseded one
+                                // emits a frame whose data does not match its
+                                // own introspection — and in this protocol one
+                                // malformed frame takes the whole TCP
+                                // connection down, not just that value. Do NOT
+                                // simplify this to an unconditional refresh:
+                                // the equality check is what keeps a stale
+                                // payload from outliving its structure. It is
+                                // equally not an unconditional clear — that
+                                // would wipe the cache on every claim and so
+                                // disable getholdoff altogether, which is the
+                                // very bug the in-place refresh above fixes.
+                                if existing.descriptor != descriptor {
+                                    *existing.last_get.lock().unwrap() = None;
+                                }
+                                existing.descriptor = descriptor.clone();
+                                existing.bound_at = Instant::now();
+                                true
+                            }
+                            // A different client or a different upstream target
+                            // is a different binding: the cached value came
+                            // from somewhere else and must not carry over.
+                            _ => false,
+                        };
+                        if !refreshed {
+                            bindings.insert(
+                                name.clone(),
+                                Binding {
+                                    client_name: client_name.clone(),
+                                    real_name: target.clone(),
+                                    descriptor: descriptor.clone(),
+                                    bound_at: Instant::now(),
+                                    last_get: Mutex::new(None),
+                                },
+                            );
+                        }
+                    }
                     return Some(PvInfo {
                         descriptor,
                         writable: true,
@@ -269,13 +419,18 @@ impl Source for GatewaySource {
                 let bindings = self.bindings.lock().unwrap();
                 let binding = bindings.get(&name)?;
 
-                let cache = binding.last_get.lock().unwrap();
-                if let Some((t_last, payload)) = cache.as_ref()
-                    && Instant::now() < *t_last + Duration::from_millis(self.getholdoff_ms as u64)
-                {
-                    return Some(payload.clone());
+                // `getholdoff = 0` (the default) means the feature is off: the
+                // window can never be satisfied, so do not even take the inner
+                // lock to compare against a zero-length window.
+                if self.getholdoff_ms > 0 {
+                    let cache = binding.last_get.lock().unwrap();
+                    if let Some((t_last, payload)) = cache.as_ref()
+                        && Instant::now()
+                            < *t_last + Duration::from_millis(self.getholdoff_ms as u64)
+                    {
+                        return Some(payload.clone());
+                    }
                 }
-                drop(cache);
 
                 (binding.client_name.clone(), binding.real_name.clone())
             };
@@ -284,7 +439,12 @@ impl Source for GatewaySource {
             match client.pvget(&real_name).await {
                 Ok(result) => {
                     let payload = nt_payload_from_get(&result);
-                    if let Some(binding) = self.bindings.lock().unwrap().get(&name) {
+                    // Only fill the cache when the feature is on: with the
+                    // default 0 the read above can never hit, so the clone and
+                    // the two locks would be pure cost on every read.
+                    if self.getholdoff_ms > 0
+                        && let Some(binding) = self.bindings.lock().unwrap().get(&name)
+                    {
                         *binding.last_get.lock().unwrap() = Some((Instant::now(), payload.clone()));
                     }
                     Some(payload)
@@ -348,7 +508,7 @@ impl Source for GatewaySource {
                 (
                     binding.client_name.clone(),
                     binding.real_name.clone(),
-                    binding.struct_id.clone().unwrap_or_default(),
+                    binding.descriptor.struct_id.clone().unwrap_or_default(),
                 )
             };
 
@@ -569,7 +729,8 @@ mod tests {
             Binding {
                 client_name: "c".into(),
                 real_name: "BOUND:PV".into(),
-                struct_id: None,
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
@@ -595,7 +756,8 @@ mod tests {
             Binding {
                 client_name: "c".into(),
                 real_name: "BOUND:PV".into(),
-                struct_id: None,
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
@@ -617,7 +779,8 @@ mod tests {
             Binding {
                 client_name: "c".into(),
                 real_name: "SECRET:PV".into(),
-                struct_id: None,
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
