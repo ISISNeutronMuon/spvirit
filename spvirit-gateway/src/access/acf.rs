@@ -19,17 +19,20 @@
 
 use std::collections::HashMap;
 
-/// A named user access group: `UAG(name) { user, user }`.
+/// A user access group: the set of accounts that belong to it.
+///
+/// The group's name is the key it is filed under in [`Acf::uags`] and is
+/// deliberately not repeated here — a second copy is a wasted `String` per
+/// group and makes a value whose name disagrees with its key representable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Uag {
-    pub name: String,
     pub users: Vec<String>,
 }
 
-/// A named host access group: `HAG(name) { host, host }`.
+/// A host access group: the set of hosts that belong to it. Named by its key
+/// in [`Acf::hags`], for the same reason as [`Uag`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hag {
-    pub name: String,
     pub hosts: Vec<String>,
 }
 
@@ -368,7 +371,7 @@ impl Parser {
                     if acf.uags.contains_key(&name) {
                         return Err(format!("duplicate UAG({name:?}) definition"));
                     }
-                    acf.uags.insert(name.clone(), Uag { name, users });
+                    acf.uags.insert(name, Uag { users });
                 }
                 "HAG" => {
                     self.expect(&Token::LParen)?;
@@ -378,7 +381,7 @@ impl Parser {
                     if acf.hags.contains_key(&name) {
                         return Err(format!("duplicate HAG({name:?}) definition"));
                     }
-                    acf.hags.insert(name.clone(), Hag { name, hosts });
+                    acf.hags.insert(name, Hag { hosts });
                 }
                 "ASG" => {
                     self.expect(&Token::LParen)?;
@@ -434,6 +437,30 @@ mod tests {
         assert!(rw[0].ops.put);
         assert_eq!(rw[0].uags, vec!["ops"]);
         assert_eq!(rw[0].hags, vec!["control"]);
+    }
+
+    /// A group's name is the key it is filed under. Storing it a second time
+    /// inside the value duplicated a String per group and made a disagreeing
+    /// pair representable — this constructs both types positionally, so
+    /// re-adding a `name` field breaks the build here.
+    #[test]
+    fn groups_are_identified_solely_by_their_map_key() {
+        // Body copied from `parses_uag_hag_asg`: the membership block is
+        // comma-separated (`UAG(ops), HAG(control)`) — the parser accepts only
+        // `,` or `}` between members and errors on anything else.
+        let acf = parse_acf(
+            "UAG(ops) { alice, bob }\nHAG(control) { 10.0.0.5 }\nASG(DEFAULT) { RULE(1, WRITE) { UAG(ops), HAG(control) } }",
+        )
+        .unwrap();
+
+        assert_eq!(
+            acf.uags.get("ops"),
+            Some(&Uag { users: vec!["alice".to_string(), "bob".to_string()] })
+        );
+        assert_eq!(
+            acf.hags.get("control"),
+            Some(&Hag { hosts: vec!["10.0.0.5".to_string()] })
+        );
     }
 
     #[test]
