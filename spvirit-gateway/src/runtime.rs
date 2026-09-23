@@ -112,7 +112,11 @@ impl Runtime {
     /// consistent with p4p's own gateway defaulting to a wildcard bind when
     /// no interface list is given.
     pub fn from_config(cfg: GatewayConfig) -> Result<Self, ConfigError> {
-        cfg.validate()?;
+        // One pass: validates the whole config AND yields the access controls,
+        // so each pvlist/.acf file is read and parsed exactly once and there
+        // is no window in which a file can change between being validated and
+        // being enforced.
+        let access_controls = cfg.validate_and_build()?;
 
         // One shared BandwidthCounters for the whole gateway, built BEFORE
         // the upstream pool so the SAME `Arc` (never a second instance) is
@@ -146,7 +150,7 @@ impl Runtime {
         let server_guids: Vec<[u8; 12]> = cfg.servers.iter().map(|_| rand_guid()).collect();
         let all_guids: HashSet<[u8; 12]> = server_guids.iter().copied().collect();
 
-        for (i, server_cfg) in cfg.servers.iter().enumerate() {
+        for ((i, server_cfg), access) in cfg.servers.iter().enumerate().zip(access_controls) {
             let guard = Arc::new(LoopGuard::build(&cfg, server_cfg, all_guids.clone()));
 
             let (ttl, capacity) = server_cfg
@@ -156,7 +160,7 @@ impl Runtime {
                 .map(|nc| (Duration::from_millis(nc.ttl_ms), nc.capacity.max(1)))
                 .unwrap_or((DEFAULT_NEG_CACHE_TTL, DEFAULT_NEG_CACHE_CAPACITY));
             let neg = Arc::new(NegativeCache::new(ttl, capacity));
-            let access = Arc::new(cfg.build_access_control(server_cfg)?);
+            let access = Arc::new(access);
 
             let src_arc = Arc::new(GatewaySource::new(
                 pool.clone(),

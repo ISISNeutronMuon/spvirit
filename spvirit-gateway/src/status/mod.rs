@@ -24,13 +24,15 @@ pub mod sampler;
 
 pub use sampler::{BandwidthSampler, RateSnapshot};
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::diag::ClientRegistry;
 use spvirit_server::pvstore::{PvInfo, Source, TryClaim};
 use spvirit_server::simple_store::descriptor_for_payload;
@@ -108,24 +110,27 @@ fn stamp(payload: &mut NtPayload, ts: NtTimeStamp) {
     }
 }
 
-/// Strips a payload's timestamp, producing the change-detection key the
-/// `subscribe` LIVE ticker uses for its `last` dedup comparison (see
-/// [`stamp`]'s caller in `subscribe`). Every other LIVE builder already
-/// returns an untimestamped payload, so this is a no-op for them; the 8
-/// bandwidth tables are the one case where the raw [`value_payload`] output
-/// carries a real timestamp (`bandwidth_table` stamps it with the sampler's
+/// Strips a payload's timestamp **in place**, turning it into the
+/// change-detection key the `subscribe` LIVE ticker uses for its `last` dedup
+/// comparison. Every other LIVE builder already returns an untimestamped
+/// payload, so this is a no-op for them; the 8 bandwidth tables are the one
+/// case where the raw [`StatusSource::value_payload`] output carries a real
+/// timestamp (`bandwidth_table` stamps it with the sampler's
 /// `RateSnapshot::ts` so a direct `get` returns the true sample time) that
-/// would otherwise change every tick — even when the underlying rate rows
-/// do not — and falsely look like a data change.
-fn clear_stamp(payload: &NtPayload) -> NtPayload {
-    let mut p = payload.clone();
-    match &mut p {
+/// would otherwise change every tick — even when the underlying rate rows do
+/// not — and falsely look like a data change.
+///
+/// In place, not by clone: on an idle gateway the key matches `last` and the
+/// tick is discarded, so the copy the old by-value version made every second
+/// per subscription was pure waste. Only a genuine change pays for a clone
+/// now, and only because the send needs one.
+fn clear_stamp_in_place(payload: &mut NtPayload) {
+    match payload {
         NtPayload::Scalar(nt) => nt.time_stamp = None,
         NtPayload::ScalarArray(nt) => nt.time_stamp = NtTimeStamp::default(),
         NtPayload::Table(nt) => nt.time_stamp = None,
         NtPayload::Generic { .. } | NtPayload::NdArray(_) | NtPayload::Enum(_) => {}
     }
-    p
 }
 
 /// Snapshots the current downstream connection's identity (socket peer host,
@@ -220,12 +225,15 @@ type ListHandle = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 /// field(s) of the `stats` [`epics:p2p/Stats:1.0`] structure.
 type CountHandle = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-/// A cheap, cloneable "read the current bandwidth-rate snapshot" callback
-/// used by [`StatusHandles`]'s 8 live bandwidth-table PVs. Cloning the
-/// closure is cheap (it captures a clone of the shared
-/// `Arc<Mutex<RateSnapshot>>`); each call locks briefly and returns an owned
-/// clone of the snapshot.
-type BandwidthHandle = Arc<dyn Fn() -> RateSnapshot + Send + Sync>;
+/// A cheap, cloneable "build the current table for this bandwidth suffix"
+/// callback, used by [`StatusHandles`]'s 8 live bandwidth-table PVs.
+///
+/// Takes the suffix and returns the finished [`NtPayload`] rather than handing
+/// back a whole [`RateSnapshot`]: a snapshot holds all eight row vectors, so
+/// returning one cloned every `String` of every row of all eight tables in
+/// order to serve one of them. Cloning the closure itself stays cheap (it
+/// captures a clone of the shared `Arc<Mutex<RateSnapshot>>`).
+type BandwidthHandle = Arc<dyn Fn(&str) -> NtPayload + Send + Sync>;
 
 /// Live-value handles `StatusSource` reads for its `clients`/`cache`/`stats`/
 /// bandwidth PVs.
@@ -257,7 +265,7 @@ impl StatusHandles {
             clients: empty.clone(),
             cache: empty,
             mcache_size: Arc::new(|| 0),
-            bandwidth: Arc::new(RateSnapshot::default),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot::default()),
         }
     }
 
@@ -283,7 +291,7 @@ impl StatusHandles {
             clients: Arc::new(Vec::new),
             cache: Arc::new(move || src_cache.upstream_monitor_names()),
             mcache_size: Arc::new(move || src_stats.upstream_monitor_count() as u64),
-            bandwidth: Arc::new(RateSnapshot::default),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot::default()),
         }
     }
 
@@ -311,32 +319,92 @@ impl StatusHandles {
 }
 
 /// Builds the `clients` [`ListHandle`] over a [`ClientRegistry`]: each
-/// connection renders as `user@ip` when identified, else the bare peer IP,
-/// with the result sorted for a stable diagnostic listing. Factored out of
+/// connection renders as `user@ip` when identified, else the bare peer IP.
+/// Ordering is applied by [`StatusSource::string_array_payload`], the single
+/// choke point `clients` and `cache` share. Factored out of
 /// [`StatusHandles::from_gateway_with`] so it can be exercised directly by a
 /// unit test that has no need for a real [`GatewaySource`].
 fn clients_list_handle(registry: Arc<ClientRegistry>) -> ListHandle {
     Arc::new(move || {
-        let mut v: Vec<String> = registry
+        registry
             .snapshot()
             .iter()
             .map(|e| match &e.user {
                 Some(u) => format!("{u}@{}", e.peer.ip()),
                 None => e.peer.ip().to_string(),
             })
-            .collect();
-        v.sort();
-        v
+            .collect()
     })
 }
 
 /// Builds the `bandwidth` [`BandwidthHandle`] over the shared
 /// `Arc<Mutex<RateSnapshot>>` the `BandwidthSampler` writes into: each call
-/// locks briefly and returns an owned clone of the latest snapshot. Factored
-/// out of [`StatusHandles::from_gateway_with`] to mirror
-/// [`clients_list_handle`].
+/// locks briefly, builds the one requested table, and releases. No `.await`
+/// inside the guard.
 fn bandwidth_snapshot_handle(snapshot: Arc<Mutex<RateSnapshot>>) -> BandwidthHandle {
-    Arc::new(move || snapshot.lock().unwrap().clone())
+    Arc::new(move |suffix: &str| {
+        let snap = snapshot.lock().unwrap();
+        StatusSource::bandwidth_table(suffix, &snap)
+    })
+}
+
+/// A [`BandwidthHandle`] over a fixed, never-changing [`RateSnapshot`] — used
+/// by [`StatusHandles::test`], by [`StatusHandles::from_gateway`] (which has
+/// no sampler to read) and by unit tests that need known rows.
+fn fixed_bandwidth_handle(snap: RateSnapshot) -> BandwidthHandle {
+    Arc::new(move |suffix: &str| StatusSource::bandwidth_table(suffix, &snap))
+}
+
+/// The shape-only payload whose descriptor `asTest` channels are created with.
+///
+/// `asTest` is an RPC endpoint: it answers a question about a *specific*
+/// (pv, account, peer) triple supplied in the request, so there is no such
+/// thing as "the current value of asTest". A channel still has to exist before
+/// a client can issue the RPC, and creating one requires a descriptor, so this
+/// returns a fully-denied response purely for its structure. The values inside
+/// it are placeholders and are never served to anyone: `get` and `subscribe`
+/// both refuse `asTest` outright (pinned by
+/// `astest_is_claimable_for_rpc_but_never_readable`).
+fn astest_descriptor_payload() -> NtPayload {
+    StatusSource::astest_response("", "", "", &Decision::Deny, &Decision::Deny)
+}
+
+/// Descriptors for all 15 served status names, computed once.
+///
+/// Every status payload is shape-stable: the bandwidth NTTables carry a fixed
+/// column set whatever the row count, an NTScalarArray's descriptor does not
+/// depend on its element count, and `stats`/`refs`/`poke`/`threads` are fixed
+/// structures. So `claim` — which only ever wanted the descriptor — no longer
+/// has to build a whole value payload (reading the client registry, the cache
+/// list, the mcache size and the bandwidth snapshot) and throw it away on
+/// every channel creation.
+///
+/// `the_cached_claim_descriptors_match_a_freshly_built_payload` pins the table
+/// against freshly built payloads over non-empty handles, so a future payload
+/// change that *did* make a descriptor data-dependent fails loudly here.
+///
+/// Cached in a process-wide `OnceLock`, so every `StatusSource` in the process
+/// shares one table. That is correct today because the descriptors are shape
+/// constants independent of prefix and handles, but a future per-server
+/// status shape would need to stop sharing this table.
+fn descriptors() -> &'static HashMap<&'static str, StructureDesc> {
+    static DESCRIPTORS: OnceLock<HashMap<&'static str, StructureDesc>> = OnceLock::new();
+    DESCRIPTORS.get_or_init(|| {
+        let handles = StatusHandles::test();
+        let generation = AtomicU64::new(0);
+        served_suffixes()
+            .map(|suffix| {
+                let payload = match suffix {
+                    "asTest" => astest_descriptor_payload(),
+                    "threads" => StatusSource::threads_static_value(),
+                    s => StatusSource::value_payload(s, &handles, &generation).unwrap_or_else(
+                        || unreachable!("every LIVE suffix has a value payload; missing: {s}"),
+                    ),
+                };
+                (suffix, descriptor_for_payload(&payload))
+            })
+            .collect()
+    })
 }
 
 /// A [`Source`] serving the gateway's status/introspection PVs under a
@@ -349,6 +417,21 @@ pub struct StatusSource {
     /// Bumped by `put("<prefix>poke", ..)`; also `poke`'s own readable
     /// value, so a client can observe the counter advance after poking it.
     generation: Arc<AtomicU64>,
+}
+
+/// Whether an access [`Decision`] permits a **gateway-local** operation.
+///
+/// `AllowAliased` carries a rewritten name for the proxy to forward under.
+/// Status PVs are served by this gateway; there is nothing to forward to and
+/// nothing to rewrite, so an alias is simply an allow and the PV keeps its
+/// real name. Written as an exhaustive `match` rather than `!matches!(d,
+/// Deny)` so that a future `Decision` variant is a compile error at every gate
+/// instead of being silently treated as permitted.
+fn allows_local(d: &Decision) -> bool {
+    match d {
+        Decision::Allow | Decision::AllowAliased(_) => true,
+        Decision::Deny => false,
+    }
 }
 
 impl StatusSource {
@@ -385,32 +468,24 @@ impl StatusSource {
     /// then fails on.
     fn serves(&self, name: &str) -> bool {
         self.suffix(name).is_some_and(|s| served_suffixes().any(|x| x == s))
-            && !matches!(
-                self.access.decide_local(Op::Get, name, &current_identity()),
-                Decision::Deny
-            )
+            && allows_local(&self.access.decide_local(Op::Get, name, &current_identity()))
     }
 
+    /// The synchronous core of [`Source::claim`]/[`Source::try_claim`]:
+    /// resolves a full PV name to the [`PvInfo`] a channel is created with, or
+    /// `None` if this source does not serve it.
+    ///
+    /// Answers from the [`descriptors`] table rather than building a value
+    /// payload and discarding everything but its shape.
     fn claim_sync(&self, name: &str) -> Option<PvInfo> {
         if !self.serves(name) {
             return None;
         }
         // `serves` already confirmed `self.suffix(name)` is `Some`.
         let suffix = self.suffix(name)?;
-        let payload = if RPC_NAMES.contains(&suffix) {
-            // RPC-only PVs still advertise a result descriptor at claim
-            // time, each in its own shape.
-            match suffix {
-                // `threads` is both a value PV and an RPC target; advertise
-                // the get/subscribe value shape (identical NTScalar('s')).
-                "threads" => Self::threads_static_value(),
-                _ => Self::astest_response("", "", "", &Decision::Deny, &Decision::Deny),
-            }
-        } else {
-            Self::value_payload(suffix, &self.handles, &self.generation)?
-        };
+        let descriptor = descriptors().get(suffix)?.clone();
         Some(PvInfo {
-            descriptor: descriptor_for_payload(&payload),
+            descriptor,
             writable: suffix == "poke",
         })
     }
@@ -419,8 +494,18 @@ impl StatusSource {
         NtPayload::Scalar(NtScalar::from_value(ScalarValue::F64(v)))
     }
 
-    /// An NTScalarArray-of-string payload (p4p's shape for `clients`/`cache`).
-    fn string_array_payload(items: Vec<String>) -> NtPayload {
+    /// An `epics:nt/NTScalarArray:1.0` of strings (p4p's shape for `clients`
+    /// and `cache`).
+    ///
+    /// **Sorts `items`.** Both backing handles read a `HashMap` — a
+    /// `ClientRegistry` snapshot for `clients`, the upstream monitor-cache map
+    /// for `cache` — whose iteration order is arbitrary and jumps wholesale on
+    /// a rehash. The `subscribe` ticker decides "did anything change?" by
+    /// comparing whole payloads, so an unstable element order manufactures
+    /// changes out of nothing. Sorting here rather than in each handle means
+    /// the two PVs cannot drift apart on this again.
+    fn string_array_payload(mut items: Vec<String>) -> NtPayload {
+        items.sort();
         NtPayload::ScalarArray(NtScalarArray::from_value(ScalarArrayValue::Str(items)))
     }
 
@@ -599,15 +684,17 @@ impl StatusSource {
             "stats" => Self::stats_structure((handles.mcache_size)()),
             "poke" => Self::scalar_payload(generation.load(Ordering::Relaxed) as f64),
             "threads" => Self::threads_static_value(),
-            s if BANDWIDTH_SUFFIXES.contains(&s) => Self::bandwidth_table(s, &(handles.bandwidth)()),
+            s if BANDWIDTH_SUFFIXES.contains(&s) => (handles.bandwidth)(s),
             _ => return None,
         })
     }
 
     /// Whether an access [`Decision`] grants the operation (an alias rewrite
-    /// still grants it).
+    /// still grants it). Thin wrapper over [`allows_local`] so `asTest`'s
+    /// reported verdicts and this source's own gates cannot disagree about
+    /// what a `Decision` variant means.
     fn allowed(d: &Decision) -> bool {
-        matches!(d, Decision::Allow | Decision::AllowAliased(_))
+        allows_local(d)
     }
 
     /// Reads a `DecodedValue::Structure` field by name as a string, per the
@@ -688,19 +775,17 @@ impl Source for StatusSource {
             if suffix == "asTest" {
                 return None;
             }
-            if let Decision::Deny = self.access.decide_local(Op::Get, &name, &current_identity()) {
+            if !allows_local(&self.access.decide_local(Op::Get, &name, &current_identity())) {
                 return None;
             }
             if !LIVE.contains(&suffix) && suffix != "threads" {
                 return None;
             }
             let mut payload = Self::value_payload(suffix, &self.handles, &self.generation)?;
-            // Stamp with the current time at read time — `clients`/`cache`/
-            // `refs`/`stats`/`poke`/`threads`. The 8 bandwidth suffixes are
-            // excluded here: `bandwidth_table` already stamped them with the
-            // sampler's true sample time (`RateSnapshot::ts`), which this
-            // wall-clock restamp would otherwise clobber.
-            if (LIVE.contains(&suffix) && !BANDWIDTH_SUFFIXES.contains(&suffix)) || suffix == "threads" {
+            // Guarded above: `suffix` is LIVE or "threads". The 8 bandwidth tables
+            // carry the sampler's own `RateSnapshot::ts` so a reader sees the true
+            // sample time; everything else is stamped at read time.
+            if !BANDWIDTH_SUFFIXES.contains(&suffix) {
                 stamp(&mut payload, now_ts());
             }
             Some(payload)
@@ -725,7 +810,7 @@ impl Source for StatusSource {
             // For a pure `readOnly` config, `decide` short-circuits at step 1
             // (before any host/pvlist match), so even a default `Identity`
             // — as seen when called outside a request scope — enforces it.
-            if let Decision::Deny = self.access.decide_local(Op::Put, &name, &current_identity()) {
+            if !allows_local(&self.access.decide_local(Op::Put, &name, &current_identity())) {
                 return Err("access denied".to_string());
             }
             self.generation.fetch_add(1, Ordering::Relaxed);
@@ -746,7 +831,7 @@ impl Source for StatusSource {
             if suffix == "asTest" {
                 return None;
             }
-            if let Decision::Deny = self.access.decide_local(Op::Get, &name, &current_identity()) {
+            if !allows_local(&self.access.decide_local(Op::Get, &name, &current_identity())) {
                 return None;
             }
             let (tx, rx) = mpsc::channel(4);
@@ -756,13 +841,13 @@ impl Source for StatusSource {
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(TICK_PERIOD);
                     // `last` holds the last dedup KEY — the change-detection
-                    // key — computed via `clear_stamp` so a stamp (which
-                    // always differs, since it carries "now") never itself
-                    // looks like a data change. This also covers the 8
+                    // key — computed via `clear_stamp_in_place` so a stamp
+                    // (which always differs, since it carries "now") never
+                    // itself looks like a data change. This also covers the 8
                     // bandwidth suffixes, whose raw payload already carries a
                     // real (sampler) timestamp that changes every tick even
-                    // when the underlying rate rows do not — `clear_stamp` is
-                    // a no-op for every other LIVE payload, which already
+                    // when the underlying rate rows do not — `clear_stamp_in_place`
+                    // is a no-op for every other LIVE payload, which already
                     // carries none. `last_ts` only advances when the data
                     // actually changes, so the timestamp reflects last-change
                     // time, not last-poll time.
@@ -777,12 +862,20 @@ impl Source for StatusSource {
                         else {
                             break;
                         };
-                        let key = clear_stamp(&data);
+                        // Turn the freshly built payload INTO the dedup key in
+                        // place. On an idle gateway — the overwhelmingly common
+                        // case — the key equals `last` and the tick costs no
+                        // copy at all; only a genuine change pays for the one
+                        // clone the send needs. `stamp` overwrites the
+                        // timestamp anyway, so sending the restamped key is
+                        // byte-for-byte what sending the restamped original was.
+                        let mut key = data;
+                        clear_stamp_in_place(&mut key);
                         if last.as_ref() != Some(&key) {
                             last_ts = now_ts();
-                            last = Some(key);
-                            let mut out = data;
+                            let mut out = key.clone();
                             stamp(&mut out, last_ts.clone());
+                            last = Some(key);
                             // The server's monitor pump suppresses
                             // byte-identical frames, but we already only
                             // send on a genuine data change — matching
@@ -841,7 +934,7 @@ impl Source for StatusSource {
             // returns the richer best-effort description. Gate it through the
             // same AccessControl (an RPC op on its own name).
             if suffix == "threads" {
-                if let Decision::Deny = self.access.decide_local(Op::Rpc, &name, &current_identity()) {
+                if !allows_local(&self.access.decide_local(Op::Rpc, &name, &current_identity())) {
                     return Err("access denied".to_string());
                 }
                 return Ok(Self::threads_rpc_payload());
@@ -869,7 +962,7 @@ impl Source for StatusSource {
             let id = current_identity();
             served_suffixes()
                 .map(|s| format!("{prefix}{s}"))
-                .filter(|name| !matches!(self.access.decide_local(Op::Get, name, &id), Decision::Deny))
+                .filter(|name| allows_local(&self.access.decide_local(Op::Get, name, &id)))
                 .collect()
         })
     }
@@ -917,6 +1010,54 @@ mod tests {
     fn source(read_only: bool) -> StatusSource {
         let access = Arc::new(AccessControl::new(read_only, None, None));
         StatusSource::new(PREFIX.to_string(), access, StatusHandles::test())
+    }
+
+    /// The cached descriptor table must equal what building the payload
+    /// would have produced, for every served suffix. Handles are deliberately
+    /// NON-empty — two clients, a cache entry, a non-zero mcache size and a
+    /// populated rate row — so a descriptor that somehow depended on row or
+    /// element count would show up here rather than hiding behind empty
+    /// vectors.
+    #[test]
+    fn the_cached_claim_descriptors_match_a_freshly_built_payload() {
+        let handles = StatusHandles {
+            clients: Arc::new(|| vec!["alice@10.0.0.5".to_string(), "10.0.0.6".to_string()]),
+            cache: Arc::new(|| vec!["UPSTREAM:PV".to_string()]),
+            mcache_size: Arc::new(|| 42),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot {
+                ds_bypv_tx: vec![("PV:A".to_string(), 1.5)],
+                ds_byhost_tx: vec![("alice".to_string(), "10.0.0.5".to_string(), 2.5)],
+                ..RateSnapshot::default()
+            }),
+        };
+        let generation = AtomicU64::new(7);
+
+        for suffix in served_suffixes() {
+            let built = match suffix {
+                "asTest" => astest_descriptor_payload(),
+                "threads" => StatusSource::threads_static_value(),
+                s => StatusSource::value_payload(s, &handles, &generation)
+                    .unwrap_or_else(|| panic!("{s} must have a value payload")),
+            };
+            assert_eq!(
+                descriptors().get(suffix),
+                Some(&descriptor_for_payload(&built)),
+                "cached descriptor for {suffix} drifted from the built payload"
+            );
+        }
+    }
+
+    /// G7: `asTest` is an RPC endpoint. Channel creation is a protocol
+    /// prerequisite for issuing an RPC, so `claim` must keep succeeding for it
+    /// — but it must never be readable as a value PV, because a `get` would
+    /// return the shape-only placeholder rather than any real access decision.
+    #[tokio::test]
+    async fn astest_is_claimable_for_rpc_but_never_readable() {
+        let src = source(false);
+        let name = format!("{PREFIX}asTest");
+        assert!(src.claim_sync(&name).is_some(), "asTest must be claimable: RPC needs a channel");
+        assert!(src.get(&name).await.is_none(), "asTest must not be readable as a value PV");
+        assert!(src.subscribe(&name).await.is_none(), "asTest must not be monitorable");
     }
 
     #[tokio::test]
@@ -1055,7 +1196,7 @@ mod tests {
             clients: Arc::new(Vec::new),
             cache: Arc::new(move || list.lock().unwrap().clone()),
             mcache_size: Arc::new(|| 0),
-            bandwidth: Arc::new(RateSnapshot::default),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot::default()),
         };
         let access = Arc::new(AccessControl::new(false, None, None));
         StatusSource::new(PREFIX.to_string(), access, handles)
@@ -1068,7 +1209,7 @@ mod tests {
             clients: Arc::new(Vec::new),
             cache: Arc::new(Vec::new),
             mcache_size: Arc::new(move || count.load(Ordering::Relaxed)),
-            bandwidth: Arc::new(RateSnapshot::default),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot::default()),
         };
         let access = Arc::new(AccessControl::new(false, None, None));
         StatusSource::new(PREFIX.to_string(), access, handles)
@@ -1101,8 +1242,53 @@ mod tests {
         // conn 2 has no identity set: renders as the bare peer IP.
 
         let clients_handle = clients_list_handle(registry);
-        let clients = clients_handle();
-        assert_eq!(clients, vec!["10.0.0.5".to_string(), "alice@10.0.0.6".to_string()]);
+        let mut clients = clients_handle();
+        clients.sort();
+        assert_eq!(
+            clients,
+            vec!["10.0.0.5".to_string(), "alice@10.0.0.6".to_string()],
+            "the handle's content is unchanged; only its ordering moved to string_array_payload"
+        );
+    }
+
+    /// `clients` and `cache` are both built from `HashMap`-backed handles
+    /// whose iteration order is arbitrary, so the served array must be sorted
+    /// at payload-construction time — the one choke point both pass through.
+    /// Unsorted, a rehash looks like new data to the LIVE ticker's change
+    /// detector and pushes a monitor frame carrying no new information.
+    #[tokio::test]
+    async fn string_array_status_pvs_are_sorted_whatever_order_the_handle_returns() {
+        let unsorted: ListHandle =
+            Arc::new(|| vec!["zeta".to_string(), "alpha".to_string(), "mu".to_string()]);
+        let handles = StatusHandles {
+            clients: unsorted.clone(),
+            cache: unsorted,
+            ..StatusHandles::test()
+        };
+        let src = StatusSource::new(
+            PREFIX.to_string(),
+            Arc::new(AccessControl::new(false, None, None)),
+            handles,
+        );
+
+        for suffix in ["clients", "cache"] {
+            let p = src
+                .get(&format!("{PREFIX}{suffix}"))
+                .await
+                .unwrap_or_else(|| panic!("{suffix} must be readable"));
+            let NtPayload::ScalarArray(a) = p else {
+                panic!("{suffix} must be a string array");
+            };
+            assert_eq!(
+                a.value,
+                ScalarArrayValue::Str(vec![
+                    "alpha".to_string(),
+                    "mu".to_string(),
+                    "zeta".to_string()
+                ]),
+                "{suffix} must be sorted"
+            );
+        }
     }
 
     /// p4p shape: `clients`/`cache` are NTScalarArray-of-string, not scalars.
@@ -1167,13 +1353,10 @@ mod tests {
     async fn bandwidth_table_serves_live_rows_from_the_sampler() {
         let snap_ts = NtTimeStamp { seconds_past_epoch: 1_700_000_000, nanoseconds: 5, user_tag: 0 };
         let handles = StatusHandles {
-            bandwidth: Arc::new({
-                let snap_ts = snap_ts.clone();
-                move || RateSnapshot {
-                    ts: snap_ts.clone(),
-                    ds_bypv_tx: vec![("PV:X".to_string(), 1234.0)],
-                    ..Default::default()
-                }
+            bandwidth: fixed_bandwidth_handle(RateSnapshot {
+                ts: snap_ts.clone(),
+                ds_bypv_tx: vec![("PV:X".to_string(), 1234.0)],
+                ..Default::default()
             }),
             ..StatusHandles::test()
         };
@@ -1196,7 +1379,7 @@ mod tests {
     #[tokio::test]
     async fn bandwidth_byhost_table_serves_live_account_client_rows() {
         let handles = StatusHandles {
-            bandwidth: Arc::new(|| RateSnapshot {
+            bandwidth: fixed_bandwidth_handle(RateSnapshot {
                 ds_byhost_tx: vec![("alice".to_string(), "10.0.0.1".to_string(), 42.0)],
                 ..Default::default()
             }),
@@ -1216,28 +1399,61 @@ mod tests {
         assert_eq!(rate_col.values, ScalarArrayValue::F64(vec![42.0]));
     }
 
-    /// The LIVE ticker must not re-post when the sampler produces identical
-    /// rows on consecutive ticks, even though `RateSnapshot::ts` itself
-    /// changes every tick — i.e. the dedup key must be timestamp-free
-    /// (`clear_stamp`), not the raw stamped table.
+    /// Serving one bandwidth PV must build only that PV's table. The handle is
+    /// asked for a suffix and returns the finished payload, so a `ds:bypv:tx`
+    /// read no longer materialises the other seven tables — the old handle
+    /// returned a clone of the whole `RateSnapshot` (all eight row vectors,
+    /// every String in every row) once per served bandwidth PV per tick.
+    #[tokio::test]
+    async fn a_bandwidth_read_asks_the_handle_for_exactly_one_suffix() {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let handles = StatusHandles {
+            bandwidth: Arc::new(move |suffix: &str| {
+                seen.lock().unwrap().push(suffix.to_string());
+                StatusSource::bandwidth_table(suffix, &RateSnapshot::default())
+            }),
+            ..StatusHandles::test()
+        };
+        let src = StatusSource::new(
+            PREFIX.to_string(),
+            Arc::new(AccessControl::new(false, None, None)),
+            handles,
+        );
+
+        src.get(&format!("{PREFIX}ds:bypv:tx")).await.expect("ds:bypv:tx is readable");
+        src.get(&format!("{PREFIX}us:byhost:rx")).await.expect("us:byhost:rx is readable");
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["ds:bypv:tx".to_string(), "us:byhost:rx".to_string()],
+            "each read must ask for its own suffix and nothing else"
+        );
+    }
+
+    /// The dedup key is now produced in place, so an idle tick copies nothing.
+    /// The property it must preserve: two samples whose rows are identical but
+    /// whose sampler timestamps differ produce the SAME key.
     #[test]
-    fn clear_stamp_makes_identical_bandwidth_rows_dedup_despite_ts_change() {
+    fn clear_stamp_in_place_makes_identical_rows_dedup_despite_a_ts_change() {
+        let rows = vec![("PV:X".to_string(), 10.0)];
         let snap_a = RateSnapshot {
             ts: NtTimeStamp { seconds_past_epoch: 1, nanoseconds: 0, user_tag: 0 },
-            ds_bypv_tx: vec![("PV:X".to_string(), 10.0)],
+            ds_bypv_tx: rows.clone(),
             ..Default::default()
         };
         let snap_b = RateSnapshot {
             ts: NtTimeStamp { seconds_past_epoch: 2, nanoseconds: 0, user_tag: 0 },
-            ds_bypv_tx: vec![("PV:X".to_string(), 10.0)],
+            ds_bypv_tx: rows,
             ..Default::default()
         };
-        let a = StatusSource::bandwidth_table("ds:bypv:tx", &snap_a);
-        let b = StatusSource::bandwidth_table("ds:bypv:tx", &snap_b);
-        // Raw payloads differ (different time_stamp)...
-        assert_ne!(a, b);
-        // ...but their dedup keys are equal (same rows, timestamp cleared).
-        assert_eq!(clear_stamp(&a), clear_stamp(&b));
+
+        let mut a = StatusSource::bandwidth_table("ds:bypv:tx", &snap_a);
+        let mut b = StatusSource::bandwidth_table("ds:bypv:tx", &snap_b);
+        assert_ne!(a, b, "the raw payloads differ: they carry different sample times");
+        clear_stamp_in_place(&mut a);
+        clear_stamp_in_place(&mut b);
+        assert_eq!(a, b, "with the stamp cleared the two samples are the same data");
     }
 
     /// A configured `pvlist` that simply says nothing about the status prefix
@@ -1308,6 +1524,49 @@ mod tests {
             src.names().await.is_empty(),
             "a hidden status PV must not be advertised in the channel listing"
         );
+    }
+
+    /// Status PVs are served by the gateway itself, so an `AllowAliased` — an
+    /// instruction to re-target the name upstream — has no upstream to be
+    /// re-targeted to and simply means "permitted". Stated once, exhaustively,
+    /// instead of implied six times by a negated `Deny` match: a new
+    /// `Decision` variant must be a compile error here, not silently
+    /// permitted at six gates.
+    #[test]
+    fn allows_local_treats_an_alias_as_permitted_and_only_deny_as_denied() {
+        assert!(allows_local(&Decision::Allow));
+        assert!(allows_local(&Decision::AllowAliased("OTHER:NAME".to_string())));
+        assert!(!allows_local(&Decision::Deny));
+    }
+
+    /// An ALIAS rule covering the status prefix must not make the status PVs
+    /// disappear: the gateway still serves them under their REAL names, and
+    /// simply ignores the rewrite (there is no upstream to re-target to).
+    ///
+    /// The template must expand to something DIFFERENT from the requested
+    /// name — an `ALIAS` back to the same name yields `Decision::Allow`, not
+    /// `AllowAliased`, and would leave this test exercising nothing.
+    #[tokio::test]
+    async fn status_pvs_are_still_served_when_a_pvlist_alias_matches_them() {
+        let pvlist =
+            crate::access::pvlist::parse_pvlist(r"GW:STATUS:(.*) ALIAS RENAMED:\1").unwrap();
+        let src = StatusSource::new(
+            PREFIX.to_string(),
+            Arc::new(AccessControl::new(false, Some(pvlist), None)),
+            StatusHandles::test(),
+        );
+        let name = format!("{PREFIX}clients");
+        // Control: the rule really does produce an AllowAliased here.
+        assert!(
+            matches!(
+                src.access.decide_local(Op::Get, &name, &Identity::default()),
+                Decision::AllowAliased(ref n) if n == "RENAMED:clients"
+            ),
+            "fixture regression: this pvlist must yield AllowAliased"
+        );
+        assert!(src.claim_sync(&name).is_some());
+        assert!(src.get(&name).await.is_some());
+        assert!(src.names().await.iter().any(|n| n == &name));
     }
 
     /// asTest returns p4p's `epics:p2p/Permission:1.0` with a nested
