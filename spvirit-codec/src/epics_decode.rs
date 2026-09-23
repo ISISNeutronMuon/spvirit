@@ -135,6 +135,15 @@ pub struct PvaHeader {
 }
 
 impl PvaHeader {
+    /// Parse an 8-byte PVA header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is shorter than 8 bytes. Only call this where the
+    /// length is already guaranteed -- typically bytes that came out of a
+    /// frame reader, or bytes this crate encoded itself. **On any path that
+    /// touches the network directly (a UDP datagram, a public function taking
+    /// a caller-supplied slice) use [`PvaHeader::try_new`] instead.**
     pub fn new(raw: &[u8]) -> Self {
         Self::try_new(raw).expect("PVA header requires at least 8 bytes")
     }
@@ -198,6 +207,14 @@ pub struct PvaPacket {
 }
 
 impl PvaPacket {
+    /// Parse a `PvaPacket` (header plus payload copy).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is shorter than the 8-byte PVA header. Only call this
+    /// where the length is already guaranteed. **On any path that touches
+    /// the network directly (a UDP datagram, a public function taking a
+    /// caller-supplied slice) use [`PvaPacket::try_new`] instead.**
     pub fn new(raw: &[u8]) -> Self {
         let header = PvaHeader::new(raw);
         let payload = raw.to_vec();
@@ -371,8 +388,12 @@ pub fn decode_status(raw: &[u8], is_be: bool) -> (Option<PvaStatus>, usize) {
 }
 
 pub fn decode_op_response_status(raw: &[u8], is_be: bool) -> Result<Option<PvaStatus>, String> {
-    let pkt = PvaPacket::new(raw);
-    let payload_len = pkt.header.payload_length as usize;
+    // Parse the header in place. `PvaPacket::new` both panics on a short
+    // slice and copies the whole frame into a fresh `Vec`; this function
+    // needs neither.
+    let header = PvaHeader::try_new(raw)
+        .ok_or_else(|| format!("op response header truncated: {} bytes", raw.len()))?;
+    let payload_len = header.payload_length as usize;
     if raw.len() < 8 + payload_len {
         return Err("op response truncated".to_string());
     }
@@ -1888,6 +1909,37 @@ mod tests {
         // Exactly 8 bytes is the minimum valid header and must succeed.
         let ok = vec![0u8; 8];
         assert!(PvaPacket::try_new(&ok).is_some());
+    }
+
+    /// Site 9. `decode_op_response_status` is public and takes an arbitrary
+    /// slice, but built a `PvaPacket` from it unconditionally --
+    /// `PvaPacket::new` -> `PvaHeader::new` -> `expect`. A caller that hands
+    /// it a truncated frame gets a panic instead of the `Result` its
+    /// signature promises.
+    #[test]
+    fn decode_op_response_status_rejects_a_short_frame_without_panicking() {
+        let err = decode_op_response_status(&[0xCA, 0x02, 0x00, 0x0B], false)
+            .expect_err("a sub-header frame must be a typed error, not a panic");
+        assert!(err.contains("truncated"), "unexpected error text: {err}");
+
+        // Empty is the degenerate case of the same thing.
+        assert!(decode_op_response_status(&[], false).is_err());
+    }
+
+    /// The fix must not change the happy path: a well-formed op response
+    /// still yields its status.
+    #[test]
+    fn decode_op_response_status_still_reads_a_well_formed_frame() {
+        // header: magic, version 2, flags 0 (LE, app), command 11 (PUT),
+        // payload_length 6. Payload: ioid(4) + subcmd(1) + status code 0xFF
+        // ("no status"), which decodes to None.
+        let mut raw = vec![0xCA, 0x02, 0x00, 0x0B];
+        raw.extend_from_slice(&6u32.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.push(0x00);
+        raw.push(0xFF);
+        let status = decode_op_response_status(&raw, false).expect("well-formed frame decodes");
+        assert!(status.is_none(), "0xFF is the no-status marker");
     }
 
     #[test]
