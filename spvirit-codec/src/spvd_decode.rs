@@ -31,6 +31,11 @@ pub struct DecodeLimits {
     /// Checked *before* the `Vec::with_capacity`, because a `Vec` allocation
     /// failure aborts the process rather than unwinding.
     pub max_struct_fields: usize,
+    /// Ceiling on introspection / value nesting depth. Unbounded recursion
+    /// here overflows the native stack -- an uncatchable process kill. The
+    /// deepest normative NT type nests fewer than ten levels; 32 leaves a 3x
+    /// margin for vendor extensions.
+    pub max_depth: usize,
 }
 
 impl Default for DecodeLimits {
@@ -42,6 +47,7 @@ impl Default for DecodeLimits {
             max_union_array: 65_536,
             max_variant_array: 65_536,
             max_struct_fields: 65_536,
+            max_depth: 32,
         }
     }
 }
@@ -368,6 +374,21 @@ pub struct PvdDecoder {
     /// IntrospectionRegistry: maps int16 keys to previously seen FieldTypes.
     /// Populated when parsing `0xFD` (full-with-id) entries, looked up on `0xFE` (only-id).
     registry: std::cell::RefCell<std::collections::HashMap<u16, FieldType>>,
+    /// Current recursion depth. A `Cell` rather than a `&mut self` parameter
+    /// so no public signature changes (which would ripple into the frozen
+    /// `spvirit-py` surface).
+    depth: std::cell::Cell<usize>,
+}
+
+/// Decrements the decoder's depth counter on *every* exit path, including the
+/// `?` early returns that are the whole point of the recursion being
+/// dangerous.
+struct DepthGuard<'a>(&'a std::cell::Cell<usize>);
+
+impl Drop for DepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 impl PvdDecoder {
@@ -381,6 +402,7 @@ impl PvdDecoder {
             is_be,
             limits,
             registry: std::cell::RefCell::new(std::collections::HashMap::new()),
+            depth: std::cell::Cell::new(0),
         }
     }
 
@@ -436,6 +458,7 @@ impl PvdDecoder {
 
     /// Parse type descriptor
     fn parse_type_desc(&self, data: &[u8]) -> DecodeResult<(FieldType, usize)> {
+        let _depth = self.enter()?;
         if data.is_empty() {
             return Err(DecodeError::Truncated {
                 needed: 1,
@@ -637,11 +660,17 @@ impl PvdDecoder {
             if offset >= data.len() {
                 break;
             }
-            if let Ok((field, consumed)) = self.parse_field_desc(&data[offset..]) {
-                offset += consumed;
-                fields.push(field);
-            } else {
-                break;
+            match self.parse_field_desc(&data[offset..]) {
+                Ok((field, consumed)) => {
+                    offset += consumed;
+                    fields.push(field);
+                }
+                // Truncated/garbage input stays lenient: stop and return what
+                // parsed. A depth violation does NOT -- swallowing it here
+                // would turn the guard into a silent truncation and the caller
+                // would never learn the descriptor was hostile.
+                Err(e @ DecodeError::DepthExceeded { .. }) => return Err(e),
+                Err(_) => break,
             }
         }
 
@@ -656,6 +685,7 @@ impl PvdDecoder {
 
     /// Parse full type introspection and return consumed bytes.
     pub fn parse_introspection_with_len(&self, data: &[u8]) -> DecodeResult<(StructureDesc, usize)> {
+        let _depth = self.enter()?;
         if data.is_empty() {
             return Err(DecodeError::Truncated {
                 needed: 1,
@@ -843,12 +873,27 @@ impl PvdDecoder {
         Ok(())
     }
 
+    /// Enter one level of recursion, or fail. Hold the returned guard for the
+    /// duration of the recursive call.
+    fn enter(&self) -> DecodeResult<DepthGuard<'_>> {
+        let next = self.depth.get() + 1;
+        if next > self.limits.max_depth {
+            return Err(DecodeError::DepthExceeded {
+                depth: next,
+                limit: self.limits.max_depth,
+            });
+        }
+        self.depth.set(next);
+        Ok(DepthGuard(&self.depth))
+    }
+
     /// Decode value according to field type
     pub fn decode_value(
         &self,
         data: &[u8],
         field_type: &FieldType,
     ) -> DecodeResult<(DecodedValue, usize)> {
+        let _depth = self.enter()?;
         match field_type {
             FieldType::Scalar(tc) => self.decode_scalar(data, *tc),
             FieldType::String | FieldType::BoundedString(_) => {
@@ -1015,12 +1060,15 @@ impl PvdDecoder {
             if offset >= data.len() {
                 break;
             }
-            if let Ok((value, consumed)) = self.decode_value(&data[offset..], &field.field_type) {
-                fields.push((field.name.clone(), value));
-                offset += consumed;
-            } else {
-                // Can't decode this field, stop
-                break;
+            match self.decode_value(&data[offset..], &field.field_type) {
+                Ok((value, consumed)) => {
+                    fields.push((field.name.clone(), value));
+                    offset += consumed;
+                }
+                // Same rule as `parse_structure_desc`: a depth violation is
+                // surfaced, everything else stops the loop as before.
+                Err(e @ DecodeError::DepthExceeded { .. }) => return Err(e),
+                Err(_) => break,
             }
         }
 
@@ -1543,6 +1591,7 @@ mod tests {
         assert_eq!(d.max_union_array, 65_536);
         assert_eq!(d.max_variant_array, 65_536);
         assert_eq!(d.max_struct_fields, 65_536);
+        assert_eq!(d.max_depth, 32);
     }
 
     /// Site 5. `parse_structure_desc` reserved `Vec::with_capacity(count)`
@@ -1935,5 +1984,78 @@ mod tests {
             panic!("expected an array");
         };
         assert_eq!(items.len(), 5);
+    }
+
+    /// Build a descriptor that nests `levels` structures inside each other.
+    ///
+    /// One level on the wire is: `0x80` (structure) + `0x00` (empty struct
+    /// id) + `0x01` (one field) + `0x00` (empty field name), then the next
+    /// level's type byte. The innermost structure is `0x80 0x00 0x00`
+    /// (empty id, zero fields).
+    fn nested_structure_desc(levels: usize) -> Vec<u8> {
+        assert!(levels >= 1);
+        let mut data = vec![0x80u8];
+        for _ in 0..levels - 1 {
+            data.extend_from_slice(&[0x00, 0x01, 0x00, 0x80]);
+        }
+        data.extend_from_slice(&[0x00, 0x00]);
+        data
+    }
+
+    /// Site 6. Nothing bounded the introspection recursion, so a crafted
+    /// descriptor could nest until the native stack overflowed -- an
+    /// immediate process kill, not an unwind.
+    ///
+    /// 65 levels is deliberately shallow enough that the *pre-fix* decoder
+    /// returns `Ok` rather than actually crashing the test runner: the test
+    /// fails cleanly and instantly on the missing error.
+    #[test]
+    fn a_deeply_nested_descriptor_is_rejected_at_the_depth_limit() {
+        let decoder = PvdDecoder::new(false);
+        let data = nested_structure_desc(65);
+        assert_eq!(data.len(), 259);
+        match decoder.parse_introspection(&data) {
+            Err(DecodeError::DepthExceeded { depth, limit }) => {
+                assert_eq!(limit, 32);
+                assert!(depth > limit, "depth {depth} should exceed limit {limit}");
+            }
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+    }
+
+    /// The bound must clear every real type. The deepest normative NT type
+    /// nests fewer than ten levels.
+    #[test]
+    fn a_realistically_nested_descriptor_still_parses() {
+        let decoder = PvdDecoder::new(false);
+        let desc = decoder
+            .parse_introspection(&nested_structure_desc(10))
+            .expect("ten levels is well inside the limit");
+        assert_eq!(desc.fields.len(), 1);
+    }
+
+    /// The counter is per-decoder state, and a `PvdDecoder` is reused for the
+    /// whole connection. If a rejected parse left the depth counter raised,
+    /// every subsequent decode on that connection would fail -- one hostile
+    /// frame would poison the channel.
+    #[test]
+    fn a_rejected_deep_parse_does_not_poison_the_decoder() {
+        let decoder = PvdDecoder::new(false);
+        assert!(decoder.parse_introspection(&nested_structure_desc(65)).is_err());
+        decoder
+            .parse_introspection(&nested_structure_desc(3))
+            .expect("the decoder must be usable again after a rejected parse");
+    }
+
+    /// The `Variant` arm of `decode_value` re-enters `parse_type_desc` on
+    /// wire bytes, so the same nesting arrives through the *value* path too.
+    #[test]
+    fn a_deeply_nested_variant_value_is_rejected() {
+        let decoder = PvdDecoder::new(false);
+        let data = nested_structure_desc(65);
+        match decoder.decode_value(&data, &FieldType::Variant) {
+            Err(DecodeError::DepthExceeded { .. }) => {}
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
     }
 }
