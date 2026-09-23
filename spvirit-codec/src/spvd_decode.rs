@@ -367,13 +367,33 @@ impl fmt::Display for DecodedValue {
     }
 }
 
+/// Height of a type tree in `PvdDecoder::enter` units: a leaf is 1, a
+/// structure or union is 1 + its tallest field. Only called on trees the
+/// decoder has already built under the depth limit, so the recursion is
+/// bounded by `DecodeLimits::max_depth`.
+fn type_height(ft: &FieldType) -> usize {
+    let fields = match ft {
+        FieldType::Structure(d) | FieldType::StructureArray(d) => &d.fields,
+        FieldType::Union(f) | FieldType::UnionArray(f) => f,
+        _ => return 1,
+    };
+    1 + fields
+        .iter()
+        .map(|f| type_height(&f.field_type))
+        .max()
+        .unwrap_or(0)
+}
+
 /// PVD Decoder state
 pub struct PvdDecoder {
     is_be: bool,
     limits: DecodeLimits,
     /// IntrospectionRegistry: maps int16 keys to previously seen FieldTypes.
     /// Populated when parsing `0xFD` (full-with-id) entries, looked up on `0xFE` (only-id).
-    registry: std::cell::RefCell<std::collections::HashMap<u16, FieldType>>,
+    /// Each entry carries the stored type's height (see `type_height`),
+    /// recorded once on insert so a `0xFE` reference can be depth-checked
+    /// in O(1) instead of re-walking the tree.
+    registry: std::cell::RefCell<std::collections::HashMap<u16, (FieldType, usize)>>,
     /// Current recursion depth. A `Cell` rather than a `&mut self` parameter
     /// so no public signature changes (which would ripple into the frozen
     /// `spvirit-py` surface).
@@ -489,7 +509,10 @@ impl PvdDecoder {
                 u16::from_le_bytes([data[1], data[2]])
             };
             let (field_type, consumed) = self.parse_type_desc(&data[3..])?;
-            self.registry.borrow_mut().insert(key, field_type.clone());
+            let height = type_height(&field_type);
+            self.registry
+                .borrow_mut()
+                .insert(key, (field_type.clone(), height));
             return Ok((field_type, 3 + consumed));
         }
 
@@ -507,7 +530,8 @@ impl PvdDecoder {
             } else {
                 u16::from_le_bytes([data[1], data[2]])
             };
-            if let Some(ft) = self.registry.borrow().get(&key) {
+            if let Some((ft, height)) = self.registry.borrow().get(&key) {
+                self.check_resolved_height(*height)?;
                 return Ok((ft.clone(), 3));
             }
             debug!(
@@ -718,9 +742,9 @@ impl PvdDecoder {
             };
             let (desc, consumed) = self.parse_introspection_with_len(&data[3..])?;
             // Register this structure type for later 0xFE references
-            self.registry
-                .borrow_mut()
-                .insert(key, FieldType::Structure(desc.clone()));
+            let field_type = FieldType::Structure(desc.clone());
+            let height = type_height(&field_type);
+            self.registry.borrow_mut().insert(key, (field_type, height));
             return Ok((desc, 3 + consumed));
         }
 
@@ -738,8 +762,9 @@ impl PvdDecoder {
             } else {
                 u16::from_le_bytes([data[1], data[2]])
             };
-            if let Some(ft) = self.registry.borrow().get(&key) {
+            if let Some((ft, height)) = self.registry.borrow().get(&key) {
                 if let FieldType::Structure(desc) = ft {
+                    self.check_resolved_height(*height)?;
                     return Ok((desc.clone(), 3));
                 }
             }
@@ -885,6 +910,23 @@ impl PvdDecoder {
         }
         self.depth.set(next);
         Ok(DepthGuard(&self.depth))
+    }
+
+    /// A `0xFE` reference splices a stored type of `height` levels in at
+    /// the current depth with O(1) wire recursion, so `enter()` alone never
+    /// sees its nesting. Reject it if the resolved tree would pass
+    /// `max_depth`; otherwise chained `0xFD`/`0xFE` entries build an
+    /// unboundedly deep tree (and overflow the stack in the derived
+    /// `Clone`/`Drop`) from wire nesting that never exceeds the limit.
+    fn check_resolved_height(&self, height: usize) -> DecodeResult<()> {
+        let depth = (self.depth.get() + height).saturating_sub(1);
+        if depth > self.limits.max_depth {
+            return Err(DecodeError::DepthExceeded {
+                depth,
+                limit: self.limits.max_depth,
+            });
+        }
+        Ok(())
     }
 
     /// Decode value according to field type
@@ -2057,5 +2099,82 @@ mod tests {
             Err(DecodeError::DepthExceeded { .. }) => {}
             other => panic!("expected DepthExceeded, got {other:?}"),
         }
+    }
+
+    /// Depth of a decoded type tree, counted the way the wire recursion
+    /// counts it: a leaf is 1, a structure/union is 1 + its deepest field.
+    fn tree_depth(ft: &FieldType) -> usize {
+        match ft {
+            FieldType::Structure(d) | FieldType::StructureArray(d) => {
+                1 + d.fields.iter().map(|f| tree_depth(&f.field_type)).max().unwrap_or(0)
+            }
+            FieldType::Union(f) | FieldType::UnionArray(f) => {
+                1 + f.iter().map(|f| tree_depth(&f.field_type)).max().unwrap_or(0)
+            }
+            _ => 1,
+        }
+    }
+
+    /// Top-level structure with `fields` fields. Field `i` is
+    /// `0xFD key_i` + 25 one-field wrapper structures + `0xFE key_{i-1}`
+    /// (field 0 ends in an empty structure instead). Each field stays well
+    /// inside the wire depth limit, but every `0xFE` splices in the whole
+    /// previous chain, so the *resolved* tree grows by ~25 levels per field.
+    fn registry_chain_desc(fields: u8) -> Vec<u8> {
+        let mut data = vec![0x80u8, 0x00, fields];
+        for i in 0..fields {
+            data.push(0x00); // empty field name
+            data.push(0xFD);
+            data.extend_from_slice(&u16::from(i).to_le_bytes());
+            for _ in 0..25 {
+                data.extend_from_slice(&[0x80, 0x00, 0x01, 0x00]);
+            }
+            if i == 0 {
+                data.extend_from_slice(&[0x80, 0x00, 0x00]);
+            } else {
+                data.push(0xFE);
+                data.extend_from_slice(&u16::from(i - 1).to_le_bytes());
+            }
+        }
+        data
+    }
+
+    /// Review finding on site 6: a `0xFE` only-id reference clones a stored
+    /// type with O(1) wire recursion, so chaining `0xFD`/`0xFE` built an
+    /// unboundedly deep tree (and a stack overflow in the derived
+    /// `Clone`/`Drop`) while the wire nesting never passed 32.
+    #[test]
+    fn registry_references_cannot_build_a_tree_deeper_than_the_limit() {
+        let decoder = PvdDecoder::new(false);
+        match decoder.parse_introspection(&registry_chain_desc(3)) {
+            Err(DecodeError::DepthExceeded { depth, limit }) => {
+                assert_eq!(limit, 32);
+                assert!(depth > limit, "depth {depth} should exceed limit {limit}");
+            }
+            Ok(desc) => panic!(
+                "expected DepthExceeded, got Ok with a tree {} levels deep",
+                tree_depth(&FieldType::Structure(desc))
+            ),
+            Err(other) => panic!("expected DepthExceeded, got {other:?}"),
+        }
+        // The rejection must not poison the decoder either.
+        decoder
+            .parse_introspection(&nested_structure_desc(3))
+            .expect("the decoder must be usable again after a rejected parse");
+    }
+
+    /// Legitimate registry reuse inside the limit still resolves.
+    #[test]
+    fn a_shallow_registry_reference_still_resolves() {
+        let decoder = PvdDecoder::new(false);
+        let data = [
+            0x80, 0x00, 0x02, // top structure, two fields
+            0x01, b'a', 0xFD, 0x07, 0x00, 0x80, 0x00, 0x01, 0x01, b'x', 0x43,
+            0x01, b'b', 0xFE, 0x07, 0x00,
+        ];
+        let desc = decoder.parse_introspection(&data).expect("parses");
+        assert_eq!(desc.fields.len(), 2);
+        assert_eq!(desc.fields[0].field_type, desc.fields[1].field_type);
+        assert_eq!(tree_depth(&FieldType::Structure(desc)), 3);
     }
 }
