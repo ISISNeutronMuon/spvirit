@@ -46,11 +46,39 @@ impl std::fmt::Display for ScanRegisterError {
 
 impl std::error::Error for ScanRegisterError {}
 
+/// Why an async completion pass did not finish cleanly.
+///
+/// [`Scanner::complete_async`] is called from device code, often on a driver's
+/// own callback thread, so it contains a panic the way a scan pass does rather
+/// than unwinding into the driver -- but it must still tell the caller that
+/// something went wrong, which is why the panic gets a variant of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsyncCompleteError {
+    /// The completion pass returned a processing error (see [`ProcError`]).
+    Proc(ProcError),
+    /// The completion pass panicked. It was caught here, and any monitors the
+    /// pass had already accumulated are lost with the context, so the record
+    /// may still be braked with PACT set (the same residual hazard
+    /// `process_ids` documents for a panicking scan pass, R-T6-PACT).
+    Panicked,
+}
+
+impl std::fmt::Display for AsyncCompleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proc(e) => write!(f, "async completion failed: {e}"),
+            Self::Panicked => write!(f, "async completion panicked"),
+        }
+    }
+}
+
+impl std::error::Error for AsyncCompleteError {}
+
 use crate::clock::Clock;
-use crate::ctx::ProcCtx;
+use crate::ctx::{ProcCtx, ProcError};
 use crate::lockset::{RecordDb, RecordId};
-use crate::process::process;
-use crate::scan::{ScanList, ScanSpec, parse_scan};
+use crate::process::{AsyncSupport, process};
+use crate::scan::{AsyncRegistry, ScanList, ScanSpec, parse_scan};
 use spvirit_server::events::EventSink;
 use spvirit_types::NtPayload;
 
@@ -68,6 +96,12 @@ pub struct Scanner {
     db: Arc<RecordDb>,
     clock: Arc<dyn Clock>,
     sink: Arc<dyn ProcSink>,
+    /// Record → async device-support bindings, handed to every pass through
+    /// `ProcCtx::with_async` (see `process_ids`). Empty by default, so an
+    /// unbound record -- which is every record until a driver calls
+    /// [`Self::bind_async`] -- processes exactly as it did before async
+    /// support was wired.
+    async_registry: AsyncRegistry,
     periodic: Mutex<HashMap<PeriodKey, ScanList>>,
     /// Event-driven scan lists, keyed by the record's `EVNT` string. Fired
     /// synchronously (on the caller's thread) by [`Self::fire_event`], never
@@ -125,6 +159,7 @@ impl Scanner {
             db,
             clock,
             sink,
+            async_registry: AsyncRegistry::new(),
             periodic: Mutex::new(HashMap::new()),
             events: Mutex::new(HashMap::new()),
             io_intr: Mutex::new(HashMap::new()),
@@ -651,9 +686,13 @@ impl Scanner {
     /// the batch continues.
     pub fn process_ids(&self, ids: &[RecordId]) {
         for &id in ids {
-            let clock = self.clock.clone();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut ctx = ProcCtx::with_clock(clock.as_ref());
+                // Borrowed, not cloned: the closure already captures `&self`,
+                // so an `Arc` clone per record per tick buys nothing. The
+                // registry rides along the same way the clock does -- this is
+                // what makes a bound record's `AsyncSupport::start` reachable
+                // from a running IOC at all.
+                let mut ctx = ProcCtx::with_async(self.clock.as_ref(), &self.async_registry);
                 let res = self.db.with_set(id.set, |set| process(set, id, &mut ctx));
                 (
                     res,
@@ -677,6 +716,62 @@ impl Scanner {
                 Err(_) => {
                     tracing::warn!("scan processing panicked; continuing the pass");
                 }
+            }
+        }
+    }
+
+    /// Bind `id` to the device support that drives it. A later bind for the
+    /// same record replaces the earlier one.
+    ///
+    /// This is the production counterpart to `.db` device support in Base,
+    /// which has no equivalent here (see the `io_intr` field's divergence
+    /// note): there is no `DTYP`-driven device layer, so a driver registers
+    /// itself in Rust, exactly as it does for I/O-Intr scanning.
+    pub fn bind_async(&self, id: RecordId, support: Arc<dyn AsyncSupport>) {
+        self.async_registry.bind(id, support);
+    }
+
+    /// Finish a record whose bound support reported its operation outstanding:
+    /// the device's callback calls this when the operation completes.
+    ///
+    /// Mirrors one iteration of [`Self::process_ids`] deliberately -- same
+    /// `catch_unwind` isolation, same context, same `sink.flush` after the
+    /// lock is dropped, same deferred drain -- so a completion-driven update
+    /// is indistinguishable downstream from a scan-driven one. The difference
+    /// is only the pass it runs: [`crate::process::complete_async`] rather
+    /// than `process`, because `process`'s PACT brake returns early for
+    /// exactly the state a pending async record is in.
+    ///
+    /// Idempotent by construction: `crate::process::complete_async` returns
+    /// `Ok(())` without processing if PACT is already clear, so a duplicate
+    /// callback is a no-op rather than a second pass.
+    pub fn complete_async(&self, id: RecordId) -> Result<(), AsyncCompleteError> {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ctx = ProcCtx::with_async(self.clock.as_ref(), &self.async_registry);
+            let res = self
+                .db
+                .with_set(id.set, |set| crate::process::complete_async(set, id, &mut ctx));
+            (
+                res,
+                ctx.take_events(),
+                std::mem::take(&mut ctx.trace),
+                std::mem::take(&mut ctx.deferred),
+            )
+        }));
+        match outcome {
+            Ok((res, events, trace, deferred)) => {
+                // Flush before reporting the error: a pass that failed part
+                // way still produced the monitors it produced, exactly as
+                // `process_ids` treats a `ProcError`.
+                self.sink.flush(events, trace);
+                if !deferred.is_empty() {
+                    self.process_ids(&deferred);
+                }
+                res.map_err(AsyncCompleteError::Proc)
+            }
+            Err(_) => {
+                tracing::warn!("async completion for {:?} panicked; contained", id);
+                Err(AsyncCompleteError::Panicked)
             }
         }
     }
@@ -1534,5 +1629,116 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("shutdown() did not return within 5s: self-join likely deadlocked");
+    }
+
+    /// Counts `start` calls and always reports the operation outstanding, so a
+    /// test can prove the engine reached a bound support at all.
+    struct RecordingSupport(std::sync::atomic::AtomicUsize);
+    impl crate::process::AsyncSupport for RecordingSupport {
+        fn start(
+            &self,
+            _record: &str,
+            _pact: bool,
+            _ctx: &mut ProcCtx,
+        ) -> crate::process::AsyncOutcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            crate::process::AsyncOutcome::Pending
+        }
+    }
+
+    #[test]
+    fn process_ids_reaches_a_bound_async_support() {
+        // `process_ids` is the only place the scan path builds a pass context.
+        // It used to call `ProcCtx::with_clock`, which hard-codes
+        // `async_registry: None` (`ctx.rs:90`), so a bound record processed
+        // synchronously and its support was never called. This pins the
+        // constructor: a regression to `with_clock` would silently make every
+        // bound record synchronous again.
+        let (scanner, sink, db) =
+            scanner_over("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n");
+        let a = db.lookup("PV:A").unwrap();
+        let support = Arc::new(RecordingSupport(std::sync::atomic::AtomicUsize::new(0)));
+        scanner.bind_async(a, support.clone());
+
+        scanner.process_ids(&[a]);
+
+        assert_eq!(
+            support.0.load(Ordering::SeqCst),
+            1,
+            "a bound record's support must be consulted exactly once per pass"
+        );
+        assert_eq!(
+            sink.count("PV:A"),
+            0,
+            "an outstanding (Pending) operation posts nothing until it completes"
+        );
+    }
+
+    #[test]
+    fn a_bound_async_record_initiates_on_a_tick_and_completes_on_the_callback() {
+        // The end-to-end wiring: a periodic tick initiates the operation
+        // (DelaySupport reports Pending, so `record_body` returns with PACT
+        // set and posts nothing), and the device's own callback --
+        // `Scanner::complete_async` -- runs the second half, which posts the
+        // monitor and clears PACT. Entirely on the ManualClock: the only
+        // waiting is `wait_until`, which watches for the scan thread to react
+        // to an advance, never for wall-clock time to pass.
+        let db = Arc::new(build_db("record(ai, \"PV:SLOW\") {\n field(INP, \"7\")\n}\n"));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
+        let slow = db.lookup("PV:SLOW").unwrap();
+
+        // The support reads the same clock the pass does, so its recorded
+        // deadline is on the timeline this test advances.
+        let support = Arc::new(crate::scan::delay::DelaySupport::new(
+            clock.clone(),
+            Duration::from_millis(50),
+        ));
+        scanner.bind_async(slow, support.clone());
+        scanner
+            .add_periodic(slow, 0, Duration::from_millis(100))
+            .expect("period is schedulable");
+        scanner.start();
+
+        // Tick 1 at t=100ms initiates.
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| support.deadline().is_some());
+        assert!(
+            !support.is_completed(),
+            "the initiating pass leaves the operation outstanding"
+        );
+        assert_eq!(
+            sink.count("PV:SLOW"),
+            0,
+            "an outstanding record posts nothing: record_body returns before \
+             the value/limits/monitor half"
+        );
+
+        // t=150ms: past the recorded deadline, and short of tick 2 at t=200ms,
+        // so nothing re-initiates underneath the completion.
+        manual.advance(Duration::from_millis(50));
+        assert!(
+            manual.now() >= support.deadline().expect("initiated above"),
+            "the operation is due before the driver calls back"
+        );
+        scanner.complete_async(slow).expect("the completion pass succeeds");
+
+        assert!(
+            support.is_completed(),
+            "the completion pass hands the support pact == true, so it collects"
+        );
+        assert_eq!(
+            sink.count("PV:SLOW"),
+            1,
+            "the completion pass runs the second half and posts the monitor"
+        );
+
+        // Once-only: a duplicate callback finds PACT clear and does nothing.
+        scanner.complete_async(slow).expect("a duplicate completion is Ok");
+        assert_eq!(sink.count("PV:SLOW"), 1, "a duplicate completion must not post again");
+
+        scanner.shutdown();
     }
 }

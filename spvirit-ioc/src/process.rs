@@ -686,11 +686,18 @@ pub enum AsyncOutcome {
 
 /// Device support that may take longer than a processing pass.
 ///
-/// This is now live machinery. A record is bound to an implementation through
-/// [`AsyncRegistry`](crate::scan::AsyncRegistry), which `record_body` reaches
-/// via `ProcCtx` (threaded like the clock). At the async hook point in
-/// `record_body` — before the synchronous body runs — a bound record's
-/// `start` is called.
+/// This is now live machinery, wired end to end. A driver binds a record with
+/// [`Scanner::bind_async`](crate::scan::Scanner::bind_async); every scan pass
+/// carries the bindings, because `Scanner::process_ids` builds its context
+/// with [`ProcCtx::with_async`](crate::ctx::ProcCtx::with_async); and the
+/// driver reports the finished operation with
+/// [`Scanner::complete_async`](crate::scan::Scanner::complete_async), which is
+/// the only entry point that reaches [`complete_async`] (`process`'s PACT
+/// brake returns early for an active record). A record is bound to an
+/// implementation through [`AsyncRegistry`](crate::scan::AsyncRegistry), which
+/// `record_body` reaches via `ProcCtx` (threaded like the clock). At the async
+/// hook point in `record_body` -- before the synchronous body runs -- a bound
+/// record's `start` is called.
 ///
 /// `pact` follows EPICS Base's `pact` local: it is the record's PACT flag as
 /// it stood *before* this pass raised it, so `pact == false` means "initiate
