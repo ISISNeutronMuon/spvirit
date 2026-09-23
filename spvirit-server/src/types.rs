@@ -550,7 +550,12 @@ impl RecordInstance {
                 }
             }
             (ScalarValue::F32(current), ScalarValue::F32(v)) => {
-                if (*current - v).abs() < f32::EPSILON {
+                // Exact comparison. `f32::EPSILON` is the gap between 1.0 and
+                // the next float, not an absolute tolerance: using it as one
+                // silently discards every write smaller than 1.19e-7.
+                // Deadbanding is monitor policy (MDEL in `simple_store.rs`),
+                // not store policy.
+                if *current == v {
                     false
                 } else {
                     *current = v;
@@ -574,7 +579,7 @@ impl RecordInstance {
                 }
             }
             (ScalarValue::F64(current), ScalarValue::F64(v)) => {
-                if (*current - v).abs() < f64::EPSILON {
+                if *current == v {
                     false
                 } else {
                     *current = v;
@@ -627,7 +632,7 @@ impl RecordInstance {
             }
             (ScalarValue::F64(current), ScalarValue::Bool(v)) => {
                 let next = if v { 1.0 } else { 0.0 };
-                if (*current - next).abs() < f64::EPSILON {
+                if *current == next {
                     false
                 } else {
                     *current = next;
@@ -636,7 +641,7 @@ impl RecordInstance {
             }
             (ScalarValue::F64(current), ScalarValue::I32(v)) => {
                 let next = v as f64;
-                if (*current - next).abs() < f64::EPSILON {
+                if *current == next {
                     false
                 } else {
                     *current = next;
@@ -690,7 +695,7 @@ impl RecordInstance {
             }
             (ScalarValue::F64(current), ScalarValue::Str(v)) => {
                 let next = v.parse::<f64>().unwrap_or(*current);
-                if (*current - next).abs() < f64::EPSILON {
+                if *current == next {
                     false
                 } else {
                     *current = next;
@@ -762,7 +767,7 @@ impl RecordInstance {
                         }
                     }
                     ScalarValue::F64(current) => {
-                        if (*current - as_f64).abs() < f64::EPSILON {
+                        if *current == as_f64 {
                             false
                         } else {
                             *current = as_f64;
@@ -848,7 +853,7 @@ impl RecordInstance {
                     }
                     ScalarValue::F32(current) => {
                         let next = as_f64 as f32;
-                        if (*current - next).abs() < f32::EPSILON {
+                        if *current == next {
                             false
                         } else {
                             *current = next;
@@ -1056,6 +1061,54 @@ mod tests {
             },
             raw_fields: std::collections::HashMap::new(),
         }
+    }
+
+    /// `ai_record` with an arbitrary scalar variant in place of F64.
+    fn ai_record_of(value: ScalarValue) -> RecordInstance {
+        let mut rec = ai_record(0.0);
+        if let RecordData::Ai { nt, .. } = &mut rec.data {
+            nt.value = value;
+        }
+        rec
+    }
+
+    #[test]
+    fn set_scalar_value_accepts_a_small_magnitude_f64_change() {
+        let mut rec = ai_record(0.0);
+        assert!(
+            rec.set_scalar_value(ScalarValue::F64(1e-18), false),
+            "a write of 1e-18 over 0.0 is a real change and must be accepted"
+        );
+        assert_eq!(rec.current_value(), ScalarValue::F64(1e-18));
+    }
+
+    #[test]
+    fn set_scalar_value_accepts_a_small_magnitude_f32_change() {
+        let mut rec = ai_record_of(ScalarValue::F32(0.0));
+        assert!(
+            rec.set_scalar_value(ScalarValue::F32(1e-9), false),
+            "f32::EPSILON is 1.19e-7; a write of 1e-9 must not be swallowed"
+        );
+        assert_eq!(rec.current_value(), ScalarValue::F32(1e-9));
+    }
+
+    #[test]
+    fn set_scalar_value_accepts_a_small_cross_variant_float_change() {
+        // Exercises the catch-all coercion arms, not just the same-variant ones.
+        let mut rec = ai_record_of(ScalarValue::F32(0.0));
+        assert!(
+            rec.set_scalar_value(ScalarValue::F64(1e-9), false),
+            "cross-variant writes must use the same exact comparison"
+        );
+    }
+
+    #[test]
+    fn set_scalar_value_still_reports_an_identical_float_write_as_unchanged() {
+        let mut rec = ai_record(2.5);
+        assert!(
+            !rec.set_scalar_value(ScalarValue::F64(2.5), false),
+            "writing the same value is still a no-op"
+        );
     }
 
     #[test]
