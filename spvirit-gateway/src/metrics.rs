@@ -447,7 +447,8 @@ async fn handle_connection(
     // Bound the write+flush: a client that sent a valid request line then
     // stopped reading must not pin the handler + socket open indefinitely.
     let write = async {
-        stream.write_all(response.as_bytes()).await?;
+        stream.write_all(response.head.as_bytes()).await?;
+        stream.write_all(response.body.as_bytes()).await?;
         stream.flush().await
     };
     match tokio::time::timeout(WRITE_TIMEOUT, write).await {
@@ -462,10 +463,14 @@ async fn handle_connection(
 async fn read_request_line(stream: &mut TcpStream) -> std::io::Result<String> {
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     let mut tmp = [0u8; 512];
+    // How far the CRLF scan has already looked. Without it, every read
+    // rescanned the whole accumulated buffer — O(n^2) in the request size.
+    let mut scanned = 0usize;
     loop {
-        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+        if let Some(pos) = find_crlf(&buf, scanned) {
             return Ok(String::from_utf8_lossy(&buf[..pos]).into_owned());
         }
+        scanned = buf.len();
         if buf.len() >= MAX_REQUEST_BYTES {
             return Ok(String::from_utf8_lossy(&buf).into_owned());
         }
@@ -478,9 +483,25 @@ async fn read_request_line(stream: &mut TcpStream) -> std::io::Result<String> {
     }
 }
 
+/// Index of the first `\r\n` at or after `from`, or `None`.
+///
+/// `from` is a resume point, not a hard start: the search actually begins at
+/// `from.saturating_sub(1)` so a delimiter split across two reads — `\r` in
+/// what was already scanned, `\n` in what just arrived — is still found.
+fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
+    let start = from.saturating_sub(1);
+    if start >= buf.len() {
+        return None;
+    }
+    buf[start..]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|p| start + p)
+}
+
 /// Pure routing: given a request line like `GET /metrics HTTP/1.1`, the
-/// configured path, and a snapshot, produce the full HTTP response text.
-fn route(request_line: &str, path: &str, snapshot: &MetricsSnapshot) -> String {
+/// configured path, and a snapshot, produce the full HTTP response.
+fn route(request_line: &str, path: &str, snapshot: &MetricsSnapshot) -> HttpResponse {
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
@@ -489,29 +510,53 @@ fn route(request_line: &str, path: &str, snapshot: &MetricsSnapshot) -> String {
         return http_response(
             "405 Method Not Allowed",
             "text/plain; charset=utf-8",
-            "method not allowed\n",
+            "method not allowed\n".to_string(),
         );
     }
     // Ignore any query string on the target.
     let target_path = target.split('?').next().unwrap_or(target);
     if target_path == path {
-        http_response("200 OK", CONTENT_TYPE, &render_prometheus(snapshot))
+        http_response("200 OK", CONTENT_TYPE, render_prometheus(snapshot))
     } else {
-        http_response("404 Not Found", "text/plain; charset=utf-8", "not found\n")
+        http_response(
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found\n".to_string(),
+        )
     }
 }
 
-/// Build a complete HTTP/1.1 response with a `Connection: close` header.
-fn http_response(status: &str, content_type: &str, body: &str) -> String {
-    format!(
+/// A rendered HTTP response, kept as head + body rather than one `String`.
+///
+/// Writing the two parts with two `write_all`s (inside the same write timeout)
+/// avoids copying the entire metrics body — by far the largest thing on this
+/// path — into a combined buffer just to hand it to the socket.
+struct HttpResponse {
+    head: String,
+    body: String,
+}
+
+impl HttpResponse {
+    /// The exact bytes this response puts on the wire. Test-only: the serve
+    /// path deliberately never builds this concatenation.
+    #[cfg(test)]
+    fn to_text(&self) -> String {
+        format!("{}{}", self.head, self.body)
+    }
+}
+
+/// Builds a complete HTTP/1.1 response. `Connection: close` because this
+/// responder serves one request per connection.
+fn http_response(status: &str, content_type: &str, body: String) -> HttpResponse {
+    let head = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
-         \r\n\
-         {body}",
+         \r\n",
         len = body.len(),
-    )
+    );
+    HttpResponse { head, body }
 }
 
 #[cfg(test)]
@@ -614,7 +659,7 @@ mod tests {
 
     #[test]
     fn route_get_configured_path_is_200_with_prometheus_body() {
-        let resp = route("GET /metrics HTTP/1.1", "/metrics", &sample());
+        let resp = route("GET /metrics HTTP/1.1", "/metrics", &sample()).to_text();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(resp.contains("Content-Type: text/plain; version=0.0.4\r\n"));
         assert!(resp.contains("spgateway_clients 3\n"));
@@ -622,20 +667,58 @@ mod tests {
 
     #[test]
     fn route_get_other_path_is_404() {
-        let resp = route("GET /nope HTTP/1.1", "/metrics", &sample());
+        let resp = route("GET /nope HTTP/1.1", "/metrics", &sample()).to_text();
         assert!(resp.starts_with("HTTP/1.1 404 Not Found\r\n"));
     }
 
     #[test]
     fn route_non_get_method_is_405() {
-        let resp = route("POST /metrics HTTP/1.1", "/metrics", &sample());
+        let resp = route("POST /metrics HTTP/1.1", "/metrics", &sample()).to_text();
         assert!(resp.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
     }
 
     #[test]
     fn route_ignores_query_string() {
-        let resp = route("GET /metrics?foo=bar HTTP/1.1", "/metrics", &sample());
+        let resp = route("GET /metrics?foo=bar HTTP/1.1", "/metrics", &sample()).to_text();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    /// The incremental CRLF scan must find the delimiter wherever it lands —
+    /// in particular when it STRADDLES the boundary between what was already
+    /// scanned and what just arrived, which is why resuming starts one byte
+    /// back rather than exactly at `from`.
+    #[test]
+    fn find_crlf_resumes_without_missing_a_straddling_delimiter() {
+        assert_eq!(find_crlf(b"GET / HTTP/1.1\r\nHost: x", 0), Some(14));
+        assert_eq!(find_crlf(b"GET / HTTP/1.1\r\nHost: x", 14), Some(14));
+        // Already scanned "GET / HTTP/1.1\r" (15 bytes, no CRLF in it); the
+        // "\n" completing the pair arrives next. Resuming at 15 exactly would
+        // miss it.
+        assert_eq!(find_crlf(b"GET / HTTP/1.1\r\nHost: x", 15), Some(14));
+        assert_eq!(find_crlf(b"no delimiter here", 0), None);
+        assert_eq!(find_crlf(b"", 0), None);
+        assert_eq!(find_crlf(b"\r\n", 0), Some(0));
+        // `from` past the end must not panic.
+        assert_eq!(find_crlf(b"abc", 99), None);
+    }
+
+    /// The response body is written straight from the rendered metrics text
+    /// rather than being copied into a combined String first — but the bytes
+    /// on the wire must be byte-for-byte what the single-String version
+    /// produced, headers and all.
+    #[test]
+    fn a_response_serialises_to_exactly_the_same_bytes_as_before() {
+        let r = http_response("200 OK", "text/plain; version=0.0.4", "body\n".to_string());
+        assert_eq!(
+            r.to_text(),
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/plain; version=0.0.4\r\n\
+             Content-Length: 5\r\n\
+             Connection: close\r\n\
+             \r\n\
+             body\n"
+        );
+        assert_eq!(r.body, "body\n", "the body is kept separate for a second write_all");
     }
 
     #[tokio::test]
