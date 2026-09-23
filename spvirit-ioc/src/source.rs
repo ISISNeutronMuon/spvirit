@@ -444,6 +444,14 @@ impl IocSource {
         let raw = Self::decoded_as_string(value);
         // Parse first: an error here must leave membership unchanged.
         let spec = parse_scan(&raw).map_err(|e| e.to_string())?;
+        // ...and validate schedulability before it, for the same reason: the
+        // put path's contract is that a rejected SCAN write changes neither
+        // list membership nor `scan_raw`. `parse_scan` only proves the text is
+        // well formed; only the Scanner knows whether the resulting period
+        // fits its grid.
+        if let ScanSpec::Periodic(period) = spec {
+            Scanner::check_period(period).map_err(|e| e.to_string())?;
+        }
         // Take the lock only to read PHAS/EVNT and update scan_raw, then drop
         // it before any Scanner call — the Scanner takes its own list locks and
         // must never be called while the record lock set is held.
@@ -456,7 +464,11 @@ impl IocSource {
         self.scanner.remove_event(id);
         self.scanner.unregister_io_intr(id);
         match spec {
-            ScanSpec::Periodic(period) => self.scanner.add_periodic(id, phas, period),
+            // Pre-validated above, so this cannot fail; propagate rather than
+            // ignore so a future edit that drops the pre-check is loud.
+            ScanSpec::Periodic(period) => {
+                self.scanner.add_periodic(id, phas, period).map_err(|e| e.to_string())?
+            }
             ScanSpec::Event => self.scanner.add_event(id, phas, evnt),
             // Explicit registration only (Task 11): a SCAN write never binds an
             // I/O-Intr record to a source.
@@ -489,7 +501,15 @@ impl IocSource {
         // re-order.
         if let Ok(spec) = spec {
             match spec {
-                ScanSpec::Periodic(period) => self.scanner.add_periodic(id, phas, period),
+                ScanSpec::Periodic(period) => {
+                    if let Err(e) = self.scanner.add_periodic(id, phas, period) {
+                        tracing::warn!(
+                            "put_phas: {:?} has an unschedulable stored SCAN period ({e}); \
+                             not re-ordering it",
+                            id
+                        );
+                    }
+                }
                 ScanSpec::Event => self.scanner.add_event(id, phas, evnt),
                 ScanSpec::IoIntr | ScanSpec::Passive => {}
             }
@@ -1027,6 +1047,45 @@ mod tests {
             .await
             .expect_err("an unparseable SCAN must be rejected");
         assert!(err.contains("banana"), "error must name the bad value, got: {err}");
+        // Membership is untouched: still on the 1 Hz list.
+        assert_eq!(
+            source.scanner_for_test().periodic_members(Duration::from_secs(1)),
+            vec![id]
+        );
+        // And scan_raw is untouched too.
+        assert_eq!(
+            source.field_value("PV:A", "SCAN").await,
+            Some(ScalarValue::Str("1 second".into())),
+            "a rejected SCAN put must not have altered scan_raw"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scan_period_too_small_to_schedule_is_rejected_and_changes_nothing() {
+        // "1e-12 seconds" parses fine today but rounds to zero whole
+        // nanoseconds, so the scanner cannot schedule it. Accepting it would
+        // put the record on no list while telling the client the write
+        // succeeded. Deliberately a *small* period: the large-period case is
+        // owned by the parse_scan clamp in a separate plan and is tested at
+        // the Scanner level instead.
+        //
+        // The message assertion is deliberately loose. Once that other plan's
+        // MIN_SCAN_PERIOD_SECS lands, `parse_scan` refuses this same string
+        // first, with ScanParseError's text instead of ScanRegisterError's.
+        // What this test pins either way is the property that matters: an
+        // unschedulable SCAN put is REJECTED and changes nothing.
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        let id = source.db.lookup("PV:A").expect("record exists");
+        Source::put(&source, "PV:A.SCAN", &s("1 second")).await.expect("put");
+
+        let err = Source::put(&source, "PV:A.SCAN", &s("1e-12 seconds"))
+            .await
+            .expect_err("an unschedulable SCAN period must be rejected");
+        assert!(
+            err.contains("greater than zero") || err.contains("not a valid SCAN value"),
+            "error must explain the refusal, got: {err}"
+        );
         // Membership is untouched: still on the 1 Hz list.
         assert_eq!(
             source.scanner_for_test().periodic_members(Duration::from_secs(1)),

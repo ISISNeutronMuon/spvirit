@@ -11,4 +11,4 @@ pub mod scanner;
 pub use async_reg::AsyncRegistry;
 pub use list::ScanList;
 pub use menu::{parse_scan, MAX_SCAN_PERIOD_SECS, MIN_SCAN_PERIOD_SECS, ScanParseError, ScanSpec};
-pub use scanner::{ProcSink, Scanner};
+pub use scanner::{ProcSink, ScanRegisterError, Scanner};

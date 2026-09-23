@@ -15,6 +15,37 @@ use std::time::Duration;
 /// reference it as `super::SCAN_ONCE_CAPACITY`.
 pub(crate) const SCAN_ONCE_CAPACITY: usize = 1024;
 
+/// Why a periodic scan registration was refused.
+///
+/// The scan grid is whole nanoseconds in a `u64` (`PeriodKey`), so a period
+/// outside that range cannot be scheduled at all. Refusing is deliberate: a
+/// SCAN value this engine accepts must actually scan (real EPICS only accepts
+/// menu periods, every one of which has a thread), so anything it cannot
+/// schedule is an error the client sees, not a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanRegisterError {
+    /// The period is zero, or rounds to zero whole nanoseconds. A zero grid
+    /// step makes every deadline equal to the anchor, and `periodic_loop`'s
+    /// overrun catch-up (`while deadline_for(n) <= now`) would then walk `n`
+    /// to `u64::MAX` on the first tick -- a livelock pegging a core forever.
+    ZeroPeriod,
+    /// The period does not fit `u64` nanoseconds (about 584 years).
+    PeriodTooLong,
+}
+
+impl std::fmt::Display for ScanRegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroPeriod => write!(f, "scan period must be greater than zero"),
+            Self::PeriodTooLong => {
+                write!(f, "scan period is too long to schedule (limit is about 584 years)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScanRegisterError {}
+
 use crate::clock::Clock;
 use crate::ctx::ProcCtx;
 use crate::lockset::{RecordDb, RecordId};
@@ -208,32 +239,59 @@ impl Scanner {
                 }
             };
             match spec {
-                ScanSpec::Periodic(period) => self.add_periodic(id, phas, period),
+                ScanSpec::Periodic(period) => {
+                    if let Err(e) = self.add_periodic(id, phas, period) {
+                        tracing::warn!(
+                            "load_from_db: {:?} has an unschedulable SCAN period ({e}); \
+                             leaving it off every scan list",
+                            id
+                        );
+                    }
+                }
                 ScanSpec::Event => self.add_event(id, phas, evnt),
                 ScanSpec::IoIntr | ScanSpec::Passive => {}
             }
         }
     }
 
+    /// The scan-grid key for `period`, or why it cannot be scheduled.
+    fn period_key(period: Duration) -> Result<PeriodKey, ScanRegisterError> {
+        let key =
+            PeriodKey::try_from(period.as_nanos()).map_err(|_| ScanRegisterError::PeriodTooLong)?;
+        if key == 0 {
+            return Err(ScanRegisterError::ZeroPeriod);
+        }
+        Ok(key)
+    }
+
+    /// Can this period be scheduled? Callers that must validate *before*
+    /// mutating anything (the SCAN put path, whose contract is that a
+    /// rejected put leaves membership and `scan_raw` untouched) call this
+    /// first; `add_periodic` re-checks, so this is an early-out, not a
+    /// precondition anyone can skip.
+    pub fn check_period(period: Duration) -> Result<(), ScanRegisterError> {
+        Self::period_key(period).map(|_| ())
+    }
+
     /// Add `id` (with scan priority `phas`) to the periodic scan list for
     /// `period`. Lists are created lazily; `start()` spawns one thread per
     /// non-empty list.
     ///
-    /// A zero period is refused (warned once, not registered): `periodic_loop`
-    /// computes deadlines as `start + n*period`, so a zero period makes every
-    /// deadline equal to `start`, and the overrun catch-up loop
+    /// A period that cannot be scheduled -- zero, or rounding to zero whole
+    /// nanoseconds, or too long to fit `u64` nanoseconds -- is refused with
+    /// `ScanRegisterError` rather than registered: `periodic_loop` computes
+    /// deadlines as `start + n*period`, so a zero period makes every deadline
+    /// equal to `start`, and the overrun catch-up loop
     /// (`while deadline_for(n) <= now`) would then spin `n` all the way to
     /// `u64::MAX` on the very first tick instead of ever sleeping again --
     /// a livelock that pegs a CPU core forever.
-    pub fn add_periodic(&self, id: RecordId, phas: i32, period: Duration) {
-        if period.is_zero() {
-            tracing::warn!(
-                "add_periodic: ignoring zero-period scan request for {:?} (would livelock)",
-                id
-            );
-            return;
-        }
-        let key = period.as_nanos() as u64;
+    pub fn add_periodic(
+        &self,
+        id: RecordId,
+        phas: i32,
+        period: Duration,
+    ) -> Result<(), ScanRegisterError> {
+        let key = Self::period_key(period)?;
         {
             self.periodic
                 .lock()
@@ -245,6 +303,7 @@ impl Scanner {
         // A period first seen after `start()` has no thread yet: give it one.
         // Before `start()` this is a no-op and `start()` does the spawning.
         self.ensure_periodic_thread(key);
+        Ok(())
     }
 
     /// Remove `id` from every periodic scan list it belongs to.
@@ -773,11 +832,11 @@ mod tests {
         let new = db.lookup("PV:NEW").unwrap();
 
         // Only the 100ms period exists when start() runs.
-        scanner.add_periodic(old, 0, Duration::from_millis(100));
+        scanner.add_periodic(old, 0, Duration::from_millis(100)).expect("period is schedulable");
         scanner.start();
 
         // ...and now a period start() never saw, exactly as a SCAN put does.
-        scanner.add_periodic(new, 0, Duration::from_millis(250));
+        scanner.add_periodic(new, 0, Duration::from_millis(250)).expect("period is schedulable");
 
         manual.advance(Duration::from_millis(250));
         wait_until(|| sink.passes("PV:NEW") >= 1);
@@ -805,10 +864,10 @@ mod tests {
         let a = db.lookup("PV:A").unwrap();
         let b = db.lookup("PV:B").unwrap();
 
-        scanner.add_periodic(a, 0, Duration::from_millis(100));
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
         scanner.start();
         // Same period, registered after start(): joins the existing thread.
-        scanner.add_periodic(b, 1, Duration::from_millis(100));
+        scanner.add_periodic(b, 1, Duration::from_millis(100)).expect("period is schedulable");
 
         // Structural guard, not just behavioural: a double-spawn bug could
         // still pass the pass-count assertions below if both threads happened
@@ -915,8 +974,8 @@ mod tests {
         let b = db.lookup("PV:B").unwrap();
         // PHAS order puts A first, so A's process() (and the injected panic)
         // runs before B's on pass 1.
-        scanner.add_periodic(a, 0, Duration::from_millis(100));
-        scanner.add_periodic(b, 1, Duration::from_millis(100));
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
+        scanner.add_periodic(b, 1, Duration::from_millis(100)).expect("period is schedulable");
         scanner.start();
 
         manual.advance(Duration::from_millis(100));
@@ -944,7 +1003,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(100)); // 10 Hz
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable"); // 10 Hz
         scanner.start();
 
         // Advance one simulated second in 100ms steps; yield so the thread runs.
@@ -970,8 +1029,8 @@ mod tests {
         let a = db.lookup("PV:A").unwrap();
         let b = db.lookup("PV:B").unwrap();
         // Both at 1 Hz; PV:B (PHAS 0) must be posted before PV:A (PHAS 1).
-        scanner.add_periodic(a, 1, Duration::from_secs(1));
-        scanner.add_periodic(b, 0, Duration::from_secs(1));
+        scanner.add_periodic(a, 1, Duration::from_secs(1)).expect("period is schedulable");
+        scanner.add_periodic(b, 0, Duration::from_secs(1)).expect("period is schedulable");
         scanner.start();
 
         clock.advance(Duration::from_secs(1));
@@ -1025,7 +1084,7 @@ mod tests {
         });
         let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(100));
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
         scanner.start();
 
         // Cross the first deadline (t=100ms); the pass itself then advances
@@ -1078,7 +1137,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(50));
+        scanner.add_periodic(a, 0, Duration::from_millis(50)).expect("period is schedulable");
         scanner.start();
         assert_eq!(scanner.threads.lock().unwrap().len(), 1);
         // shutdown() must return (i.e. actually join) even though the thread
@@ -1099,7 +1158,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(100));
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
         scanner.start();
 
         clock.advance(Duration::from_millis(100));
@@ -1146,7 +1205,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(50));
+        scanner.add_periodic(a, 0, Duration::from_millis(50)).expect("period is schedulable");
         scanner.start();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1171,7 +1230,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::ZERO);
+        assert_eq!(scanner.add_periodic(a, 0, Duration::ZERO), Err(ScanRegisterError::ZeroPeriod));
         assert!(
             scanner.periodic.lock().unwrap().is_empty(),
             "a zero-period request must not be registered"
@@ -1183,6 +1242,33 @@ mod tests {
             "no thread should be spawned for a period with nothing registered"
         );
         scanner.shutdown();
+    }
+
+    #[test]
+    fn an_unschedulable_period_is_refused_rather_than_truncated() {
+        let (scanner, _sink, db) = scanner_over("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n");
+        let a = db.lookup("PV:A").unwrap();
+
+        // Sub-nanosecond: rounds to a zero-nanosecond grid step, which would
+        // livelock `periodic_loop`'s catch-up.
+        assert_eq!(
+            scanner.add_periodic(a, 0, Duration::from_nanos(0)),
+            Err(ScanRegisterError::ZeroPeriod)
+        );
+        // Past the u64-nanosecond grid: `as u64` used to wrap this into some
+        // unrelated short period and scan the record at the wrong rate.
+        let too_long = Duration::new(u64::MAX, 0);
+        assert_eq!(
+            scanner.add_periodic(a, 0, too_long),
+            Err(ScanRegisterError::PeriodTooLong)
+        );
+        assert!(
+            scanner.periodic_members(too_long).is_empty(),
+            "a refused period must leave the record off every list"
+        );
+        // The good case still registers.
+        assert_eq!(scanner.add_periodic(a, 0, Duration::from_secs(1)), Ok(()));
+        assert_eq!(scanner.periodic_members(Duration::from_secs(1)), vec![a]);
     }
 
     #[test]
