@@ -538,12 +538,18 @@ impl PvaConnectionValidationPayload {
                     offset += consumed;
                     let mut first_method = None;
                     for _ in 0..count {
-                        if let Some((s, c)) = decode_string(&raw[offset..], is_be) {
-                            if first_method.is_none() && !s.is_empty() {
-                                first_method = Some(s);
-                            }
-                            offset += c;
+                        // `count` is wire-supplied and unbounded. Without this
+                        // `else` the loop keeps going with `offset` frozen
+                        // once the strings run out, so a declared u32::MAX
+                        // spins ~4.3e9 times on an 11-byte frame. Same shape
+                        // as `PvaAuthNzPayload::new` below.
+                        let Some((s, c)) = decode_string(&raw[offset..], is_be) else {
+                            break;
+                        };
+                        if first_method.is_none() && !s.is_empty() {
+                            first_method = Some(s);
                         }
+                        offset += c;
                     }
                     first_method
                 } else {
@@ -1924,6 +1930,61 @@ mod tests {
 
         // Empty is the degenerate case of the same thing.
         assert!(decode_op_response_status(&[], false).is_err());
+    }
+
+    /// Site 7. The server-direction authz loop has no `else { break }`, so a
+    /// declared count of `u32::MAX` with no strings behind it iterates ~4.3e9
+    /// times on an 11-byte frame. Run it on a worker thread and harvest with
+    /// a timeout, so the pre-fix failure is a fast deterministic timeout
+    /// rather than an eight-second hang inside the test process.
+    #[test]
+    fn a_bogus_authz_count_does_not_spin_the_validation_decoder() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Server -> client body: buffer_size(u32) +
+        // introspection_registry_size(u16) + Size(count) + count x string.
+        // 254 introduces a 4-byte size, so the count is u32::MAX. Nothing
+        // follows it.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&4096u32.to_le_bytes());
+        raw.extend_from_slice(&16u16.to_le_bytes());
+        raw.push(254);
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(raw.len(), 11);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let out = PvaConnectionValidationPayload::new(&raw, false, true);
+            let _ = tx.send(out.map(|p| p.authz));
+        });
+
+        let authz = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("decoding a bogus authz count did not terminate promptly");
+        assert_eq!(
+            authz,
+            Some(None),
+            "no strings followed the count, so no method can be found"
+        );
+    }
+
+    /// The fix must not change the ordinary case: a real server sends one or
+    /// more authz method names and the first non-empty one is picked.
+    #[test]
+    fn a_well_formed_authz_list_still_yields_the_first_method() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&4096u32.to_le_bytes());
+        raw.extend_from_slice(&16u16.to_le_bytes());
+        raw.push(2); // two methods
+        raw.push(2);
+        raw.extend_from_slice(b"ca");
+        raw.push(9);
+        raw.extend_from_slice(b"anonymous");
+
+        let p = PvaConnectionValidationPayload::new(&raw, false, true)
+            .expect("well-formed validation decodes");
+        assert_eq!(p.authz.as_deref(), Some("ca"));
     }
 
     /// The fix must not change the happy path: a well-formed op response
