@@ -28,6 +28,23 @@ impl std::fmt::Display for ScanParseError {
 }
 impl std::error::Error for ScanParseError {}
 
+/// The shortest periodic scan period accepted from a `SCAN` field.
+///
+/// `Duration::from_secs_f64(1e-300)` is exactly zero, and a record on the
+/// periodic list with a zero period is a hot spin. 1 us is four orders of
+/// magnitude below the fastest real EPICS scan rate, so nothing legitimate is
+/// excluded.
+pub const MIN_SCAN_PERIOD_SECS: f64 = 1.0e-6;
+
+/// The longest periodic scan period accepted from a `SCAN` field.
+///
+/// `Duration::from_secs_f64` *panics* for finite values that do not fit a
+/// `Duration` — above roughly 1.8e19 seconds (`2^64`) — and a `SCAN` field is
+/// client-writable, so the bound must sit below that. 1e9 s is ~31.7 years.
+/// It also keeps the period under 1e18 ns, which is where `scanner`'s
+/// `period.as_nanos() as u64` list key would start to truncate.
+pub const MAX_SCAN_PERIOD_SECS: f64 = 1.0e9;
+
 /// Parse a `SCAN` field value. Case-insensitive; surrounding whitespace ignored.
 pub fn parse_scan(raw: &str) -> Result<ScanSpec, ScanParseError> {
     let err = || ScanParseError { raw: raw.to_string() };
@@ -45,7 +62,11 @@ pub fn parse_scan(raw: &str) -> Result<ScanSpec, ScanParseError> {
         .or_else(|| lower.strip_suffix("second"))
         .ok_or_else(err)?;
     let n: f64 = secs_word.trim().parse().map_err(|_| err())?;
-    if !(n.is_finite() && n > 0.0) {
+    // `is_finite() && n > 0.0` is not enough: `from_secs_f64` panics above
+    // ~1.8e19 (a Duration cannot hold it) and rounds anything below half a
+    // nanosecond to a zero Duration. A `SCAN` field is client-writable, so
+    // both are remote.
+    if !(n.is_finite() && (MIN_SCAN_PERIOD_SECS..=MAX_SCAN_PERIOD_SECS).contains(&n)) {
         return Err(err());
     }
     Ok(ScanSpec::Periodic(Duration::from_secs_f64(n)))
@@ -89,5 +110,56 @@ mod tests {
         assert!(parse_scan("-1 second").is_err());
         assert!(parse_scan("banana").is_err());
         assert!(parse_scan("").is_err());
+    }
+
+    /// Site 8. `Duration::from_secs_f64` panics for finite inputs that do not
+    /// fit a `Duration` (above ~1.8e19 seconds), and the old guard
+    /// (`is_finite() && n > 0.0`) let every one of them through. A client PUT
+    /// of `SCAN = "1e30 seconds"` reaches this function via
+    /// `source::put_scan`, so the panic is remote.
+    ///
+    /// The `1e30` assertion is deliberately FIRST: it is the one that panics
+    /// pre-fix. `1e12` does *not* panic (it fits a `Duration`) — it is here
+    /// because a 31 700-year period is still nonsense on a scan list, and it
+    /// is the assertion that proves the new bound is `1e9`, not just "whatever
+    /// `Duration` accepts".
+    #[test]
+    fn an_absurdly_large_period_is_rejected_not_a_panic() {
+        assert!(parse_scan("1e30 seconds").is_err());
+        assert!(parse_scan("1e12 seconds").is_err());
+        // A huge finite literal (~1.8e38), spelled out rather than in
+        // exponent form, to prove the guard is on the value and not on the
+        // spelling.
+        assert!(parse_scan("179769313486231570000000000000000000000 seconds").is_err());
+    }
+
+    /// The other end of the same hole: `Duration::from_secs_f64(1e-300)` is
+    /// exactly zero, and a zero-period entry on the periodic list is a hot
+    /// spin -- a second denial of service through the same PUT.
+    #[test]
+    fn an_absurdly_small_period_is_rejected_not_a_zero_duration() {
+        assert!(parse_scan("1e-300 seconds").is_err());
+        assert!(parse_scan("0.0000000001 seconds").is_err());
+    }
+
+    /// The bounds must not have eaten any realistic scan rate. 10 kHz is
+    /// already faster than any EPICS periodic scan, and a one-hour period is
+    /// a perfectly ordinary slow record.
+    #[test]
+    fn realistic_periods_survive_the_new_bounds() {
+        assert_eq!(
+            parse_scan("0.0001 seconds").unwrap(),
+            ScanSpec::Periodic(Duration::from_micros(100))
+        );
+        assert_eq!(
+            parse_scan("3600 seconds").unwrap(),
+            ScanSpec::Periodic(Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
+    fn the_scan_period_bounds_match_the_documented_values() {
+        assert_eq!(MIN_SCAN_PERIOD_SECS, 1.0e-6);
+        assert_eq!(MAX_SCAN_PERIOD_SECS, 1.0e9);
     }
 }

@@ -4,7 +4,7 @@ use tokio::time::timeout;
 
 use crate::auth::{resolved_authnz_host, resolved_authnz_user};
 use crate::search::resolve_pv_server;
-use crate::transport::{read_packet, read_until};
+use crate::transport::{FrameBuf, read_frame_resumable, read_until};
 use crate::types::{PvGetError, PvGetOptions, PvGetResult};
 use spvirit_codec::SegmentReassembler;
 use spvirit_codec::epics_decode::{
@@ -87,8 +87,16 @@ pub async fn pva_handshake(
     let mut version = 2u8;
     let mut is_be = false;
 
+    // A persistent buffer, so committed reads can be deadline-bounded
+    // (`read_frame_resumable` sets `bound_committed`) without ever losing a
+    // partially-read frame. `read_packet` deliberately does NOT bound
+    // committed reads -- the tools' fresh-buffer `Err(Timeout) => continue`
+    // loops depend on that -- so the handshake needs its own buffer rather
+    // than a change to the shared helper.
+    let mut fb = FrameBuf::new();
+
     for _ in 0..2 {
-        if let Ok(bytes) = read_packet(stream, opts.timeout, reassembler).await {
+        if let Ok(bytes) = read_frame_resumable(stream, opts.timeout, reassembler, &mut fb).await {
             let mut pkt = PvaPacket::new(&bytes);
             if let Some(cmd) = pkt.decode_payload() {
                 match cmd {

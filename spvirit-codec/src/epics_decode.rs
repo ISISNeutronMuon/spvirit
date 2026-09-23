@@ -135,6 +135,15 @@ pub struct PvaHeader {
 }
 
 impl PvaHeader {
+    /// Parse an 8-byte PVA header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is shorter than 8 bytes. Only call this where the
+    /// length is already guaranteed -- typically bytes that came out of a
+    /// frame reader, or bytes this crate encoded itself. **On any path that
+    /// touches the network directly (a UDP datagram, a public function taking
+    /// a caller-supplied slice) use [`PvaHeader::try_new`] instead.**
     pub fn new(raw: &[u8]) -> Self {
         Self::try_new(raw).expect("PVA header requires at least 8 bytes")
     }
@@ -198,6 +207,14 @@ pub struct PvaPacket {
 }
 
 impl PvaPacket {
+    /// Parse a `PvaPacket` (header plus payload copy).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is shorter than the 8-byte PVA header. Only call this
+    /// where the length is already guaranteed. **On any path that touches
+    /// the network directly (a UDP datagram, a public function taking a
+    /// caller-supplied slice) use [`PvaPacket::try_new`] instead.**
     pub fn new(raw: &[u8]) -> Self {
         let header = PvaHeader::new(raw);
         let payload = raw.to_vec();
@@ -371,8 +388,12 @@ pub fn decode_status(raw: &[u8], is_be: bool) -> (Option<PvaStatus>, usize) {
 }
 
 pub fn decode_op_response_status(raw: &[u8], is_be: bool) -> Result<Option<PvaStatus>, String> {
-    let pkt = PvaPacket::new(raw);
-    let payload_len = pkt.header.payload_length as usize;
+    // Parse the header in place. `PvaPacket::new` both panics on a short
+    // slice and copies the whole frame into a fresh `Vec`; this function
+    // needs neither.
+    let header = PvaHeader::try_new(raw)
+        .ok_or_else(|| format!("op response header truncated: {} bytes", raw.len()))?;
+    let payload_len = header.payload_length as usize;
     if raw.len() < 8 + payload_len {
         return Err("op response truncated".to_string());
     }
@@ -517,12 +538,18 @@ impl PvaConnectionValidationPayload {
                     offset += consumed;
                     let mut first_method = None;
                     for _ in 0..count {
-                        if let Some((s, c)) = decode_string(&raw[offset..], is_be) {
-                            if first_method.is_none() && !s.is_empty() {
-                                first_method = Some(s);
-                            }
-                            offset += c;
+                        // `count` is wire-supplied and unbounded. Without this
+                        // `else` the loop keeps going with `offset` frozen
+                        // once the strings run out, so a declared u32::MAX
+                        // spins ~4.3e9 times on an 11-byte frame. Same shape
+                        // as `PvaAuthNzPayload::new` below.
+                        let Some((s, c)) = decode_string(&raw[offset..], is_be) else {
+                            break;
+                        };
+                        if first_method.is_none() && !s.is_empty() {
+                            first_method = Some(s);
                         }
+                        offset += c;
                     }
                     first_method
                 } else {
@@ -1888,6 +1915,92 @@ mod tests {
         // Exactly 8 bytes is the minimum valid header and must succeed.
         let ok = vec![0u8; 8];
         assert!(PvaPacket::try_new(&ok).is_some());
+    }
+
+    /// Site 9. `decode_op_response_status` is public and takes an arbitrary
+    /// slice, but built a `PvaPacket` from it unconditionally --
+    /// `PvaPacket::new` -> `PvaHeader::new` -> `expect`. A caller that hands
+    /// it a truncated frame gets a panic instead of the `Result` its
+    /// signature promises.
+    #[test]
+    fn decode_op_response_status_rejects_a_short_frame_without_panicking() {
+        let err = decode_op_response_status(&[0xCA, 0x02, 0x00, 0x0B], false)
+            .expect_err("a sub-header frame must be a typed error, not a panic");
+        assert!(err.contains("truncated"), "unexpected error text: {err}");
+
+        // Empty is the degenerate case of the same thing.
+        assert!(decode_op_response_status(&[], false).is_err());
+    }
+
+    /// Site 7. The server-direction authz loop has no `else { break }`, so a
+    /// declared count of `u32::MAX` with no strings behind it iterates ~4.3e9
+    /// times on an 11-byte frame. Run it on a worker thread and harvest with
+    /// a timeout, so the pre-fix failure is a fast deterministic timeout
+    /// rather than an eight-second hang inside the test process.
+    #[test]
+    fn a_bogus_authz_count_does_not_spin_the_validation_decoder() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Server -> client body: buffer_size(u32) +
+        // introspection_registry_size(u16) + Size(count) + count x string.
+        // 254 introduces a 4-byte size, so the count is u32::MAX. Nothing
+        // follows it.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&4096u32.to_le_bytes());
+        raw.extend_from_slice(&16u16.to_le_bytes());
+        raw.push(254);
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(raw.len(), 11);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let out = PvaConnectionValidationPayload::new(&raw, false, true);
+            let _ = tx.send(out.map(|p| p.authz));
+        });
+
+        let authz = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("decoding a bogus authz count did not terminate promptly");
+        assert_eq!(
+            authz,
+            Some(None),
+            "no strings followed the count, so no method can be found"
+        );
+    }
+
+    /// The fix must not change the ordinary case: a real server sends one or
+    /// more authz method names and the first non-empty one is picked.
+    #[test]
+    fn a_well_formed_authz_list_still_yields_the_first_method() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&4096u32.to_le_bytes());
+        raw.extend_from_slice(&16u16.to_le_bytes());
+        raw.push(2); // two methods
+        raw.push(2);
+        raw.extend_from_slice(b"ca");
+        raw.push(9);
+        raw.extend_from_slice(b"anonymous");
+
+        let p = PvaConnectionValidationPayload::new(&raw, false, true)
+            .expect("well-formed validation decodes");
+        assert_eq!(p.authz.as_deref(), Some("ca"));
+    }
+
+    /// The fix must not change the happy path: a well-formed op response
+    /// still yields its status.
+    #[test]
+    fn decode_op_response_status_still_reads_a_well_formed_frame() {
+        // header: magic, version 2, flags 0 (LE, app), command 11 (PUT),
+        // payload_length 6. Payload: ioid(4) + subcmd(1) + status code 0xFF
+        // ("no status"), which decodes to None.
+        let mut raw = vec![0xCA, 0x02, 0x00, 0x0B];
+        raw.extend_from_slice(&6u32.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.push(0x00);
+        raw.push(0xFF);
+        let status = decode_op_response_status(&raw, false).expect("well-formed frame decodes");
+        assert!(status.is_none(), "0xFF is the no-status marker");
     }
 
     #[test]

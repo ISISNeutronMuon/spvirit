@@ -9,6 +9,14 @@ use crate::types::PvGetError;
 use spvirit_codec::epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand};
 use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
+/// The largest payload this reader will allocate for one inbound frame.
+///
+/// The PVA protocol puts no ceiling on `payload_length` beyond the u32 field
+/// itself, so there is no protocol number to adopt. Reuse the workspace
+/// constant that already bounds *reassembled* messages, so one number governs
+/// the whole inbound byte budget instead of two that can drift apart.
+pub const MAX_INBOUND_PAYLOAD_BYTES: usize = spvirit_codec::DEFAULT_MAX_MESSAGE_BYTES;
+
 /// Persistent partial-read state for one connection, used by
 /// [`read_frame_resumable`].
 ///
@@ -24,7 +32,6 @@ use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 ///
 /// The `payload` allocation is also reused as the fill buffer across resumed
 /// reads of a single frame.
-#[derive(Default)]
 pub struct FrameBuf {
     /// The 8-byte header being filled.
     header: [u8; 8],
@@ -38,12 +45,39 @@ pub struct FrameBuf {
     payload_filled: usize,
     /// Expected payload length for the current frame (0 for control frames).
     payload_need: usize,
+    /// Largest `payload_length` this buffer will honour.
+    max_payload: usize,
+}
+
+impl Default for FrameBuf {
+    fn default() -> Self {
+        Self {
+            header: [0u8; 8],
+            header_filled: 0,
+            header_done: false,
+            payload: Vec::new(),
+            payload_filled: 0,
+            payload_need: 0,
+            max_payload: MAX_INBOUND_PAYLOAD_BYTES,
+        }
+    }
 }
 
 impl FrameBuf {
     /// A fresh buffer with no partial read in progress.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A buffer with a non-default payload ceiling.
+    ///
+    /// Exists so the cap can be exercised without a large allocation, and so
+    /// an embedder with a tighter byte budget can impose one.
+    pub fn with_max_payload_bytes(max: usize) -> Self {
+        Self {
+            max_payload: max,
+            ..Self::default()
+        }
     }
 
     /// Reset to await a new frame (keeps the `payload` allocation for reuse).
@@ -190,11 +224,22 @@ where
                 Fill::Done => {}
             }
             let parsed = PvaHeader::new(&fb.header);
-            fb.payload_need = if parsed.flags.is_control {
+            let declared = if parsed.flags.is_control {
                 0
             } else {
                 parsed.payload_length as usize
             };
+            // `declared` is a raw u32 off the wire. Refuse before the resize:
+            // eight bytes of header must not be able to make this process ask
+            // the allocator for gigabytes.
+            if declared > fb.max_payload {
+                return Err(PvGetError::Protocol(format!(
+                    "inbound frame declares {declared} payload bytes, over the \
+                     {} byte limit",
+                    fb.max_payload
+                )));
+            }
+            fb.payload_need = declared;
             fb.payload.clear();
             fb.payload.resize(fb.payload_need, 0);
             fb.payload_filled = 0;
@@ -335,6 +380,73 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::time::sleep;
+
+    /// Site 2. `read_frame_into` resized straight to the peer-declared u32.
+    /// Eight bytes of header from an upstream server made the gateway ask for
+    /// up to 4 GiB. The cap is checked against a *configured* small ceiling
+    /// here so the test itself never allocates anything large.
+    #[tokio::test]
+    async fn a_frame_declaring_more_than_the_cap_is_rejected() {
+        // magic, version 2, flags 0 (client, LE, application), command 0,
+        // payload_length = 1024. No payload bytes follow at all.
+        let mut frame = vec![0xCA, 0x02, 0x00, 0x00];
+        frame.extend_from_slice(&1024u32.to_le_bytes());
+
+        let mut reader = &frame[..];
+        let mut reassembler = SegmentReassembler::new();
+        let mut fb = FrameBuf::with_max_payload_bytes(16);
+
+        let err = read_frame_resumable(
+            &mut reader,
+            Duration::from_millis(200),
+            &mut reassembler,
+            &mut fb,
+        )
+        .await
+        .expect_err("a frame over the cap must be rejected");
+
+        match err {
+            PvGetError::Protocol(msg) => assert!(
+                msg.contains("1024") && msg.contains("16"),
+                "the error should name both the declared length and the cap: {msg}"
+            ),
+            other => panic!("expected Protocol, got {other:?}"),
+        }
+    }
+
+    /// The default ceiling is the workspace's single inbound byte budget, the
+    /// same constant that already bounds segmented reassembly. One number,
+    /// not two.
+    #[test]
+    fn the_default_payload_cap_is_the_workspace_message_limit() {
+        assert_eq!(
+            MAX_INBOUND_PAYLOAD_BYTES,
+            spvirit_codec::DEFAULT_MAX_MESSAGE_BYTES
+        );
+        assert_eq!(MAX_INBOUND_PAYLOAD_BYTES, 268_435_456);
+    }
+
+    /// An ordinary frame is unaffected.
+    #[tokio::test]
+    async fn a_frame_within_the_cap_still_reads() {
+        let mut frame = vec![0xCA, 0x02, 0x00, 0x00];
+        frame.extend_from_slice(&4u32.to_le_bytes());
+        frame.extend_from_slice(&[1, 2, 3, 4]);
+
+        let mut reader = &frame[..];
+        let mut reassembler = SegmentReassembler::new();
+        let mut fb = FrameBuf::new();
+
+        let msg = read_frame_resumable(
+            &mut reader,
+            Duration::from_millis(200),
+            &mut reassembler,
+            &mut fb,
+        )
+        .await
+        .expect("a 4-byte payload is well inside the cap");
+        assert_eq!(msg.len(), 12);
+    }
 
     /// A complete, unsegmented, little-endian PVA app frame: 8-byte header
     /// (magic, version, flags=0x40 server-dir, command=13) followed by a
