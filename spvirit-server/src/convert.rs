@@ -55,7 +55,9 @@ pub fn decoded_to_i32(val: &DecodedValue) -> Option<i32> {
         DecodedValue::UInt32(v) => i32::try_from(*v).ok(),
         DecodedValue::UInt64(v) => i32::try_from(*v).ok(),
         DecodedValue::Boolean(v) => Some(if *v { 1 } else { 0 }),
-        DecodedValue::Float32(v) => f64_to_i64_checked(*v as f64).and_then(|i| i32::try_from(i).ok()),
+        DecodedValue::Float32(v) => {
+            f64_to_i64_checked(*v as f64).and_then(|i| i32::try_from(i).ok())
+        }
         DecodedValue::Float64(v) => f64_to_i64_checked(*v).and_then(|i| i32::try_from(i).ok()),
         _ => None,
     }
@@ -165,40 +167,76 @@ pub fn decoded_to_scalar_array(
     };
     match template {
         ScalarArrayValue::Bool(_) => Some(ScalarArrayValue::Bool(
-            items.iter().map(decoded_to_bool).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_bool)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::I8(_) => Some(ScalarArrayValue::I8(
-            items.iter().map(decoded_to_i8).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_i8)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::I16(_) => Some(ScalarArrayValue::I16(
-            items.iter().map(decoded_to_i16).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_i16)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::I32(_) => Some(ScalarArrayValue::I32(
-            items.iter().map(decoded_to_i32).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_i32)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::I64(_) => Some(ScalarArrayValue::I64(
-            items.iter().map(decoded_to_i64).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_i64)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::U8(_) => Some(ScalarArrayValue::U8(
-            items.iter().map(decoded_to_u8).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_u8)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::U16(_) => Some(ScalarArrayValue::U16(
-            items.iter().map(decoded_to_u16).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_u16)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::U32(_) => Some(ScalarArrayValue::U32(
-            items.iter().map(decoded_to_u32).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_u32)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::U64(_) => Some(ScalarArrayValue::U64(
-            items.iter().map(decoded_to_u64).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_u64)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::F32(_) => Some(ScalarArrayValue::F32(
-            items.iter().map(decoded_to_f32).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_f32)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::F64(_) => Some(ScalarArrayValue::F64(
-            items.iter().map(decoded_to_f64).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_f64)
+                .collect::<Option<Vec<_>>>()?,
         )),
         ScalarArrayValue::Str(_) => Some(ScalarArrayValue::Str(
-            items.iter().map(decoded_to_string).collect::<Option<Vec<_>>>()?,
+            items
+                .iter()
+                .map(decoded_to_string)
+                .collect::<Option<Vec<_>>>()?,
         )),
     }
 }
@@ -257,15 +295,37 @@ mod tests {
 
     #[test]
     fn alarm_severity_out_of_range_yields_default_not_a_wrapped_value() {
-        // Int64(1 << 40) does not fit in i32. decode_nt_alarm's field lookup
-        // must fall back to the default (0), never a truncated/wrapped value.
+        // (1 << 40) + 3 does not fit in i32, but its low 32 bits are 3 (not
+        // 0), so an `as i32` wrap would produce Some(3) -- distinguishable
+        // from the default. decode_nt_alarm's field lookup must fall back to
+        // the default (0), never that wrapped value.
         let val = DecodedValue::Structure(vec![
-            ("severity".to_string(), DecodedValue::Int64(1i64 << 40)),
+            (
+                "severity".to_string(),
+                DecodedValue::Int64((1i64 << 40) + 3),
+            ),
             ("status".to_string(), DecodedValue::Int32(0)),
             ("message".to_string(), DecodedValue::String(String::new())),
         ]);
         let alarm = decode_nt_alarm(&val).expect("structure decodes");
-        assert_eq!(alarm.severity, 0, "out-of-range severity must default, not wrap");
+        assert_eq!(
+            alarm.severity, 0,
+            "out-of-range severity must default, not wrap"
+        );
+    }
+
+    #[test]
+    fn f64_to_i64_checked_boundaries() {
+        assert_eq!(f64_to_i64_checked(9_223_372_036_854_775_808.0), None); // 2^63
+        assert_eq!(
+            f64_to_i64_checked(-9_223_372_036_854_775_808.0),
+            Some(i64::MIN)
+        ); // -2^63
+    }
+
+    #[test]
+    fn f64_to_u64_checked_boundary() {
+        assert_eq!(f64_to_u64_checked(18_446_744_073_709_551_616.0), None); // 2^64
     }
 }
 
