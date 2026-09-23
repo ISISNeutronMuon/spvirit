@@ -419,6 +419,21 @@ pub struct StatusSource {
     generation: Arc<AtomicU64>,
 }
 
+/// Whether an access [`Decision`] permits a **gateway-local** operation.
+///
+/// `AllowAliased` carries a rewritten name for the proxy to forward under.
+/// Status PVs are served by this gateway; there is nothing to forward to and
+/// nothing to rewrite, so an alias is simply an allow and the PV keeps its
+/// real name. Written as an exhaustive `match` rather than `!matches!(d,
+/// Deny)` so that a future `Decision` variant is a compile error at every gate
+/// instead of being silently treated as permitted.
+fn allows_local(d: &Decision) -> bool {
+    match d {
+        Decision::Allow | Decision::AllowAliased(_) => true,
+        Decision::Deny => false,
+    }
+}
+
 impl StatusSource {
     pub fn new(prefix: String, access: Arc<AccessControl>, handles: StatusHandles) -> Self {
         Self {
@@ -453,10 +468,7 @@ impl StatusSource {
     /// then fails on.
     fn serves(&self, name: &str) -> bool {
         self.suffix(name).is_some_and(|s| served_suffixes().any(|x| x == s))
-            && !matches!(
-                self.access.decide_local(Op::Get, name, &current_identity()),
-                Decision::Deny
-            )
+            && allows_local(&self.access.decide_local(Op::Get, name, &current_identity()))
     }
 
     /// The synchronous core of [`Source::claim`]/[`Source::try_claim`]:
@@ -678,9 +690,11 @@ impl StatusSource {
     }
 
     /// Whether an access [`Decision`] grants the operation (an alias rewrite
-    /// still grants it).
+    /// still grants it). Thin wrapper over [`allows_local`] so `asTest`'s
+    /// reported verdicts and this source's own gates cannot disagree about
+    /// what a `Decision` variant means.
     fn allowed(d: &Decision) -> bool {
-        matches!(d, Decision::Allow | Decision::AllowAliased(_))
+        allows_local(d)
     }
 
     /// Reads a `DecodedValue::Structure` field by name as a string, per the
@@ -761,19 +775,17 @@ impl Source for StatusSource {
             if suffix == "asTest" {
                 return None;
             }
-            if let Decision::Deny = self.access.decide_local(Op::Get, &name, &current_identity()) {
+            if !allows_local(&self.access.decide_local(Op::Get, &name, &current_identity())) {
                 return None;
             }
             if !LIVE.contains(&suffix) && suffix != "threads" {
                 return None;
             }
             let mut payload = Self::value_payload(suffix, &self.handles, &self.generation)?;
-            // Stamp with the current time at read time — `clients`/`cache`/
-            // `refs`/`stats`/`poke`/`threads`. The 8 bandwidth suffixes are
-            // excluded here: `bandwidth_table` already stamped them with the
-            // sampler's true sample time (`RateSnapshot::ts`), which this
-            // wall-clock restamp would otherwise clobber.
-            if (LIVE.contains(&suffix) && !BANDWIDTH_SUFFIXES.contains(&suffix)) || suffix == "threads" {
+            // Guarded above: `suffix` is LIVE or "threads". The 8 bandwidth tables
+            // carry the sampler's own `RateSnapshot::ts` so a reader sees the true
+            // sample time; everything else is stamped at read time.
+            if !BANDWIDTH_SUFFIXES.contains(&suffix) {
                 stamp(&mut payload, now_ts());
             }
             Some(payload)
@@ -798,7 +810,7 @@ impl Source for StatusSource {
             // For a pure `readOnly` config, `decide` short-circuits at step 1
             // (before any host/pvlist match), so even a default `Identity`
             // — as seen when called outside a request scope — enforces it.
-            if let Decision::Deny = self.access.decide_local(Op::Put, &name, &current_identity()) {
+            if !allows_local(&self.access.decide_local(Op::Put, &name, &current_identity())) {
                 return Err("access denied".to_string());
             }
             self.generation.fetch_add(1, Ordering::Relaxed);
@@ -819,7 +831,7 @@ impl Source for StatusSource {
             if suffix == "asTest" {
                 return None;
             }
-            if let Decision::Deny = self.access.decide_local(Op::Get, &name, &current_identity()) {
+            if !allows_local(&self.access.decide_local(Op::Get, &name, &current_identity())) {
                 return None;
             }
             let (tx, rx) = mpsc::channel(4);
@@ -922,7 +934,7 @@ impl Source for StatusSource {
             // returns the richer best-effort description. Gate it through the
             // same AccessControl (an RPC op on its own name).
             if suffix == "threads" {
-                if let Decision::Deny = self.access.decide_local(Op::Rpc, &name, &current_identity()) {
+                if !allows_local(&self.access.decide_local(Op::Rpc, &name, &current_identity())) {
                     return Err("access denied".to_string());
                 }
                 return Ok(Self::threads_rpc_payload());
@@ -950,7 +962,7 @@ impl Source for StatusSource {
             let id = current_identity();
             served_suffixes()
                 .map(|s| format!("{prefix}{s}"))
-                .filter(|name| !matches!(self.access.decide_local(Op::Get, name, &id), Decision::Deny))
+                .filter(|name| allows_local(&self.access.decide_local(Op::Get, name, &id)))
                 .collect()
         })
     }
@@ -1512,6 +1524,49 @@ mod tests {
             src.names().await.is_empty(),
             "a hidden status PV must not be advertised in the channel listing"
         );
+    }
+
+    /// Status PVs are served by the gateway itself, so an `AllowAliased` — an
+    /// instruction to re-target the name upstream — has no upstream to be
+    /// re-targeted to and simply means "permitted". Stated once, exhaustively,
+    /// instead of implied six times by a negated `Deny` match: a new
+    /// `Decision` variant must be a compile error here, not silently
+    /// permitted at six gates.
+    #[test]
+    fn allows_local_treats_an_alias_as_permitted_and_only_deny_as_denied() {
+        assert!(allows_local(&Decision::Allow));
+        assert!(allows_local(&Decision::AllowAliased("OTHER:NAME".to_string())));
+        assert!(!allows_local(&Decision::Deny));
+    }
+
+    /// An ALIAS rule covering the status prefix must not make the status PVs
+    /// disappear: the gateway still serves them under their REAL names, and
+    /// simply ignores the rewrite (there is no upstream to re-target to).
+    ///
+    /// The template must expand to something DIFFERENT from the requested
+    /// name — an `ALIAS` back to the same name yields `Decision::Allow`, not
+    /// `AllowAliased`, and would leave this test exercising nothing.
+    #[tokio::test]
+    async fn status_pvs_are_still_served_when_a_pvlist_alias_matches_them() {
+        let pvlist =
+            crate::access::pvlist::parse_pvlist(r"GW:STATUS:(.*) ALIAS RENAMED:\1").unwrap();
+        let src = StatusSource::new(
+            PREFIX.to_string(),
+            Arc::new(AccessControl::new(false, Some(pvlist), None)),
+            StatusHandles::test(),
+        );
+        let name = format!("{PREFIX}clients");
+        // Control: the rule really does produce an AllowAliased here.
+        assert!(
+            matches!(
+                src.access.decide_local(Op::Get, &name, &Identity::default()),
+                Decision::AllowAliased(ref n) if n == "RENAMED:clients"
+            ),
+            "fixture regression: this pvlist must yield AllowAliased"
+        );
+        assert!(src.claim_sync(&name).is_some());
+        assert!(src.get(&name).await.is_some());
+        assert!(src.names().await.iter().any(|n| n == &name));
     }
 
     /// asTest returns p4p's `epics:p2p/Permission:1.0` with a nested
