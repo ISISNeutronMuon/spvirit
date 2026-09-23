@@ -351,6 +351,14 @@ impl Scanner {
     }
 
     fn ensure_periodic_thread_at(&self, key: PeriodKey, anchor: std::time::Instant) {
+        // `weak` (not a strong clone) so the thread never keeps `Scanner`
+        // alive: if it did, `Scanner::drop` could never run while any thread
+        // was alive (a strong-ref cycle), leaking the thread whenever a
+        // caller drops its handle without calling `shutdown()` explicitly.
+        // `clock` and `stop` are independent `Arc`s (not `Arc<Self>`), so
+        // cloning them does not re-create that cycle -- they let the thread
+        // sleep and observe shutdown without ever needing to upgrade `weak`
+        // for that.
         let Some(weak) = self.self_weak.lock().unwrap().clone() else {
             return;
         };
@@ -373,9 +381,28 @@ impl Scanner {
         if !self.thread_keys.lock().unwrap().insert(key) {
             return;
         }
-        threads.push(std::thread::spawn(move || {
-            Self::periodic_loop(weak, clock, stop, key, period, anchor)
-        }));
+        // `Builder::spawn` (not `thread::spawn`) so an OS failure to create
+        // the thread (e.g. resource exhaustion) returns `Err` instead of
+        // panicking here, under the `threads` lock -- a panic here would
+        // poison the mutex, and every later `lock().unwrap()` on it
+        // (including the one in `Drop::drop` -> `shutdown()`) would then
+        // itself panic, aborting the process instead of degrading. On `Err`
+        // the key is un-claimed so a later retry (another `add_periodic` on
+        // the same period, or a future `start()`) is not permanently blocked
+        // by a thread that never came into existence.
+        match std::thread::Builder::new()
+            .name(format!("spvirit-scan-{key}"))
+            .spawn(move || Self::periodic_loop(weak, clock, stop, key, period, anchor))
+        {
+            Ok(handle) => threads.push(handle),
+            Err(e) => {
+                self.thread_keys.lock().unwrap().remove(&key);
+                tracing::error!(
+                    "failed to spawn periodic scan thread for period {:?}: {e}",
+                    period
+                );
+            }
+        }
     }
 
     /// Spawn one thread per non-empty periodic scan list. Call once; `self`
@@ -385,6 +412,15 @@ impl Scanner {
         // (spec §PINI): startup-time initialization must finish first, not
         // race the first periodic pass.
         self.process_pini();
+        // Publish the weak handle BEFORE the key snapshot below (not just
+        // before spawning): an `add_periodic` that lands between the
+        // snapshot and the publish would otherwise see a `None` weak (its
+        // own `ensure_periodic_thread` would no-op) while also being missed
+        // by this loop's snapshot, since it started before the put arrived.
+        // Publishing first closes that window; `thread_keys` dedupes the
+        // remaining, harmless overlap where both this loop and a racing
+        // `add_periodic` observe the same key.
+        *self.self_weak.lock().unwrap() = Some(Arc::downgrade(self));
         let keys: Vec<PeriodKey> = {
             let periodic = self.periodic.lock().unwrap();
             periodic
@@ -400,10 +436,6 @@ impl Scanner {
         // `start()` returns (the thread could see an already-advanced clock
         // and silently compute deadlines from the wrong origin).
         let anchor = self.clock.now();
-        // Publish the weak handle BEFORE spawning: from here on, any
-        // `add_periodic` for a period we did not enumerate above spawns its
-        // own thread rather than landing on a list nobody drives.
-        *self.self_weak.lock().unwrap() = Some(Arc::downgrade(self));
         for key in keys {
             // Every thread in this batch shares one anchor, so a caller that
             // advances the clock right after `start()` returns sees one
@@ -777,6 +809,25 @@ mod tests {
         scanner.start();
         // Same period, registered after start(): joins the existing thread.
         scanner.add_periodic(b, 1, Duration::from_millis(100));
+
+        // Structural guard, not just behavioural: a double-spawn bug could
+        // still pass the pass-count assertions below if both threads happened
+        // to run in lockstep (each processing the list once per tick would
+        // look identical to a single thread doing so). Assert directly on
+        // `thread_keys` (exactly one key claimed) and `threads` (exactly one
+        // periodic thread -- the drain thread lives in the separate
+        // `drain_thread` field, not in `threads`) so a rival second thread on
+        // the same key is caught even if its timing happened to coincide.
+        assert_eq!(
+            scanner.thread_keys.lock().unwrap().len(),
+            1,
+            "exactly one period key must be claimed"
+        );
+        assert_eq!(
+            scanner.threads.lock().unwrap().len(),
+            1,
+            "exactly one periodic thread must exist for the shared period"
+        );
 
         manual.advance(Duration::from_millis(100));
         wait_until(|| sink.passes("PV:B") >= 1);
