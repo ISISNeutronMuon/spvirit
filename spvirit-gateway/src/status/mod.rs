@@ -108,24 +108,27 @@ fn stamp(payload: &mut NtPayload, ts: NtTimeStamp) {
     }
 }
 
-/// Strips a payload's timestamp, producing the change-detection key the
-/// `subscribe` LIVE ticker uses for its `last` dedup comparison (see
-/// [`stamp`]'s caller in `subscribe`). Every other LIVE builder already
-/// returns an untimestamped payload, so this is a no-op for them; the 8
-/// bandwidth tables are the one case where the raw [`value_payload`] output
-/// carries a real timestamp (`bandwidth_table` stamps it with the sampler's
+/// Strips a payload's timestamp **in place**, turning it into the
+/// change-detection key the `subscribe` LIVE ticker uses for its `last` dedup
+/// comparison. Every other LIVE builder already returns an untimestamped
+/// payload, so this is a no-op for them; the 8 bandwidth tables are the one
+/// case where the raw [`StatusSource::value_payload`] output carries a real
+/// timestamp (`bandwidth_table` stamps it with the sampler's
 /// `RateSnapshot::ts` so a direct `get` returns the true sample time) that
-/// would otherwise change every tick — even when the underlying rate rows
-/// do not — and falsely look like a data change.
-fn clear_stamp(payload: &NtPayload) -> NtPayload {
-    let mut p = payload.clone();
-    match &mut p {
+/// would otherwise change every tick — even when the underlying rate rows do
+/// not — and falsely look like a data change.
+///
+/// In place, not by clone: on an idle gateway the key matches `last` and the
+/// tick is discarded, so the copy the old by-value version made every second
+/// per subscription was pure waste. Only a genuine change pays for a clone
+/// now, and only because the send needs one.
+fn clear_stamp_in_place(payload: &mut NtPayload) {
+    match payload {
         NtPayload::Scalar(nt) => nt.time_stamp = None,
         NtPayload::ScalarArray(nt) => nt.time_stamp = NtTimeStamp::default(),
         NtPayload::Table(nt) => nt.time_stamp = None,
         NtPayload::Generic { .. } | NtPayload::NdArray(_) | NtPayload::Enum(_) => {}
     }
-    p
 }
 
 /// Snapshots the current downstream connection's identity (socket peer host,
@@ -220,12 +223,15 @@ type ListHandle = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 /// field(s) of the `stats` [`epics:p2p/Stats:1.0`] structure.
 type CountHandle = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-/// A cheap, cloneable "read the current bandwidth-rate snapshot" callback
-/// used by [`StatusHandles`]'s 8 live bandwidth-table PVs. Cloning the
-/// closure is cheap (it captures a clone of the shared
-/// `Arc<Mutex<RateSnapshot>>`); each call locks briefly and returns an owned
-/// clone of the snapshot.
-type BandwidthHandle = Arc<dyn Fn() -> RateSnapshot + Send + Sync>;
+/// A cheap, cloneable "build the current table for this bandwidth suffix"
+/// callback, used by [`StatusHandles`]'s 8 live bandwidth-table PVs.
+///
+/// Takes the suffix and returns the finished [`NtPayload`] rather than handing
+/// back a whole [`RateSnapshot`]: a snapshot holds all eight row vectors, so
+/// returning one cloned every `String` of every row of all eight tables in
+/// order to serve one of them. Cloning the closure itself stays cheap (it
+/// captures a clone of the shared `Arc<Mutex<RateSnapshot>>`).
+type BandwidthHandle = Arc<dyn Fn(&str) -> NtPayload + Send + Sync>;
 
 /// Live-value handles `StatusSource` reads for its `clients`/`cache`/`stats`/
 /// bandwidth PVs.
@@ -257,7 +263,7 @@ impl StatusHandles {
             clients: empty.clone(),
             cache: empty,
             mcache_size: Arc::new(|| 0),
-            bandwidth: Arc::new(RateSnapshot::default),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot::default()),
         }
     }
 
@@ -283,7 +289,7 @@ impl StatusHandles {
             clients: Arc::new(Vec::new),
             cache: Arc::new(move || src_cache.upstream_monitor_names()),
             mcache_size: Arc::new(move || src_stats.upstream_monitor_count() as u64),
-            bandwidth: Arc::new(RateSnapshot::default),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot::default()),
         }
     }
 
@@ -331,11 +337,20 @@ fn clients_list_handle(registry: Arc<ClientRegistry>) -> ListHandle {
 
 /// Builds the `bandwidth` [`BandwidthHandle`] over the shared
 /// `Arc<Mutex<RateSnapshot>>` the `BandwidthSampler` writes into: each call
-/// locks briefly and returns an owned clone of the latest snapshot. Factored
-/// out of [`StatusHandles::from_gateway_with`] to mirror
-/// [`clients_list_handle`].
+/// locks briefly, builds the one requested table, and releases. No `.await`
+/// inside the guard.
 fn bandwidth_snapshot_handle(snapshot: Arc<Mutex<RateSnapshot>>) -> BandwidthHandle {
-    Arc::new(move || snapshot.lock().unwrap().clone())
+    Arc::new(move |suffix: &str| {
+        let snap = snapshot.lock().unwrap();
+        StatusSource::bandwidth_table(suffix, &snap)
+    })
+}
+
+/// A [`BandwidthHandle`] over a fixed, never-changing [`RateSnapshot`] — used
+/// by [`StatusHandles::test`], by [`StatusHandles::from_gateway`] (which has
+/// no sampler to read) and by unit tests that need known rows.
+fn fixed_bandwidth_handle(snap: RateSnapshot) -> BandwidthHandle {
+    Arc::new(move |suffix: &str| StatusSource::bandwidth_table(suffix, &snap))
 }
 
 /// A [`Source`] serving the gateway's status/introspection PVs under a
@@ -608,7 +623,7 @@ impl StatusSource {
             "stats" => Self::stats_structure((handles.mcache_size)()),
             "poke" => Self::scalar_payload(generation.load(Ordering::Relaxed) as f64),
             "threads" => Self::threads_static_value(),
-            s if BANDWIDTH_SUFFIXES.contains(&s) => Self::bandwidth_table(s, &(handles.bandwidth)()),
+            s if BANDWIDTH_SUFFIXES.contains(&s) => (handles.bandwidth)(s),
             _ => return None,
         })
     }
@@ -765,13 +780,13 @@ impl Source for StatusSource {
                 tokio::spawn(async move {
                     let mut interval = tokio::time::interval(TICK_PERIOD);
                     // `last` holds the last dedup KEY — the change-detection
-                    // key — computed via `clear_stamp` so a stamp (which
-                    // always differs, since it carries "now") never itself
-                    // looks like a data change. This also covers the 8
+                    // key — computed via `clear_stamp_in_place` so a stamp
+                    // (which always differs, since it carries "now") never
+                    // itself looks like a data change. This also covers the 8
                     // bandwidth suffixes, whose raw payload already carries a
                     // real (sampler) timestamp that changes every tick even
-                    // when the underlying rate rows do not — `clear_stamp` is
-                    // a no-op for every other LIVE payload, which already
+                    // when the underlying rate rows do not — `clear_stamp_in_place`
+                    // is a no-op for every other LIVE payload, which already
                     // carries none. `last_ts` only advances when the data
                     // actually changes, so the timestamp reflects last-change
                     // time, not last-poll time.
@@ -786,12 +801,20 @@ impl Source for StatusSource {
                         else {
                             break;
                         };
-                        let key = clear_stamp(&data);
+                        // Turn the freshly built payload INTO the dedup key in
+                        // place. On an idle gateway — the overwhelmingly common
+                        // case — the key equals `last` and the tick costs no
+                        // copy at all; only a genuine change pays for the one
+                        // clone the send needs. `stamp` overwrites the
+                        // timestamp anyway, so sending the restamped key is
+                        // byte-for-byte what sending the restamped original was.
+                        let mut key = data;
+                        clear_stamp_in_place(&mut key);
                         if last.as_ref() != Some(&key) {
                             last_ts = now_ts();
-                            last = Some(key);
-                            let mut out = data;
+                            let mut out = key.clone();
                             stamp(&mut out, last_ts.clone());
+                            last = Some(key);
                             // The server's monitor pump suppresses
                             // byte-identical frames, but we already only
                             // send on a genuine data change — matching
@@ -1064,7 +1087,7 @@ mod tests {
             clients: Arc::new(Vec::new),
             cache: Arc::new(move || list.lock().unwrap().clone()),
             mcache_size: Arc::new(|| 0),
-            bandwidth: Arc::new(RateSnapshot::default),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot::default()),
         };
         let access = Arc::new(AccessControl::new(false, None, None));
         StatusSource::new(PREFIX.to_string(), access, handles)
@@ -1077,7 +1100,7 @@ mod tests {
             clients: Arc::new(Vec::new),
             cache: Arc::new(Vec::new),
             mcache_size: Arc::new(move || count.load(Ordering::Relaxed)),
-            bandwidth: Arc::new(RateSnapshot::default),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot::default()),
         };
         let access = Arc::new(AccessControl::new(false, None, None));
         StatusSource::new(PREFIX.to_string(), access, handles)
@@ -1221,13 +1244,10 @@ mod tests {
     async fn bandwidth_table_serves_live_rows_from_the_sampler() {
         let snap_ts = NtTimeStamp { seconds_past_epoch: 1_700_000_000, nanoseconds: 5, user_tag: 0 };
         let handles = StatusHandles {
-            bandwidth: Arc::new({
-                let snap_ts = snap_ts.clone();
-                move || RateSnapshot {
-                    ts: snap_ts.clone(),
-                    ds_bypv_tx: vec![("PV:X".to_string(), 1234.0)],
-                    ..Default::default()
-                }
+            bandwidth: fixed_bandwidth_handle(RateSnapshot {
+                ts: snap_ts.clone(),
+                ds_bypv_tx: vec![("PV:X".to_string(), 1234.0)],
+                ..Default::default()
             }),
             ..StatusHandles::test()
         };
@@ -1250,7 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn bandwidth_byhost_table_serves_live_account_client_rows() {
         let handles = StatusHandles {
-            bandwidth: Arc::new(|| RateSnapshot {
+            bandwidth: fixed_bandwidth_handle(RateSnapshot {
                 ds_byhost_tx: vec![("alice".to_string(), "10.0.0.1".to_string(), 42.0)],
                 ..Default::default()
             }),
@@ -1270,28 +1290,61 @@ mod tests {
         assert_eq!(rate_col.values, ScalarArrayValue::F64(vec![42.0]));
     }
 
-    /// The LIVE ticker must not re-post when the sampler produces identical
-    /// rows on consecutive ticks, even though `RateSnapshot::ts` itself
-    /// changes every tick — i.e. the dedup key must be timestamp-free
-    /// (`clear_stamp`), not the raw stamped table.
+    /// Serving one bandwidth PV must build only that PV's table. The handle is
+    /// asked for a suffix and returns the finished payload, so a `ds:bypv:tx`
+    /// read no longer materialises the other seven tables — the old handle
+    /// returned a clone of the whole `RateSnapshot` (all eight row vectors,
+    /// every String in every row) once per served bandwidth PV per tick.
+    #[tokio::test]
+    async fn a_bandwidth_read_asks_the_handle_for_exactly_one_suffix() {
+        let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let handles = StatusHandles {
+            bandwidth: Arc::new(move |suffix: &str| {
+                seen.lock().unwrap().push(suffix.to_string());
+                StatusSource::bandwidth_table(suffix, &RateSnapshot::default())
+            }),
+            ..StatusHandles::test()
+        };
+        let src = StatusSource::new(
+            PREFIX.to_string(),
+            Arc::new(AccessControl::new(false, None, None)),
+            handles,
+        );
+
+        src.get(&format!("{PREFIX}ds:bypv:tx")).await.expect("ds:bypv:tx is readable");
+        src.get(&format!("{PREFIX}us:byhost:rx")).await.expect("us:byhost:rx is readable");
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["ds:bypv:tx".to_string(), "us:byhost:rx".to_string()],
+            "each read must ask for its own suffix and nothing else"
+        );
+    }
+
+    /// The dedup key is now produced in place, so an idle tick copies nothing.
+    /// The property it must preserve: two samples whose rows are identical but
+    /// whose sampler timestamps differ produce the SAME key.
     #[test]
-    fn clear_stamp_makes_identical_bandwidth_rows_dedup_despite_ts_change() {
+    fn clear_stamp_in_place_makes_identical_rows_dedup_despite_a_ts_change() {
+        let rows = vec![("PV:X".to_string(), 10.0)];
         let snap_a = RateSnapshot {
             ts: NtTimeStamp { seconds_past_epoch: 1, nanoseconds: 0, user_tag: 0 },
-            ds_bypv_tx: vec![("PV:X".to_string(), 10.0)],
+            ds_bypv_tx: rows.clone(),
             ..Default::default()
         };
         let snap_b = RateSnapshot {
             ts: NtTimeStamp { seconds_past_epoch: 2, nanoseconds: 0, user_tag: 0 },
-            ds_bypv_tx: vec![("PV:X".to_string(), 10.0)],
+            ds_bypv_tx: rows,
             ..Default::default()
         };
-        let a = StatusSource::bandwidth_table("ds:bypv:tx", &snap_a);
-        let b = StatusSource::bandwidth_table("ds:bypv:tx", &snap_b);
-        // Raw payloads differ (different time_stamp)...
-        assert_ne!(a, b);
-        // ...but their dedup keys are equal (same rows, timestamp cleared).
-        assert_eq!(clear_stamp(&a), clear_stamp(&b));
+
+        let mut a = StatusSource::bandwidth_table("ds:bypv:tx", &snap_a);
+        let mut b = StatusSource::bandwidth_table("ds:bypv:tx", &snap_b);
+        assert_ne!(a, b, "the raw payloads differ: they carry different sample times");
+        clear_stamp_in_place(&mut a);
+        clear_stamp_in_place(&mut b);
+        assert_eq!(a, b, "with the stamp cleared the two samples are the same data");
     }
 
     /// A configured `pvlist` that simply says nothing about the status prefix
