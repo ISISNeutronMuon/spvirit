@@ -30,6 +30,7 @@ use spvirit_types::{NtPayload, ScalarValue};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::mpsc;
 
@@ -58,6 +59,14 @@ fn feed_subscribers(subscribers: &Mutex<HashMap<String, Vec<mpsc::Sender<NtPaylo
 /// Depth of a subscriber's monitor channel. Matches `SimplePvStore`'s
 /// `mpsc::channel(64)` in `Source::subscribe`.
 const SUBSCRIBER_QUEUE: usize = 64;
+
+/// Depth of the monitor-notify queue between `EgressSink::flush` (any thread)
+/// and the async drain task. Matches `SCAN_ONCE_CAPACITY`: deep enough to ride
+/// out a burst or a scheduling hiccup, bounded so a stalled drain task costs a
+/// fixed amount of memory instead of growing without limit. Overflow drops the
+/// update, exactly as a full subscriber channel does -- a processing pass must
+/// never block on a consumer.
+const NOTIFY_QUEUE: usize = 1024;
 
 /// The processing engine as a `Source`.
 ///
@@ -218,6 +227,7 @@ impl IocSource {
         let egress = Arc::new(EgressSink {
             subscribers: subscribers.clone(),
             notify_tx: OnceLock::new(),
+            notify_dropped: AtomicU64::new(0),
         });
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let sink: Arc<dyn ProcSink> = egress.clone();
@@ -570,7 +580,40 @@ struct EgressSink {
     /// ("cannot start a runtime from within a runtime") whenever `flush` ran on
     /// a runtime worker — i.e. for every PINI and every posted event. See
     /// `events.rs`, which made `EventSink` async for exactly this reason.
-    notify_tx: OnceLock<mpsc::UnboundedSender<(String, NtPayload)>>,
+    ///
+    /// A bounded channel's `try_send` is synchronous and never blocks.
+    notify_tx: OnceLock<mpsc::Sender<(String, NtPayload)>>,
+    /// Monitor updates dropped because the notify queue was full (a stalled or
+    /// slow drain task). Counted rather than silently discarded so the warning
+    /// below can report the running total.
+    notify_dropped: AtomicU64,
+}
+
+impl EgressSink {
+    /// Hand one monitor update to the drain task, dropping it if the queue is
+    /// full or closed.
+    ///
+    /// Non-blocking on purpose: `flush` runs on a std scan thread, on the
+    /// serve worker during the PINI sweep, and on a runtime worker during a
+    /// posted event, and none of those may stall behind a monitor consumer.
+    /// The warning is rate-limited to powers of two, exactly as
+    /// `Scanner::scan_once` rate-limits its own overflow warning, so a
+    /// persistently stalled consumer costs O(log n) log lines, not one per
+    /// update.
+    fn send_notify(&self, event: (String, NtPayload)) {
+        let Some(tx) = self.notify_tx.get() else {
+            return;
+        };
+        if tx.try_send(event).is_err() {
+            let dropped = self.notify_dropped.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    "monitor-notify queue full or closed; dropped {dropped} update(s) so far \
+                     (queue depth {NOTIFY_QUEUE})"
+                );
+            }
+        }
+    }
 }
 
 impl ProcSink for EgressSink {
@@ -579,17 +622,8 @@ impl ProcSink for EgressSink {
             tracing::debug!(target: "spvirit_ioc", "{line}");
         }
         feed_subscribers(&self.subscribers, &events);
-        // Hand the monitor-registry half to the drain task. `send` on an
-        // unbounded channel is synchronous and never blocks, so this is safe on
-        // any thread — unlike the `block_on` it replaces. No sender (Scanner
-        // never started) means nobody to publish to: correct for a bare engine,
-        // unreachable in a running server, which sets it before `Scanner::start`.
-        let Some(tx) = self.notify_tx.get() else {
-            return;
-        };
         for event in events {
-            // `Err` only if the drain task is gone (teardown); nothing to do.
-            let _ = tx.send(event);
+            self.send_notify(event);
         }
     }
 }
@@ -821,7 +855,7 @@ impl StoreSource for IocSource {
         // are each meant to run once. A duplicate `start_scanning` is a caller
         // bug, not something to paper over, but the set at least stays sane —
         // and we only spawn a drain for the sender that actually took.
-        let (tx, mut rx) = mpsc::unbounded_channel::<(String, NtPayload)>();
+        let (tx, mut rx) = mpsc::channel::<(String, NtPayload)>(NOTIFY_QUEUE);
         if self.egress.notify_tx.set(tx).is_ok() {
             let registry = self.registry.clone();
             let drain = handle.spawn(async move {
@@ -871,6 +905,35 @@ impl Drop for IocSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    #[tokio::test]
+    async fn a_full_monitor_notify_queue_drops_instead_of_growing() {
+        // The drain task awaits notify_monitors per item; if it stalls, flush
+        // must drop rather than queue without bound. Same rule as
+        // feed_subscribers: never block a processing pass.
+        let egress = EgressSink {
+            subscribers: Arc::new(Mutex::new(HashMap::new())),
+            notify_tx: OnceLock::new(),
+            notify_dropped: AtomicU64::new(0),
+        };
+        // Capacity 1, and _rx is never polled: a stalled drain task.
+        let (tx, _rx) = mpsc::channel::<(String, NtPayload)>(1);
+        // `is_ok()` rather than `expect`: `OnceLock::set`'s error carries the
+        // sender back, and `expect` would demand `Sender<...>: Debug`.
+        assert!(egress.notify_tx.set(tx).is_ok(), "first set wins");
+
+        let payload = || NtPayload::Generic { struct_id: "t".into(), fields: Vec::new() };
+        egress.send_notify(("PV:A".to_string(), payload()));
+        egress.send_notify(("PV:A".to_string(), payload()));
+        egress.send_notify(("PV:A".to_string(), payload()));
+
+        assert_eq!(
+            egress.notify_dropped.load(AtomicOrdering::Relaxed),
+            2,
+            "one item fits the queue; the other two must be dropped, not buffered"
+        );
+    }
 
     /// A minimal `tracing::Subscriber` that captures every event's
     /// formatted `message` field, so a test can assert on log content
