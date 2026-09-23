@@ -688,7 +688,14 @@ impl Scanner {
     /// there is no such list. Test-only observability for Task 12's put
     /// routing, which drives membership but cannot read it back from `Common`.
     pub fn periodic_members(&self, period: Duration) -> Vec<RecordId> {
-        let key = period.as_nanos() as u64;
+        let Ok(key) = Self::period_key(period) else {
+            // A period that cannot be scheduled is on no list by
+            // construction; going through the same key derivation as
+            // `add_periodic` (rather than a raw `as u64`, which would wrap an
+            // out-of-range period into an arbitrary key) is what makes that
+            // guarantee checkable.
+            return Vec::new();
+        };
         self.periodic
             .lock()
             .unwrap()
