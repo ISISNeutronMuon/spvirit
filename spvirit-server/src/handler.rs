@@ -47,6 +47,32 @@ use crate::state::{ConnState, MonitorState, MonitorSub};
 /// server (crate-audit review R1-H1).
 pub const MAX_PIPELINE_WINDOW: u32 = 4096;
 
+/// The largest payload the server will allocate for one inbound frame.
+///
+/// The PVA protocol puts no ceiling on `payload_length` beyond the u32 field
+/// itself. This is the same constant the codec uses to bound reassembled
+/// segmented messages and the client uses for its own frame reader, so one
+/// number governs the whole inbound byte budget.
+pub const MAX_INBOUND_PAYLOAD_BYTES: usize = spvirit_codec::DEFAULT_MAX_MESSAGE_BYTES;
+
+/// How many payload bytes to read for `header`, or `Err(declared)` when the
+/// wire-supplied length exceeds [`MAX_INBOUND_PAYLOAD_BYTES`].
+///
+/// A pure function so the cap is testable without allocating: the caller must
+/// refuse *before* `vec![0u8; n]`, because a failed `Vec` allocation calls
+/// `handle_alloc_error` and aborts the process rather than unwinding.
+pub(crate) fn inbound_payload_len(header: &PvaHeader) -> Result<usize, usize> {
+    if header.flags.is_control {
+        return Ok(0);
+    }
+    let declared = header.payload_length as usize;
+    if declared > MAX_INBOUND_PAYLOAD_BYTES {
+        Err(declared)
+    } else {
+        Ok(declared)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PvListMode — controls virtual PV listing behaviour
 // ---------------------------------------------------------------------------
@@ -1286,10 +1312,16 @@ pub async fn handle_connection(
             }
         }
         let header_pkt = PvaPacket::new(&header);
-        let payload_len = if header_pkt.header.flags.is_control {
-            0usize
-        } else {
-            header_pkt.header.payload_length as usize
+        let payload_len = match inbound_payload_len(&header_pkt.header) {
+            Ok(len) => len,
+            Err(declared) => {
+                warn!(
+                    "Conn {}: peer declared a {}-byte payload, over the {}-byte \
+                     inbound limit; closing the connection",
+                    conn_id, declared, MAX_INBOUND_PAYLOAD_BYTES
+                );
+                break;
+            }
         };
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
@@ -2425,6 +2457,52 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket as TokioUdpSocket;
+
+    /// Site 1. `handle_connection` did `vec![0u8; header.payload_length]`
+    /// with no ceiling: eight bytes from any unauthenticated peer asked the
+    /// allocator for up to 4 GiB, and `vec![0u8; n]`'s failure path calls
+    /// `handle_alloc_error`, which aborts rather than unwinding.
+    ///
+    /// A pure function, so the cap is tested with no allocation whatsoever.
+    #[test]
+    fn an_oversized_declared_payload_is_refused_before_allocating() {
+        let mut raw = vec![0xCA, 0x02, 0x00, 0x00];
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        let header = PvaHeader::new(&raw);
+        assert_eq!(
+            inbound_payload_len(&header),
+            Err(u32::MAX as usize),
+            "a 4 GiB declaration must be refused, not reserved"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_declared_payload_is_accepted() {
+        let mut raw = vec![0xCA, 0x02, 0x00, 0x00];
+        raw.extend_from_slice(&64u32.to_le_bytes());
+        let header = PvaHeader::new(&raw);
+        assert_eq!(inbound_payload_len(&header), Ok(64));
+    }
+
+    /// A control frame carries no payload however the length field reads.
+    #[test]
+    fn a_control_frame_reads_no_payload_regardless_of_the_length_field() {
+        let mut raw = vec![0xCA, 0x02, 0x01, 0x02];
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        let header = PvaHeader::new(&raw);
+        assert!(header.flags.is_control);
+        assert_eq!(inbound_payload_len(&header), Ok(0));
+    }
+
+    /// The server and the client must share one inbound byte budget.
+    #[test]
+    fn the_inbound_payload_cap_is_the_workspace_message_limit() {
+        assert_eq!(
+            MAX_INBOUND_PAYLOAD_BYTES,
+            spvirit_codec::DEFAULT_MAX_MESSAGE_BYTES
+        );
+        assert_eq!(MAX_INBOUND_PAYLOAD_BYTES, 268_435_456);
+    }
 
     /// V6 LOW-1. The bound's *magnitude* was unpinned: `from_secs(30)` →
     /// `from_millis(30)`, the classic units slip, survived the whole suite.
