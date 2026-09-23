@@ -1,7 +1,7 @@
 //! The scan driver: owns every scan list and processes records against the
 //! record engine, never holding a scan-list lock across a process() call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,6 +60,17 @@ pub struct Scanner {
     io_intr: Mutex<HashMap<String, ScanList>>,
     stop: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// A weak handle to `self`, published by `start()`. `ensure_periodic_thread`
+    /// needs a `Weak<Scanner>` to hand each thread, and it is reachable from
+    /// `&self` methods (`add_periodic`) that have no `Arc<Self>` to downgrade.
+    /// `None` until `start()` runs, which is exactly the "not scanning yet"
+    /// state: `load_from_db()` registers every `.db` period before `start()`,
+    /// and `start()` spawns for all of them at once.
+    self_weak: Mutex<Option<Weak<Scanner>>>,
+    /// Period keys that already own a thread, so a second registration on a
+    /// running period joins the existing thread instead of spawning a rival
+    /// one (two threads on one key would double-process every member).
+    thread_keys: Mutex<HashSet<PeriodKey>>,
     /// Sender end of the bounded `scan_once` queue. `None` once `shutdown()`
     /// has closed it (dropping the sender is what makes the drain thread's
     /// blocked `recv()` return `Err` and exit).
@@ -88,6 +99,8 @@ impl Scanner {
             io_intr: Mutex::new(HashMap::new()),
             stop: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
+            self_weak: Mutex::new(None),
+            thread_keys: Mutex::new(HashSet::new()),
             scan_once_tx: Mutex::new(Some(tx)),
             scan_once_rx: Mutex::new(Some(rx)),
             scan_once_dropped: AtomicU64::new(0),
@@ -221,12 +234,17 @@ impl Scanner {
             return;
         }
         let key = period.as_nanos() as u64;
-        self.periodic
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .insert(id, phas);
+        {
+            self.periodic
+                .lock()
+                .unwrap()
+                .entry(key)
+                .or_default()
+                .insert(id, phas);
+        }
+        // A period first seen after `start()` has no thread yet: give it one.
+        // Before `start()` this is a no-op and `start()` does the spawning.
+        self.ensure_periodic_thread(key);
     }
 
     /// Remove `id` from every periodic scan list it belongs to.
@@ -311,6 +329,55 @@ impl Scanner {
         self.process_ids(&ids);
     }
 
+    /// Spawn the periodic thread for `key` if it does not already have one.
+    ///
+    /// Idempotent per key, and a deliberate no-op in two states: before
+    /// `start()` (no `self_weak` published yet -- `start()` will spawn for
+    /// every registered key in one go) and after `shutdown()` (`stop` set --
+    /// spawning then would resurrect a scanner the owner has torn down).
+    ///
+    /// `anchor` is captured on the *calling* thread rather than inside the
+    /// thread body, for the same reason `start()` does it: a caller that
+    /// advances a `ManualClock` immediately afterwards must not race the
+    /// spawned thread into computing deadlines from an already-advanced
+    /// origin. It is captured *now* rather than reusing `start()`'s anchor
+    /// because `periodic_loop`'s catch-up loop walks `n` forward one tick at
+    /// a time from the anchor -- a period registered long after `start()`
+    /// would otherwise spin through every tick since then before its first
+    /// sleep.
+    fn ensure_periodic_thread(&self, key: PeriodKey) {
+        let anchor = self.clock.now();
+        self.ensure_periodic_thread_at(key, anchor);
+    }
+
+    fn ensure_periodic_thread_at(&self, key: PeriodKey, anchor: std::time::Instant) {
+        let Some(weak) = self.self_weak.lock().unwrap().clone() else {
+            return;
+        };
+        let clock = self.clock.clone();
+        let stop = self.stop.clone();
+        let period = Duration::from_nanos(key);
+        // Take `threads` FIRST, then decide. `shutdown()` stores `stop`
+        // BEFORE it locks `threads` to take the handles, so either we push
+        // first (and shutdown joins us) or we observe `stop == true` here and
+        // never spawn: there is no window in which a thread is spawned but
+        // missed by the join. `thread_keys` is claimed only once the spawn is
+        // certain -- claiming it earlier and then returning on `stop` would
+        // leave a key permanently marked as owning a thread it never got.
+        // Lock order is `threads` -> `thread_keys`, and nothing else takes
+        // both, so there is no cycle.
+        let mut threads = self.threads.lock().unwrap();
+        if self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if !self.thread_keys.lock().unwrap().insert(key) {
+            return;
+        }
+        threads.push(std::thread::spawn(move || {
+            Self::periodic_loop(weak, clock, stop, key, period, anchor)
+        }));
+    }
+
     /// Spawn one thread per non-empty periodic scan list. Call once; `self`
     /// must be held in an `Arc` so each thread can hold a strong reference.
     pub fn start(self: &Arc<Self>) {
@@ -333,23 +400,15 @@ impl Scanner {
         // `start()` returns (the thread could see an already-advanced clock
         // and silently compute deadlines from the wrong origin).
         let anchor = self.clock.now();
-        let mut threads = self.threads.lock().unwrap();
+        // Publish the weak handle BEFORE spawning: from here on, any
+        // `add_periodic` for a period we did not enumerate above spawns its
+        // own thread rather than landing on a list nobody drives.
+        *self.self_weak.lock().unwrap() = Some(Arc::downgrade(self));
         for key in keys {
-            // `weak` (not a strong clone) so the thread never keeps `Scanner`
-            // alive: if it did, `Scanner::drop` could never run while any
-            // thread was alive (a strong-ref cycle), leaking the thread
-            // whenever a caller drops its handle without calling
-            // `shutdown()` explicitly. `clock` and `stop` are independent
-            // `Arc`s (not `Arc<Self>`), so cloning them does not re-create
-            // that cycle -- they let the thread sleep and observe shutdown
-            // without ever needing to upgrade `weak` for that.
-            let weak = Arc::downgrade(self);
-            let clock = self.clock.clone();
-            let stop = self.stop.clone();
-            let period = Duration::from_nanos(key);
-            threads.push(std::thread::spawn(move || {
-                Self::periodic_loop(weak, clock, stop, key, period, anchor)
-            }));
+            // Every thread in this batch shares one anchor, so a caller that
+            // advances the clock right after `start()` returns sees one
+            // coherent grid across all of them.
+            self.ensure_periodic_thread_at(key, anchor);
         }
         // The `scan_once` drain/callback thread: drains the bounded queue and
         // processes each request via `process_ids`. Like the periodic threads
@@ -662,6 +721,72 @@ mod tests {
             std::thread::yield_now();
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn a_period_first_seen_after_start_gets_its_own_scan_thread() {
+        // The headline bug: SCAN puts arrive after start(), so a period that
+        // nobody had registered when start() enumerated the map used to get a
+        // scan list with no thread behind it -- the record silently never
+        // scanned. Both records are TPRO'd so `passes()` counts every pass.
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:OLD\") {\n field(INP, \"1\")\n field(TPRO, \"1\")\n}\n\
+             record(ai, \"PV:NEW\") {\n field(INP, \"2\")\n field(TPRO, \"1\")\n}\n",
+        ));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let old = db.lookup("PV:OLD").unwrap();
+        let new = db.lookup("PV:NEW").unwrap();
+
+        // Only the 100ms period exists when start() runs.
+        scanner.add_periodic(old, 0, Duration::from_millis(100));
+        scanner.start();
+
+        // ...and now a period start() never saw, exactly as a SCAN put does.
+        scanner.add_periodic(new, 0, Duration::from_millis(250));
+
+        manual.advance(Duration::from_millis(250));
+        wait_until(|| sink.passes("PV:NEW") >= 1);
+        assert!(
+            sink.passes("PV:NEW") >= 1,
+            "a period registered after start() must still be scanned"
+        );
+
+        scanner.shutdown();
+    }
+
+    #[test]
+    fn a_second_record_on_a_running_period_does_not_spawn_a_second_thread() {
+        // Guard on the fix above: ensure_periodic_thread must be idempotent
+        // per period key. Two threads on one key would each snapshot the same
+        // list every tick, so every member would process twice per tick.
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:A\") {\n field(INP, \"1\")\n field(TPRO, \"1\")\n}\n\
+             record(ai, \"PV:B\") {\n field(INP, \"2\")\n field(TPRO, \"1\")\n}\n",
+        ));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let a = db.lookup("PV:A").unwrap();
+        let b = db.lookup("PV:B").unwrap();
+
+        scanner.add_periodic(a, 0, Duration::from_millis(100));
+        scanner.start();
+        // Same period, registered after start(): joins the existing thread.
+        scanner.add_periodic(b, 1, Duration::from_millis(100));
+
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| sink.passes("PV:B") >= 1);
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| sink.passes("PV:B") >= 2);
+
+        assert_eq!(sink.passes("PV:B"), 2, "exactly one pass per tick, not two");
+        assert_eq!(sink.passes("PV:A"), 2, "exactly one pass per tick, not two");
+
+        scanner.shutdown();
     }
 
     #[test]
