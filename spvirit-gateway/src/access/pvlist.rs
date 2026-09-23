@@ -37,17 +37,11 @@ pub struct PvlistRule {
     pub from_hosts: Vec<String>,
 }
 
-/// An ordered set of [`PvlistRule`]s; [`Pvlist::match_first`] implements
-/// first-match-wins evaluation.
+/// An ordered set of [`PvlistRule`]s. First-match-wins evaluation lives in
+/// `AccessControl::pvlist_step`, which has to combine the pattern test with
+/// the rule's `FROM host` qualifier and so scans `rules` itself.
 pub struct Pvlist {
     pub rules: Vec<PvlistRule>,
-}
-
-impl Pvlist {
-    /// Returns the first rule whose pattern matches `pv`, if any.
-    pub fn match_first(&self, pv: &str) -> Option<&PvlistRule> {
-        self.rules.iter().find(|r| r.pattern.is_match(pv))
-    }
 }
 
 /// Parses a p4p `pvlist` document into an ordered [`Pvlist`].
@@ -180,17 +174,23 @@ mod tests {
         assert_eq!(p.rules[0].from_hosts, vec!["10.0.0.1", "10.0.0.2"]);
     }
 
+    /// First matching rule wins: a later catch-all `ALLOW` must not rescue a
+    /// name an earlier `DENY` already claimed. Exercised through
+    /// `AccessControl::decide` — the only first-match evaluator that exists —
+    /// rather than through a parallel helper that the evaluator does not use.
     #[test]
-    fn match_first_wins() {
+    fn first_matching_rule_wins() {
         let p = parse_pvlist("SECRET:.* DENY\n.* ALLOW").unwrap();
-        assert!(matches!(
-            p.match_first("SECRET:X").unwrap().action,
-            PvlistAction::Deny
-        ));
-        assert!(matches!(
-            p.match_first("OTHER").unwrap().action,
-            PvlistAction::Allow
-        ));
+        let ac = crate::access::AccessControl::new(false, Some(p), None);
+        let who = crate::access::Identity::default();
+        assert_eq!(
+            ac.decide(crate::access::Op::Get, "SECRET:X", &who),
+            crate::access::Decision::Deny
+        );
+        assert_eq!(
+            ac.decide(crate::access::Op::Get, "OPEN:X", &who),
+            crate::access::Decision::Allow
+        );
     }
 
     #[test]

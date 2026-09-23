@@ -8,6 +8,8 @@
 pub mod acf;
 pub mod pvlist;
 
+use std::borrow::Cow;
+
 use self::acf::Acf;
 use self::pvlist::{Pvlist, PvlistAction};
 
@@ -61,11 +63,28 @@ fn expand_template(template: &str, caps: &regex::Captures) -> String {
     out
 }
 
-/// The bound ASG/ASL threaded from a surviving pvlist match (or the
-/// implicit default) into the ACF step.
-struct Binding {
-    asg: String,
+/// The bound ASG/ASL threaded from a surviving pvlist match (or the implicit
+/// default) into the ACF step. Borrows the ASG name from the matched rule (or
+/// from the `"DEFAULT"` literal) so a decision allocates nothing for it.
+struct Binding<'a> {
+    asg: &'a str,
     asl: u32,
+}
+
+/// The binding a name gets when no pvlist is configured, or when a configured
+/// pvlist has no rule for it and the caller is `decide_local`.
+const DEFAULT_BINDING: Binding<'static> = Binding { asg: "DEFAULT", asl: 0 };
+
+/// `Allow` when the surviving name is the one that was requested,
+/// `AllowAliased` when a pvlist `ALIAS` rewrote it — so an `ALIAS` template
+/// that happens to expand back to `pv` is a plain `Allow`, exactly as before
+/// this became a `Cow`. Materialises a `String` only in the aliased case.
+fn allow_decision(pv: &str, survived: Cow<'_, str>) -> Decision {
+    if survived.as_ref() == pv {
+        Decision::Allow
+    } else {
+        Decision::AllowAliased(survived.into_owned())
+    }
 }
 
 /// Combines the p4p `pvlist` and `.acf` access-control inputs with a fixed
@@ -133,79 +152,81 @@ impl AccessControl {
             return Decision::Deny;
         }
 
-        // Step 2: pvlist first-match, host-aware (from_hosts filtering is
-        // not handled by Pvlist::match_first, so scan manually here).
-        let (survived_name, binding) = match &self.pvlist {
-            None => (pv.to_string(), Binding {
-                asg: "DEFAULT".to_string(),
-                asl: 0,
-            }),
-            Some(pvlist) => {
-                let matched = pvlist.rules.iter().find(|r| {
-                    r.pattern.is_match(pv)
-                        && (r.from_hosts.is_empty()
-                            || id
-                                .host
-                                .as_deref()
-                                .is_some_and(|h| r.from_hosts.iter().any(|fh| fh == h)))
-                });
-                match matched {
-                    None if unmatched_is_default => (pv.to_string(), Binding {
-                        asg: "DEFAULT".to_string(),
-                        asl: 0,
-                    }),
-                    None => return Decision::Deny,
-                    Some(rule) => match &rule.action {
-                        PvlistAction::Deny => return Decision::Deny,
-                        PvlistAction::Allow => (
-                            pv.to_string(),
-                            Binding {
-                                asg: rule.asg.clone(),
-                                asl: rule.asl,
-                            },
-                        ),
-                        PvlistAction::Alias(template) => {
-                            let name = match rule.pattern.captures(pv) {
-                                Some(caps) => expand_template(template, &caps),
-                                None => pv.to_string(),
-                            };
-                            (
-                                name,
-                                Binding {
-                                    asg: rule.asg.clone(),
-                                    asl: rule.asl,
-                                },
-                            )
-                        }
-                    },
-                }
-            }
-        };
-
-        let is_aliased = survived_name != pv;
-        let allow_decision = || {
-            if is_aliased {
-                Decision::AllowAliased(survived_name.clone())
-            } else {
-                Decision::Allow
-            }
+        // Step 2: pvlist first-match, host-aware.
+        let Some((survived_name, binding)) = self.pvlist_step(pv, id, unmatched_is_default) else {
+            return Decision::Deny;
         };
 
         // Step 4: Get (and Monitor) are never denied by ACF — only a
         // pvlist DENY can deny a read, and that already returned above.
         if matches!(op, Op::Get) {
-            return allow_decision();
+            return allow_decision(pv, survived_name);
         }
 
         // Step 3: ACF evaluation for Put/Rpc that survived pvlist as
         // ALLOW/ALIAS.
         match &self.acf {
-            None => allow_decision(),
+            None => allow_decision(pv, survived_name),
             Some(acf) => {
                 if self.acf_grants(acf, &binding, op, id) {
-                    allow_decision()
+                    allow_decision(pv, survived_name)
                 } else {
                     Decision::Deny
+                }
+            }
+        }
+    }
+
+    /// Step 2 of [`Self::decide_inner`]: the pvlist first-match scan,
+    /// host-aware.
+    ///
+    /// Returns the surviving name and its ASG/ASL binding, or `None` when the
+    /// request is denied (an explicit `DENY`, or no matching rule under the
+    /// fail-closed `unmatched_is_default = false` treatment).
+    ///
+    /// The name is a [`Cow`] and the binding borrows: with no pvlist, or with
+    /// a plain `ALLOW`, nothing is allocated at all. `decide` is called once
+    /// per search name, per claim, per get, per put and per rpc, so the two
+    /// throwaway `String`s this replaces were pure per-request cost.
+    ///
+    /// Scans `pvlist.rules` directly rather than through a helper on
+    /// [`Pvlist`], because the `FROM host` qualifier has to be part of the
+    /// first-match test: a rule that matches the pattern but not the host must
+    /// be skipped so a later rule can win.
+    fn pvlist_step<'a>(
+        &'a self,
+        pv: &'a str,
+        id: &Identity,
+        unmatched_is_default: bool,
+    ) -> Option<(Cow<'a, str>, Binding<'a>)> {
+        let Some(pvlist) = &self.pvlist else {
+            return Some((Cow::Borrowed(pv), DEFAULT_BINDING));
+        };
+
+        let matched = pvlist.rules.iter().find(|r| {
+            r.pattern.is_match(pv)
+                && (r.from_hosts.is_empty()
+                    || id
+                        .host
+                        .as_deref()
+                        .is_some_and(|h| r.from_hosts.iter().any(|fh| fh == h)))
+        });
+
+        match matched {
+            None if unmatched_is_default => Some((Cow::Borrowed(pv), DEFAULT_BINDING)),
+            None => None,
+            Some(rule) => {
+                let binding = Binding { asg: rule.asg.as_str(), asl: rule.asl };
+                match &rule.action {
+                    PvlistAction::Deny => None,
+                    PvlistAction::Allow => Some((Cow::Borrowed(pv), binding)),
+                    PvlistAction::Alias(template) => {
+                        let name = match rule.pattern.captures(pv) {
+                            Some(caps) => Cow::Owned(expand_template(template, &caps)),
+                            None => Cow::Borrowed(pv),
+                        };
+                        Some((name, binding))
+                    }
                 }
             }
         }
@@ -214,8 +235,8 @@ impl AccessControl {
     /// Whether some rule in the ASG named `binding.asg` grants `op` to
     /// `id`, given the bound ASL. Fail-closed: an absent ASG, or a
     /// referenced UAG/HAG name absent from the ACF's maps, grants nothing.
-    fn acf_grants(&self, acf: &Acf, binding: &Binding, op: Op, id: &Identity) -> bool {
-        let Some(rules) = acf.asgs.get(&binding.asg) else {
+    fn acf_grants(&self, acf: &Acf, binding: &Binding<'_>, op: Op, id: &Identity) -> bool {
+        let Some(rules) = acf.asgs.get(binding.asg) else {
             return false;
         };
 
@@ -405,5 +426,55 @@ mod tests {
             a.decide(Op::Put, "X", &id(Some("alice"), None)),
             Decision::Deny
         ));
+    }
+
+    /// `decide` runs per search, per claim, per get, per put and per rpc. The
+    /// two overwhelmingly common outcomes — no pvlist configured at all, and
+    /// a plain `ALLOW` — must borrow the requested name and the rule's ASG
+    /// rather than heap-allocating a throwaway `String` for each. Only an
+    /// `ALIAS` rewrite, which genuinely produces a new name, may allocate.
+    #[test]
+    fn the_common_pvlist_outcomes_borrow_instead_of_allocating() {
+        let nobody = id(None, None);
+
+        let none = ac(false, "", "");
+        let (name, binding) = none.pvlist_step("X:1", &nobody, false).expect("allowed");
+        assert!(matches!(name, Cow::Borrowed(_)), "no-pvlist path must borrow the PV name");
+        assert_eq!(binding.asg, "DEFAULT");
+        assert_eq!(binding.asl, 0);
+
+        let allow = ac(false, ".* ALLOW RWGROUP 3", "");
+        let (name, binding) = allow.pvlist_step("X:1", &nobody, false).expect("allowed");
+        assert!(matches!(name, Cow::Borrowed(_)), "plain ALLOW must borrow the PV name");
+        assert_eq!(binding.asg, "RWGROUP");
+        assert_eq!(binding.asl, 3);
+
+        let alias = ac(false, r"PUB:(.*) ALIAS INT:\1", "");
+        let (name, binding) = alias.pvlist_step("PUB:t", &nobody, false).expect("allowed");
+        assert!(matches!(name, Cow::Owned(_)), "an ALIAS rewrite genuinely produces a new name");
+        assert_eq!(name.as_ref(), "INT:t");
+        assert_eq!(binding.asg, "DEFAULT");
+
+        // A DENY, and an unmatched name under the fail-closed `decide`
+        // treatment, are both "no surviving name".
+        let deny = ac(false, "X:.* DENY", "");
+        assert!(deny.pvlist_step("X:1", &nobody, false).is_none());
+        let partial = ac(false, "Y:.* ALLOW", "");
+        assert!(partial.pvlist_step("X:1", &nobody, false).is_none());
+        // ...but `decide_local`'s treatment falls through to DEFAULT.
+        let (name, binding) = partial.pvlist_step("X:1", &nobody, true).expect("local default");
+        assert!(matches!(name, Cow::Borrowed(_)));
+        assert_eq!(binding.asg, "DEFAULT");
+    }
+
+    /// The one semantic corner the borrow refactor could quietly change: an
+    /// `ALIAS` whose template expands back to exactly the requested name is
+    /// `Allow`, NOT `AllowAliased(pv)`. Callers branch on that variant to
+    /// decide whether to re-target the upstream name, so flipping it would
+    /// send them chasing a rename that never happened.
+    #[test]
+    fn an_alias_that_expands_to_the_requested_name_is_a_plain_allow() {
+        let a = ac(false, r"(X:.*) ALIAS \1", "");
+        assert_eq!(a.decide(Op::Get, "X:1", &id(None, None)), Decision::Allow);
     }
 }
