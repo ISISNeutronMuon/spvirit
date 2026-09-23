@@ -638,7 +638,10 @@ fn payload_to_full_structure(payload: &NtPayload) -> PvValue {
                     "alarm".to_string(),
                     alarm_to_pv_value(nt.alarm_severity, nt.alarm_status, &nt.alarm_message),
                 ),
-                ("timeStamp".to_string(), timestamp_to_pv_value_default()),
+                (
+                    "timeStamp".to_string(),
+                    scalar_timestamp_pv(nt.time_stamp.as_ref()),
+                ),
             ];
             fields.push((
                 "display".to_string(),
@@ -769,7 +772,10 @@ fn payload_to_meta_only(payload: &NtPayload) -> PvValue {
                     "alarm".to_string(),
                     alarm_to_pv_value(nt.alarm_severity, nt.alarm_status, &nt.alarm_message),
                 ),
-                ("timeStamp".to_string(), timestamp_to_pv_value_default()),
+                (
+                    "timeStamp".to_string(),
+                    scalar_timestamp_pv(nt.time_stamp.as_ref()),
+                ),
             ],
         },
         NtPayload::ScalarArray(nt) => PvValue::Structure {
@@ -954,6 +960,16 @@ fn timestamp_pv(ts: &spvirit_types::NtTimeStamp) -> PvValue {
 
 fn timestamp_to_pv_value_default() -> PvValue {
     timestamp_pv(&spvirit_types::NtTimeStamp::default())
+}
+
+/// Timestamp of a scalar member. `NtScalar::time_stamp` is optional; publish
+/// the record's own stamp whenever it has one and fall back to the epoch-0
+/// default only when it genuinely has never been stamped.
+fn scalar_timestamp_pv(ts: Option<&spvirit_types::NtTimeStamp>) -> PvValue {
+    match ts {
+        Some(ts) => timestamp_pv(ts),
+        None => timestamp_to_pv_value_default(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,5 +1209,54 @@ mod tests {
 
         assert_eq!(source.try_claim("GRP:absent"), TryClaim::No);
         assert!(Source::claim(&source, "GRP:absent").await.is_none());
+    }
+
+    /// Pull `timeStamp.secondsPastEpoch` out of a group member structure.
+    fn timestamp_seconds_of(v: &PvValue) -> i64 {
+        let PvValue::Structure { fields, .. } = v else {
+            panic!("expected a structure, got {v:?}");
+        };
+        let (_, ts) = fields
+            .iter()
+            .find(|(n, _)| n == "timeStamp")
+            .expect("no timeStamp field");
+        let PvValue::Structure { fields, .. } = ts else {
+            panic!("timeStamp is not a structure: {ts:?}");
+        };
+        let (_, secs) = fields
+            .iter()
+            .find(|(n, _)| n == "secondsPastEpoch")
+            .expect("no secondsPastEpoch field");
+        match secs {
+            PvValue::Scalar(ScalarValue::I64(s)) => *s,
+            other => panic!("secondsPastEpoch is not an I64: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_member_publishes_its_own_timestamp_not_epoch_zero() {
+        let nt = spvirit_types::NtScalar::from_value(ScalarValue::F64(1.5))
+            .with_timestamp(1_700_000_000, 250);
+        let payload = NtPayload::Scalar(nt);
+
+        assert_eq!(
+            timestamp_seconds_of(&payload_to_full_structure(&payload)),
+            1_700_000_000,
+            "scalar mapping must publish the member's own timestamp"
+        );
+        assert_eq!(
+            timestamp_seconds_of(&payload_to_meta_only(&payload)),
+            1_700_000_000,
+            "meta mapping must publish the member's own timestamp"
+        );
+    }
+
+    #[test]
+    fn scalar_member_without_a_timestamp_still_reports_epoch_zero() {
+        // A record that has genuinely never been stamped keeps the old
+        // behaviour; only records WITH a stamp change.
+        let payload = NtPayload::Scalar(spvirit_types::NtScalar::from_value(ScalarValue::F64(1.5)));
+        assert_eq!(timestamp_seconds_of(&payload_to_full_structure(&payload)), 0);
+        assert_eq!(timestamp_seconds_of(&payload_to_meta_only(&payload)), 0);
     }
 }
