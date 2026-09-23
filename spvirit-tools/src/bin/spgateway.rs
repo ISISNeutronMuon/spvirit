@@ -159,6 +159,17 @@ fn apply_metrics_override(cfg: &mut GatewayConfig, force_on: bool, listen: Optio
     }
 }
 
+/// Whether `--metrics-listen` was actually passed.
+///
+/// The parsed value uses the empty string for "not given", which makes an
+/// explicit `--metrics-listen ""` — a typo, or an unset shell variable that
+/// expanded to nothing — indistinguishable from omitting the flag, silently
+/// handing the operator the default listen address. Scanning raw argv is the
+/// only way to tell the two apart.
+fn metrics_listen_given(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--metrics-listen")
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -188,6 +199,10 @@ fn main() -> ExitCode {
     }
 
     let metrics_listen = if opts.metrics_listen.is_empty() {
+        if metrics_listen_given(&args) {
+            eprintln!("--metrics-listen requires a non-empty ADDR");
+            return ExitCode::FAILURE;
+        }
         None
     } else {
         Some(opts.metrics_listen.as_str())
@@ -213,7 +228,10 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                println!("{e}");
+                // stderr, like every other error path in this binary: stdout
+                // is `-T`'s machine-readable channel and carries `OK` alone,
+                // so a caller can redirect it without catching error text.
+                eprintln!("{e}");
                 ExitCode::FAILURE
             }
         };
