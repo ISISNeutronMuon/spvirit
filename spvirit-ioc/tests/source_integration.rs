@@ -157,6 +157,28 @@ async fn pini_definition_order_differs_from_lock_set_traversal_order() {
     );
 }
 
+/// Base's `initialProcess` sweeps PINI records in scan-phase order; definition
+/// order is only the tie-break within a phase. `Scanner::process_pini` already
+/// did this; the public `IocSource::process_pini` used to ignore PHAS
+/// entirely, so the entry point the conformance tests call disagreed with the
+/// one a running server uses.
+#[tokio::test]
+async fn pini_phas_order_beats_definition_order() {
+    let src = IocSource::from_db_str(
+        "record(ai, \"PV:LATE\") {\n    field(PINI, \"YES\")\n    field(PHAS, \"2\")\n    field(INP, \"1\")\n}\n\
+         record(ai, \"PV:EARLY\") {\n    field(PINI, \"YES\")\n    field(PHAS, \"0\")\n    field(INP, \"2\")\n}\n\
+         record(ai, \"PV:MIDDLE\") {\n    field(PINI, \"YES\")\n    field(PHAS, \"1\")\n    field(INP, \"3\")\n}\n",
+    )
+    .expect("load");
+    let events = src.process_pini();
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["PV:EARLY", "PV:MIDDLE", "PV:LATE"],
+        "PINI order is PHAS ascending; .db definition order only breaks ties"
+    );
+}
+
 /// A put to a record whose `INP` names another record produces two monitors:
 /// the raw written value, then the value processing recomputes from the link.
 /// EPICS Base does the same — `dbPut` posts the field write before

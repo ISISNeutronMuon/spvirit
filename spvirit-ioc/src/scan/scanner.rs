@@ -223,28 +223,11 @@ impl Scanner {
     /// ordering, per-record panic isolation, and deferred-recursion handling
     /// uniform with every other caller of `process_ids` (R-T8-FLUSH).
     ///
-    /// This is a NEW, PHAS-ordered sweep distinct from the pre-existing
-    /// `IocSource::process_pini` (`source.rs`), which sweeps in `.db`
-    /// definition order only; that older path is left untouched (R-T8-DUP).
+    /// This sweep and the pre-existing `IocSource::process_pini`
+    /// (`source.rs`) now share one ordering via `RecordDb::pini_order`, so
+    /// the two can no longer disagree about processing order (R-T8-DUP).
     pub fn process_pini(&self) {
-        let mut sweep: Vec<(i32, usize, RecordId)> = self
-            .db
-            .order()
-            .iter()
-            .enumerate()
-            .filter_map(|(order_index, &id)| {
-                let (pini, phas) = self
-                    .db
-                    .with_set(id.set, |set| {
-                        let common = &set.get(id).common;
-                        (common.pini, common.phas)
-                    });
-                pini.then_some((phas, order_index, id))
-            })
-            .collect();
-        sweep.sort_by_key(|&(phas, order_index, _)| (phas, order_index));
-        let ids: Vec<RecordId> = sweep.into_iter().map(|(_, _, id)| id).collect();
-        self.process_ids(&ids);
+        self.process_ids(&self.db.pini_order());
     }
 
     /// Populate every scan list from the loaded database.

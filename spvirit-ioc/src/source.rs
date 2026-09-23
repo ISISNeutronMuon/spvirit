@@ -294,10 +294,12 @@ impl IocSource {
         self.registry.read().expect("registry lock poisoned").clone()
     }
 
-    /// Process every PINI record, in `.db` definition order.
+    /// Process every PINI record, in `PHAS` order (`.db` definition order
+    /// breaking ties) -- the same order `Scanner::process_pini` uses, via the
+    /// shared [`RecordDb::pini_order`].
     pub fn process_pini(&self) -> Vec<(String, NtPayload)> {
         let mut all = Vec::new();
-        for &id in self.db.order() {
+        for id in self.db.pini_order() {
             let mut ctx = ProcCtx::new();
             // A single lock acquisition: check PINI and, if set, run the pass
             // under the same guard, so there is no window between the check
