@@ -24,13 +24,15 @@ pub mod sampler;
 
 pub use sampler::{BandwidthSampler, RateSnapshot};
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::diag::ClientRegistry;
 use spvirit_server::pvstore::{PvInfo, Source, TryClaim};
 use spvirit_server::simple_store::descriptor_for_payload;
@@ -353,6 +355,58 @@ fn fixed_bandwidth_handle(snap: RateSnapshot) -> BandwidthHandle {
     Arc::new(move |suffix: &str| StatusSource::bandwidth_table(suffix, &snap))
 }
 
+/// The shape-only payload whose descriptor `asTest` channels are created with.
+///
+/// `asTest` is an RPC endpoint: it answers a question about a *specific*
+/// (pv, account, peer) triple supplied in the request, so there is no such
+/// thing as "the current value of asTest". A channel still has to exist before
+/// a client can issue the RPC, and creating one requires a descriptor, so this
+/// returns a fully-denied response purely for its structure. The values inside
+/// it are placeholders and are never served to anyone: `get` and `subscribe`
+/// both refuse `asTest` outright (pinned by
+/// `astest_is_claimable_for_rpc_but_never_readable`).
+fn astest_descriptor_payload() -> NtPayload {
+    StatusSource::astest_response("", "", "", &Decision::Deny, &Decision::Deny)
+}
+
+/// Descriptors for all 15 served status names, computed once.
+///
+/// Every status payload is shape-stable: the bandwidth NTTables carry a fixed
+/// column set whatever the row count, an NTScalarArray's descriptor does not
+/// depend on its element count, and `stats`/`refs`/`poke`/`threads` are fixed
+/// structures. So `claim` — which only ever wanted the descriptor — no longer
+/// has to build a whole value payload (reading the client registry, the cache
+/// list, the mcache size and the bandwidth snapshot) and throw it away on
+/// every channel creation.
+///
+/// `the_cached_claim_descriptors_match_a_freshly_built_payload` pins the table
+/// against freshly built payloads over non-empty handles, so a future payload
+/// change that *did* make a descriptor data-dependent fails loudly here.
+///
+/// Cached in a process-wide `OnceLock`, so every `StatusSource` in the process
+/// shares one table. That is correct today because the descriptors are shape
+/// constants independent of prefix and handles, but a future per-server
+/// status shape would need to stop sharing this table.
+fn descriptors() -> &'static HashMap<&'static str, StructureDesc> {
+    static DESCRIPTORS: OnceLock<HashMap<&'static str, StructureDesc>> = OnceLock::new();
+    DESCRIPTORS.get_or_init(|| {
+        let handles = StatusHandles::test();
+        let generation = AtomicU64::new(0);
+        served_suffixes()
+            .map(|suffix| {
+                let payload = match suffix {
+                    "asTest" => astest_descriptor_payload(),
+                    "threads" => StatusSource::threads_static_value(),
+                    s => StatusSource::value_payload(s, &handles, &generation).unwrap_or_else(
+                        || unreachable!("every LIVE suffix has a value payload; missing: {s}"),
+                    ),
+                };
+                (suffix, descriptor_for_payload(&payload))
+            })
+            .collect()
+    })
+}
+
 /// A [`Source`] serving the gateway's status/introspection PVs under a
 /// configurable prefix, gated through the same [`AccessControl`] the
 /// gateway's data-plane `GatewaySource` uses.
@@ -405,26 +459,21 @@ impl StatusSource {
             )
     }
 
+    /// The synchronous core of [`Source::claim`]/[`Source::try_claim`]:
+    /// resolves a full PV name to the [`PvInfo`] a channel is created with, or
+    /// `None` if this source does not serve it.
+    ///
+    /// Answers from the [`descriptors`] table rather than building a value
+    /// payload and discarding everything but its shape.
     fn claim_sync(&self, name: &str) -> Option<PvInfo> {
         if !self.serves(name) {
             return None;
         }
         // `serves` already confirmed `self.suffix(name)` is `Some`.
         let suffix = self.suffix(name)?;
-        let payload = if RPC_NAMES.contains(&suffix) {
-            // RPC-only PVs still advertise a result descriptor at claim
-            // time, each in its own shape.
-            match suffix {
-                // `threads` is both a value PV and an RPC target; advertise
-                // the get/subscribe value shape (identical NTScalar('s')).
-                "threads" => Self::threads_static_value(),
-                _ => Self::astest_response("", "", "", &Decision::Deny, &Decision::Deny),
-            }
-        } else {
-            Self::value_payload(suffix, &self.handles, &self.generation)?
-        };
+        let descriptor = descriptors().get(suffix)?.clone();
         Some(PvInfo {
-            descriptor: descriptor_for_payload(&payload),
+            descriptor,
             writable: suffix == "poke",
         })
     }
@@ -949,6 +998,54 @@ mod tests {
     fn source(read_only: bool) -> StatusSource {
         let access = Arc::new(AccessControl::new(read_only, None, None));
         StatusSource::new(PREFIX.to_string(), access, StatusHandles::test())
+    }
+
+    /// The cached descriptor table must equal what building the payload
+    /// would have produced, for every served suffix. Handles are deliberately
+    /// NON-empty — two clients, a cache entry, a non-zero mcache size and a
+    /// populated rate row — so a descriptor that somehow depended on row or
+    /// element count would show up here rather than hiding behind empty
+    /// vectors.
+    #[test]
+    fn the_cached_claim_descriptors_match_a_freshly_built_payload() {
+        let handles = StatusHandles {
+            clients: Arc::new(|| vec!["alice@10.0.0.5".to_string(), "10.0.0.6".to_string()]),
+            cache: Arc::new(|| vec!["UPSTREAM:PV".to_string()]),
+            mcache_size: Arc::new(|| 42),
+            bandwidth: fixed_bandwidth_handle(RateSnapshot {
+                ds_bypv_tx: vec![("PV:A".to_string(), 1.5)],
+                ds_byhost_tx: vec![("alice".to_string(), "10.0.0.5".to_string(), 2.5)],
+                ..RateSnapshot::default()
+            }),
+        };
+        let generation = AtomicU64::new(7);
+
+        for suffix in served_suffixes() {
+            let built = match suffix {
+                "asTest" => astest_descriptor_payload(),
+                "threads" => StatusSource::threads_static_value(),
+                s => StatusSource::value_payload(s, &handles, &generation)
+                    .unwrap_or_else(|| panic!("{s} must have a value payload")),
+            };
+            assert_eq!(
+                descriptors().get(suffix),
+                Some(&descriptor_for_payload(&built)),
+                "cached descriptor for {suffix} drifted from the built payload"
+            );
+        }
+    }
+
+    /// G7: `asTest` is an RPC endpoint. Channel creation is a protocol
+    /// prerequisite for issuing an RPC, so `claim` must keep succeeding for it
+    /// — but it must never be readable as a value PV, because a `get` would
+    /// return the shape-only placeholder rather than any real access decision.
+    #[tokio::test]
+    async fn astest_is_claimable_for_rpc_but_never_readable() {
+        let src = source(false);
+        let name = format!("{PREFIX}asTest");
+        assert!(src.claim_sync(&name).is_some(), "asTest must be claimable: RPC needs a channel");
+        assert!(src.get(&name).await.is_none(), "asTest must not be readable as a value PV");
+        assert!(src.subscribe(&name).await.is_none(), "asTest must not be monitorable");
     }
 
     #[tokio::test]
