@@ -311,22 +311,21 @@ impl StatusHandles {
 }
 
 /// Builds the `clients` [`ListHandle`] over a [`ClientRegistry`]: each
-/// connection renders as `user@ip` when identified, else the bare peer IP,
-/// with the result sorted for a stable diagnostic listing. Factored out of
+/// connection renders as `user@ip` when identified, else the bare peer IP.
+/// Ordering is applied by [`StatusSource::string_array_payload`], the single
+/// choke point `clients` and `cache` share. Factored out of
 /// [`StatusHandles::from_gateway_with`] so it can be exercised directly by a
 /// unit test that has no need for a real [`GatewaySource`].
 fn clients_list_handle(registry: Arc<ClientRegistry>) -> ListHandle {
     Arc::new(move || {
-        let mut v: Vec<String> = registry
+        registry
             .snapshot()
             .iter()
             .map(|e| match &e.user {
                 Some(u) => format!("{u}@{}", e.peer.ip()),
                 None => e.peer.ip().to_string(),
             })
-            .collect();
-        v.sort();
-        v
+            .collect()
     })
 }
 
@@ -419,8 +418,18 @@ impl StatusSource {
         NtPayload::Scalar(NtScalar::from_value(ScalarValue::F64(v)))
     }
 
-    /// An NTScalarArray-of-string payload (p4p's shape for `clients`/`cache`).
-    fn string_array_payload(items: Vec<String>) -> NtPayload {
+    /// An `epics:nt/NTScalarArray:1.0` of strings (p4p's shape for `clients`
+    /// and `cache`).
+    ///
+    /// **Sorts `items`.** Both backing handles read a `HashMap` — a
+    /// `ClientRegistry` snapshot for `clients`, the upstream monitor-cache map
+    /// for `cache` — whose iteration order is arbitrary and jumps wholesale on
+    /// a rehash. The `subscribe` ticker decides "did anything change?" by
+    /// comparing whole payloads, so an unstable element order manufactures
+    /// changes out of nothing. Sorting here rather than in each handle means
+    /// the two PVs cannot drift apart on this again.
+    fn string_array_payload(mut items: Vec<String>) -> NtPayload {
+        items.sort();
         NtPayload::ScalarArray(NtScalarArray::from_value(ScalarArrayValue::Str(items)))
     }
 
@@ -1101,8 +1110,53 @@ mod tests {
         // conn 2 has no identity set: renders as the bare peer IP.
 
         let clients_handle = clients_list_handle(registry);
-        let clients = clients_handle();
-        assert_eq!(clients, vec!["10.0.0.5".to_string(), "alice@10.0.0.6".to_string()]);
+        let mut clients = clients_handle();
+        clients.sort();
+        assert_eq!(
+            clients,
+            vec!["10.0.0.5".to_string(), "alice@10.0.0.6".to_string()],
+            "the handle's content is unchanged; only its ordering moved to string_array_payload"
+        );
+    }
+
+    /// `clients` and `cache` are both built from `HashMap`-backed handles
+    /// whose iteration order is arbitrary, so the served array must be sorted
+    /// at payload-construction time — the one choke point both pass through.
+    /// Unsorted, a rehash looks like new data to the LIVE ticker's change
+    /// detector and pushes a monitor frame carrying no new information.
+    #[tokio::test]
+    async fn string_array_status_pvs_are_sorted_whatever_order_the_handle_returns() {
+        let unsorted: ListHandle =
+            Arc::new(|| vec!["zeta".to_string(), "alpha".to_string(), "mu".to_string()]);
+        let handles = StatusHandles {
+            clients: unsorted.clone(),
+            cache: unsorted,
+            ..StatusHandles::test()
+        };
+        let src = StatusSource::new(
+            PREFIX.to_string(),
+            Arc::new(AccessControl::new(false, None, None)),
+            handles,
+        );
+
+        for suffix in ["clients", "cache"] {
+            let p = src
+                .get(&format!("{PREFIX}{suffix}"))
+                .await
+                .unwrap_or_else(|| panic!("{suffix} must be readable"));
+            let NtPayload::ScalarArray(a) = p else {
+                panic!("{suffix} must be a string array");
+            };
+            assert_eq!(
+                a.value,
+                ScalarArrayValue::Str(vec![
+                    "alpha".to_string(),
+                    "mu".to_string(),
+                    "zeta".to_string()
+                ]),
+                "{suffix} must be sorted"
+            );
+        }
     }
 
     /// p4p shape: `clients`/`cache` are NTScalarArray-of-string, not scalars.

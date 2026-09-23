@@ -47,24 +47,39 @@ pub fn compute_rate(now: u64, prev: u64, dt: f64) -> f64 {
 /// seconds elapsed. A key present in `cur` but absent from `prev` is treated
 /// as `prev = 0` — the intended first-sample behavior (the whole cumulative
 /// count divided by `dt`).
+///
+/// Rows come out **sorted by key**. The source is a `HashMap`, whose
+/// iteration order is arbitrary and jumps wholesale on a rehash; the status
+/// ticker compares whole payloads to decide whether anything changed, so an
+/// unstable row order manufactures "changes" out of nothing.
 fn rate_rows(cur: &[(String, u64)], prev: &HashMap<String, u64>, dt: f64) -> Vec<(String, f64)> {
-    cur.iter()
+    let mut rows: Vec<(String, f64)> = cur
+        .iter()
         .map(|(k, v)| {
             let p = prev.get(k).copied().unwrap_or(0);
             (k.clone(), compute_rate(*v, p, dt))
         })
-        .collect()
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
 }
 
 /// Converts the `ClientRegistry::byhost` cumulative rows
 /// (`Vec<(account, client_ip, u64)>`) into per-`(account, client)` rate rows
 /// against `prev`, using `dt` seconds elapsed.
+///
+/// Rows come out **sorted by `(account, client)`**. This is the worst case of
+/// the ordering problem: `ClientRegistry::byhost` allocates a fresh `HashMap`
+/// on every call, so its iteration order is re-randomized every single tick
+/// and the `ds:byhost:*` status PVs would otherwise emit a monitor frame per
+/// second on a completely idle gateway.
 fn rate_rows_byhost(
     cur: &[(String, String, u64)],
     prev: &HashMap<(String, String), u64>,
     dt: f64,
 ) -> Vec<(String, String, f64)> {
-    cur.iter()
+    let mut rows: Vec<(String, String, f64)> = cur
+        .iter()
         .map(|(account, client, v)| {
             let p = prev
                 .get(&(account.clone(), client.clone()))
@@ -72,7 +87,9 @@ fn rate_rows_byhost(
                 .unwrap_or(0);
             (account.clone(), client.clone(), compute_rate(*v, p, dt))
         })
-        .collect()
+        .collect();
+    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    rows
 }
 
 fn to_map(rows: &[(String, u64)]) -> HashMap<String, u64> {
@@ -265,5 +282,79 @@ mod tests {
 
         let s = snapshot.lock().unwrap();
         assert_eq!(s.us_bypv_rx, vec![("PV:B".to_string(), 0.0)]);
+    }
+
+    /// Consecutive samples over *unchanged* counters must produce
+    /// byte-identical rows.
+    ///
+    /// `ClientRegistry::byhost` builds a fresh `HashMap` per call, so it gets
+    /// a fresh `RandomState` and a fresh iteration order every single tick.
+    /// Unsorted, the status ticker's whole-payload change detector reads that
+    /// reshuffle as new data and pushes a monitor frame for
+    /// `ds:byhost:rx`/`ds:byhost:tx` every second on a completely idle
+    /// gateway. The `ByteMap`-backed rows have the same defect one degree
+    /// weaker (stable until the map rehashes, then a wholesale jump).
+    #[test]
+    fn repeated_ticks_over_unchanged_counters_produce_identical_rows() {
+        let counters = Arc::new(BandwidthCounters::new());
+        let registry = Arc::new(ClientRegistry::new());
+        // Five distinct rows: with an unsorted map the chance that 20
+        // consecutive samples all happen to iterate in the same order is
+        // about (1/120)^20, so this cannot pass by luck.
+        for (i, user) in ["alice", "bob", "carol", "dave", "erin"].iter().enumerate() {
+            let id = i as u64 + 1;
+            registry.connect(id, peer(40000 + i as u16));
+            registry.set_identity(id, Some((*user).to_string()), None);
+            registry.add_tx(id, 1000 * id);
+            registry.add_rx(id, 500 * id);
+            counters.ds_bypv_tx.add(&format!("PV:{user}"), 100 * id);
+            counters.us_byhost_rx.add(&format!("ioc-{user}"), 7 * id);
+        }
+
+        let snapshot = Arc::new(Mutex::new(RateSnapshot::default()));
+        let mut sampler = BandwidthSampler::new(counters, registry, snapshot.clone());
+
+        // Two warm-up ticks: after the second, `prev` equals the current
+        // cumulative counts, so every rate is a steady 0.0 and only the row
+        // ORDER can still differ between samples.
+        sampler.tick_with_dt(1.0);
+        sampler.tick_with_dt(1.0);
+        let first = snapshot.lock().unwrap().clone();
+
+        for i in 0..20 {
+            sampler.tick_with_dt(1.0);
+            let s = snapshot.lock().unwrap();
+            assert_eq!(s.ds_byhost_tx, first.ds_byhost_tx, "ds:byhost:tx row order changed on tick {i}");
+            assert_eq!(s.ds_byhost_rx, first.ds_byhost_rx, "ds:byhost:rx row order changed on tick {i}");
+            assert_eq!(s.ds_bypv_tx, first.ds_bypv_tx, "ds:bypv:tx row order changed on tick {i}");
+            assert_eq!(s.us_byhost_rx, first.us_byhost_rx, "us:byhost:rx row order changed on tick {i}");
+        }
+    }
+
+    /// The ordering contract itself, stated directly: rows come out sorted by
+    /// key, so two samplers fed the same data in any internal order agree.
+    #[test]
+    fn rate_rows_are_sorted_by_key() {
+        let counters = Arc::new(BandwidthCounters::new());
+        for name in ["PV:zulu", "PV:alpha", "PV:mike", "PV:bravo"] {
+            counters.ds_bypv_tx.add(name, 10);
+        }
+        let registry = Arc::new(ClientRegistry::new());
+        registry.connect(1, peer(40001));
+        registry.set_identity(1, Some("zoe".to_string()), None);
+        registry.add_tx(1, 1);
+        registry.connect(2, peer(40002));
+        registry.set_identity(2, Some("adam".to_string()), None);
+        registry.add_tx(2, 1);
+
+        let snapshot = Arc::new(Mutex::new(RateSnapshot::default()));
+        let mut sampler = BandwidthSampler::new(counters, registry, snapshot.clone());
+        sampler.tick_with_dt(1.0);
+
+        let s = snapshot.lock().unwrap();
+        let names: Vec<&str> = s.ds_bypv_tx.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["PV:alpha", "PV:bravo", "PV:mike", "PV:zulu"]);
+        let accounts: Vec<&str> = s.ds_byhost_tx.iter().map(|(a, _, _)| a.as_str()).collect();
+        assert_eq!(accounts, vec!["adam", "zoe"]);
     }
 }
