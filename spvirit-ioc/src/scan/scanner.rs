@@ -56,10 +56,15 @@ impl std::error::Error for ScanRegisterError {}
 pub enum AsyncCompleteError {
     /// The completion pass returned a processing error (see [`ProcError`]).
     Proc(ProcError),
-    /// The completion pass panicked. It was caught here, and any monitors the
-    /// pass had already accumulated are lost with the context, so the record
-    /// may still be braked with PACT set (the same residual hazard
-    /// `process_ids` documents for a panicking scan pass, R-T6-PACT).
+    /// The completion pass panicked inside the processing body. It was caught
+    /// here, and any monitors the pass had already accumulated are lost with
+    /// the context. A panic in the bound `start` has PACT reset by
+    /// `record_body`'s guard; a panic elsewhere in the body may leave the
+    /// record braked with PACT set (the same residual hazard `process_ids`
+    /// documents for a panicking scan pass, R-T6-PACT). Only the body is
+    /// contained: the `sink.flush` and deferred `process_ids` that follow a
+    /// successful body run outside `catch_unwind`, as in `process_ids`, so a
+    /// panic there unwinds into the caller rather than becoming this variant.
     Panicked,
 }
 
@@ -691,7 +696,8 @@ impl Scanner {
                 // so an `Arc` clone per record per tick buys nothing. The
                 // registry rides along the same way the clock does -- this is
                 // what makes a bound record's `AsyncSupport::start` reachable
-                // from a running IOC at all.
+                // for a `Scanner` driven directly. (`IocSource`'s put and PINI
+                // paths still build `ProcCtx::new()`; a known follow-up.)
                 let mut ctx = ProcCtx::with_async(self.clock.as_ref(), &self.async_registry);
                 let res = self.db.with_set(id.set, |set| process(set, id, &mut ctx));
                 (
@@ -735,8 +741,9 @@ impl Scanner {
     /// the device's callback calls this when the operation completes.
     ///
     /// Mirrors one iteration of [`Self::process_ids`] deliberately -- same
-    /// `catch_unwind` isolation, same context, same `sink.flush` after the
-    /// lock is dropped, same deferred drain -- so a completion-driven update
+    /// `catch_unwind` isolation of the processing body (and, as there, the
+    /// `sink.flush` and deferred drain run outside it), same context, same
+    /// `sink.flush` after the lock is dropped -- so a completion-driven update
     /// is indistinguishable downstream from a scan-driven one. The difference
     /// is only the pass it runs: [`crate::process::complete_async`] rather
     /// than `process`, because `process`'s PACT brake returns early for
@@ -744,7 +751,21 @@ impl Scanner {
     ///
     /// Idempotent by construction: `crate::process::complete_async` returns
     /// `Ok(())` without processing if PACT is already clear, so a duplicate
-    /// callback is a no-op rather than a second pass.
+    /// callback is a no-op rather than a second pass. That guarantee is per PACT
+    /// cycle, not per operation: in its `pact == true` branch the support must
+    /// confirm its own operation has finished and return
+    /// [`AsyncOutcome::Pending`](crate::process::AsyncOutcome::Pending)
+    /// otherwise, exactly as Base device support must.
+    ///
+    /// **Contract.** The bound support's `start` runs while this pass holds the
+    /// record's lock-set mutex, which is not re-entrant. `start` must not
+    /// block, and must not call back into the `Scanner` (no `complete_async`,
+    /// `scan_once`, `fire_event` or `process_ids` for any record in the same
+    /// lock set); an operation that finishes immediately must return
+    /// [`AsyncOutcome::Complete`](crate::process::AsyncOutcome::Complete)
+    /// rather than calling this. Do not call this while holding any driver
+    /// lock that `start` also takes: this acquires the lock-set mutex, and
+    /// `start` runs under it, so that is a lock inversion.
     pub fn complete_async(&self, id: RecordId) -> Result<(), AsyncCompleteError> {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut ctx = ProcCtx::with_async(self.clock.as_ref(), &self.async_registry);
@@ -1736,8 +1757,80 @@ mod tests {
         );
 
         // Once-only: a duplicate callback finds PACT clear and does nothing.
+        let deadline_before = support.deadline();
         scanner.complete_async(slow).expect("a duplicate completion is Ok");
         assert_eq!(sink.count("PV:SLOW"), 1, "a duplicate completion must not post again");
+        assert!(
+            !db.with_set(slow.set, |set| set.get(slow).common.pact),
+            "PACT is clear after the completion and the duplicate"
+        );
+        assert_eq!(
+            support.deadline(),
+            deadline_before,
+            "a duplicate completion must not re-initiate the operation (a \
+             re-initiation at t=150ms would record a new deadline)"
+        );
+
+        scanner.shutdown();
+    }
+
+    /// Initiates normally (counting initiations) and panics on the completion
+    /// pass, so a test can prove a panicking completion is contained and does
+    /// not strand the record.
+    struct PanicOnCompleteSupport(std::sync::atomic::AtomicUsize);
+    impl crate::process::AsyncSupport for PanicOnCompleteSupport {
+        fn start(
+            &self,
+            _record: &str,
+            pact: bool,
+            _ctx: &mut ProcCtx,
+        ) -> crate::process::AsyncOutcome {
+            if pact {
+                panic!("device completion failed");
+            }
+            self.0.fetch_add(1, Ordering::SeqCst);
+            crate::process::AsyncOutcome::Pending
+        }
+    }
+
+    #[test]
+    fn a_panicking_completion_is_reported_and_the_next_tick_re_initiates() {
+        // A driver's completion panics inside `start`. `complete_async` must
+        // contain it and say so (not unwind into the driver's callback
+        // thread), `record_body`'s PactResetGuard must leave PACT clear, and
+        // the record must therefore not be braked: the next tick re-initiates.
+        let db = Arc::new(build_db("record(ai, \"PV:BAD\") {\n field(INP, \"7\")\n}\n"));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let bad = db.lookup("PV:BAD").unwrap();
+        let support = Arc::new(PanicOnCompleteSupport(std::sync::atomic::AtomicUsize::new(0)));
+        scanner.bind_async(bad, support.clone());
+        scanner
+            .add_periodic(bad, 0, Duration::from_millis(100))
+            .expect("period is schedulable");
+        scanner.start();
+
+        // Tick 1 at t=100ms initiates and leaves PACT set.
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| support.0.load(Ordering::SeqCst) == 1);
+        assert!(
+            db.with_set(bad.set, |set| set.get(bad).common.pact),
+            "the initiating pass leaves PACT set"
+        );
+
+        // The completion callback panics inside `start`: contained, reported.
+        assert_eq!(scanner.complete_async(bad), Err(AsyncCompleteError::Panicked));
+        assert!(
+            !db.with_set(bad.set, |set| set.get(bad).common.pact),
+            "a panicking completion must not strand the record with PACT set"
+        );
+        assert_eq!(sink.count("PV:BAD"), 0, "a panicked completion posts nothing");
+
+        // Tick 2 at t=200ms is not braked: it re-initiates.
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| support.0.load(Ordering::SeqCst) == 2);
 
         scanner.shutdown();
     }
