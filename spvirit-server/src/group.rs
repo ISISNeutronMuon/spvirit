@@ -422,6 +422,8 @@ impl Source for GroupSource {
                 ordered.sort_by_key(|m| m.put_order);
 
                 let mut results = Vec::new();
+                let mut attempted = 0usize;
+                let mut failures: Vec<String> = Vec::new();
                 for member in ordered {
                     if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Meta
                     {
@@ -430,6 +432,7 @@ impl Source for GroupSource {
                     // Find the sub-field matching this member.
                     if let Some((_, sub_val)) = fields.iter().find(|(n, _)| n == &member.field_name)
                     {
+                        attempted += 1;
                         match self.sources.put(&member.channel, sub_val).await {
                             Ok(mut r) => results.append(&mut r),
                             Err(e) => {
@@ -438,9 +441,20 @@ impl Source for GroupSource {
                                     name,
                                     member.field_name
                                 );
+                                failures.push(format!("{}: {e}", member.field_name));
                             }
                         }
                     }
+                }
+                // A partial failure still committed something, so it stays Ok
+                // and the warnings above are the record. A group PUT where
+                // every attempted member failed committed nothing and must not
+                // be reported to the client as a successful write.
+                if attempted > 0 && failures.len() == attempted {
+                    return Err(format!(
+                        "group PUT {name}: all {attempted} member PUT(s) failed: {}",
+                        failures.join("; ")
+                    ));
                 }
                 Ok(results)
             } else {
@@ -1258,5 +1272,58 @@ mod tests {
         let payload = NtPayload::Scalar(spvirit_types::NtScalar::from_value(ScalarValue::F64(1.5)));
         assert_eq!(timestamp_seconds_of(&payload_to_full_structure(&payload)), 0);
         assert_eq!(timestamp_seconds_of(&payload_to_meta_only(&payload)), 0);
+    }
+
+    #[tokio::test]
+    async fn group_put_fails_when_every_member_put_fails() {
+        // An empty registry resolves no channels, so every member PUT fails.
+        let json = r#"{
+            "GRP:allfail": {
+                "a": { "+channel": "R:missing:a", "+type": "plain" },
+                "b": { "+channel": "R:missing:b", "+type": "plain" }
+            }
+        }"#;
+        let groups: HashMap<String, GroupPvDef> = parse_group_config(json)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.name.clone(), g))
+            .collect();
+        let source = GroupSource::new(Arc::new(SourceRegistry::new()), groups);
+
+        let value = DecodedValue::Structure(vec![
+            ("a".to_string(), DecodedValue::Float64(1.0)),
+            ("b".to_string(), DecodedValue::Float64(2.0)),
+        ]);
+
+        let err = Source::put(&source, "GRP:allfail", &value)
+            .await
+            .expect_err("a group PUT whose members all failed must not report success");
+        assert!(
+            err.contains("all 2"),
+            "error should say how many member PUTs failed: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_put_with_no_attempted_members_is_still_ok() {
+        // Proc/Meta members are skipped, so nothing is attempted and there is
+        // nothing to fail.
+        let json = r#"{
+            "GRP:proconly": {
+                "go": { "+channel": "R:missing:proc", "+type": "proc" }
+            }
+        }"#;
+        let groups: HashMap<String, GroupPvDef> = parse_group_config(json)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.name.clone(), g))
+            .collect();
+        let source = GroupSource::new(Arc::new(SourceRegistry::new()), groups);
+
+        let value = DecodedValue::Structure(vec![("go".to_string(), DecodedValue::Int32(1))]);
+        let out = Source::put(&source, "GRP:proconly", &value)
+            .await
+            .expect("nothing was attempted, so nothing failed");
+        assert!(out.is_empty());
     }
 }
