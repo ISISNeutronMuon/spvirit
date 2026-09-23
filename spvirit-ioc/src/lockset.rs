@@ -209,6 +209,35 @@ impl RecordDb {
         &self.order
     }
 
+    /// Records with `PINI` set, in the order Base's `initialProcess` sweeps
+    /// them: `PHAS` ascending, `.db` definition order breaking ties within a
+    /// phase.
+    ///
+    /// Shared by both PINI sweeps -- `Scanner::process_pini` (what a running
+    /// server uses) and `IocSource::process_pini` (the public entry point the
+    /// conformance tests call) -- so the two can no longer disagree about
+    /// processing order.
+    ///
+    /// Reads PINI outside the per-record lock its callers then take, so
+    /// treat the result as a candidate list: a caller that cares re-checks
+    /// PINI under its own lock.
+    pub fn pini_order(&self) -> Vec<RecordId> {
+        let mut sweep: Vec<(i32, usize, RecordId)> = self
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(order_index, &id)| {
+                let (pini, phas) = self.with_set(id.set, |set| {
+                    let common = &set.get(id).common;
+                    (common.pini, common.phas)
+                });
+                pini.then_some((phas, order_index, id))
+            })
+            .collect();
+        sweep.sort_by_key(|&(phas, order_index, _)| (phas, order_index));
+        sweep.into_iter().map(|(_, _, id)| id).collect()
+    }
+
     /// Link targets that named a record the database does not contain.
     pub fn unresolved_links(&self) -> Vec<String> {
         self.unresolved.clone()

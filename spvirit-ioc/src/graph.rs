@@ -206,6 +206,11 @@ impl RecordDb {
 /// stack overflow inside the diagnostic.
 fn find_cycles(edges: &[Edge]) -> Vec<Vec<String>> {
     let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    // A set, not `Vec::contains`: the linear scan made this O(E*N), and this
+    // diagnostic runs at every load. Collected into a Vec and sorted below so
+    // the traversal order -- and therefore the order components come out in --
+    // stays deterministic.
+    let mut seen: HashSet<&str> = HashSet::new();
     let mut nodes: Vec<&str> = Vec::new();
     for edge in edges {
         adjacency
@@ -213,7 +218,7 @@ fn find_cycles(edges: &[Edge]) -> Vec<Vec<String>> {
             .or_default()
             .push(edge.to.as_str());
         for n in [edge.from.as_str(), edge.to.as_str()] {
-            if !nodes.contains(&n) {
+            if seen.insert(n) {
                 nodes.push(n);
             }
         }
@@ -400,6 +405,33 @@ mod tests {
         assert!(
             g.report().iter().any(|l| l.contains("cycle")),
             "the cycle must appear in the startup report"
+        );
+    }
+
+    #[test]
+    fn cycle_detection_scales_to_a_large_database() {
+        // The node dedupe used to linear-scan the accumulated list per edge
+        // endpoint, so this chain (30k records, 30k links, no cycle) cost
+        // ~9e8 comparisons before Tarjan started -- on every IOC startup.
+        let mut text = String::from("record(ai, \"PV:0\") {\n field(INP, \"1\")\n}\n");
+        for i in 1..30_000 {
+            text.push_str(&format!(
+                "record(ai, \"PV:{i}\") {{\n field(INP, \"PV:{} NPP\")\n}}\n",
+                i - 1
+            ));
+        }
+        // Build the database OUTSIDE the timed region: `.db` parsing and
+        // `RecordDb::build` are not what this test is about, and at this scale
+        // they are not free either.
+        let raw = parse_db_records(&text, "t.db", &HashMap::new()).expect("parse");
+        let db = RecordDb::build(build_records(&raw).expect("build"));
+        let started = std::time::Instant::now();
+        let g = db.dependency_graph();
+        assert!(g.cycles.is_empty(), "a chain has no cycles");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "cycle detection over 30k records took {:?}; the dedupe is still quadratic",
+            started.elapsed()
         );
     }
 

@@ -99,24 +99,96 @@ fn lex_number(s: &str) -> Option<(f64, usize)> {
         return Some((value as i32 as f64, 2 + len));
     }
 
-    // Longest prefix that parses as a float. Bounded by the literal's length,
-    // so the quadratic worst case is irrelevant in practice.
-    let max = s
-        .char_indices()
-        .take_while(|(_, c)| c.is_ascii_digit() || *c == '.' || *c == 'e' || *c == 'E' || *c == '+' || *c == '-')
-        .map(|(idx, c)| idx + c.len_utf8())
-        .last()?;
-    for end in (1..=max).rev() {
-        if let Ok(v) = s[..end].parse::<f64>() {
-            return Some((v, end));
+    // Scan the float grammar forward, once: digits, at most one `.`, then an
+    // exponent only if it is complete. The previous version took the longest
+    // run of `[0-9.eE+-]` bytes and re-parsed every shrinking prefix of it --
+    // and because `+`/`-` are in that set, the run was the literal plus every
+    // operator following it, so `1+1+1+...` was quadratic in the whole
+    // expression, not in the literal.
+    let b = s.as_bytes();
+    let mut end = 0usize;
+    while end < b.len() && b[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end < b.len() && b[end] == b'.' {
+        let mut after = end + 1;
+        while after < b.len() && b[after].is_ascii_digit() {
+            after += 1;
+        }
+        // A `.` counts only if it has a digit on one side or the other:
+        // ".5" and "1." are numbers, a bare "." is not.
+        if after > end + 1 || end > 0 {
+            end = after;
         }
     }
-    None
+    if end == 0 {
+        return None;
+    }
+    if end < b.len() && (b[end] == b'e' || b[end] == b'E') {
+        let mut after = end + 1;
+        if after < b.len() && (b[after] == b'+' || b[after] == b'-') {
+            after += 1;
+        }
+        let digits_at = after;
+        while after < b.len() && b[after].is_ascii_digit() {
+            after += 1;
+        }
+        // An exponent with no digits is not part of the literal: "1e" is the
+        // number 1 followed by the identifier "e".
+        if after > digits_at {
+            end = after;
+        }
+    }
+    s[..end].parse::<f64>().ok().map(|v| (v, end))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lex_number_accepts_exactly_the_same_prefixes_as_before() {
+        // Behaviour lock for the rewrite below: every one of these is a case
+        // the shrink-loop version handled, including the ones where the
+        // longest float-ish run is NOT a valid float.
+        let cases: &[(&str, Option<(f64, usize)>)] = &[
+            ("1", Some((1.0, 1))),
+            ("12.5", Some((12.5, 4))),
+            (".5", Some((0.5, 2))),
+            ("1.", Some((1.0, 2))),
+            ("1.5e3", Some((1500.0, 5))),
+            ("1e+5", Some((100000.0, 4))),
+            ("1e-5", Some((0.00001, 4))),
+            ("1e", Some((1.0, 1))),
+            ("1e+", Some((1.0, 1))),
+            ("1+2", Some((1.0, 1))),
+            ("1-2", Some((1.0, 1))),
+            ("1..2", Some((1.0, 2))),
+            ("0x1f", Some((31.0, 4))),
+            ("0xffffffff", Some((-1.0, 10))),
+            (".", None),
+            ("0x", None),
+        ];
+        for (src, want) in cases {
+            assert_eq!(lex_number(src), *want, "lex_number({src:?})");
+        }
+    }
+
+    #[test]
+    fn lexing_a_number_followed_by_many_operators_is_linear() {
+        // `+` and `-` are inside the old "float-ish run", so the run was the
+        // literal plus every operator after it, and each shrinking prefix got
+        // its own `parse::<f64>()`. This is one token and 20k operators.
+        let src = format!("1{}", "+1".repeat(20_000));
+        let started = std::time::Instant::now();
+        let tokens = lex(&src).expect("lexes");
+        assert_eq!(tokens.len(), 40_001, "1, then 20k (+, 1) pairs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "lexing took {:?}; lex_number is still quadratic",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn lexes_operands_numbers_and_operators() {

@@ -1,12 +1,25 @@
 //! A single scan list: records ordered by PHAS then insertion order.
 
 use crate::lockset::RecordId;
+use std::collections::HashMap;
 
+/// One scan list: the records to process on a tick, already in processing
+/// order.
+///
+/// `members` is held sorted by `(phas, seq)` at all times, so `snapshot` --
+/// which runs on every tick of every period -- is a plain copy of the ids
+/// rather than a clone-and-re-sort. `index` maps a member to its sort key so
+/// membership tests and removals do not scan the vec.
 #[derive(Debug, Default)]
 pub struct ScanList {
-    /// (phas, seq, id). `seq` is a monotonic insertion counter that makes the
-    /// PHAS-tie order stable and independent of Vec churn.
+    /// Sorted ascending by `(phas, seq)`. Invariant: exactly the entries in
+    /// `index`, and `binary_search` on `(phas, seq)` finds each of them.
     members: Vec<(i32, u64, RecordId)>,
+    /// Each member's `(phas, seq)` sort key.
+    index: HashMap<RecordId, (i32, u64)>,
+    /// Monotonic insertion counter: ties within a PHAS break by first-added,
+    /// and a member that changes PHAS keeps its original seq (so a re-insert
+    /// re-orders without jumping to the back of its new phase).
     next_seq: u64,
 }
 
@@ -15,30 +28,56 @@ impl ScanList {
         Self::default()
     }
 
-    /// Add `id` at `phas`, or update its `phas` if already present. Order is
-    /// realized lazily in `snapshot`, so insert stays O(n) find + push.
+    /// Position of the member with sort key `(phas, seq)`.
+    fn locate(&self, phas: i32, seq: u64) -> Option<usize> {
+        self.members
+            .binary_search_by(|probe| (probe.0, probe.1).cmp(&(phas, seq)))
+            .ok()
+    }
+
+    /// Where sort key `key` belongs in `members`.
+    fn slot_for(&self, key: (i32, u64)) -> usize {
+        self.members.partition_point(|probe| (probe.0, probe.1) < key)
+    }
+
+    /// Add `id` at priority `phas`, or re-prioritise it if already a member.
     pub fn insert(&mut self, id: RecordId, phas: i32) {
-        if let Some(slot) = self.members.iter_mut().find(|(_, _, m)| *m == id) {
-            slot.0 = phas;
+        if let Some(&(old_phas, seq)) = self.index.get(&id) {
+            if old_phas == phas {
+                return;
+            }
+            if let Some(pos) = self.locate(old_phas, seq) {
+                self.members.remove(pos);
+            }
+            let key = (phas, seq);
+            let at = self.slot_for(key);
+            self.members.insert(at, (phas, seq, id));
+            self.index.insert(id, key);
             return;
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.members.push((phas, seq, id));
+        let key = (phas, seq);
+        let at = self.slot_for(key);
+        self.members.insert(at, (phas, seq, id));
+        self.index.insert(id, key);
     }
 
-    /// Remove `id`. Returns whether it was present.
+    /// Take `id` off this list. Returns whether it was present -- the
+    /// signature `remove_takes_it_off` asserts on; do not change it to `()`.
     pub fn remove(&mut self, id: RecordId) -> bool {
-        let before = self.members.len();
-        self.members.retain(|(_, _, m)| *m != id);
-        self.members.len() != before
+        let Some((phas, seq)) = self.index.remove(&id) else {
+            return false;
+        };
+        if let Some(pos) = self.locate(phas, seq) {
+            self.members.remove(pos);
+        }
+        true
     }
 
-    /// The processing order for one pass: PHAS ascending, ties by insertion.
+    /// The processing order for one tick. Already sorted, so this is a copy.
     pub fn snapshot(&self) -> Vec<RecordId> {
-        let mut ordered = self.members.clone();
-        ordered.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        ordered.into_iter().map(|(_, _, id)| id).collect()
+        self.members.iter().map(|&(_, _, id)| id).collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -53,6 +92,7 @@ impl ScanList {
 mod tests {
     use super::*;
     use crate::lockset::RecordId;
+    use std::time::{Duration, Instant};
 
     fn rid(slot: usize) -> RecordId {
         RecordId { set: 0, slot }
@@ -106,5 +146,26 @@ mod tests {
         assert!(!l.is_empty());
         l.remove(rid(1));
         assert!(l.is_empty());
+    }
+
+    #[test]
+    fn a_large_list_loads_and_snapshots_without_quadratic_blowup() {
+        // `insert` used to linear-scan the whole vec (so loading n records was
+        // O(n^2)) and `snapshot` used to clone + re-sort the whole list on
+        // every tick. Both are now O(1)-lookup / O(n)-copy, so this finishes
+        // comfortably inside the bound even in a debug build.
+        let started = Instant::now();
+        let mut list = ScanList::default();
+        for slot in 0..50_000 {
+            list.insert(rid(slot), 0);
+        }
+        for _ in 0..200 {
+            assert_eq!(list.snapshot().len(), 50_000);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "50k inserts + 200 snapshots took {:?}; the list is still quadratic",
+            started.elapsed()
+        );
     }
 }

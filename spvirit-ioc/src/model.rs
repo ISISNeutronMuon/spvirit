@@ -128,6 +128,26 @@ impl Field {
             _ => None,
         }
     }
+
+    /// The EPICS field name: the `.db` spelling and the wire text.
+    ///
+    /// The exact inverse of [`Field::parse`], and deliberately a table rather
+    /// than derived `Debug` output -- this string reaches clients as the value
+    /// of a link field, so it must not move when a variant is renamed.
+    pub fn epics_name(self) -> &'static str {
+        match self {
+            Field::Val => "VAL",
+            Field::Sevr => "SEVR",
+            Field::Stat => "STAT",
+            Field::Disa => "DISA",
+            Field::Disv => "DISV",
+            Field::Hihi => "HIHI",
+            Field::High => "HIGH",
+            Field::Low => "LOW",
+            Field::Lolo => "LOLO",
+            Field::Proc => "PROC",
+        }
+    }
 }
 
 /// A db link's target: a name until [`crate::lockset::RecordDb::build`]
@@ -370,6 +390,30 @@ mod tests {
         match r.to_payload() {
             NtPayload::Scalar(nt) => assert_eq!(nt.units, ""),
             other => panic!("expected scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_field_name_round_trips_through_parse() {
+        // `epics_name` is the wire/`.db` spelling and the inverse of `parse`.
+        // It exists so link rendering never depends on derived `Debug` output,
+        // which is a debugging aid and not an API.
+        let all = [
+            Field::Val,
+            Field::Sevr,
+            Field::Stat,
+            Field::Disa,
+            Field::Disv,
+            Field::Hihi,
+            Field::High,
+            Field::Low,
+            Field::Lolo,
+            Field::Proc,
+        ];
+        for f in all {
+            let name = f.epics_name();
+            assert_eq!(name, name.to_ascii_uppercase(), "{name} must already be upper case");
+            assert_eq!(Field::parse(name), Some(f), "{name} must parse back to itself");
         }
     }
 }
