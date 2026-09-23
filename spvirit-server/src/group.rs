@@ -422,6 +422,8 @@ impl Source for GroupSource {
                 ordered.sort_by_key(|m| m.put_order);
 
                 let mut results = Vec::new();
+                let mut attempted = 0usize;
+                let mut failures: Vec<String> = Vec::new();
                 for member in ordered {
                     if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Meta
                     {
@@ -430,6 +432,7 @@ impl Source for GroupSource {
                     // Find the sub-field matching this member.
                     if let Some((_, sub_val)) = fields.iter().find(|(n, _)| n == &member.field_name)
                     {
+                        attempted += 1;
                         match self.sources.put(&member.channel, sub_val).await {
                             Ok(mut r) => results.append(&mut r),
                             Err(e) => {
@@ -438,9 +441,20 @@ impl Source for GroupSource {
                                     name,
                                     member.field_name
                                 );
+                                failures.push(format!("{}: {e}", member.field_name));
                             }
                         }
                     }
+                }
+                // A partial failure still committed something, so it stays Ok
+                // and the warnings above are the record. A group PUT where
+                // every attempted member failed committed nothing and must not
+                // be reported to the client as a successful write.
+                if attempted > 0 && failures.len() == attempted {
+                    return Err(format!(
+                        "group PUT {name}: all {attempted} member PUT(s) failed: {}",
+                        failures.join("; ")
+                    ));
                 }
                 Ok(results)
             } else {
@@ -638,7 +652,10 @@ fn payload_to_full_structure(payload: &NtPayload) -> PvValue {
                     "alarm".to_string(),
                     alarm_to_pv_value(nt.alarm_severity, nt.alarm_status, &nt.alarm_message),
                 ),
-                ("timeStamp".to_string(), timestamp_to_pv_value_default()),
+                (
+                    "timeStamp".to_string(),
+                    scalar_timestamp_pv(nt.time_stamp.as_ref()),
+                ),
             ];
             fields.push((
                 "display".to_string(),
@@ -769,7 +786,10 @@ fn payload_to_meta_only(payload: &NtPayload) -> PvValue {
                     "alarm".to_string(),
                     alarm_to_pv_value(nt.alarm_severity, nt.alarm_status, &nt.alarm_message),
                 ),
-                ("timeStamp".to_string(), timestamp_to_pv_value_default()),
+                (
+                    "timeStamp".to_string(),
+                    scalar_timestamp_pv(nt.time_stamp.as_ref()),
+                ),
             ],
         },
         NtPayload::ScalarArray(nt) => PvValue::Structure {
@@ -954,6 +974,16 @@ fn timestamp_pv(ts: &spvirit_types::NtTimeStamp) -> PvValue {
 
 fn timestamp_to_pv_value_default() -> PvValue {
     timestamp_pv(&spvirit_types::NtTimeStamp::default())
+}
+
+/// Timestamp of a scalar member. `NtScalar::time_stamp` is optional; publish
+/// the record's own stamp whenever it has one and fall back to the epoch-0
+/// default only when it genuinely has never been stamped.
+fn scalar_timestamp_pv(ts: Option<&spvirit_types::NtTimeStamp>) -> PvValue {
+    match ts {
+        Some(ts) => timestamp_pv(ts),
+        None => timestamp_to_pv_value_default(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,5 +1223,107 @@ mod tests {
 
         assert_eq!(source.try_claim("GRP:absent"), TryClaim::No);
         assert!(Source::claim(&source, "GRP:absent").await.is_none());
+    }
+
+    /// Pull `timeStamp.secondsPastEpoch` out of a group member structure.
+    fn timestamp_seconds_of(v: &PvValue) -> i64 {
+        let PvValue::Structure { fields, .. } = v else {
+            panic!("expected a structure, got {v:?}");
+        };
+        let (_, ts) = fields
+            .iter()
+            .find(|(n, _)| n == "timeStamp")
+            .expect("no timeStamp field");
+        let PvValue::Structure { fields, .. } = ts else {
+            panic!("timeStamp is not a structure: {ts:?}");
+        };
+        let (_, secs) = fields
+            .iter()
+            .find(|(n, _)| n == "secondsPastEpoch")
+            .expect("no secondsPastEpoch field");
+        match secs {
+            PvValue::Scalar(ScalarValue::I64(s)) => *s,
+            other => panic!("secondsPastEpoch is not an I64: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_member_publishes_its_own_timestamp_not_epoch_zero() {
+        let nt = spvirit_types::NtScalar::from_value(ScalarValue::F64(1.5))
+            .with_timestamp(1_700_000_000, 250);
+        let payload = NtPayload::Scalar(nt);
+
+        assert_eq!(
+            timestamp_seconds_of(&payload_to_full_structure(&payload)),
+            1_700_000_000,
+            "scalar mapping must publish the member's own timestamp"
+        );
+        assert_eq!(
+            timestamp_seconds_of(&payload_to_meta_only(&payload)),
+            1_700_000_000,
+            "meta mapping must publish the member's own timestamp"
+        );
+    }
+
+    #[test]
+    fn scalar_member_without_a_timestamp_still_reports_epoch_zero() {
+        // A record that has genuinely never been stamped keeps the old
+        // behaviour; only records WITH a stamp change.
+        let payload = NtPayload::Scalar(spvirit_types::NtScalar::from_value(ScalarValue::F64(1.5)));
+        assert_eq!(timestamp_seconds_of(&payload_to_full_structure(&payload)), 0);
+        assert_eq!(timestamp_seconds_of(&payload_to_meta_only(&payload)), 0);
+    }
+
+    #[tokio::test]
+    async fn group_put_fails_when_every_member_put_fails() {
+        // An empty registry resolves no channels, so every member PUT fails.
+        let json = r#"{
+            "GRP:allfail": {
+                "a": { "+channel": "R:missing:a", "+type": "plain" },
+                "b": { "+channel": "R:missing:b", "+type": "plain" }
+            }
+        }"#;
+        let groups: HashMap<String, GroupPvDef> = parse_group_config(json)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.name.clone(), g))
+            .collect();
+        let source = GroupSource::new(Arc::new(SourceRegistry::new()), groups);
+
+        let value = DecodedValue::Structure(vec![
+            ("a".to_string(), DecodedValue::Float64(1.0)),
+            ("b".to_string(), DecodedValue::Float64(2.0)),
+        ]);
+
+        let err = Source::put(&source, "GRP:allfail", &value)
+            .await
+            .expect_err("a group PUT whose members all failed must not report success");
+        assert!(
+            err.contains("all 2"),
+            "error should say how many member PUTs failed: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_put_with_no_attempted_members_is_still_ok() {
+        // Proc/Meta members are skipped, so nothing is attempted and there is
+        // nothing to fail.
+        let json = r#"{
+            "GRP:proconly": {
+                "go": { "+channel": "R:missing:proc", "+type": "proc" }
+            }
+        }"#;
+        let groups: HashMap<String, GroupPvDef> = parse_group_config(json)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.name.clone(), g))
+            .collect();
+        let source = GroupSource::new(Arc::new(SourceRegistry::new()), groups);
+
+        let value = DecodedValue::Structure(vec![("go".to_string(), DecodedValue::Int32(1))]);
+        let out = Source::put(&source, "GRP:proconly", &value)
+            .await
+            .expect("nothing was attempted, so nothing failed");
+        assert!(out.is_empty());
     }
 }

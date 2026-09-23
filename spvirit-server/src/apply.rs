@@ -50,35 +50,24 @@ pub fn apply_value_update(nt: &mut NtScalar, val: &DecodedValue, compute_alarms:
                 return true;
             }
         }
+        // Every remaining target width. Each one uses its own exact decoder
+        // rather than a shared f64 round-trip, so a 64-bit PUT keeps its full
+        // magnitude and an out-of-range PUT is refused instead of saturated.
+        // This is the same policy `RecordInstance::set_scalar_value` applies
+        // to host-API writes; the two paths must not disagree.
         _ => {
-            if let Some(v) = decoded_to_f64(val) {
-                match &mut nt.value {
-                    ScalarValue::I8(c) => {
-                        *c = v as i8;
-                    }
-                    ScalarValue::I16(c) => {
-                        *c = v as i16;
-                    }
-                    ScalarValue::I64(c) => {
-                        *c = v as i64;
-                    }
-                    ScalarValue::U8(c) => {
-                        *c = v as u8;
-                    }
-                    ScalarValue::U16(c) => {
-                        *c = v as u16;
-                    }
-                    ScalarValue::U32(c) => {
-                        *c = v as u32;
-                    }
-                    ScalarValue::U64(c) => {
-                        *c = v as u64;
-                    }
-                    ScalarValue::F32(c) => {
-                        *c = v as f32;
-                    }
-                    _ => return false,
-                }
+            let applied = match &mut nt.value {
+                ScalarValue::I8(c) => decoded_to_i8(val).map(|v| *c = v),
+                ScalarValue::I16(c) => decoded_to_i16(val).map(|v| *c = v),
+                ScalarValue::I64(c) => decoded_to_i64(val).map(|v| *c = v),
+                ScalarValue::U8(c) => decoded_to_u8(val).map(|v| *c = v),
+                ScalarValue::U16(c) => decoded_to_u16(val).map(|v| *c = v),
+                ScalarValue::U32(c) => decoded_to_u32(val).map(|v| *c = v),
+                ScalarValue::U64(c) => decoded_to_u64(val).map(|v| *c = v),
+                ScalarValue::F32(c) => decoded_to_f32(val).map(|v| *c = v),
+                _ => None,
+            };
+            if applied.is_some() {
                 if compute_alarms {
                     nt.update_alarm_from_value();
                 }
@@ -1100,5 +1089,61 @@ mod tests {
             nt.time_stamp.as_ref().expect("stamped").seconds_past_epoch > OLD.seconds_past_epoch
         );
         assert!(nt.data_time_stamp.seconds_past_epoch > OLD.seconds_past_epoch);
+    }
+
+    fn nt_of(value: ScalarValue) -> NtScalar {
+        NtScalar::from_value(value)
+    }
+
+    #[test]
+    fn a_wire_put_into_a_u64_record_is_exact_above_two_to_the_53() {
+        let mut nt = nt_of(ScalarValue::U64(0));
+        let big: u64 = 9_007_199_254_740_993; // 2^53 + 1, not representable in f64
+        assert!(apply_value_update(
+            &mut nt,
+            &DecodedValue::UInt64(big),
+            false
+        ));
+        assert_eq!(
+            nt.value,
+            ScalarValue::U64(big),
+            "the wire PUT path must not round 64-bit integers through f64"
+        );
+    }
+
+    #[test]
+    fn a_wire_put_that_does_not_fit_the_target_is_refused() {
+        let mut nt = nt_of(ScalarValue::U8(7));
+        assert!(
+            !apply_value_update(&mut nt, &DecodedValue::Int32(300), false),
+            "300 does not fit a U8 record; the PUT must be refused, not saturated"
+        );
+        assert_eq!(
+            nt.value,
+            ScalarValue::U8(7),
+            "a refused PUT must not mutate"
+        );
+    }
+
+    #[test]
+    fn a_wire_put_that_does_fit_the_target_still_applies() {
+        let mut nt = nt_of(ScalarValue::I16(0));
+        assert!(apply_value_update(
+            &mut nt,
+            &DecodedValue::Int32(-300),
+            false
+        ));
+        assert_eq!(nt.value, ScalarValue::I16(-300));
+    }
+
+    #[test]
+    fn a_wire_put_into_an_f32_record_still_applies() {
+        let mut nt = nt_of(ScalarValue::F32(0.0));
+        assert!(apply_value_update(
+            &mut nt,
+            &DecodedValue::Float64(1.5),
+            false
+        ));
+        assert_eq!(nt.value, ScalarValue::F32(1.5));
     }
 }
