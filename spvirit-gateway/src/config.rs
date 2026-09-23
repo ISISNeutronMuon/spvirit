@@ -307,9 +307,16 @@ impl GatewayConfig {
         serde_json::from_value(raw).map_err(|e| ConfigError::Json(e.to_string()))
     }
 
-    /// Semantic validation beyond what serde can express: uniqueness of
-    /// names and cross-references between clients/servers.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    /// Runs every semantic check and builds one [`AccessControl`] per server,
+    /// in `self.servers` order, reading each pvlist/`.acf` file **exactly
+    /// once**.
+    ///
+    /// The two used to be separate passes: `validate` built a control per
+    /// server to prove the files parsed and dropped it, and the runtime then
+    /// built them all over again. That doubled the startup file I/O and, worse,
+    /// opened a TOCTOU window — a file edited between the two reads is
+    /// validated in one state and enforced in another, silently.
+    pub fn validate_and_build(&self) -> Result<Vec<AccessControl>, ConfigError> {
         use std::collections::HashSet;
 
         if self.version != SUPPORTED_CONFIG_VERSION {
@@ -379,13 +386,20 @@ impl GatewayConfig {
         // Fail-closed: load+parse every access/pvlist file now, so
         // `spgateway -T` catches a missing/unreadable/unparseable file
         // before the gateway ever serves a request. The built
-        // `AccessControl` is discarded here; the live Runtime (Task 11)
-        // calls `build_access_control` again to get one it keeps.
-        for s in &self.servers {
-            let _ = self.build_access_control(s)?;
-        }
+        // `AccessControl`s are handed back to the caller so this is the
+        // only time each file is read.
+        self.servers
+            .iter()
+            .map(|s| self.build_access_control(s))
+            .collect()
+    }
 
-        Ok(())
+    /// Runs every semantic check, discarding the [`AccessControl`]s built
+    /// along the way. For callers that only want a yes/no — `spgateway -T`,
+    /// principally. A caller that is about to *use* the controls should call
+    /// [`Self::validate_and_build`] instead of validating and then rebuilding.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_and_build().map(|_| ())
     }
 
     /// Loads and parses `server`'s `access` (ACF) and `pvlist` files into a
@@ -700,5 +714,60 @@ mod tests {
         let mut cfg = minimal_valid_config();
         cfg.servers[0].pvlist = path.to_string_lossy().into();
         assert!(cfg.validate().is_err());
+    }
+
+    /// Validation and construction must be one pass over the ACL files, not
+    /// two. Proven by rewriting every pvlist file to its opposite *after* the
+    /// call returns: if the returned controls still enforce what was
+    /// validated, the files were read once and the result kept. Two reads
+    /// would leave a TOCTOU window in which the config that got validated is
+    /// not the config that gets enforced.
+    ///
+    /// Also pins the ordering contract runtime.rs depends on: one control per
+    /// server, in `self.servers` order.
+    #[test]
+    fn validate_and_build_reads_each_acl_file_once_and_returns_them_in_server_order() {
+        use crate::access::{Decision, Identity, Op};
+
+        // `tempdir()` is this module's existing helper (config.rs:516-525);
+        // its `TempDir` has no `new()`.
+        let dir = tempdir();
+        let allow = dir.path().join("allow.pvlist");
+        let deny = dir.path().join("deny.pvlist");
+        std::fs::write(&allow, ".* ALLOW\n").unwrap();
+        std::fs::write(&deny, "SECRET:.* DENY\n.* ALLOW\n").unwrap();
+
+        let json = format!(
+            r#"{{
+                "version": 2,
+                "clients": [{{"name": "cli", "provider": "pva", "addrlist": "127.0.0.1"}}],
+                "servers": [
+                  {{"name": "open",   "clients": ["cli"], "pvlist": "{}"}},
+                  {{"name": "closed", "clients": ["cli"], "pvlist": "{}"}}
+                ]
+            }}"#,
+            allow.display().to_string().replace('\\', "\\\\"),
+            deny.display().to_string().replace('\\', "\\\\"),
+        );
+        let cfg = GatewayConfig::from_json_str(&json).unwrap();
+
+        let controls = cfg.validate_and_build().expect("a valid config builds");
+        assert_eq!(controls.len(), cfg.servers.len(), "one control per server");
+
+        // Swap the files out from under the returned controls.
+        std::fs::write(&allow, "SECRET:.* DENY\n.* ALLOW\n").unwrap();
+        std::fs::write(&deny, ".* ALLOW\n").unwrap();
+
+        let who = Identity::default();
+        assert_eq!(
+            controls[0].decide(Op::Get, "SECRET:X", &who),
+            Decision::Allow,
+            "servers[0] must still enforce the ruleset that was validated"
+        );
+        assert_eq!(
+            controls[1].decide(Op::Get, "SECRET:X", &who),
+            Decision::Deny,
+            "servers[1] must still enforce the ruleset that was validated, in order"
+        );
     }
 }
