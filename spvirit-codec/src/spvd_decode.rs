@@ -26,6 +26,11 @@ pub struct DecodeLimits {
     pub max_struct_array: usize,
     pub max_union_array: usize,
     pub max_variant_array: usize,
+    /// Ceiling on the field count in one structure descriptor. Matches the
+    /// non-scalar array ceilings above; real NT structures have ~30 fields.
+    /// Checked *before* the `Vec::with_capacity`, because a `Vec` allocation
+    /// failure aborts the process rather than unwinding.
+    pub max_struct_fields: usize,
 }
 
 impl Default for DecodeLimits {
@@ -36,6 +41,7 @@ impl Default for DecodeLimits {
             max_struct_array: 65_536,
             max_union_array: 65_536,
             max_variant_array: 65_536,
+            max_struct_fields: 65_536,
         }
     }
 }
@@ -605,7 +611,27 @@ impl PvdDecoder {
         let (field_count, consumed) = self.decode_size(&data[offset..])?;
         offset += consumed;
 
-        let mut fields = Vec::with_capacity(field_count);
+        // Reject on the configured ceiling *before* reserving -- a failed
+        // `Vec` allocation aborts the process instead of unwinding.
+        //
+        // Deliberately NOT a bytes-remaining check (`check_array_count`'s
+        // second half): a descriptor cut short by a third-party IOC must keep
+        // parsing leniently via the `break` in the loop below, and the codec
+        // plan pins that contract with `truncated_descriptor_parses_leniently_by_design`.
+        // The reserve is instead capped at the number of two-byte fields
+        // (one-byte empty-name prefix + one-byte type code) the remaining
+        // bytes could possibly hold, so a legal-but-oversized count cannot
+        // over-allocate either.
+        if field_count > self.limits.max_struct_fields {
+            return Err(DecodeError::ArrayTooLarge {
+                kind: "structure fields",
+                count: field_count,
+                limit: self.limits.max_struct_fields,
+            });
+        }
+
+        let mut fields =
+            Vec::with_capacity(field_count.min(data.len().saturating_sub(offset) / 2));
 
         for _ in 0..field_count {
             if offset >= data.len() {
@@ -1516,6 +1542,76 @@ mod tests {
         assert_eq!(d.max_struct_array, 65_536);
         assert_eq!(d.max_union_array, 65_536);
         assert_eq!(d.max_variant_array, 65_536);
+        assert_eq!(d.max_struct_fields, 65_536);
+    }
+
+    /// Site 5. `parse_structure_desc` reserved `Vec::with_capacity(count)`
+    /// straight off the wire. `Vec`'s allocation failure calls
+    /// `handle_alloc_error`, which aborts the process -- it is not a
+    /// catchable panic, so this must be rejected before the reserve.
+    ///
+    /// Driven with a *configured* small ceiling so the test never asks for a
+    /// real over-large allocation. The u32::MAX case is
+    /// `an_enormous_field_count_is_rejected_before_the_reserve` below.
+    #[test]
+    fn a_field_count_over_the_configured_limit_is_rejected() {
+        let decoder = PvdDecoder::with_limits(
+            false,
+            DecodeLimits {
+                max_struct_fields: 4,
+                ..DecodeLimits::default()
+            },
+        );
+        // 0x80 structure, empty struct id, nine fields declared, no field
+        // bytes at all.
+        let data = [0x80u8, 0x00, 0x09];
+        let err = decoder
+            .parse_introspection(&data)
+            .expect_err("a field count over the limit must be an error");
+        match err {
+            DecodeError::ArrayTooLarge { kind, count, limit } => {
+                assert_eq!(kind, "structure fields");
+                assert_eq!(count, 9);
+                assert_eq!(limit, 4);
+            }
+            other => panic!("expected ArrayTooLarge, got {other:?}"),
+        }
+    }
+
+    /// A realistic structure must still parse. The guard is a backstop, not a
+    /// new ceiling on real data.
+    #[test]
+    fn an_ordinary_structure_still_parses_under_the_field_limit() {
+        let decoder = PvdDecoder::new(false);
+        let mut data = vec![0x80u8, 0x00, 0x03];
+        for name in ["a", "bb", "ccc"] {
+            data.push(name.len() as u8);
+            data.extend_from_slice(name.as_bytes());
+            data.push(0x43); // float64
+        }
+        let desc = decoder.parse_introspection(&data).expect("parses");
+        assert_eq!(desc.fields.len(), 3);
+    }
+
+    /// The actual bomb from the review: a seven-byte blob declaring
+    /// `u32::MAX` fields. Pre-fix this reached
+    /// `Vec::<FieldDesc>::with_capacity(4_294_967_295)`, which aborts the
+    /// process; post-fix it is rejected on the count alone, with no
+    /// allocation at all.
+    #[test]
+    fn an_enormous_field_count_is_rejected_before_the_reserve() {
+        let decoder = PvdDecoder::new(false);
+        let mut data = vec![0x80u8, 0x00, 254];
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(data.len(), 7);
+        match decoder.parse_introspection(&data) {
+            Err(DecodeError::ArrayTooLarge { kind, count, limit }) => {
+                assert_eq!(kind, "structure fields");
+                assert_eq!(count, u32::MAX as usize);
+                assert_eq!(limit, 65_536);
+            }
+            other => panic!("expected ArrayTooLarge, got {other:?}"),
+        }
     }
 
     #[test]
