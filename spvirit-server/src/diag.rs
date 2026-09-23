@@ -125,6 +125,28 @@ impl ClientRegistry {
             .map(|((account, client_ip), bytes)| (account, client_ip, bytes))
             .collect()
     }
+
+    /// Total `tx` (or `rx`) bytes across every live connection.
+    ///
+    /// Equivalent to `byhost(tx).iter().map(|(_, _, b)| b).sum()`, but without
+    /// building the per-`(account, client_ip)` aggregation `HashMap` — two
+    /// cloned `String`s per connection — that the `/metrics` scrape path
+    /// immediately collapses back to one number. Grouping cannot change a sum,
+    /// so the two agree by construction (pinned by
+    /// `byhost_total_equals_the_sum_of_byhost_rows`).
+    pub fn byhost_total(&self, tx: bool) -> u64 {
+        let conns = self.conns.lock().unwrap();
+        conns
+            .values()
+            .map(|rec| {
+                if tx {
+                    rec.tx.load(Ordering::Relaxed)
+                } else {
+                    rec.rx.load(Ordering::Relaxed)
+                }
+            })
+            .sum()
+    }
 }
 
 impl Default for ClientRegistry {
@@ -155,6 +177,16 @@ impl ByteMap {
     pub fn snapshot(&self) -> Vec<(String, u64)> {
         let counts = self.counts.lock().unwrap();
         counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    /// Sum of every key's byte count, without cloning a single key.
+    ///
+    /// The `/metrics` scrape path only ever wants this number;
+    /// [`Self::snapshot`] allocates a `String` per key to produce it, which on
+    /// a gateway proxying thousands of PVs is thousands of allocations per
+    /// scrape. Use `snapshot` when the keys are actually needed.
+    pub fn total(&self) -> u64 {
+        self.counts.lock().unwrap().values().sum()
     }
 }
 
@@ -267,5 +299,51 @@ mod tests {
         c.us_byhost_rx.add("H", 2);
         assert_eq!(c.ds_bypv_tx.snapshot(), vec![("P".to_string(), 1)]);
         assert_eq!(c.us_byhost_rx.snapshot(), vec![("H".to_string(), 2)]);
+    }
+
+    /// `total` must agree with summing `snapshot()` exactly — it exists only
+    /// to skip cloning every key on the `/metrics` scrape path, which sums and
+    /// then discards them.
+    #[test]
+    fn byte_map_total_equals_the_sum_of_its_snapshot() {
+        let m = ByteMap::new();
+        assert_eq!(m.total(), 0, "an empty map totals zero");
+        m.add("PV:A", 10);
+        m.add("PV:B", 5);
+        m.add("PV:A", 7); // accumulates onto the existing key
+        let by_snapshot: u64 = m.snapshot().iter().map(|(_, b)| *b).sum();
+        assert_eq!(m.total(), 22);
+        assert_eq!(m.total(), by_snapshot);
+    }
+
+    /// `byhost_total` must agree with summing `byhost()` exactly — it exists
+    /// only to skip building the per-(account, client_ip) aggregation map,
+    /// which the scrape path immediately collapses to one number. Two
+    /// connections sharing an account+IP aggregate into one `byhost` row, so
+    /// this also pins that the total is unaffected by that grouping.
+    #[test]
+    fn byhost_total_equals_the_sum_of_byhost_rows() {
+        // `IpAddr`/`Ipv4Addr` come from this test module's own import at
+        // diag.rs:202 and `SocketAddr` from `use super::*`; no local `use`.
+        let reg = ClientRegistry::new();
+        assert_eq!(reg.byhost_total(true), 0, "no connections totals zero");
+
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        reg.connect(1, SocketAddr::new(ip, 40000));
+        reg.connect(2, SocketAddr::new(ip, 40001));
+        reg.connect(3, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6)), 40002));
+        reg.set_identity(1, Some("alice".to_string()), None);
+        reg.set_identity(2, Some("alice".to_string()), None); // same account+IP as 1
+        reg.add_tx(1, 100);
+        reg.add_tx(2, 20);
+        reg.add_tx(3, 3);
+        reg.add_rx(1, 7);
+
+        let tx_by_rows: u64 = reg.byhost(true).iter().map(|(_, _, b)| *b).sum();
+        let rx_by_rows: u64 = reg.byhost(false).iter().map(|(_, _, b)| *b).sum();
+        assert_eq!(reg.byhost_total(true), 123);
+        assert_eq!(reg.byhost_total(true), tx_by_rows);
+        assert_eq!(reg.byhost_total(false), 7);
+        assert_eq!(reg.byhost_total(false), rx_by_rows);
     }
 }

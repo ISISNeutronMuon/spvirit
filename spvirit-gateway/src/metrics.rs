@@ -168,14 +168,6 @@ pub fn apply_resolve_stats(
     snap.search_pattern_enum_shed = r.pattern_enum_shed;
 }
 
-/// Sum a `ByteMap`/`ClientRegistry::byhost` style snapshot's byte counts
-/// into a single cumulative total. `pairs` is an iterator of tuples whose
-/// last element is the byte count (`(key, bytes)` for a `ByteMap`
-/// snapshot, `(account, client_ip, bytes)` for `ClientRegistry::byhost`).
-fn sum_last<T, I: IntoIterator<Item = T>>(pairs: I, last: impl Fn(&T) -> u64) -> u64 {
-    pairs.into_iter().map(|t| last(&t)).sum()
-}
-
 /// Build the six `ByteMap`-backed byte-gauge fields (`ds_bypv_*`,
 /// `us_bypv_*`, `us_byhost_*`) plus the two registry-derived `ds_byhost_*`
 /// fields from the shared cumulative counters, leaving every other
@@ -184,20 +176,24 @@ fn sum_last<T, I: IntoIterator<Item = T>>(pairs: I, last: impl Fn(&T) -> u64) ->
 /// struct-update.
 ///
 /// `ds_byhost_{tx,rx}` have no `ByteMap` (see [`BandwidthCounters`]'s docs)
-/// and are instead derived from `ClientRegistry::byhost`.
+/// and are instead derived from the `ClientRegistry`.
+///
+/// Uses the summing accessors rather than `snapshot()`/`byhost()`: a scrape
+/// wants eight numbers, and materialising every counter key just to add up
+/// the values behind them cost one `String` allocation per key per scrape.
 pub fn snapshot_from_bandwidth(
     counters: &BandwidthCounters,
     registry: &ClientRegistry,
 ) -> MetricsSnapshot {
     MetricsSnapshot {
-        ds_bypv_tx_bytes: sum_last(counters.ds_bypv_tx.snapshot(), |(_, b)| *b),
-        ds_bypv_rx_bytes: sum_last(counters.ds_bypv_rx.snapshot(), |(_, b)| *b),
-        us_bypv_tx_bytes: sum_last(counters.us_bypv_tx.snapshot(), |(_, b)| *b),
-        us_bypv_rx_bytes: sum_last(counters.us_bypv_rx.snapshot(), |(_, b)| *b),
-        us_byhost_tx_bytes: sum_last(counters.us_byhost_tx.snapshot(), |(_, b)| *b),
-        us_byhost_rx_bytes: sum_last(counters.us_byhost_rx.snapshot(), |(_, b)| *b),
-        ds_byhost_tx_bytes: sum_last(registry.byhost(true), |(_, _, b)| *b),
-        ds_byhost_rx_bytes: sum_last(registry.byhost(false), |(_, _, b)| *b),
+        ds_bypv_tx_bytes: counters.ds_bypv_tx.total(),
+        ds_bypv_rx_bytes: counters.ds_bypv_rx.total(),
+        us_bypv_tx_bytes: counters.us_bypv_tx.total(),
+        us_bypv_rx_bytes: counters.us_bypv_rx.total(),
+        us_byhost_tx_bytes: counters.us_byhost_tx.total(),
+        us_byhost_rx_bytes: counters.us_byhost_rx.total(),
+        ds_byhost_tx_bytes: registry.byhost_total(true),
+        ds_byhost_rx_bytes: registry.byhost_total(false),
         ..Default::default()
     }
 }
