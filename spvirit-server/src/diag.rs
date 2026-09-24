@@ -187,9 +187,17 @@ impl ByteMap {
     }
 
     /// Add `n` bytes to the counter for `key`, creating it if absent.
+    ///
+    /// Looks up before inserting: `entry(key.to_string())` would heap-allocate
+    /// a fresh `String` on every call, and this is called per frame and per
+    /// monitor fan-out, where the key is essentially always already present.
     pub fn add(&self, key: &str, n: u64) {
         let mut counts = self.counts.lock().unwrap();
-        *counts.entry(key.to_string()).or_insert(0) += n;
+        if let Some(v) = counts.get_mut(key) {
+            *v += n;
+            return;
+        }
+        counts.insert(key.to_string(), n);
     }
 
     /// Snapshot all key/count pairs.
