@@ -14,21 +14,21 @@ fn handler_src() -> String {
 /// task created itself and could simply have kept. That is a global lock
 /// acquisition per reply, serializing every connection on the server against
 /// every other.
+///
+/// The call can also be spread across several lines (e.g. `.send_msg(\n  ...`
+/// or `.\n send_msg(`), so this collapses all whitespace out of the source
+/// before matching rather than scanning line-by-line — a line-oriented scan
+/// would silently miss a wrapped call.
 #[test]
 fn handler_does_not_reply_through_the_global_conns_map() {
     let src = handler_src();
-    let offenders: Vec<String> = src
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| l.contains("registry.send_msg(conn_id"))
-        .map(|(i, l)| format!("handler.rs:{}: {}", i + 1, l.trim()))
-        .collect();
+    let collapsed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
-        offenders.is_empty(),
-        "these replies still go through MonitorRegistry::send_msg, which locks \
-         the global conns map for a writer the connection already holds. Use \
-         the connection's Replier instead.\n  {}",
-        offenders.join("\n  ")
+        !collapsed.contains(".send_msg("),
+        "handler.rs still contains a `.send_msg(` call (possibly spanning \
+         multiple lines). One-shot replies must go through the connection's \
+         Replier, not MonitorRegistry::send_msg, which locks the global conns \
+         map for a writer the connection already holds."
     );
 }

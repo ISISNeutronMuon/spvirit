@@ -764,6 +764,54 @@ impl Replier {
         }
         self.cw.send_control(bytes).await;
     }
+
+    /// A weak handle for a reply that may outlive the connection.
+    ///
+    /// The spawned pattern-query-reply task can run for as long as
+    /// [`spawn_pattern_query_reply`]'s enumeration timeout (up to 30s), well
+    /// after the client that asked for it may have disconnected. Cloning
+    /// `Replier` itself keeps a strong `Arc<ConnWriter>` alive for that whole
+    /// window even though nothing else references the connection any more —
+    /// [`ConnCleanupGuard`] has already run `cleanup_connection`, which drops
+    /// the registry's own strong reference, but the spawned task's clone kept
+    /// the writer (and its buffers) resident regardless. A `WeakReplier`
+    /// holds a `Weak<ConnWriter>` instead, so once every strong owner is gone
+    /// the writer is freed immediately; the delayed reply is simply dropped
+    /// (nobody is listening on that socket any more).
+    pub fn downgrade(&self) -> WeakReplier {
+        WeakReplier {
+            cw: Arc::downgrade(&self.cw),
+            conn_id: self.conn_id,
+            client_registry: self.client_registry.clone(),
+        }
+    }
+}
+
+/// [`Replier::downgrade`]: a reply handle that does not keep the connection's
+/// writer alive.
+pub struct WeakReplier {
+    cw: std::sync::Weak<ConnWriter>,
+    conn_id: u64,
+    client_registry: Option<Arc<ClientRegistry>>,
+}
+
+impl WeakReplier {
+    /// Deliver the frame if the connection's writer is still alive; otherwise
+    /// drop it silently (at debug level) — the connection is gone, so there
+    /// is nothing to deliver to.
+    pub async fn send(&self, bytes: Vec<u8>) {
+        let Some(cw) = self.cw.upgrade() else {
+            debug!(
+                "Conn {}: dropping a delayed reply — connection already torn down",
+                self.conn_id
+            );
+            return;
+        };
+        if let Some(cr) = &self.client_registry {
+            cr.add_tx(self.conn_id, bytes.len() as u64);
+        }
+        cw.send_control(bytes).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1282,6 +1330,32 @@ pub fn disable_nagle(stream: &TcpStream, conn_id: u64) {
     }
 }
 
+/// Runs a connection's registry cleanup no matter how its task ends.
+///
+/// `cleanup_connection` used to be the last statement of `handle_connection`,
+/// so a panic anywhere in the read loop — including one caused by another
+/// task poisoning a shared `std::sync::Mutex` — unwound past it and leaked the
+/// connection's `ConnWriter`, its channel-tables registration, its
+/// `ClientRegistry` row and its `monitors[pv]` entries (which kept its pumps
+/// alive forever). Any early return added later is now safe by construction.
+/// `Drop` cannot `await`, so the work is spawned — the same shape as
+/// `conn_writer::FlushGuard`. With no runtime to spawn on (process shutting
+/// down) there is nothing left to leak into.
+struct ConnCleanupGuard {
+    registry: Arc<MonitorRegistry>,
+    conn_id: u64,
+}
+
+impl Drop for ConnCleanupGuard {
+    fn drop(&mut self) {
+        let registry = self.registry.clone();
+        let conn_id = self.conn_id;
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { registry.cleanup_connection(conn_id).await });
+        }
+    }
+}
+
 /// Handle a single PVA TCP connection.
 ///
 /// This is the main protocol loop: handshake, then dispatch each command
@@ -1306,6 +1380,10 @@ pub async fn handle_connection(
         let mut conns = state.registry.conns.lock().await;
         conns.insert(conn_id, cw.clone());
     }
+    let _cleanup = ConnCleanupGuard {
+        registry: state.registry.clone(),
+        conn_id,
+    };
     let replier = Replier::new(cw, conn_id, state.client_registry.clone());
 
     if let Some(cr) = &state.client_registry
@@ -2414,7 +2492,7 @@ pub async fn handle_connection(
                     let answer_negative = !found;
                     let dispatch = {
                         let state_for_task = state.clone();
-                        let replier_for_task = replier.clone();
+                        let replier_for_task = replier.downgrade();
                         // `handle_connection` runs inside `request_ctx::scope`
                         // and `set_credentials` has already installed the
                         // validated `ca` user, so this is the full identity the
@@ -2485,7 +2563,6 @@ pub async fn handle_connection(
         }
     }
 
-    state.registry.cleanup_connection(conn_id).await;
     Ok(())
 }
 
@@ -4008,6 +4085,75 @@ mod tests {
         assert!(
             conn_state.channels.lock().unwrap().ioids_for_sid(100).is_empty(),
             "the channel's bindings must be gone from the tables too"
+        );
+    }
+
+    /// Cleanup is the last statement of handle_connection, so a panic or an
+    /// early return leaks the connection's writer, its channel tables and its
+    /// client-registry row. A drop guard cannot be skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conn_cleanup_guard_runs_even_when_the_task_unwinds() {
+        let registry = Arc::new(MonitorRegistry::new());
+        let (_client, server_side) = tokio::io::duplex(64);
+        registry
+            .conns
+            .lock()
+            .await
+            .insert(7, ConnWriter::new(server_side));
+        assert!(
+            registry.conns.lock().await.contains_key(&7),
+            "precondition: the connection is registered"
+        );
+
+        let reg = registry.clone();
+        let task = tokio::spawn(async move {
+            let _guard = ConnCleanupGuard {
+                registry: reg,
+                conn_id: 7,
+            };
+            panic!("connection task blew up");
+        });
+        assert!(task.await.is_err(), "the task must have panicked");
+
+        for _ in 0..50 {
+            if !registry.conns.lock().await.contains_key(&7) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the connection was leaked: cleanup did not run on unwind");
+    }
+
+    /// The spawned search-reply task used to hold a strong `Arc<ConnWriter>`
+    /// for as long as its enumeration window (up to 30s), keeping the
+    /// writer's buffers resident well after the connection that asked for it
+    /// was gone. A `WeakReplier` must let the writer be freed the moment
+    /// every other strong owner drops it, regardless of whether the delayed
+    /// reply itself has fired yet.
+    #[tokio::test]
+    async fn weak_replier_does_not_keep_the_writer_alive_after_teardown() {
+        use crate::diag::ClientRegistry;
+
+        let (_client, server_side) = tokio::io::duplex(64);
+        let cw = ConnWriter::new(server_side);
+        let cr = Arc::new(ClientRegistry::new());
+        let replier = Replier::new(cw.clone(), 1, Some(cr));
+        let weak_replier = replier.downgrade();
+
+        // Simulate every strong owner (the registry's `conns` map and the
+        // connection task's own `replier`) going away, exactly as happens
+        // once `ConnCleanupGuard` has run and `handle_connection` returns.
+        drop(replier);
+        drop(cw);
+
+        // The pending "search reply" fires after teardown: it must find the
+        // writer gone rather than resurrect it.
+        weak_replier.send(vec![9, 9, 9]).await;
+
+        assert!(
+            weak_replier.cw.upgrade().is_none(),
+            "the writer must already be freed once every strong owner is gone, \
+             proving the search-reply closure was not holding it alive"
         );
     }
 }
