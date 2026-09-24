@@ -67,3 +67,28 @@ fn deferred_search_reply_captures_a_weak_replier_not_a_strong_one() {
          down. Use `replier.downgrade()` instead."
     );
 }
+
+/// `Events::drain` polled `inflight` in a yield_now loop, rescheduling itself
+/// on every tick for up to ten seconds. It must wait on a notification.
+#[test]
+fn events_drain_does_not_busy_spin() {
+    let src = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/events.rs"))
+        .expect("events.rs must be readable");
+    let start = src
+        .find("pub async fn drain(&self)")
+        .expect("Events::drain must exist");
+    let end = src[start..]
+        .find("\n    }\n")
+        .map(|e| start + e)
+        .unwrap_or(src.len());
+    let body = &src[start..end];
+
+    assert!(
+        !body.contains("yield_now"),
+        "Events::drain must wait on a Notify, not spin with yield_now"
+    );
+    assert!(
+        body.contains("notified()"),
+        "Events::drain must await the idle notification"
+    );
+}
