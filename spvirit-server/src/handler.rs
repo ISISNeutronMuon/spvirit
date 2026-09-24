@@ -37,6 +37,7 @@ use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue, Scalar
 
 use crate::conn_writer::ConnWriter;
 use crate::decode::decode_put_body;
+use crate::diag::ClientRegistry;
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::{SourceRegistry, TryClaim};
 use crate::state::{ConnState, MonitorState, MonitorSub};
@@ -726,6 +727,46 @@ async fn notify_changed_records(state: &ServerState, changed: Vec<(String, NtPay
 }
 
 // ---------------------------------------------------------------------------
+// Replier: a connection's own reply channel
+// ---------------------------------------------------------------------------
+
+/// A connection's own reply channel.
+///
+/// `MonitorRegistry::send_msg` locks the process-global `conns` map on every
+/// call to find a writer that the connection task itself created and handed to
+/// the registry. Holding the `Arc` directly removes a global lock acquisition
+/// from every single one-shot reply, while reproducing `send_msg`'s tx
+/// accounting exactly.
+#[derive(Clone)]
+pub struct Replier {
+    cw: Arc<ConnWriter>,
+    conn_id: u64,
+    client_registry: Option<Arc<ClientRegistry>>,
+}
+
+impl Replier {
+    pub fn new(
+        cw: Arc<ConnWriter>,
+        conn_id: u64,
+        client_registry: Option<Arc<ClientRegistry>>,
+    ) -> Self {
+        Self {
+            cw,
+            conn_id,
+            client_registry,
+        }
+    }
+
+    /// Queue one complete frame on the connection's lossless control lane.
+    pub async fn send(&self, bytes: Vec<u8>) {
+        if let Some(cr) = &self.client_registry {
+            cr.add_tx(self.conn_id, bytes.len() as u64);
+        }
+        self.cw.send_control(bytes).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET_FIELD handler
 // ---------------------------------------------------------------------------
 
@@ -736,6 +777,7 @@ async fn handle_get_field_request(
     payload: spvirit_codec::epics_decode::PvaGetFieldPayload,
     version: u8,
     is_be: bool,
+    replier: &Replier,
 ) {
     if payload.is_server {
         let resp = encode_get_field_error(
@@ -744,7 +786,7 @@ async fn handle_get_field_request(
             version,
             is_be,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
 
@@ -787,7 +829,7 @@ async fn handle_get_field_request(
                                 version,
                                 is_be,
                             );
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             return;
                         }
                     }
@@ -796,7 +838,7 @@ async fn handle_get_field_request(
                 };
                 let resp = encode_get_field_response(request_id, &desc, version, is_be);
                 dump_hex_packet(conn_id, "tx", "cmd=17 get_field", version, is_be, &resp);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
                 debug!(
                     "Conn {}: get_field cid={} sid={:?} ioid={:?} resolved_sid={} pv='{}' field={:?}",
                     conn_id,
@@ -810,7 +852,7 @@ async fn handle_get_field_request(
                 return;
             }
             let resp = encode_get_field_error(request_id, "PV not found", version, is_be);
-            state.registry.send_msg(conn_id, resp).await;
+            replier.send(resp).await;
             return;
         }
     }
@@ -822,7 +864,7 @@ async fn handle_get_field_request(
             version,
             is_be,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
 
@@ -833,7 +875,7 @@ async fn handle_get_field_request(
             version,
             is_be,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     };
 
@@ -850,7 +892,7 @@ async fn handle_get_field_request(
     if names.is_empty() {
         let resp =
             encode_get_field_error(request_id, "No PVs matched list request", version, is_be);
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
     let desc = build_pvlist_structure(&names);
@@ -863,7 +905,7 @@ async fn handle_get_field_request(
         is_be,
         &resp,
     );
-    state.registry.send_msg(conn_id, resp).await;
+    replier.send(resp).await;
     debug!(
         "Conn {}: get_field list pattern='{}' returned {} entries",
         conn_id,
@@ -878,11 +920,11 @@ async fn handle_get_field_request(
 
 async fn handle_server_rpc(
     state: &ServerState,
-    conn_id: u64,
     ioid: u32,
     subcmd: u8,
     version: u8,
     is_be: bool,
+    replier: &Replier,
 ) {
     if state.pvlist_mode != PvListMode::List {
         let resp = encode_op_status_error_response(
@@ -893,7 +935,7 @@ async fn handle_server_rpc(
             version,
             is_be,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
 
@@ -909,19 +951,19 @@ async fn handle_server_rpc(
     let is_init = (subcmd & 0x08) != 0;
     if is_init {
         let resp = encode_op_status_response(20, ioid, subcmd, version, is_be);
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
 
     let resp = encode_op_rpc_data_response_payload(ioid, subcmd, &payload, version, is_be);
-    state.registry.send_msg(conn_id, resp).await;
+    replier.send(resp).await;
 }
 
 // ---------------------------------------------------------------------------
 // Control message handler (inside segmented stream)
 // ---------------------------------------------------------------------------
 
-async fn handle_control_message(state: &ServerState, conn_id: u64, header: &PvaHeader) {
+async fn handle_control_message(conn_id: u64, header: &PvaHeader, replier: &Replier) {
     debug!(
         "Conn {}: control (segmented) cmd={} data={}",
         conn_id, header.command, header.payload_length
@@ -934,7 +976,7 @@ async fn handle_control_message(state: &ServerState, conn_id: u64, header: &PvaH
             4,
             header.payload_length,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
     }
 }
 
@@ -1259,10 +1301,12 @@ pub async fn handle_connection(
     disable_nagle(&stream, conn_id);
     let (mut reader, writer) = stream.into_split();
 
+    let cw = ConnWriter::new(writer);
     {
         let mut conns = state.registry.conns.lock().await;
-        conns.insert(conn_id, ConnWriter::new(writer));
+        conns.insert(conn_id, cw.clone());
     }
+    let replier = Replier::new(cw, conn_id, state.client_registry.clone());
 
     if let Some(cr) = &state.client_registry
         && let Some(ctx) = crate::request_ctx::current_request()
@@ -1287,7 +1331,7 @@ pub async fn handle_connection(
         false,
         &set_byte_order,
     );
-    state.registry.send_msg(conn_id, set_byte_order).await;
+    replier.send(set_byte_order).await;
 
     // Server sends Connection Validation (cmd=1) next.
     let server_validation =
@@ -1301,7 +1345,7 @@ pub async fn handle_connection(
         false,
         &server_validation,
     );
-    state.registry.send_msg(conn_id, server_validation).await;
+    replier.send(server_validation).await;
 
     let mut last_activity = Instant::now();
     // One reassembler for the whole connection: the segments of a message may
@@ -1373,7 +1417,7 @@ pub async fn handle_connection(
             Ok(SegmentOutcome::Pending) => continue,
             Ok(SegmentOutcome::Control(msg)) => {
                 let ctrl = PvaPacket::new(&msg);
-                handle_control_message(&state, conn_id, &ctrl.header).await;
+                handle_control_message(conn_id, &ctrl.header, &replier).await;
                 continue;
             }
             Err(e) => {
@@ -1420,7 +1464,7 @@ pub async fn handle_connection(
                     is_be,
                     &resp,
                 );
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
                 continue;
             }
         }
@@ -1433,7 +1477,7 @@ pub async fn handle_connection(
                 debug!("Conn {}: control {}", conn_id, payload);
                 if payload.command == 3 {
                     let resp = encode_control_message(true, is_be, version, 4, payload.data);
-                    state.registry.send_msg(conn_id, resp).await;
+                    replier.send(resp).await;
                 }
                 continue;
             }
@@ -1458,14 +1502,14 @@ pub async fn handle_connection(
                             .unwrap()
                             .insert_channel(cid, sid, &pv_name);
                         let resp = encode_create_channel_response(cid, sid, version, is_be);
-                        state.registry.send_msg(conn_id, resp).await;
+                        replier.send(resp).await;
                         info!(
                             "Conn {}: channel '{}' cid={} sid={}",
                             conn_id, pv_name, cid, sid
                         );
                     } else {
                         let resp = encode_create_channel_error(cid, "PV not found", version, is_be);
-                        state.registry.send_msg(conn_id, resp).await;
+                        replier.send(resp).await;
                         info!(
                             "Conn {}: channel '{}' not found (cid={})",
                             conn_id, pv_name, cid
@@ -1496,10 +1540,8 @@ pub async fn handle_connection(
                     .get(&sid)
                     .cloned();
                 let Some(pv_name) = pv_lookup else {
-                    state
-                        .registry
-                        .send_msg(
-                            conn_id,
+                    replier
+                        .send(
                             encode_op_error(
                                 payload.command,
                                 payload.subcmd,
@@ -1540,10 +1582,8 @@ pub async fn handle_connection(
                                 } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     nt_payload_desc(&nt)
                                 } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
+                                    replier
+                                        .send(
                                             encode_op_error(
                                                 payload.command,
                                                 payload.subcmd,
@@ -1571,14 +1611,12 @@ pub async fn handle_connection(
                                 version,
                                 is_be,
                             );
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             info!("Conn {}: get init pv='{}' ioid={}", conn_id, pv_name, ioid);
                         } else {
                             let Some(nt) = get_nt_snapshot(&state, &pv_name).await else {
-                                state
-                                    .registry
-                                    .send_msg(
-                                        conn_id,
+                                replier
+                                    .send(
                                         encode_op_error(
                                             payload.command,
                                             payload.subcmd,
@@ -1598,7 +1636,7 @@ pub async fn handle_connection(
                             } else {
                                 encode_op_get_data_response_payload(ioid, &nt, version, is_be)
                             };
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             debug!("Conn {}: get data pv='{}' ioid={}", conn_id, pv_name, ioid);
                         }
                     }
@@ -1614,10 +1652,8 @@ pub async fn handle_connection(
                                 } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     nt_payload_desc(&nt)
                                 } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
+                                    replier
+                                        .send(
                                             encode_op_error(
                                                 payload.command,
                                                 payload.subcmd,
@@ -1640,7 +1676,7 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                                 continue;
                             }
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
@@ -1653,7 +1689,7 @@ pub async fn handle_connection(
                                 version,
                                 is_be,
                             );
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             info!("Conn {}: put init pv='{}' ioid={}", conn_id, pv_name, ioid);
                         } else {
                             if (payload.subcmd & 0x40) != 0 {
@@ -1667,23 +1703,21 @@ pub async fn handle_connection(
                                         version,
                                         is_be,
                                     );
-                                    state.registry.send_msg(conn_id, resp).await;
+                                    replier.send(resp).await;
                                     continue;
                                 }
                                 if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     let resp = encode_op_put_getput_response_payload(
                                         ioid, &nt, version, is_be,
                                     );
-                                    state.registry.send_msg(conn_id, resp).await;
+                                    replier.send(resp).await;
                                     debug!(
                                         "Conn {}: put get-put pv='{}' ioid={}",
                                         conn_id, pv_name, ioid
                                     );
                                 } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
+                                    replier
+                                        .send(
                                             encode_op_error(
                                                 payload.command,
                                                 payload.subcmd,
@@ -1700,10 +1734,8 @@ pub async fn handle_connection(
                             let desc = match conn_state.ioid_to_desc.get(&ioid) {
                                 Some(d) => d.clone(),
                                 None => {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
+                                    replier
+                                        .send(
                                             encode_op_error(
                                                 payload.command,
                                                 payload.subcmd,
@@ -1731,7 +1763,7 @@ pub async fn handle_connection(
                                             version,
                                             is_be,
                                         );
-                                        state.registry.send_msg(conn_id, resp).await;
+                                        replier.send(resp).await;
                                         continue;
                                     }
                                 }
@@ -1749,11 +1781,11 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                                 continue;
                             }
                             let resp = encode_op_put_response(ioid, payload.subcmd, version, is_be);
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             debug!("Conn {}: put data pv='{}' ioid={}", conn_id, pv_name, ioid);
                         }
                     }
@@ -1769,10 +1801,8 @@ pub async fn handle_connection(
                                 } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     nt_payload_desc(&nt)
                                 } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
+                                    replier
+                                        .send(
                                             encode_op_error(
                                                 payload.command,
                                                 payload.subcmd,
@@ -1794,14 +1824,14 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                                 continue;
                             }
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
                             let resp =
                                 encode_op_put_get_init_response(ioid, &desc, &desc, version, is_be);
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             info!(
                                 "Conn {}: put_get init pv='{}' ioid={}",
                                 conn_id, pv_name, ioid
@@ -1810,10 +1840,8 @@ pub async fn handle_connection(
                             let desc = match conn_state.ioid_to_desc.get(&ioid) {
                                 Some(d) => d.clone(),
                                 None => {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
+                                    replier
+                                        .send(
                                             encode_op_error(
                                                 payload.command,
                                                 payload.subcmd,
@@ -1837,7 +1865,7 @@ pub async fn handle_connection(
                                         let resp = encode_op_put_get_data_error_response(
                                             ioid, &msg, version, is_be,
                                         );
-                                        state.registry.send_msg(conn_id, resp).await;
+                                        replier.send(resp).await;
                                         continue;
                                     }
                                 }
@@ -1854,19 +1882,17 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                                 continue;
                             }
                             if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                 let resp = encode_op_put_get_data_response_payload(
                                     ioid, &nt, version, is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                             } else {
-                                state
-                                    .registry
-                                    .send_msg(
-                                        conn_id,
+                                replier
+                                    .send(
                                         encode_op_error(
                                             payload.command,
                                             payload.subcmd,
@@ -1900,10 +1926,8 @@ pub async fn handle_connection(
                                 } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     nt_payload_desc(&nt)
                                 } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
+                                    replier
+                                        .send(
                                             encode_op_error(
                                                 payload.command,
                                                 payload.subcmd,
@@ -1956,7 +1980,7 @@ pub async fn handle_connection(
                                 version,
                                 is_be,
                             );
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             conn_state.ioid_to_monitor.insert(
                                 ioid,
                                 MonitorState {
@@ -2026,7 +2050,7 @@ pub async fn handle_connection(
                                 let resp = encode_monitor_data_response_payload(
                                     ioid, 0x10, &nt, version, is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                             }
                             state
                                 .registry
@@ -2129,11 +2153,11 @@ pub async fn handle_connection(
                         if is_server_rpc_pv(&pv_name) {
                             handle_server_rpc(
                                 &state,
-                                conn_id,
                                 ioid,
                                 payload.subcmd,
                                 version,
                                 is_be,
+                                &replier,
                             )
                             .await;
                         } else {
@@ -2147,7 +2171,7 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                             } else {
                                 // RPC EXEC — decode self-describing PVD args and
                                 // delegate to the source registry
@@ -2177,7 +2201,7 @@ pub async fn handle_connection(
                                             version,
                                             is_be,
                                         );
-                                        state.registry.send_msg(conn_id, resp).await;
+                                        replier.send(resp).await;
                                     }
                                     Err(msg) => {
                                         let resp = encode_op_status_error_response(
@@ -2188,17 +2212,15 @@ pub async fn handle_connection(
                                             version,
                                             is_be,
                                         );
-                                        state.registry.send_msg(conn_id, resp).await;
+                                        replier.send(resp).await;
                                     }
                                 }
                             }
                         }
                     }
                     14 | 16 => {
-                        state
-                            .registry
-                            .send_msg(
-                                conn_id,
+                        replier
+                            .send(
                                 encode_op_error(
                                     payload.command,
                                     payload.subcmd,
@@ -2211,10 +2233,8 @@ pub async fn handle_connection(
                             .await;
                     }
                     _ => {
-                        state
-                            .registry
-                            .send_msg(
-                                conn_id,
+                        replier
+                            .send(
                                 encode_op_error(
                                     payload.command,
                                     payload.subcmd,
@@ -2267,36 +2287,44 @@ pub async fn handle_connection(
             PvaPacketCommand::AclChange(_) => {
                 let resp =
                     encode_message_error("ACL_CHANGE command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::GetField(payload) => {
-                handle_get_field_request(&state, &conn_state, conn_id, payload, version, is_be)
-                    .await;
+                handle_get_field_request(
+                    &state,
+                    &conn_state,
+                    conn_id,
+                    payload,
+                    version,
+                    is_be,
+                    &replier,
+                )
+                .await;
             }
             PvaPacketCommand::Echo(payload_bytes) => {
                 let mut resp =
                     encode_header(true, is_be, false, version, 2, payload_bytes.len() as u32);
                 resp.extend_from_slice(&payload_bytes);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::Message(_) => {
                 let resp = encode_message_error("MESSAGE command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::MultipleData(_) => {
                 let resp =
                     encode_message_error("MULTIPLE_DATA command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::CancelRequest(_) => {
                 let resp =
                     encode_message_error("CANCEL_REQUEST command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::OriginTag(_) => {
                 let resp =
                     encode_message_error("ORIGIN_TAG command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::Search(payload) => {
                 debug!(
@@ -2378,7 +2406,8 @@ pub async fn handle_connection(
                     let seq = payload.seq;
                     let answer_negative = !found;
                     let dispatch = {
-                        let replier = state.clone();
+                        let state_for_task = state.clone();
+                        let replier_for_task = replier.clone();
                         // `handle_connection` runs inside `request_ctx::scope`
                         // and `set_credentials` has already installed the
                         // validated `ca` user, so this is the full identity the
@@ -2401,7 +2430,7 @@ pub async fn handle_connection(
                             req_ctx,
                             pattern_requests,
                             move |pattern_cids| async move {
-                                let state = replier;
+                                let state = state_for_task;
                                 if pattern_cids.is_empty() && !answer_negative {
                                     return;
                                 }
@@ -2416,12 +2445,12 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, response).await;
+                                replier_for_task.send(response).await;
                             },
                         )
                     };
                     if found || !dispatch.withholds_negative() {
-                        state.registry.send_msg(conn_id, response).await;
+                        replier.send(response).await;
                         debug!(
                             "Conn {}: TCP search responded found={} matches={}",
                             conn_id,
@@ -2436,7 +2465,7 @@ pub async fn handle_connection(
             PvaPacketCommand::SearchResponse(_) | PvaPacketCommand::Beacon(_) => {
                 let resp =
                     encode_message_error("Unexpected command for server endpoint", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::Unknown(payload) => {
                 let resp = encode_message_error(
@@ -2444,7 +2473,7 @@ pub async fn handle_connection(
                     version,
                     is_be,
                 );
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
         }
     }
@@ -3867,5 +3896,32 @@ mod tests {
             out.contains("00 de ad ff"),
             "the dump must still print every byte when DEBUG is enabled; got:\n{out}"
         );
+    }
+
+    /// A Replier must reproduce send_msg's behaviour exactly: the bytes reach
+    /// the writer, and the connection's tx counter is credited.
+    #[tokio::test]
+    async fn replier_writes_the_frame_and_credits_tx() {
+        use crate::diag::ClientRegistry;
+
+        let (mut client, server_side) = tokio::io::duplex(1024);
+        let cr = Arc::new(ClientRegistry::new());
+        cr.connect(1, "127.0.0.1:9999".parse().unwrap());
+
+        let replier = Replier::new(ConnWriter::new(server_side), 1, Some(cr.clone()));
+        replier.send(vec![1, 2, 3, 4]).await;
+
+        let mut got = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut got),
+        )
+        .await
+        .expect("frame must arrive")
+        .expect("read");
+        assert_eq!(got, [1, 2, 3, 4]);
+
+        let entry = cr.snapshot().into_iter().next().expect("one connection");
+        assert_eq!(entry.tx, 4, "the reply's bytes must be credited to the conn");
     }
 }
