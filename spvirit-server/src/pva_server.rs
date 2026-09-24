@@ -791,6 +791,7 @@ impl PvaServerBuilder {
             start_hooks: self.start_hooks,
             client_registry: self.client_registry,
             bandwidth_counters: self.bandwidth_counters,
+            scan_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -854,6 +855,9 @@ pub struct PvaServer {
     /// Set via [`PvaServerBuilder::bandwidth_counters`]; installed onto the
     /// resolved [`MonitorRegistry`] in [`Self::resolved_monitor_registry`].
     bandwidth_counters: Option<Arc<crate::diag::BandwidthCounters>>,
+    /// Handles for the scan tasks, so `RunningServer::abort` can stop them.
+    /// Dropping them at spawn time made them unkillable for the process's life.
+    scan_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl PvaServer {
@@ -1026,6 +1030,46 @@ impl PvaServer {
         self.serve_after_start_hooks().await
     }
 
+    /// Run the `on_start` hooks to completion, then spawn the server; returns
+    /// a handle for typed access and shutdown.
+    ///
+    /// Returns `Err` if a hook aborts startup, mirroring Python's
+    /// `start_background`. This phase is awaited here rather than inside the
+    /// spawned task for two reasons: a hook that aborts must surface to the
+    /// caller instead of only reaching a `tracing::error!` they may have no
+    /// subscriber for, and hooks must have finished before `start()` returns
+    /// so `RunningServer::pv(...)` cannot read pre-hook values.
+    ///
+    /// A failure *after* the hook phase (a bind error, say) still cannot be
+    /// returned here — the server is serving by then — and is logged from
+    /// the spawned task as before.
+    ///
+    /// Shared by [`ServeBuilder::start`], which delegates here after
+    /// building its `PvaServer`.
+    pub async fn start(self) -> Result<RunningServer, String> {
+        let store = self.store().clone();
+        let events = self.events().clone();
+        let scan_tasks = self.scan_tasks.clone(); // must precede the move below
+        self.run_start_hooks().await?;
+        // Start the dispatcher here rather than leaving it to
+        // `serve_after_start_hooks` in the spawned task: otherwise
+        // `RunningServer::post_event` immediately after `start()` races the
+        // spawn, and `events().drain()` would report a dispatcher that has
+        // not started yet. `start_dispatcher` is idempotent.
+        events.start_dispatcher(store.clone());
+        let handle = tokio::spawn(async move {
+            if let Err(e) = self.serve_after_start_hooks().await {
+                tracing::error!("PvaServer exited with error: {e}");
+            }
+        });
+        Ok(RunningServer {
+            store,
+            events,
+            scan_tasks,
+            handle,
+        })
+    }
+
     /// Continue startup on the assumption that `run_start_hooks()` has
     /// already completed successfully.
     ///
@@ -1105,7 +1149,7 @@ impl PvaServer {
             let name = name.clone();
             let period = *period;
             let callback = callback.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(period);
                 loop {
                     interval.tick().await;
@@ -1113,6 +1157,10 @@ impl PvaServer {
                     store.set_value(&name, new_val).await;
                 }
             });
+            // Keeping the handle is what makes `RunningServer::abort` able to
+            // stop the scan; dropping it made these tasks unkillable for the
+            // life of the process.
+            self.scan_tasks.lock().unwrap().push(handle);
         }
 
         // 3. Start the event dispatcher.
@@ -1276,40 +1324,9 @@ impl ServeBuilder {
         self.build().await.run().await
     }
 
-    /// Build, run the `on_start` hooks to completion, then spawn the server;
-    /// returns a handle for typed access and shutdown.
-    ///
-    /// Returns `Err` if a hook aborts startup, mirroring Python's
-    /// `start_background`. This phase is awaited here rather than inside the
-    /// spawned task for two reasons: a hook that aborts must surface to the
-    /// caller instead of only reaching a `tracing::error!` they may have no
-    /// subscriber for, and hooks must have finished before `start()` returns
-    /// so `RunningServer::pv(...)` cannot read pre-hook values.
-    ///
-    /// A failure *after* the hook phase (a bind error, say) still cannot be
-    /// returned here — the server is serving by then — and is logged from
-    /// the spawned task as before.
+    /// Build, then start. See [`PvaServer::start`] for the behaviour.
     pub async fn start(self) -> Result<RunningServer, String> {
-        let server = self.build().await;
-        let store = server.store().clone();
-        let events = server.events().clone();
-        server.run_start_hooks().await?;
-        // Start the dispatcher here rather than leaving it to
-        // `serve_after_start_hooks` in the spawned task: otherwise
-        // `RunningServer::post_event` immediately after `start()` races the
-        // spawn, and `events().drain()` would report a dispatcher that has
-        // not started yet. `start_dispatcher` is idempotent.
-        events.start_dispatcher(store.clone());
-        let handle = tokio::spawn(async move {
-            if let Err(e) = server.serve_after_start_hooks().await {
-                tracing::error!("PvaServer exited with error: {e}");
-            }
-        });
-        Ok(RunningServer {
-            store,
-            events,
-            handle,
-        })
+        self.build().await.start().await
     }
 }
 
@@ -1321,6 +1338,10 @@ pub struct RunningServer {
     /// handlers that nothing could ever fire. Python's `PyServer` keeps the
     /// same handle for the same reason.
     events: Arc<crate::events::Events>,
+    /// Shared with the `PvaServer` moved into the spawned task: cloned
+    /// *before* the move so both sides see the same `Vec`, which the spawned
+    /// task's `serve_after_start_hooks` fills in a moment later.
+    scan_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -1416,6 +1437,10 @@ impl RunningServer {
 
     pub fn abort(&self) {
         self.handle.abort();
+        for h in self.scan_tasks.lock().unwrap().drain(..) {
+            h.abort();
+        }
+        self.events.abort_dispatcher();
     }
 }
 
@@ -2456,5 +2481,47 @@ mod tests {
             server.pv::<bool>("PRE:X").await,
             Err(crate::pv::PvError::TypeMismatch { .. })
         ));
+    }
+
+    /// `abort()` must stop everything the server started, not just the accept
+    /// task. A scan task that outlives its server keeps writing to the store
+    /// (and keeps a runtime thread busy) for the life of the process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_stops_the_scan_tasks_and_the_dispatcher() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let ticks = std::sync::Arc::new(AtomicUsize::new(0));
+        let t = ticks.clone();
+        let server = PvaServer::builder()
+            .ai("T:TICK", 0.0)
+            .port(0)
+            .scan("T:TICK", Duration::from_millis(1), move |_name| {
+                t.fetch_add(1, Ordering::SeqCst);
+                ScalarValue::F64(1.0)
+            })
+            .build();
+        let running = server.start().await.expect("start");
+
+        // Let the scan run so we know it is alive.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            ticks.load(Ordering::SeqCst) > 0,
+            "precondition: the scan task must actually be running"
+        );
+
+        running.abort();
+        // Let anything still alive settle, then take the baseline.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = ticks.load(Ordering::SeqCst);
+        // A 1 ms scan would tick ~200 more times in this window.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after = ticks.load(Ordering::SeqCst);
+
+        assert_eq!(
+            before, after,
+            "a scan task kept running after abort(): its JoinHandle was dropped \
+             at spawn time, so nothing could ever stop it"
+        );
     }
 }

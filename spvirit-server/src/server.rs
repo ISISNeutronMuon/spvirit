@@ -133,8 +133,12 @@ impl PvaServerState {
 
 /// Run a PVA server (UDP search + TCP handler + beacon).
 ///
-/// This function drives the three server tasks in a `tokio::select!` loop and
-/// returns when any task errors or the future is dropped.
+/// Runs the UDP search responder, the TCP connection acceptor and the beacon
+/// emitter concurrently and returns when **all three** have finished
+/// (`tokio::join!`). None of the three returns under normal operation, so in
+/// practice this runs until the future is dropped. A task that ends early —
+/// for example the UDP responder dying — is logged by that task itself; this
+/// function does not tear the others down in response.
 pub async fn run_pva_server(
     sources: Arc<SourceRegistry>,
     config: PvaServerConfig,
@@ -218,7 +222,16 @@ pub async fn run_pva_server_with_registry(
         }
     });
 
-    let _ = tokio::join!(udp_task, tcp_task, beacon_task);
+    // All three are `JoinHandle<()>` — each spawned closure logs its own error
+    // and returns `()` — so `join!` yields three `Result<(), JoinError>`. A
+    // JoinError means the task panicked or was aborted, which the old
+    // `let _ = ...` swallowed entirely.
+    let (udp_res, tcp_res, beacon_res) = tokio::join!(udp_task, tcp_task, beacon_task);
+    for (name, res) in [("udp", udp_res), ("tcp", tcp_res), ("beacon", beacon_res)] {
+        if let Err(e) = res {
+            error!("{} server task ended abnormally: {}", name, e);
+        }
+    }
     Ok(())
 }
 
@@ -253,5 +266,37 @@ mod tests {
         let (addr, iface) = udp_search_bind(false, listen, 5076);
         assert_eq!(addr, SocketAddr::new(listen, 5076));
         assert_eq!(iface, None);
+    }
+
+    /// A doc comment that describes a supervision strategy the code does not
+    /// implement is worse than no comment: it tells a reader a dead UDP task
+    /// would be noticed.
+    ///
+    /// The needle is just "`tokio::select!`" and the join! check is separate:
+    /// the offending sentence is wrapped across two `///` lines, so any needle
+    /// spanning the wrap would never match and the test would pass green
+    /// against the unfixed source.
+    #[test]
+    fn run_pva_server_doc_matches_its_actual_supervision() {
+        let full_src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server.rs"),
+        )
+        .expect("server.rs must be readable");
+        // Scan only the production code above this test module: this test's
+        // own doc comment and assertions quote the needle literally, so
+        // scanning the whole file would make the second assertion below
+        // fail unconditionally regardless of what run_pva_server's doc says.
+        let src = full_src
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("server.rs must have a #[cfg(test)] module");
+        assert!(
+            src.contains("tokio::join!(udp_task, tcp_task, beacon_task)"),
+            "precondition: run_pva_server still joins its three tasks"
+        );
+        assert!(
+            !src.contains("tokio::select!"),
+            "the doc claims select!-based supervision; the code uses join!"
+        );
     }
 }

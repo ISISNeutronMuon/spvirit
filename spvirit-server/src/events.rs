@@ -82,6 +82,8 @@ pub struct Events {
     /// Incremented on every successful enqueue, decremented after the handler
     /// finishes. `drain()` waits for this to reach zero.
     inflight: Arc<AtomicU64>,
+    /// The dispatcher task, so a shutting-down server can actually stop it.
+    dispatcher: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Events {
@@ -96,6 +98,7 @@ impl Events {
             failed: Arc::new(AtomicU64::new(0)),
             dispatcher_started: std::sync::atomic::AtomicBool::new(false),
             inflight: Arc::new(AtomicU64::new(0)),
+            dispatcher: std::sync::Mutex::new(None),
         }
     }
 
@@ -141,7 +144,7 @@ impl Events {
         let inflight = self.inflight.clone();
         let failed = self.failed.clone();
         self.dispatcher_started.store(true, Ordering::SeqCst);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Some(Dispatch { handler, event }) = rx.recv().await {
                 let fut = handler(store.clone(), event.clone());
                 // AssertUnwindSafe: on panic we drop the handler's state and
@@ -155,6 +158,14 @@ impl Events {
                 inflight.fetch_sub(1, Ordering::SeqCst);
             }
         });
+        *self.dispatcher.lock().unwrap() = Some(handle);
+    }
+
+    /// Stop the dispatcher task. Idempotent.
+    pub fn abort_dispatcher(&self) {
+        if let Some(h) = self.dispatcher.lock().unwrap().take() {
+            h.abort();
+        }
     }
 
     /// Post `event`: await every sink, then queue handlers and return.
