@@ -131,14 +131,34 @@ impl PvaServerState {
     }
 }
 
+/// Aborts the wrapped tasks when dropped.
+///
+/// A bare `JoinHandle` only detaches its task on drop — it does not stop it.
+/// Cancelling the caller's own task (e.g. via `RunningServer::abort()`, which
+/// aborts the task running [`run_pva_server_with_registry`]) drops this
+/// guard along with the rest of that task's stack, which is what actually
+/// stops the UDP responder, the TCP acceptor and the beacon instead of
+/// merely orphaning them.
+struct AbortTasksOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// Run a PVA server (UDP search + TCP handler + beacon).
 ///
 /// Runs the UDP search responder, the TCP connection acceptor and the beacon
 /// emitter concurrently and returns when **all three** have finished
 /// (`tokio::join!`). None of the three returns under normal operation, so in
-/// practice this runs until the future is dropped. A task that ends early —
-/// for example the UDP responder dying — is logged by that task itself; this
-/// function does not tear the others down in response.
+/// practice this runs until one of two things happens: a task panics (logged
+/// below, the other two keep running), or this function's own future is
+/// dropped — which happens when the caller's task is aborted, e.g. via
+/// `RunningServer::abort()`. In that second case an abort-on-drop guard
+/// aborts all three tasks in turn, so nothing is left running or bound.
 pub async fn run_pva_server(
     sources: Arc<SourceRegistry>,
     config: PvaServerConfig,
@@ -222,6 +242,18 @@ pub async fn run_pva_server_with_registry(
         }
     });
 
+    // Abort all three the moment this function's future is dropped (e.g. by
+    // `RunningServer::abort()` aborting the task this is running in), not
+    // just when it returns normally. Without this a caller's abort only ever
+    // cancelled the *outer* task and dropped these three handles, which
+    // detaches them — the UDP responder, the TCP acceptor and the beacon all
+    // kept running (and the port stayed bound) for the life of the process.
+    let _abort_guard = AbortTasksOnDrop(vec![
+        udp_task.abort_handle(),
+        tcp_task.abort_handle(),
+        beacon_task.abort_handle(),
+    ]);
+
     // All three are `JoinHandle<()>` — each spawned closure logs its own error
     // and returns `()` — so `join!` yields three `Result<(), JoinError>`. A
     // JoinError means the task panicked or was aborted, which the old
@@ -248,7 +280,10 @@ mod tests {
     fn udp_search_bind_parity_on_pinned_interface() {
         let listen = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
         let (addr, iface) = udp_search_bind(true, listen, 5076);
-        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076));
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076)
+        );
         assert_eq!(iface, Some(Ipv4Addr::new(10, 0, 0, 5)));
     }
 
@@ -256,7 +291,10 @@ mod tests {
     fn udp_search_bind_parity_on_unset_interface() {
         let listen = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         let (addr, iface) = udp_search_bind(true, listen, 5076);
-        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076));
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076)
+        );
         assert_eq!(iface, Some(Ipv4Addr::UNSPECIFIED));
     }
 
@@ -286,10 +324,15 @@ mod tests {
         // own doc comment and assertions quote the needle literally, so
         // scanning the whole file would make the second assertion below
         // fail unconditionally regardless of what run_pva_server's doc says.
+        // Cut at the `mod tests {` marker itself, not the first
+        // `#[cfg(test)]`: a `#[cfg(test)]` item placed above
+        // `run_pva_server` (e.g. a `#[cfg(test)] use ...`) would otherwise
+        // truncate the scan before it ever reaches the doc comment, and the
+        // second assertion would pass green against unfixed source.
         let src = full_src
-            .split_once("#[cfg(test)]")
+            .split_once("mod tests {")
             .map(|(before, _)| before)
-            .expect("server.rs must have a #[cfg(test)] module");
+            .expect("server.rs must have a `mod tests {` module");
         assert!(
             src.contains("tokio::join!(udp_task, tcp_task, beacon_task)"),
             "precondition: run_pva_server still joins its three tasks"

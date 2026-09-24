@@ -791,7 +791,7 @@ impl PvaServerBuilder {
             start_hooks: self.start_hooks,
             client_registry: self.client_registry,
             bandwidth_counters: self.bandwidth_counters,
-            scan_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            scan_tasks: Arc::new(std::sync::Mutex::new(Some(Vec::new()))),
         }
     }
 }
@@ -830,6 +830,22 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 ///
 /// server.run().await?;
 /// ```
+/// Race-proof push into a `scan_tasks` slot: if `abort()` has already run
+/// concurrently and set the slot to `None`, it will never drain this `Vec`
+/// again, so abort `handle` on the spot instead of leaking the task. Shared
+/// by `PvaServer::serve_after_start_hooks`'s scan-spawn loop; factored out so
+/// the race is directly unit-testable without timing.
+fn push_scan_handle(
+    scan_tasks: &std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut guard = scan_tasks.lock().unwrap();
+    match guard.as_mut() {
+        Some(tasks) => tasks.push(handle),
+        None => handle.abort(),
+    }
+}
+
 pub struct PvaServer {
     store: Arc<SimplePvStore>,
     extra_sources: Vec<(String, i32, Arc<dyn Source>)>,
@@ -857,7 +873,14 @@ pub struct PvaServer {
     bandwidth_counters: Option<Arc<crate::diag::BandwidthCounters>>,
     /// Handles for the scan tasks, so `RunningServer::abort` can stop them.
     /// Dropping them at spawn time made them unkillable for the process's life.
-    scan_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    ///
+    /// `None` means "abort() has already run": a scan-spawn loop that is
+    /// still executing concurrently with `abort()` (e.g. `abort()` called
+    /// immediately after `start()` returns, while `serve_after_start_hooks`
+    /// is still building the source registry on another worker) checks for
+    /// this and aborts its own handle on the spot instead of pushing it into
+    /// a `Vec` `abort()` has already drained and will never look at again.
+    scan_tasks: Arc<std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>,
 }
 
 impl PvaServer {
@@ -910,7 +933,9 @@ impl PvaServer {
     /// `serve_after_start_hooks`, since `run_start_hooks` can be — and, via
     /// Python's `start_background`, is — called on its own ahead of it.
     pub async fn run_start_hooks(&self) -> Result<(), String> {
-        self.store.set_registry(self.resolved_monitor_registry()).await;
+        self.store
+            .set_registry(self.resolved_monitor_registry())
+            .await;
         if let Some(ioc) = &self.ioc {
             // Same reasoning as the store above: a hook (or any host-side
             // write issued before `serve_after_start_hooks` runs) must reach
@@ -920,8 +945,7 @@ impl PvaServer {
         }
         for (i, hook) in self.start_hooks.iter().enumerate() {
             let fut = hook(self.store.clone());
-            let result =
-                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await;
             if let Err(payload) = result {
                 // Fold the panic payload into the message. Without this the
                 // real cause ("ValueError: DB connection refused", or the
@@ -1159,8 +1183,10 @@ impl PvaServer {
             });
             // Keeping the handle is what makes `RunningServer::abort` able to
             // stop the scan; dropping it made these tasks unkillable for the
-            // life of the process.
-            self.scan_tasks.lock().unwrap().push(handle);
+            // life of the process. If `abort()` has already run concurrently
+            // (the `None` case), it will never drain this `Vec` again, so
+            // abort the handle immediately instead of leaking the task.
+            push_scan_handle(&self.scan_tasks, handle);
         }
 
         // 3. Start the event dispatcher.
@@ -1340,8 +1366,9 @@ pub struct RunningServer {
     events: Arc<crate::events::Events>,
     /// Shared with the `PvaServer` moved into the spawned task: cloned
     /// *before* the move so both sides see the same `Vec`, which the spawned
-    /// task's `serve_after_start_hooks` fills in a moment later.
-    scan_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// task's `serve_after_start_hooks` fills in a moment later. See the
+    /// field doc on `PvaServer::scan_tasks` for what `None` means.
+    scan_tasks: Arc<std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -1437,8 +1464,14 @@ impl RunningServer {
 
     pub fn abort(&self) {
         self.handle.abort();
-        for h in self.scan_tasks.lock().unwrap().drain(..) {
-            h.abort();
+        // Take the Vec, leaving `None`, before aborting anything in it: a
+        // scan-spawn loop still running concurrently (see the field doc on
+        // `PvaServer::scan_tasks`) checks for `None` and aborts its own
+        // handle instead of pushing into a `Vec` this call already drained.
+        if let Some(tasks) = self.scan_tasks.lock().unwrap().take() {
+            for h in tasks {
+                h.abort();
+            }
         }
         self.events.abort_dispatcher();
     }
@@ -1612,7 +1645,11 @@ pub(crate) fn make_enum_record(
 ) -> RecordInstance {
     RecordInstance {
         name: name.to_string(),
-        record_type: if writable { RecordType::Mbbo } else { RecordType::Mbbi },
+        record_type: if writable {
+            RecordType::Mbbo
+        } else {
+            RecordType::Mbbi
+        },
         common: DbCommonState::default(),
         data: RecordData::NtEnum {
             nt: NtEnum::new(index, choices),
@@ -1638,7 +1675,13 @@ pub(crate) fn make_table_record(
         record_type: RecordType::NtTable,
         common: DbCommonState::default(),
         data: RecordData::NtTable {
-            nt: NtTableType { labels, columns: cols, descriptor: None, alarm: None, time_stamp: None },
+            nt: NtTableType {
+                labels,
+                columns: cols,
+                descriptor: None,
+                alarm: None,
+                time_stamp: None,
+            },
             inp: None,
             out: None,
             omsl: OutputMode::Supervisory,
@@ -1662,11 +1705,15 @@ mod tests {
             .ai("T:A", 1.0)
             .on_start(move |_store| {
                 let l = l1.clone();
-                Box::pin(async move { l.lock().unwrap().push("first"); })
+                Box::pin(async move {
+                    l.lock().unwrap().push("first");
+                })
             })
             .on_start(move |_store| {
                 let l = l2.clone();
-                Box::pin(async move { l.lock().unwrap().push("second"); })
+                Box::pin(async move {
+                    l.lock().unwrap().push("second");
+                })
             })
             .build();
 
@@ -1753,15 +1800,16 @@ mod tests {
                 .udp_port(0)
                 .on_start(|store| {
                     Box::pin(async move {
-                        store.insert(
-                            "T:HOOKED".to_string(),
-                            make_scalar_record(
-                                "T:HOOKED",
-                                RecordType::Ai,
-                                ScalarValue::F64(7.0),
-                            ),
-                        )
-                        .await;
+                        store
+                            .insert(
+                                "T:HOOKED".to_string(),
+                                make_scalar_record(
+                                    "T:HOOKED",
+                                    RecordType::Ai,
+                                    ScalarValue::F64(7.0),
+                                ),
+                            )
+                            .await;
                     })
                 })
                 .start(),
@@ -1825,10 +1873,7 @@ mod tests {
         use std::sync::Mutex;
         struct RecordingSink(Mutex<Vec<String>>);
         impl crate::events::EventSink for RecordingSink {
-            fn on_event(
-                &self,
-                event: &str,
-            ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            fn on_event(&self, event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
                 let event = event.to_string();
                 Box::pin(async move { self.0.lock().unwrap().push(event) })
             }
@@ -1961,7 +2006,9 @@ mod tests {
             .ai("T:A", 1.0)
             .on_event("SHUTTER", move |_store, event| {
                 let s = s.clone();
-                Box::pin(async move { s.lock().unwrap().push(event); })
+                Box::pin(async move {
+                    s.lock().unwrap().push(event);
+                })
             })
             .build();
 
@@ -2053,7 +2100,10 @@ mod tests {
 
         // Give run() time to reach the hook and block there.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(hook_entered.load(Ordering::SeqCst), "hook should have started");
+        assert!(
+            hook_entered.load(Ordering::SeqCst),
+            "hook should have started"
+        );
         assert_eq!(
             store.get_value("T:GATED").await,
             Some(ScalarValue::F64(0.0)),
@@ -2076,7 +2126,11 @@ mod tests {
         let server = PvaServer::builder()
             .ai("T:A", 1.0)
             .port(0)
-            .on_start(|_store| Box::pin(async { panic!("init failed"); }))
+            .on_start(|_store| {
+                Box::pin(async {
+                    panic!("init failed");
+                })
+            })
             .build();
 
         // Bounded, like `Events::drain()` (events.rs:176): if a future
@@ -2111,11 +2165,15 @@ mod tests {
         let server = PvaServer::serve([temp])
             .on_start(move |_store| {
                 let l = l1.clone();
-                Box::pin(async move { l.lock().unwrap().push("started"); })
+                Box::pin(async move {
+                    l.lock().unwrap().push("started");
+                })
             })
             .on_event("GO", move |_store, _event| {
                 let l = l2.clone();
-                Box::pin(async move { l.lock().unwrap().push("evented"); })
+                Box::pin(async move {
+                    l.lock().unwrap().push("evented");
+                })
             })
             .build()
             .await;
@@ -2149,7 +2207,9 @@ mod tests {
         ));
 
         // add a read-only i16 scalar; family maps to an input record
-        let _ = server.add_scalar("RT:I16", ScalarValue::I16(-3), false).await;
+        let _ = server
+            .add_scalar("RT:I16", ScalarValue::I16(-3), false)
+            .await;
         assert!(matches!(
             server.store().get_value("RT:I16").await,
             Some(ScalarValue::I16(-3))
@@ -2181,7 +2241,12 @@ mod tests {
 
         // writable enum -> mbbo, choices + index preserved
         server
-            .add_enum("RT:ENUM", vec!["OFF".into(), "ON".into(), "TRIP".into()], 1, true)
+            .add_enum(
+                "RT:ENUM",
+                vec!["OFF".into(), "ON".into(), "TRIP".into()],
+                1,
+                true,
+            )
             .await;
         match server.store().get_nt("RT:ENUM").await {
             Some(NtPayload::Enum(e)) => {
@@ -2192,7 +2257,9 @@ mod tests {
         }
 
         // read-only enum -> mbbi; still writable() at the store layer (documented)
-        server.add_enum("RT:ENUM_RO", vec!["A".into(), "B".into()], 0, false).await;
+        server
+            .add_enum("RT:ENUM_RO", vec!["A".into(), "B".into()], 0, false)
+            .await;
         assert!(matches!(
             server.store().get_nt("RT:ENUM_RO").await,
             Some(NtPayload::Enum(_))
@@ -2281,7 +2348,9 @@ mod tests {
         // Finding 2: a parse failure must not be swallowed into a server
         // with zero records from this source -- it must abort loudly at
         // startup instead.
-        let _ = PvaServer::builder().db_string("not a valid db line").build();
+        let _ = PvaServer::builder()
+            .db_string("not a valid db line")
+            .build();
     }
 
     #[test]
@@ -2523,5 +2592,155 @@ mod tests {
             "a scan task kept running after abort(): its JoinHandle was dropped \
              at spawn time, so nothing could ever stop it"
         );
+    }
+
+    /// M2: the race between `abort()` (which takes `scan_tasks`, leaving
+    /// `None`) and a scan-spawn loop still running concurrently on another
+    /// worker (which would otherwise push into a `Vec` `abort()` already
+    /// drained and will never look at again — leaking the task exactly as
+    /// before the fix). Deterministic, not timing-based: this drives
+    /// `push_scan_handle` directly against a slot already set to `None`,
+    /// which is exactly the state `abort()` leaves behind mid-race.
+    #[tokio::test]
+    async fn push_scan_handle_aborts_its_own_handle_once_abort_has_run() {
+        let scan_tasks: std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>> =
+            std::sync::Mutex::new(None); // the post-abort() state
+
+        // A long-lived task standing in for a real scan task. Its own
+        // AbortHandle is kept separately so the test can confirm what
+        // happened to it after `push_scan_handle` has consumed the
+        // JoinHandle — pre-fix, this would still be running (leaked); the
+        // fix must have cancelled it.
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let abort_handle = handle.abort_handle();
+        assert!(!abort_handle.is_finished(), "precondition: task is alive");
+
+        push_scan_handle(&scan_tasks, handle);
+
+        // Give the abort a moment to actually land.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            abort_handle.is_finished(),
+            "push_scan_handle must abort the handle immediately when the \
+             slot is already None, not leave it running"
+        );
+        assert!(
+            scan_tasks.lock().unwrap().is_none(),
+            "pushing into an already-None slot must not resurrect the Vec"
+        );
+    }
+
+    /// `RunningServer::abort()` must actually stop the dispatcher, not just
+    /// drop the outer accept-task handle (which never touched the
+    /// dispatcher at all). Proven by checking the dispatcher's *effect*
+    /// (a handler posted after `abort()` never runs) rather than by
+    /// inspecting internal state — a test that merely called
+    /// `abort_dispatcher()` again and checked it didn't panic would stay
+    /// green even if `RunningServer::abort()` never called it. Not vacuous:
+    /// removing the `self.events.abort_dispatcher();` line from
+    /// `RunningServer::abort()` makes this test FAIL (see task-11 fix-round-1
+    /// report for the pasted RED output).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_stops_the_dispatcher() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let r = ran.clone();
+        let server = PvaServer::builder()
+            .ai("T:ABORTDISPATCH", 0.0)
+            .port(0)
+            .build();
+        server.events().add_handler(
+            "GO",
+            std::sync::Arc::new(move |_store, _event| {
+                let r = r.clone();
+                Box::pin(async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        let running = server.start().await.expect("start");
+
+        // Precondition: the dispatcher is actually alive and runs handlers.
+        running.post_event("GO").await;
+        running.events().drain().await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "precondition: the dispatcher must run a handler before abort()"
+        );
+
+        running.abort();
+
+        // Post again after abort(). If the dispatcher is truly stopped, its
+        // receiver is dropped with the task, so this handler is never run —
+        // it should sit at 1 forever, not climb to 2.
+        running.post_event("GO").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "a handler posted after abort() ran: the dispatcher task is still alive"
+        );
+    }
+
+    /// `abort()` must actually stop the TCP acceptor: without an
+    /// abort-on-drop guard on `run_pva_server_with_registry`'s three inner
+    /// tasks, aborting the *outer* handle merely drops those tasks'
+    /// `JoinHandle`s, which detaches rather than stops them, and the port
+    /// stays bound and serving forever. FAILS at f066f59.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_stops_the_tcp_acceptor() {
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Reserve a free port the same way tests elsewhere in this crate do
+        // (see `search_try_claim_metrics.rs`): bind ephemerally, read the
+        // port back, then drop the listener so the server can bind it.
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+
+        let server = PvaServer::builder()
+            .ai("T:ABORTTCP", 0.0)
+            .listen_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .port(port)
+            .udp_port(0)
+            .build();
+        let running = server.start().await.expect("start");
+
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+
+        // Precondition: the server is actually up and accepting.
+        TcpStream::connect(addr)
+            .await
+            .expect("precondition: the server must be reachable before abort()");
+
+        running.abort();
+
+        // Bounded retry window rather than a fixed sleep: connect immediately
+        // fails while the OS still has the old listener's backlog draining,
+        // and immediately succeeding once would be a flake, not a pass.
+        const RETRY_WINDOW: Duration = Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + RETRY_WINDOW;
+        loop {
+            match TcpStream::connect(addr).await {
+                Err(_) => break, // refused/failed — the acceptor is gone.
+                Ok(_) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!(
+                            "TCP connect to {addr} kept succeeding for {RETRY_WINDOW:?} \
+                             after abort(): the acceptor task is still running"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
     }
 }
