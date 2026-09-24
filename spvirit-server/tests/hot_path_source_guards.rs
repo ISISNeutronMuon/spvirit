@@ -32,3 +32,38 @@ fn handler_does_not_reply_through_the_global_conns_map() {
          map for a writer the connection already holds."
     );
 }
+
+/// The spawned pattern-query-reply task (`spawn_pattern_query_reply`, driven
+/// from the TCP search handler) can run for up to 30s after the connection
+/// that asked for it has torn down. Its closure must capture the deferred
+/// reply through `replier.downgrade()` (a `Weak<ConnWriter>`) rather than
+/// `replier.clone()` (a strong `Replier`, which keeps the connection's
+/// `ConnWriter` — and its buffers — resident for the closure's whole
+/// lifetime regardless of teardown).
+///
+/// This is a wiring assertion, not a behavioural one: `WeakReplier` itself
+/// is exercised elsewhere, but nothing short of reading the source proves
+/// the *search-reply closure specifically* uses it, since any correctly
+/// behaving `Weak` would pass a generic "does downgrade work" test even if
+/// the production call site had been reverted to a strong clone.
+#[test]
+fn deferred_search_reply_captures_a_weak_replier_not_a_strong_one() {
+    let src = handler_src();
+    let collapsed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(
+        collapsed.contains("letreplier_for_task=replier.downgrade();"),
+        "handler.rs no longer wires the deferred search-reply closure through \
+         `replier.downgrade()`. The spawned task must capture a weak handle, \
+         not a strong one, or it will keep the connection's ConnWriter alive \
+         for up to 30s after teardown."
+    );
+    assert!(
+        !collapsed.contains("letreplier_for_task=replier.clone();"),
+        "handler.rs wires the deferred search-reply closure through \
+         `replier.clone()`, a strong Replier. This keeps the connection's \
+         ConnWriter (and its buffers) alive for as long as the pattern-query \
+         enumeration runs (up to 30s), even after the connection has torn \
+         down. Use `replier.downgrade()` instead."
+    );
+}

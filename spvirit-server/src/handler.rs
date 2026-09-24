@@ -767,18 +767,19 @@ impl Replier {
 
     /// A weak handle for a reply that may outlive the connection.
     ///
-    /// The spawned pattern-query-reply task can run for as long as
-    /// [`spawn_pattern_query_reply`]'s enumeration timeout (up to 30s), well
-    /// after the client that asked for it may have disconnected. Cloning
-    /// `Replier` itself keeps a strong `Arc<ConnWriter>` alive for that whole
-    /// window even though nothing else references the connection any more —
-    /// [`ConnCleanupGuard`] has already run `cleanup_connection`, which drops
-    /// the registry's own strong reference, but the spawned task's clone kept
-    /// the writer (and its buffers) resident regardless. A `WeakReplier`
-    /// holds a `Weak<ConnWriter>` instead, so once every strong owner is gone
-    /// the writer is freed immediately; the delayed reply is simply dropped
-    /// (nobody is listening on that socket any more).
-    pub fn downgrade(&self) -> WeakReplier {
+    /// The spawned pattern-query-reply task (`spawn_pattern_query_reply`) can
+    /// run for as long as its enumeration timeout (up to 30s), well after the
+    /// client that asked for it may have disconnected. Cloning `Replier`
+    /// itself keeps a strong `Arc<ConnWriter>` alive for that whole window
+    /// even though nothing else references the connection any more — the
+    /// connection's cleanup guard (`ConnCleanupGuard`) has already run
+    /// `cleanup_connection`, which drops the registry's own strong reference,
+    /// but the spawned task's clone kept the writer (and its buffers)
+    /// resident regardless. A `WeakReplier` holds a `Weak<ConnWriter>`
+    /// instead, so once every strong owner is gone the writer is freed
+    /// immediately; the delayed reply is simply dropped (nobody is listening
+    /// on that socket any more).
+    pub(crate) fn downgrade(&self) -> WeakReplier {
         WeakReplier {
             cw: Arc::downgrade(&self.cw),
             conn_id: self.conn_id,
@@ -787,9 +788,9 @@ impl Replier {
     }
 }
 
-/// [`Replier::downgrade`]: a reply handle that does not keep the connection's
+/// `Replier::downgrade`: a reply handle that does not keep the connection's
 /// writer alive.
-pub struct WeakReplier {
+pub(crate) struct WeakReplier {
     cw: std::sync::Weak<ConnWriter>,
     conn_id: u64,
     client_registry: Option<Arc<ClientRegistry>>,
@@ -799,7 +800,7 @@ impl WeakReplier {
     /// Deliver the frame if the connection's writer is still alive; otherwise
     /// drop it silently (at debug level) — the connection is gone, so there
     /// is nothing to deliver to.
-    pub async fn send(&self, bytes: Vec<u8>) {
+    pub(crate) async fn send(&self, bytes: Vec<u8>) {
         let Some(cw) = self.cw.upgrade() else {
             debug!(
                 "Conn {}: dropping a delayed reply — connection already torn down",
@@ -1340,7 +1341,10 @@ pub fn disable_nagle(stream: &TcpStream, conn_id: u64) {
 /// alive forever). Any early return added later is now safe by construction.
 /// `Drop` cannot `await`, so the work is spawned — the same shape as
 /// `conn_writer::FlushGuard`. With no runtime to spawn on (process shutting
-/// down) there is nothing left to leak into.
+/// down) there is nothing left to leak into. If a runtime exists but is
+/// already shutting down, the spawned cleanup task may itself be cancelled
+/// before it runs — that is harmless too, since the `MonitorRegistry` it
+/// would have cleaned up is owned by (and dies with) that same runtime.
 struct ConnCleanupGuard {
     registry: Arc<MonitorRegistry>,
     conn_id: u64,
