@@ -608,6 +608,12 @@ pub fn rand_guid() -> [u8; 12] {
 // ---------------------------------------------------------------------------
 
 pub fn validate_encoded_packet(conn_id: u64, label: &str, bytes: &[u8]) {
+    // Re-decoding every outbound frame is only worth doing if we can report
+    // the result — and every report here is a `debug!`. Bail before the decode
+    // when DEBUG is off.
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     let mut pkt = PvaPacket::new(bytes);
     let decoded = pkt.decode_payload();
     match decoded {
@@ -637,6 +643,11 @@ pub fn dump_hex_packet(
     is_be: bool,
     bytes: &[u8],
 ) {
+    // A `format!` per byte, allocating a String per line, and then `debug!`
+    // discards all of it at the default level. Check first.
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     debug!(
         "Conn {}: {} {} ver={} be={} len={}",
         conn_id,
@@ -646,16 +657,19 @@ pub fn dump_hex_packet(
         is_be,
         bytes.len()
     );
+    use std::fmt::Write as _;
+    // 16 bytes as "xx " plus a trailing byte with no space.
+    let mut line = String::with_capacity(48);
     let mut offset = 0usize;
     while offset < bytes.len() {
         let end = usize::min(offset + 16, bytes.len());
-        let chunk = &bytes[offset..end];
-        let mut line = String::new();
-        for (i, b) in chunk.iter().enumerate() {
+        line.clear();
+        for (i, b) in bytes[offset..end].iter().enumerate() {
             if i > 0 {
                 line.push(' ');
             }
-            line.push_str(&format!("{:02x}", b));
+            // Writes into the existing buffer; no per-byte allocation.
+            let _ = write!(line, "{b:02x}");
         }
         debug!("Conn {}: {:04x} {}", conn_id, offset, line);
         offset += 16;
@@ -3775,6 +3789,83 @@ mod tests {
             found,
             "background resolution never made the name findable; the \
              no-reply resolver design does not deliver"
+        );
+    }
+
+    /// The hex dump allocated a String per byte via `format!` and only then
+    /// handed the line to `debug!`, which throws it away at the default level.
+    /// Both dump helpers must bail out before doing any work when their level
+    /// is disabled.
+    #[test]
+    fn packet_dump_helpers_check_the_level_before_formatting() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handler.rs"),
+        )
+        .expect("handler.rs must be readable");
+
+        // Both helpers log only at DEBUG (validate_encoded_packet's four log
+        // statements are all `debug!`), so DEBUG is the level both must gate on.
+        for (name, level) in [
+            ("pub fn dump_hex_packet(", "Level::DEBUG"),
+            ("pub fn validate_encoded_packet(", "Level::DEBUG"),
+        ] {
+            let start = src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let body = &src[start..start + 900.min(src.len() - start)];
+            assert!(
+                body.contains("tracing::enabled!") && body.contains(level),
+                "{name} must open with a tracing::enabled!({level}) guard so it \
+                 does no formatting or decoding when that level is off"
+            );
+        }
+
+        assert!(
+            !src[src.find("pub fn dump_hex_packet(").unwrap()
+                ..src.find("pub fn dump_hex_packet(").unwrap() + 900]
+                .contains("push_str(&format!"),
+            "dump_hex_packet must not allocate a String per byte; write into \
+             the line buffer with write! instead"
+        );
+    }
+
+    /// Gating must not change what is logged when the level IS on.
+    #[test]
+    fn hex_dump_still_emits_every_byte_when_debug_is_on() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(buf.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            dump_hex_packet(1, "->", "test", 2, false, &[0x00, 0xde, 0xad, 0xff]);
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).expect("utf8");
+        assert!(
+            out.contains("00 de ad ff"),
+            "the dump must still print every byte when DEBUG is enabled; got:\n{out}"
         );
     }
 }
