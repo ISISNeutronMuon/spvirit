@@ -1379,9 +1379,24 @@ mod tests {
             mons.insert("pv".to_string(), vec![sub]);
         }
 
-        let p1 = nt_payload(1.0, 0);
-        let p2 = nt_payload(2.0, 0);
-        let p3 = nt_payload(3.0, 0);
+        // Explicit `time_stamp`s: without one the encoder falls back to
+        // `SystemTime::now()`, and `want` below is computed by re-encoding
+        // independently of what `notify_monitors` actually sent — two
+        // separate `now()` samples would make the comparison flaky/always-fail.
+        let stamped = |value: f64, secs: i64| {
+            let mut p = nt_payload(value, 0);
+            if let NtPayload::Scalar(ref mut nt) = p {
+                nt.time_stamp = Some(spvirit_types::NtTimeStamp {
+                    seconds_past_epoch: secs,
+                    nanoseconds: 0,
+                    user_tag: 0,
+                });
+            }
+            p
+        };
+        let p1 = stamped(1.0, 1_700_000_001);
+        let p2 = stamped(2.0, 1_700_000_002);
+        let p3 = stamped(3.0, 1_700_000_003);
 
         // Park the flusher on the first frame.
         let r = reg.clone();
@@ -1395,20 +1410,43 @@ mod tests {
         reg.notify_monitors("pv", &p2).await;
         reg.notify_monitors("pv", &p3).await;
 
+        let want: Vec<u8> = [&p1, &p2, &p3]
+            .iter()
+            .flat_map(|p| encode_monitor_data_response_payload(42, 0x00, p, 2, false))
+            .collect();
+
         for _ in 0..40 {
             sink.release(4);
-            if sink.writes.lock().unwrap().len() >= 3 {
+            if sink
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+                >= want.len()
+            {
                 break;
             }
             tokio::task::yield_now().await;
         }
         t.await.unwrap();
 
-        let writes = sink.writes.lock().unwrap().clone();
+        // Batching is now at the write layer, so assert on the byte stream, not
+        // on the number of write_all calls: the control lane is FIFO and
+        // lossless, so every charged frame must appear, in order.
+        let got: Vec<u8> = sink
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
         assert_eq!(
-            writes.len(),
-            3,
-            "pipelined monitor frames must be delivered losslessly, not coalesced; got {writes:?}"
+            got, want,
+            "pipelined monitor frames must be delivered losslessly and in order, \
+             not coalesced"
         );
     }
 
