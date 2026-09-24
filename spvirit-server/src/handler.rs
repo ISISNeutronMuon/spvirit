@@ -40,7 +40,7 @@ use crate::decode::decode_put_body;
 use crate::diag::ClientRegistry;
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::{SourceRegistry, TryClaim};
-use crate::state::{ConnState, MonitorState, MonitorSub};
+use crate::state::{ChannelTables, ConnState, MonitorState, MonitorSub};
 
 /// Hard server-side ceiling on a pipelined monitor's outstanding-frame credit,
 /// regardless of the window a client requests or ACKs. Bounds worst-case memory
@@ -819,6 +819,49 @@ impl WeakReplier {
 // GET_FIELD handler
 // ---------------------------------------------------------------------------
 
+/// Work out which channel a GET_FIELD request is about.
+///
+/// Order, unchanged from the `or_else` chain this replaces:
+/// 1. the sid the client named, taken as-is (never validated here — an
+///    unknown one falls out as "PV not found" at the caller's `sid_to_pv`
+///    lookup);
+/// 2. the cid it named, resolved through `cid_to_sid`;
+/// 3. the cid field read as if it held a sid — some clients populate it that
+///    way;
+/// 4. only when the client sent `cid == 0` **and** exactly one channel is
+///    open on this connection, that channel.
+///
+/// Step 4 is a compatibility shim, not a rule: real clients do send GET_FIELD
+/// with cid 0, and refusing them breaks introspection. It is deliberately
+/// confined to the unambiguous case and logged, because it is a guess.
+pub fn resolve_get_field_sid(
+    tables: &ChannelTables,
+    sid: Option<u32>,
+    cid: u32,
+) -> Option<u32> {
+    if let Some(s) = sid {
+        return Some(s);
+    }
+    if let Some(s) = tables.cid_to_sid.get(&cid).copied() {
+        return Some(s);
+    }
+    if tables.sid_to_pv.contains_key(&cid) {
+        return Some(cid);
+    }
+    if cid == 0 && tables.sid_to_pv.len() == 1 {
+        let only = tables.sid_to_pv.keys().copied().next();
+        if let Some(s) = only {
+            warn!(
+                "GET_FIELD names no channel (no sid, cid=0); guessing the \
+                 connection's only open channel sid={}",
+                s
+            );
+        }
+        return only;
+    }
+    None
+}
+
 async fn handle_get_field_request(
     state: &ServerState,
     conn_state: &ConnState,
@@ -845,20 +888,7 @@ async fn handle_get_field_request(
     // release the tables before any `.await` below.
     let (sid, resolved_pv) = {
         let tables = conn_state.channels.lock().unwrap();
-        let sid = payload
-            .sid
-            .or_else(|| tables.cid_to_sid.get(&payload.cid).copied())
-            .or_else(|| {
-                tables
-                    .sid_to_pv
-                    .contains_key(&payload.cid)
-                    .then_some(payload.cid)
-            })
-            .or_else(|| {
-                (payload.cid == 0 && tables.sid_to_pv.len() == 1)
-                    .then(|| tables.sid_to_pv.keys().copied().next())
-                    .flatten()
-            });
+        let sid = resolve_get_field_sid(&tables, payload.sid, payload.cid);
         let pv = sid.and_then(|s| tables.sid_to_pv.get(&s).cloned());
         (sid, pv)
     };
@@ -2634,6 +2664,60 @@ mod tests {
         raw.extend_from_slice(&64u32.to_le_bytes());
         let header = PvaHeader::new(&raw);
         assert_eq!(inbound_payload_len(&header), Ok(64));
+    }
+
+    /// Pins all four resolution steps, in order, exactly as the chain at
+    /// `handler.rs:715-733` implements them today. Step 1 in particular is
+    /// unvalidated: a client-named sid is returned whether or not the
+    /// connection has such a channel — the caller's later `sid_to_pv` lookup
+    /// is what turns an unknown one into "not found".
+    #[test]
+    fn get_field_resolves_by_sid_then_cid_then_cid_as_sid_then_the_arity_one_guess() {
+        let mut t = ChannelTables::default();
+        t.insert_channel(5, 500, "A");
+
+        assert_eq!(
+            resolve_get_field_sid(&t, Some(500), 0),
+            Some(500),
+            "a client-named sid wins outright"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, Some(999), 5),
+            Some(999),
+            "a client-named sid is taken as-is, even one this connection does \
+             not know: the chain never validated it and this is an extraction, \
+             not a fix"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 5),
+            Some(500),
+            "no sid named: fall back to the cid"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 500),
+            Some(500),
+            "a cid that is not a cid but IS a known sid is accepted as one"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 0),
+            Some(500),
+            "cid == 0 with exactly one channel is the compatibility guess real \
+             clients depend on"
+        );
+
+        // Two channels: the guess is ambiguous and must not fire.
+        t.insert_channel(6, 600, "B");
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 0),
+            None,
+            "with more than one channel open there is nothing to guess"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 7),
+            None,
+            "a non-zero cid that is neither a known cid nor a known sid is \
+             never guessed at"
+        );
     }
 
     /// A control frame carries no payload however the length field reads.
