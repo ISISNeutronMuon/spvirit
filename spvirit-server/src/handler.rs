@@ -1603,6 +1603,10 @@ pub async fn handle_connection(
                             };
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
+                            // Bind the request to its channel so DESTROY_CHANNEL
+                            // can find and purge it. Previously only MONITOR
+                            // bound, so GET/PUT/PUT_GET rows leaked.
+                            conn_state.channels.lock().unwrap().bind_monitor(ioid, sid);
                             let resp = encode_op_init_response_desc(
                                 payload.command,
                                 ioid,
@@ -1681,6 +1685,10 @@ pub async fn handle_connection(
                             }
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
+                            // Bind the request to its channel so DESTROY_CHANNEL
+                            // can find and purge it. Previously only MONITOR
+                            // bound, so GET/PUT/PUT_GET rows leaked.
+                            conn_state.channels.lock().unwrap().bind_monitor(ioid, sid);
                             let resp = encode_op_init_response_desc(
                                 payload.command,
                                 ioid,
@@ -1829,6 +1837,10 @@ pub async fn handle_connection(
                             }
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
+                            // Bind the request to its channel so DESTROY_CHANNEL
+                            // can find and purge it. Previously only MONITOR
+                            // bound, so GET/PUT/PUT_GET rows leaked.
+                            conn_state.channels.lock().unwrap().bind_monitor(ioid, sid);
                             let resp =
                                 encode_op_put_get_init_response(ioid, &desc, &desc, version, is_be);
                             replier.send(resp).await;
@@ -2254,14 +2266,9 @@ pub async fn handle_connection(
                 // The client names the sid, so it may be stale: a client that
                 // re-created a channel on the same cid and only then echoes a
                 // DestroyChannel for the old sid must not strip the *new*
-                // channel's `cid_to_sid` row. Losing it makes
-                // `MonitorRegistry::destroy_subs` decline to send that client a
-                // DESTROY_CHANNEL on the next upstream death.
-                conn_state
-                    .channels
-                    .lock()
-                    .unwrap()
-                    .remove_channel_if_current(cid, sid);
+                // channel's `cid_to_sid` row (see remove_channel_if_current).
+                // Every request bound to the destroyed channel is also dead.
+                purge_channel_requests(&mut conn_state, cid, sid);
                 info!(
                     "Conn {}: channel destroyed sid={} cid={}",
                     conn_id, sid, cid
@@ -2480,6 +2487,27 @@ pub async fn handle_connection(
 
     state.registry.cleanup_connection(conn_id).await;
     Ok(())
+}
+
+/// Forget every request that was running on a channel the client just
+/// destroyed.
+///
+/// A destroyed channel's request ids can never be referenced again, but
+/// `ConnState`'s three per-request maps kept their rows — and `ioid_to_desc`
+/// holds a whole `StructureDesc` each. A client that flaps channels on one
+/// long-lived connection grew all three without bound.
+fn purge_channel_requests(conn_state: &mut ConnState, cid: u32, sid: u32) {
+    let ioids = {
+        let mut t = conn_state.channels.lock().unwrap();
+        let ioids = t.ioids_for_sid(sid);
+        t.remove_channel_if_current(cid, sid);
+        ioids
+    };
+    for ioid in ioids {
+        conn_state.ioid_to_desc.remove(&ioid);
+        conn_state.ioid_to_pv.remove(&ioid);
+        conn_state.ioid_to_monitor.remove(&ioid);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3923,5 +3951,63 @@ mod tests {
 
         let entry = cr.snapshot().into_iter().next().expect("one connection");
         assert_eq!(entry.tx, 4, "the reply's bytes must be credited to the conn");
+    }
+
+    /// A client that flaps channels on one connection must not grow the
+    /// connection's per-request maps. Every request bound to the destroyed
+    /// channel is dead the moment the channel is: its ioid can never be used
+    /// again.
+    #[test]
+    fn destroying_a_channel_purges_every_request_bound_to_it() {
+        let mut conn_state = ConnState::default();
+        {
+            let mut t = conn_state.channels.lock().unwrap();
+            t.insert_channel(1, 100, "A");
+            t.insert_channel(2, 200, "B");
+            // A monitor and a get on the doomed channel, and one on the other.
+            t.bind_monitor(10, 100);
+            t.bind_monitor(11, 100);
+            t.bind_monitor(20, 200);
+        }
+        // `ioid_to_desc` is the map that actually leaks memory (a whole
+        // StructureDesc, with an owned String per field), so it must be
+        // populated or the assertion on it below proves nothing.
+        let desc = nt_payload_desc(&NtPayload::Scalar(NtScalar::from_value(
+            ScalarValue::F64(1.0),
+        )));
+        for ioid in [10u32, 11, 20] {
+            conn_state
+                .ioid_to_pv
+                .insert(ioid, format!("PV{ioid}"));
+            conn_state.ioid_to_desc.insert(ioid, desc.clone());
+            conn_state.ioid_to_monitor.insert(
+                ioid,
+                MonitorState {
+                    running: true,
+                    pipeline_enabled: false,
+                    nfree: 0,
+                },
+            );
+        }
+
+        purge_channel_requests(&mut conn_state, 1, 100);
+
+        assert!(
+            conn_state.ioid_to_pv.get(&10).is_none()
+                && conn_state.ioid_to_pv.get(&11).is_none()
+                && conn_state.ioid_to_monitor.get(&10).is_none()
+                && conn_state.ioid_to_desc.get(&10).is_none(),
+            "every request on the destroyed channel must be forgotten"
+        );
+        assert!(
+            conn_state.ioid_to_pv.contains_key(&20)
+                && conn_state.ioid_to_monitor.contains_key(&20)
+                && conn_state.ioid_to_desc.contains_key(&20),
+            "requests on other channels must survive"
+        );
+        assert!(
+            conn_state.channels.lock().unwrap().ioids_for_sid(100).is_empty(),
+            "the channel's bindings must be gone from the tables too"
+        );
     }
 }

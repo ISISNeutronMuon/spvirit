@@ -81,7 +81,11 @@ impl ChannelTables {
         false
     }
 
-    /// Record that monitor `ioid` runs on channel `sid`.
+    /// Record that request `ioid` runs on channel `sid`.
+    ///
+    /// Despite the name, this binds every request ioid (GET/PUT/PUT_GET too,
+    /// not just MONITOR) so DESTROY_CHANNEL can purge them all; not renamed
+    /// because `spvirit-gateway` and `spvirit-server` tests call it.
     pub fn bind_monitor(&mut self, ioid: u32, sid: u32) {
         if let Some(old) = self.ioid_to_sid.insert(ioid, sid)
             && old != sid
