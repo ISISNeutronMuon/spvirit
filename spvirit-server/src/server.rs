@@ -154,11 +154,21 @@ impl Drop for AbortTasksOnDrop {
 /// Runs the UDP search responder, the TCP connection acceptor and the beacon
 /// emitter concurrently and returns when **all three** have finished
 /// (`tokio::join!`). None of the three returns under normal operation, so in
-/// practice this runs until one of two things happens: a task panics (logged
-/// below, the other two keep running), or this function's own future is
-/// dropped — which happens when the caller's task is aborted, e.g. via
-/// `RunningServer::abort()`. In that second case an abort-on-drop guard
-/// aborts all three tasks in turn, so nothing is left running or bound.
+/// practice this runs until one of two things happens:
+///
+/// - A task panics or is aborted individually: `join!` does not short-circuit
+///   on that — it still waits for the other two, which under normal
+///   operation never end on their own — so nothing is logged until all three
+///   have ended, which in practice means this branch only completes once the
+///   caller's task is itself aborted (see the next bullet) after one member
+///   already failed.
+/// - The caller's own task is aborted, e.g. via `RunningServer::abort()`.
+///   That drops this function's future, including the `AbortTasksOnDrop`
+///   guard held on its stack, which aborts all three inner tasks in turn.
+///   This stops the UDP responder, the TCP acceptor and the beacon; it does
+///   not stop tasks *they* spawned per connection or per pattern-match
+///   search (see [`RunningServer::abort`] for the complete picture,
+///   including what `abort()` itself additionally stops and does not stop).
 pub async fn run_pva_server(
     sources: Arc<SourceRegistry>,
     config: PvaServerConfig,

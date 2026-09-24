@@ -810,6 +810,22 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Race-proof push into a `scan_tasks` slot: if `abort()` has already run
+/// concurrently and set the slot to `None`, it will never drain this `Vec`
+/// again, so abort `handle` on the spot instead of leaking the task. Shared
+/// by `PvaServer::serve_after_start_hooks`'s scan-spawn loop; factored out so
+/// the race is directly unit-testable without timing.
+fn push_scan_handle(
+    scan_tasks: &std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut guard = scan_tasks.lock().unwrap();
+    match guard.as_mut() {
+        Some(tasks) => tasks.push(handle),
+        None => handle.abort(),
+    }
+}
+
 // ─── PvaServer ───────────────────────────────────────────────────────────
 
 /// High-level PVAccess server.
@@ -830,22 +846,6 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 ///
 /// server.run().await?;
 /// ```
-/// Race-proof push into a `scan_tasks` slot: if `abort()` has already run
-/// concurrently and set the slot to `None`, it will never drain this `Vec`
-/// again, so abort `handle` on the spot instead of leaking the task. Shared
-/// by `PvaServer::serve_after_start_hooks`'s scan-spawn loop; factored out so
-/// the race is directly unit-testable without timing.
-fn push_scan_handle(
-    scan_tasks: &std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
-    handle: tokio::task::JoinHandle<()>,
-) {
-    let mut guard = scan_tasks.lock().unwrap();
-    match guard.as_mut() {
-        Some(tasks) => tasks.push(handle),
-        None => handle.abort(),
-    }
-}
-
 pub struct PvaServer {
     store: Arc<SimplePvStore>,
     extra_sources: Vec<(String, i32, Arc<dyn Source>)>,
@@ -1462,6 +1462,14 @@ impl RunningServer {
         self.events.post(event).await;
     }
 
+    /// Stop the server.
+    ///
+    /// Stops the TCP listener, the UDP search responder, the beacon emitter,
+    /// every spawned scan task and the event dispatcher. It does **not**
+    /// stop tasks those spawn in turn: an in-flight per-connection handler
+    /// (one per accepted TCP client) or an in-flight pattern-search task
+    /// keeps running to completion — only the loops that would spawn new
+    /// ones are stopped.
     pub fn abort(&self) {
         self.handle.abort();
         // Take the Vec, leaving `None`, before aborting anything in it: a
@@ -2594,6 +2602,29 @@ mod tests {
         );
     }
 
+    /// N4: `abort()` must leave the scan-task slot at `None`, not
+    /// `Some(vec![])`. `push_scan_handle`'s race-freedom (M2) depends on
+    /// `None` being a permanent, distinguishable "abort already ran" marker;
+    /// if `abort()` instead drained the `Vec` in place with something like
+    /// `mem::take` (which leaves `Some(vec![])`) a scan-spawn loop racing
+    /// concurrently would see `Some` and push into it, and that handle would
+    /// never be aborted by anyone. Cheap and deterministic: no timing, no
+    /// concurrency, just checks the field directly after a synchronous call.
+    #[tokio::test]
+    async fn abort_leaves_the_scan_task_slot_as_none_not_some_empty() {
+        let server = PvaServer::builder().ai("N4:PV", 0.0).port(0).build();
+        let running = server.start().await.expect("start");
+
+        running.abort();
+
+        assert!(
+            running.scan_tasks.lock().unwrap().is_none(),
+            "abort() must leave the scan-task slot at None (a permanent \
+             marker push_scan_handle relies on), not Some(vec![]) from an \
+             in-place drain"
+        );
+    }
+
     /// M2: the race between `abort()` (which takes `scan_tasks`, leaving
     /// `None`) and a scan-spawn loop still running concurrently on another
     /// worker (which would otherwise push into a `Vec` `abort()` already
@@ -2723,9 +2754,12 @@ mod tests {
 
         running.abort();
 
-        // Bounded retry window rather than a fixed sleep: connect immediately
-        // fails while the OS still has the old listener's backlog draining,
-        // and immediately succeeding once would be a flake, not a pass.
+        // Bounded retry window rather than a fixed sleep: on Windows a
+        // connect against a just-closed listener can still get an RST, and
+        // the OS retries the SYN itself (once at ~0.5s, again at ~1s) before
+        // finally reporting ECONNREFUSED — so an immediately-failing first
+        // attempt is not guaranteed, and asserting on the first attempt
+        // alone would be a flake, not a pass.
         const RETRY_WINDOW: Duration = Duration::from_secs(2);
         let deadline = tokio::time::Instant::now() + RETRY_WINDOW;
         loop {
