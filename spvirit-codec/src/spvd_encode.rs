@@ -1768,8 +1768,9 @@ fn field_type_equal(a: &FieldType, b: &FieldType) -> bool {
 ///
 /// This is the reference implementation retained for the differential
 /// byte-identity tests; the production delta path uses the direct
-/// [`nt_payload_to_decoded`] projection below, which produces a byte-identical
-/// tree without the wire encode+decode round-trip (see finding codec-C1).
+/// [`nt_payload_to_decoded_for`] projection below, which produces a
+/// byte-identical tree without the wire encode+decode round-trip (see
+/// finding codec-C1).
 #[cfg(test)]
 fn decode_payload_to_structure(payload: &NtPayload, is_be: bool) -> Option<DecodedValue> {
     let desc = nt_payload_desc(payload);
@@ -1947,6 +1948,14 @@ fn wants_field(desc: Option<&StructureDesc>, name: &str) -> bool {
     }
 }
 
+/// Direct, allocation-only projection of an [`NtPayload`] into the
+/// `DecodedValue::Structure` tree that the encode→decode round-trip would
+/// yield. Byte-identity with [`decode_payload_to_structure`] is enforced by
+/// the differential tests; the production monitor delta hot path uses this
+/// to avoid the redundant wire serialization (finding codec-C1).
+///
+/// `desc: None` builds every field; `Some(desc)` builds only the top-level
+/// fields `desc` names, skipping the rest (finding codec-perf, Task 7).
 fn nt_payload_to_decoded_for(
     payload: &NtPayload,
     desc: Option<&StructureDesc>,
@@ -4055,7 +4064,18 @@ mod tests {
             one_field.fields.truncate(1);
             let mut middle = full.clone();
             middle.fields.remove(0);
-            for desc in [&full, &one_field, &middle] {
+            // Non-contiguous multi-field subset (e.g. keep field 0 and field 2,
+            // skipping field 1) — every sample here has at least 3 top-level
+            // fields (Enum, the smallest, has exactly 3).
+            let mut non_contiguous = full.clone();
+            non_contiguous.fields = full
+                .fields
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| *idx == 0 || *idx == 2)
+                .map(|(_, f)| f.clone())
+                .collect();
+            for desc in [&full, &one_field, &middle, &non_contiguous] {
                 for is_be in [false, true] {
                     let gated = nt_payload_to_decoded_for(&payload, Some(desc), is_be);
                     let ungated = nt_payload_to_decoded_for(&payload, None, is_be);
@@ -4066,6 +4086,46 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// The above test proves neutrality (gating never changes projected bytes)
+    /// but would still pass if `wants_field` always returned `true` — it never
+    /// checks that anything was actually skipped. This test proves the skip
+    /// itself, for every variant: narrow to a single top-level field (`value`
+    /// where the variant has one, otherwise its first field — `Generic`'s
+    /// sample has no field named `value`) and assert the gated tree contains
+    /// exactly that field and no other.
+    ///
+    /// RED proof (recorded before the fix, with `wants_field` hard-coded to
+    /// `true`, then reverted):
+    /// ```text
+    /// ---- spvd_encode::tests::descriptor_gate_skips_unrequested_fields_for_every_variant stdout ----
+    /// thread 'spvd_encode::tests::descriptor_gate_skips_unrequested_fields_for_every_variant' panicked:
+    /// sample 0: gate built fields the descriptor did not name: ["value", "alarm", "timeStamp", "display", "control", "valueAlarm"] != ["value"]
+    /// ```
+    #[test]
+    fn descriptor_gate_skips_unrequested_fields_for_every_variant() {
+        for (i, payload) in pinned_time_samples().into_iter().enumerate() {
+            let full = nt_payload_desc(&payload);
+            let keep_name = full
+                .fields
+                .iter()
+                .find(|f| f.name == "value")
+                .map(|f| f.name.clone())
+                .unwrap_or_else(|| full.fields[0].name.clone());
+            let mut one_field = full.clone();
+            one_field.fields.retain(|f| f.name == keep_name);
+            let gated = nt_payload_to_decoded_for(&payload, Some(&one_field), false);
+            let DecodedValue::Structure(fields) = &gated else {
+                panic!("sample {i}: expected a structure");
+            };
+            let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(
+                names,
+                vec![keep_name.as_str()],
+                "sample {i}: gate built fields the descriptor did not name: {names:?} != [{keep_name:?}]"
+            );
         }
     }
 
