@@ -2433,6 +2433,30 @@ pub fn encode_nt_payload_delta(
     Some((bitset, values))
 }
 
+/// True if the projections of `prev` and `next` onto `filtered_desc` differ.
+///
+/// The change detector for filtered subscriptions. Exactly equivalent to
+/// `encode_nt_payload_delta(prev, next, filtered_desc, is_be).is_some()`, but
+/// stops after the comparison instead of also building a bitset and a value
+/// block the caller discards. For an NTNDArray subscriber that discarded block
+/// is the whole image.
+///
+/// Deliberately has **no** `prev == next` fast path: an `NtScalar` with no
+/// stored timestamp is stamped with `SystemTime::now()` on each projection, so
+/// two projections of one payload legitimately differ and the delta encoder
+/// reports a change. Short-circuiting on equality would silently suppress
+/// those updates — a behaviour change, not a speed-up.
+pub fn nt_payload_changed_on_desc(
+    prev: &NtPayload,
+    next: &NtPayload,
+    filtered_desc: &StructureDesc,
+    is_be: bool,
+) -> bool {
+    let prev_proj = project_payload_on_desc(prev, filtered_desc, is_be);
+    let next_proj = project_payload_on_desc(next, filtered_desc, is_be);
+    compute_changed_bits(&prev_proj, &next_proj, filtered_desc).is_some()
+}
+
 // ---------------------------------------------------------------------------
 // pvRequest builder
 // ---------------------------------------------------------------------------
@@ -3805,5 +3829,62 @@ mod tests {
             crate::spvd_decode::count_structure_fields(&desc),
             nt_payload_field_count(&NtPayload::NdArray(b))
         );
+    }
+
+    /// `encode_timestamp` and `dv_scalar_timestamp` fall back to `SystemTime::now()`
+    /// when the payload carries no timestamp, so two encodes of the *same* payload
+    /// differ. Any test that compares two encodes must pin the timestamps first.
+    fn pin_timestamps(p: NtPayload) -> NtPayload {
+        fn ts() -> NtTimeStamp {
+            NtTimeStamp {
+                seconds_past_epoch: 1_700_000_000,
+                nanoseconds: 123_456_789,
+                user_tag: 7,
+            }
+        }
+        match p {
+            NtPayload::Scalar(mut nt) => {
+                nt.time_stamp = Some(ts());
+                NtPayload::Scalar(nt)
+            }
+            NtPayload::Table(mut nt) => {
+                nt.time_stamp = Some(ts());
+                NtPayload::Table(nt)
+            }
+            NtPayload::NdArray(mut nt) => {
+                nt.time_stamp = Some(ts());
+                NtPayload::NdArray(nt)
+            }
+            // NtScalarArray and NtEnum hold a non-optional NtTimeStamp already.
+            other => other,
+        }
+    }
+
+    fn pinned_time_samples() -> Vec<NtPayload> {
+        all_payload_samples().into_iter().map(pin_timestamps).collect()
+    }
+
+    #[test]
+    fn changed_on_desc_agrees_with_the_delta_encoder() {
+        for (i, payload) in pinned_time_samples().into_iter().enumerate() {
+            let mutated = pin_timestamps(mutate_payload(&payload));
+            let full = nt_payload_desc(&payload);
+            let mut narrowed = full.clone();
+            narrowed.fields.truncate(1);
+            for desc in [&full, &narrowed] {
+                for is_be in [false, true] {
+                    assert_eq!(
+                        nt_payload_changed_on_desc(&payload, &payload, desc, is_be),
+                        encode_nt_payload_delta(&payload, &payload, desc, is_be).is_some(),
+                        "sample {i}: disagreed on an unchanged payload, is_be={is_be}"
+                    );
+                    assert_eq!(
+                        nt_payload_changed_on_desc(&payload, &mutated, desc, is_be),
+                        encode_nt_payload_delta(&payload, &mutated, desc, is_be).is_some(),
+                        "sample {i}: disagreed on a mutated payload, is_be={is_be}"
+                    );
+                }
+            }
+        }
     }
 }
