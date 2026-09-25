@@ -32,7 +32,7 @@ pub fn op_response_status(
     raw: &[u8],
     is_be: bool,
 ) -> Result<Option<spvirit_codec::epics_decode::PvaStatus>, PvGetError> {
-    codec_decode_op_response_status(raw, is_be).map_err(PvGetError::Protocol)
+    codec_decode_op_response_status(raw, is_be).map_err(|e| PvGetError::Protocol(e.to_string()))
 }
 
 pub fn ensure_status_ok(raw: &[u8], is_be: bool, step: &str) -> Result<(), PvGetError> {
