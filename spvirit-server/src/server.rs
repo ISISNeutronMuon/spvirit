@@ -131,10 +131,44 @@ impl PvaServerState {
     }
 }
 
+/// Aborts the wrapped tasks when dropped.
+///
+/// A bare `JoinHandle` only detaches its task on drop — it does not stop it.
+/// Cancelling the caller's own task (e.g. via `RunningServer::abort()`, which
+/// aborts the task running [`run_pva_server_with_registry`]) drops this
+/// guard along with the rest of that task's stack, which is what actually
+/// stops the UDP responder, the TCP acceptor and the beacon instead of
+/// merely orphaning them.
+struct AbortTasksOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// Run a PVA server (UDP search + TCP handler + beacon).
 ///
-/// This function drives the three server tasks in a `tokio::select!` loop and
-/// returns when any task errors or the future is dropped.
+/// Runs the UDP search responder, the TCP connection acceptor and the beacon
+/// emitter concurrently and returns when **all three** have finished
+/// (`tokio::join!`). None of the three returns under normal operation, so in
+/// practice this runs until one of two things happens:
+///
+/// - A task panics or is aborted individually: `join!` does not short-circuit
+///   on that — it still waits for the other two, which under normal
+///   operation never end on their own — so nothing is logged until all three
+///   have ended, which in practice means this branch only completes once the
+///   caller's task is itself aborted (see the next bullet) after one member
+///   already failed.
+/// - The caller's own task is aborted, e.g. via `RunningServer::abort()`.
+///   That drops this function's future, including the `AbortTasksOnDrop`
+///   guard held on its stack, which aborts all three inner tasks in turn.
+///   This stops the UDP responder, the TCP acceptor and the beacon; it does
+///   not stop tasks *they* spawned per connection or per pattern-match
+///   search (see [`RunningServer::abort`] for the complete picture,
+///   including what `abort()` itself additionally stops and does not stop).
 pub async fn run_pva_server(
     sources: Arc<SourceRegistry>,
     config: PvaServerConfig,
@@ -218,7 +252,28 @@ pub async fn run_pva_server_with_registry(
         }
     });
 
-    let _ = tokio::join!(udp_task, tcp_task, beacon_task);
+    // Abort all three the moment this function's future is dropped (e.g. by
+    // `RunningServer::abort()` aborting the task this is running in), not
+    // just when it returns normally. Without this a caller's abort only ever
+    // cancelled the *outer* task and dropped these three handles, which
+    // detaches them — the UDP responder, the TCP acceptor and the beacon all
+    // kept running (and the port stayed bound) for the life of the process.
+    let _abort_guard = AbortTasksOnDrop(vec![
+        udp_task.abort_handle(),
+        tcp_task.abort_handle(),
+        beacon_task.abort_handle(),
+    ]);
+
+    // All three are `JoinHandle<()>` — each spawned closure logs its own error
+    // and returns `()` — so `join!` yields three `Result<(), JoinError>`. A
+    // JoinError means the task panicked or was aborted, which the old
+    // `let _ = ...` swallowed entirely.
+    let (udp_res, tcp_res, beacon_res) = tokio::join!(udp_task, tcp_task, beacon_task);
+    for (name, res) in [("udp", udp_res), ("tcp", tcp_res), ("beacon", beacon_res)] {
+        if let Err(e) = res {
+            error!("{} server task ended abnormally: {}", name, e);
+        }
+    }
     Ok(())
 }
 
@@ -235,7 +290,10 @@ mod tests {
     fn udp_search_bind_parity_on_pinned_interface() {
         let listen = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
         let (addr, iface) = udp_search_bind(true, listen, 5076);
-        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076));
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076)
+        );
         assert_eq!(iface, Some(Ipv4Addr::new(10, 0, 0, 5)));
     }
 
@@ -243,7 +301,10 @@ mod tests {
     fn udp_search_bind_parity_on_unset_interface() {
         let listen = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         let (addr, iface) = udp_search_bind(true, listen, 5076);
-        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076));
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076)
+        );
         assert_eq!(iface, Some(Ipv4Addr::UNSPECIFIED));
     }
 
@@ -253,5 +314,42 @@ mod tests {
         let (addr, iface) = udp_search_bind(false, listen, 5076);
         assert_eq!(addr, SocketAddr::new(listen, 5076));
         assert_eq!(iface, None);
+    }
+
+    /// A doc comment that describes a supervision strategy the code does not
+    /// implement is worse than no comment: it tells a reader a dead UDP task
+    /// would be noticed.
+    ///
+    /// The needle is just "`tokio::select!`" and the join! check is separate:
+    /// the offending sentence is wrapped across two `///` lines, so any needle
+    /// spanning the wrap would never match and the test would pass green
+    /// against the unfixed source.
+    #[test]
+    fn run_pva_server_doc_matches_its_actual_supervision() {
+        let full_src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server.rs"),
+        )
+        .expect("server.rs must be readable");
+        // Scan only the production code above this test module: this test's
+        // own doc comment and assertions quote the needle literally, so
+        // scanning the whole file would make the second assertion below
+        // fail unconditionally regardless of what run_pva_server's doc says.
+        // Cut at the `mod tests {` marker itself, not the first
+        // `#[cfg(test)]`: a `#[cfg(test)]` item placed above
+        // `run_pva_server` (e.g. a `#[cfg(test)] use ...`) would otherwise
+        // truncate the scan before it ever reaches the doc comment, and the
+        // second assertion would pass green against unfixed source.
+        let src = full_src
+            .split_once("mod tests {")
+            .map(|(before, _)| before)
+            .expect("server.rs must have a `mod tests {` module");
+        assert!(
+            src.contains("tokio::join!(udp_task, tcp_task, beacon_task)"),
+            "precondition: run_pva_server still joins its three tasks"
+        );
+        assert!(
+            !src.contains("tokio::select!"),
+            "the doc claims select!-based supervision; the code uses join!"
+        );
     }
 }

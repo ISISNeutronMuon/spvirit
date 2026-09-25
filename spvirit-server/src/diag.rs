@@ -81,6 +81,25 @@ impl ClientRegistry {
         }
     }
 
+    /// Credit many connections' transmit counters under a **single** registry
+    /// lock. The monitor fan-out produces one `(conn_id, bytes)` pair per
+    /// subscriber; taking the registry mutex once per pair made a global lock
+    /// acquisition part of the per-subscriber cost of every update.
+    ///
+    /// Repeated connection ids are summed; unknown ids are ignored, exactly as
+    /// [`Self::add_tx`] does.
+    pub fn add_tx_many(&self, items: &[(u64, u64)]) {
+        if items.is_empty() {
+            return;
+        }
+        let conns = self.conns.lock().unwrap();
+        for (conn_id, n) in items {
+            if let Some(rec) = conns.get(conn_id) {
+                rec.tx.fetch_add(*n, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Add `n` bytes to the receive counter for `conn_id`. No-op if unknown.
     pub fn add_rx(&self, conn_id: u64, n: u64) {
         let conns = self.conns.lock().unwrap();
@@ -168,9 +187,17 @@ impl ByteMap {
     }
 
     /// Add `n` bytes to the counter for `key`, creating it if absent.
+    ///
+    /// Looks up before inserting: `entry(key.to_string())` would heap-allocate
+    /// a fresh `String` on every call, and this is called per frame and per
+    /// monitor fan-out, where the key is essentially always already present.
     pub fn add(&self, key: &str, n: u64) {
         let mut counts = self.counts.lock().unwrap();
-        *counts.entry(key.to_string()).or_insert(0) += n;
+        if let Some(v) = counts.get_mut(key) {
+            *v += n;
+            return;
+        }
+        counts.insert(key.to_string(), n);
     }
 
     /// Snapshot all key/count pairs.
@@ -345,5 +372,28 @@ mod tests {
         assert_eq!(reg.byhost_total(true), tx_by_rows);
         assert_eq!(reg.byhost_total(false), 7);
         assert_eq!(reg.byhost_total(false), rx_by_rows);
+    }
+
+    #[test]
+    fn add_tx_many_credits_every_connection_in_one_pass() {
+        let reg = ClientRegistry::new();
+        reg.connect(1, "127.0.0.1:1111".parse().unwrap());
+        reg.connect(2, "127.0.0.1:2222".parse().unwrap());
+
+        // Includes a repeat for conn 1 (two subscriptions on one connection)
+        // and an unknown conn 9, which must be ignored exactly as add_tx does.
+        reg.add_tx_many(&[(1, 10), (2, 20), (1, 5), (9, 100)]);
+
+        let mut got: Vec<(u16, u64)> = reg
+            .snapshot()
+            .into_iter()
+            .map(|e| (e.peer.port(), e.tx))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(1111, 15), (2222, 20)],
+            "add_tx_many must sum per connection and ignore unknown ids"
+        );
     }
 }

@@ -138,17 +138,21 @@ impl ConnWriter {
                 let monitors = c.monitor.drain().map(|(_ioid, buf)| buf).collect();
                 (controls, monitors)
             };
-            // Priority: control lane first, then coalesced monitor frames.
-            let mut failed = false;
-            {
-                let mut w = self.writer.lock().await;
-                for buf in controls.iter().chain(monitors.iter()) {
-                    if w.write_all(buf).await.is_err() {
-                        failed = true;
-                        break;
-                    }
-                }
+            // Priority: control lane first, then coalesced monitor frames —
+            // concatenated into ONE buffer so the batch reaches the kernel in a
+            // single write_all. Doing a write per frame throws away the whole
+            // point of collecting a batch, and with TCP_NODELAY set (which the
+            // server does on every accepted socket) each such write can become
+            // its own packet.
+            let total: usize = controls.iter().chain(monitors.iter()).map(Vec::len).sum();
+            let mut batch = Vec::with_capacity(total);
+            for buf in controls.iter().chain(monitors.iter()) {
+                batch.extend_from_slice(buf);
             }
+            let failed = {
+                let mut w = self.writer.lock().await;
+                w.write_all(&batch).await.is_err()
+            };
             if failed {
                 let mut c = self.coalesce.lock().unwrap();
                 c.dead = true;
@@ -305,7 +309,15 @@ mod tests {
     async fn wait_for(sink: &GateSink, frame: &Vec<u8>) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if sink.writes.lock().unwrap().iter().any(|w| w == frame) {
+            // A frame may now share a write with others in the same batch, so
+            // look for it as a subsequence rather than as a whole write.
+            if sink
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|w| w.windows(frame.len()).any(|c| c == frame.as_slice()))
+            {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -359,7 +371,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|w| w[0])
+            .flat_map(|w| w.iter().copied())
             .collect();
         let want: std::collections::HashSet<u8> = (0u32..64).map(|i| i as u8).collect();
         assert_eq!(got, want, "every distinct ioid must be delivered");
@@ -389,7 +401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_lane_drains_before_monitor_lane() {
+    async fn control_lane_drains_before_monitor_lane_in_one_write() {
         let sink = GateSink::new();
         let cw = ConnWriter::new(sink.clone());
 
@@ -408,7 +420,13 @@ mod tests {
         a.await.unwrap();
 
         let writes = sink.writes.lock().unwrap().clone();
-        assert_eq!(writes, vec![vec![0xC1], vec![0xC2], vec![0x77]]);
+        assert_eq!(
+            writes,
+            vec![vec![0xC1], vec![0xC2, 0x77]],
+            "a batch must reach the socket in ONE write_all, control lane \
+             first: the flat-combining writer collects a batch and then must \
+             not hand it to the kernel one frame at a time"
+        );
     }
 
     #[tokio::test]

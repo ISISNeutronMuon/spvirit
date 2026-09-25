@@ -82,6 +82,12 @@ pub struct Events {
     /// Incremented on every successful enqueue, decremented after the handler
     /// finishes. `drain()` waits for this to reach zero.
     inflight: Arc<AtomicU64>,
+    /// The dispatcher task, so a shutting-down server can actually stop it.
+    dispatcher: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Signalled whenever `inflight` reaches zero, so `drain` can wait rather
+    /// than spin. `Arc` because `start_dispatcher` clones it into the spawned
+    /// dispatcher task, which has no `self`.
+    idle: Arc<tokio::sync::Notify>,
 }
 
 impl Events {
@@ -96,6 +102,8 @@ impl Events {
             failed: Arc::new(AtomicU64::new(0)),
             dispatcher_started: std::sync::atomic::AtomicBool::new(false),
             inflight: Arc::new(AtomicU64::new(0)),
+            dispatcher: std::sync::Mutex::new(None),
+            idle: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -140,8 +148,9 @@ impl Events {
         };
         let inflight = self.inflight.clone();
         let failed = self.failed.clone();
+        let idle = self.idle.clone();
         self.dispatcher_started.store(true, Ordering::SeqCst);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Some(Dispatch { handler, event }) = rx.recv().await {
                 let fut = handler(store.clone(), event.clone());
                 // AssertUnwindSafe: on panic we drop the handler's state and
@@ -152,9 +161,21 @@ impl Events {
                     warn!("event handler for '{}' panicked", event);
                     failed.fetch_add(1, Ordering::Relaxed);
                 }
-                inflight.fetch_sub(1, Ordering::SeqCst);
+                // `fetch_sub` returns the PREVIOUS value, so `== 1` means this
+                // decrement is the one that emptied the queue.
+                if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    idle.notify_waiters();
+                }
             }
         });
+        *self.dispatcher.lock().unwrap() = Some(handle);
+    }
+
+    /// Stop the dispatcher task. Idempotent.
+    pub fn abort_dispatcher(&self) {
+        if let Some(h) = self.dispatcher.lock().unwrap().take() {
+            h.abort();
+        }
     }
 
     /// Post `event`: await every sink, then queue handlers and return.
@@ -210,7 +231,9 @@ impl Events {
                 event: event.to_string(),
             });
             if queued.is_err() {
-                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                if self.inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    self.idle.notify_waiters();
+                }
                 let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     warn!(
@@ -247,8 +270,26 @@ impl Events {
             );
         }
         let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
-        while self.inflight.load(Ordering::SeqCst) > 0 {
-            if tokio::time::Instant::now() >= deadline {
+        loop {
+            // tokio guarantees a `Notified` created here already catches any
+            // `notify_waiters()` that runs before its first poll, so this is
+            // already safe against the lost-wakeup window between the check
+            // and the await without `enable()`. `enable()` is kept anyway as
+            // belt-and-braces, explicit-intent registration (it is what
+            // actually matters if this ever switches to `notify_one`, whose
+            // single stored permit `enable()` claims immediately rather than
+            // leaving to be raced for on first poll).
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inflight.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                if self.inflight.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
                 panic!(
                     "Events::drain() timed out after {DRAIN_TIMEOUT:?} with {} handler(s) still in flight — \
                      the dispatcher likely stopped consuming (e.g. a handler future \
@@ -256,7 +297,6 @@ impl Events {
                     self.inflight.load(Ordering::SeqCst)
                 );
             }
-            tokio::task::yield_now().await;
         }
     }
 }
@@ -731,6 +771,72 @@ mod tests {
             late_fired.load(Ordering::SeqCst),
             1,
             "sink registered from inside a call-out must take effect"
+        );
+    }
+
+    /// The wait must not miss a completion that lands between the inflight
+    /// check and the await, and must return promptly once the queue empties.
+    #[tokio::test]
+    async fn drain_returns_once_every_handler_has_run() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let events = Events::new();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        events.add_handler(
+            "GO",
+            Arc::new(move |_s, _e| {
+                let h = h.clone();
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    h.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        events.start_dispatcher(test_store());
+
+        for _ in 0..5 {
+            events.post("GO").await;
+        }
+        events.drain().await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            5,
+            "drain must not return until every posted handler has finished"
+        );
+    }
+
+    /// A lost wakeup (the notify call dropped from a decrement site) does
+    /// not make `drain` panic or hang forever — it just makes it sleep to
+    /// the 10s deadline before its post-timeout re-check sees `inflight ==
+    /// 0` and returns normally. That silent slowdown is otherwise
+    /// undetectable, so run under a paused clock: a real wait completes in
+    /// well under a second of virtual time, while a lost wakeup makes the
+    /// clock jump straight to the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn drain_does_not_sleep_to_the_deadline_for_a_normal_completion() {
+        let events = Events::new();
+        events.add_handler(
+            "GO",
+            Arc::new(|_s, _e| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                })
+            }),
+        );
+        events.start_dispatcher(test_store());
+
+        events.post("GO").await;
+        let t0 = tokio::time::Instant::now();
+        events.drain().await;
+
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "drain took {:?} of virtual time; a real notify-driven wait \
+             completes in well under 1s, a lost wakeup sleeps to the 10s \
+             deadline",
+            t0.elapsed()
         );
     }
 }
