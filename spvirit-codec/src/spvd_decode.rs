@@ -1152,6 +1152,8 @@ impl PvdDecoder {
         let mut fields: Vec<(String, DecodedValue)> = Vec::new();
         let mut offset = 0usize;
 
+        // Recursive decoder threads its whole state explicitly; a context struct would widen this byte-critical path.
+        #[allow(clippy::too_many_arguments)]
         fn decode_with_bitset_recursive(
             decoder: &PvdDecoder,
             data: &[u8],
