@@ -1686,6 +1686,33 @@ pub fn encode_nt_payload_filtered(
     (bitset, values)
 }
 
+/// Cheap necessary condition for `structure_desc_equal(&nt_payload_desc(payload), desc)`.
+///
+/// Compares only the struct id and the top-level field arity, both of which are
+/// known from the payload without materialising a `StructureDesc`. A `false`
+/// here is a definitive "not equal"; a `true` still needs the deep comparison.
+/// Pinned by `shape_precheck_never_disagrees_with_the_deep_comparison`.
+fn nt_payload_shape_matches(payload: &NtPayload, desc: &StructureDesc) -> bool {
+    let (struct_id, top_level_fields): (Option<&str>, usize) = match payload {
+        NtPayload::Scalar(_) => (Some("epics:nt/NTScalar:1.0"), 6),
+        NtPayload::ScalarArray(_) => (Some("epics:nt/NTScalarArray:1.0"), 5),
+        // NTTable's *top-level* arity is fixed at 5 (labels, value, descriptor,
+        // alarm, timeStamp); the columns live one level down inside `value`.
+        NtPayload::Table(_) => (Some("epics:nt/NTTable:1.0"), 5),
+        NtPayload::NdArray(_) => (Some("epics:nt/NTNDArray:1.0"), 12),
+        NtPayload::Enum(_) => (Some("epics:nt/NTEnum:1.0"), 3),
+        NtPayload::Generic { struct_id, fields } => (
+            if struct_id.is_empty() {
+                None
+            } else {
+                Some(struct_id.as_str())
+            },
+            fields.len(),
+        ),
+    };
+    desc.struct_id.as_deref() == struct_id && desc.fields.len() == top_level_fields
+}
+
 /// Encode the value bytes of an `NtPayload` projected onto a (possibly
 /// narrowed) descriptor. Fields not represented in `desc` are omitted;
 /// sub-structures are encoded recursively.
@@ -1694,10 +1721,14 @@ pub fn encode_nt_payload_values_for_desc(
     desc: &StructureDesc,
     is_be: bool,
 ) -> Vec<u8> {
-    let full_desc = nt_payload_desc(payload);
-    if structure_desc_equal(&full_desc, desc) {
-        // Fast path: no narrowing.
-        return encode_nt_payload_full(payload, is_be);
+    // Reject the common filtered case (a narrowed descriptor) without building
+    // the payload's own descriptor at all.
+    if nt_payload_shape_matches(payload, desc) {
+        let full_desc = nt_payload_desc(payload);
+        if structure_desc_equal(&full_desc, desc) {
+            // Fast path: no narrowing.
+            return encode_nt_payload_full(payload, is_be);
+        }
     }
     let decoded = nt_payload_to_decoded(payload, is_be);
     encode_decoded_projected(&decoded, desc, is_be)
@@ -2530,6 +2561,66 @@ fn path_tree_to_field_descs(node: &PathNode) -> Vec<FieldDesc> {
 mod tests {
     use super::*;
     use crate::spvd_decode::PvdDecoder;
+
+    /// The cheap pre-check must never reject a descriptor that `structure_desc_equal`
+    /// would have accepted — that would silently switch the encoder from the full
+    /// path to the projected path and change the bytes.
+    #[test]
+    fn shape_precheck_never_disagrees_with_the_deep_comparison() {
+        for (i, payload) in all_payload_samples().into_iter().enumerate() {
+            let full = nt_payload_desc(&payload);
+            assert!(
+                nt_payload_shape_matches(&payload, &full),
+                "sample {i}: pre-check rejected the payload's own descriptor"
+            );
+            // A narrowed descriptor: drop the last top-level field.
+            let mut narrowed = full.clone();
+            narrowed.fields.pop();
+            assert!(
+                !nt_payload_shape_matches(&payload, &narrowed),
+                "sample {i}: pre-check accepted a narrowed descriptor"
+            );
+            // Same arity, different identity.
+            let mut renamed = full.clone();
+            renamed.struct_id = Some("not:the/same:1.0".to_string());
+            assert!(
+                !nt_payload_shape_matches(&payload, &renamed),
+                "sample {i}: pre-check ignored the struct id"
+            );
+        }
+    }
+
+    #[test]
+    fn values_for_desc_bytes_unchanged_by_the_precheck() {
+        /// The pre-Task-2 implementation, retained verbatim as the reference.
+        fn reference_values_for_desc(
+            payload: &NtPayload,
+            desc: &StructureDesc,
+            is_be: bool,
+        ) -> Vec<u8> {
+            let full_desc = nt_payload_desc(payload);
+            if structure_desc_equal(&full_desc, desc) {
+                return encode_nt_payload_full(payload, is_be);
+            }
+            let decoded = nt_payload_to_decoded(payload, is_be);
+            encode_decoded_projected(&decoded, desc, is_be)
+        }
+
+        for (i, payload) in all_payload_samples().into_iter().enumerate() {
+            let full = nt_payload_desc(&payload);
+            let mut narrowed = full.clone();
+            narrowed.fields.truncate(1);
+            for desc in [&full, &narrowed] {
+                for is_be in [false, true] {
+                    assert_eq!(
+                        encode_nt_payload_values_for_desc(&payload, desc, is_be),
+                        reference_values_for_desc(&payload, desc, is_be),
+                        "sample {i}, is_be={is_be}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn nt_payload_field_count_matches_the_descriptor_for_every_variant() {
