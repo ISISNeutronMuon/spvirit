@@ -2,6 +2,7 @@
 //!
 //! Minimal encoder for NTScalar introspection and value updates.
 
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::spvd_decode::{FieldDesc, FieldType, StructureDesc, TypeCode};
@@ -331,37 +332,117 @@ pub fn encode_nt_scalar_full(nt: &NtScalar, is_be: bool) -> Vec<u8> {
 }
 
 fn encode_structure_bitset(desc: &StructureDesc, is_be: bool) -> Vec<u8> {
-    let total_bits = 1 + crate::spvd_decode::count_structure_fields(desc);
-    let bitset_size = (total_bits + 7) / 8;
-    let mut bitset = vec![0u8; bitset_size];
-    for bit in 0..total_bits {
-        let byte_idx = bit / 8;
-        let bit_idx = bit % 8;
-        bitset[byte_idx] |= 1 << bit_idx;
+    encode_all_ones_bitset(1 + crate::spvd_decode::count_structure_fields(desc), is_be)
+}
+
+/// The number of field bits (bit 0, the whole-structure bit, excluded) in the
+/// descriptor [`nt_payload_desc`] would build for `payload`.
+///
+/// Building that descriptor costs ~45 allocations for an `NTScalar`, and the
+/// monitor encoder used to do it once per frame purely to reach this number.
+/// The four fixed-shape normative types have a descriptor whose *shape* does
+/// not depend on the payload — only the leaf `TypeCode`s vary — so their counts
+/// are computed once, from the real descriptor builders, and memoised. `NTTable`
+/// and `Generic` are payload-shaped and are counted structurally from the
+/// payload itself, still without building a `StructureDesc`.
+///
+/// `nt_payload_field_count_matches_the_descriptor_for_every_variant` and
+/// `fixed_shape_descriptors_have_payload_independent_bit_counts` pin this
+/// against `nt_payload_desc`. Keep them passing.
+pub(crate) fn nt_payload_field_count(payload: &NtPayload) -> usize {
+    use crate::spvd_decode::count_structure_fields;
+    match payload {
+        NtPayload::Scalar(_) => nt_scalar_field_count(),
+        NtPayload::ScalarArray(_) => {
+            static N: OnceLock<usize> = OnceLock::new();
+            *N.get_or_init(|| {
+                count_structure_fields(&nt_scalar_array_desc(&ScalarArrayValue::I32(Vec::new())))
+            })
+        }
+        NtPayload::NdArray(_) => {
+            static N: OnceLock<usize> = OnceLock::new();
+            *N.get_or_init(|| count_structure_fields(&nt_ndarray_desc_default()))
+        }
+        NtPayload::Enum(_) => {
+            static N: OnceLock<usize> = OnceLock::new();
+            *N.get_or_init(|| count_structure_fields(&nt_enum_desc()))
+        }
+        NtPayload::Table(nt) => {
+            // Everything around the columns is fixed: labels, value, descriptor,
+            // alarm (+3) and timeStamp (+3). Each column adds exactly one bit.
+            static FIXED: OnceLock<usize> = OnceLock::new();
+            let fixed = *FIXED.get_or_init(|| {
+                count_structure_fields(&nt_table_desc(&NtTable {
+                    labels: Vec::new(),
+                    columns: Vec::new(),
+                    descriptor: None,
+                    alarm: None,
+                    time_stamp: None,
+                }))
+            });
+            fixed + nt.columns.len()
+        }
+        NtPayload::Generic { fields, .. } => pv_value_field_count(fields),
     }
-    let mut out = Vec::new();
+}
+
+/// Field-bit count for `NTScalar`. `nt_scalar_desc`'s only payload-dependent
+/// part is the leaf `TypeCode` of `value`, which is never a `Structure`, so the
+/// count is constant. One memoised cell, shared with `encode_nt_scalar_bitset`
+/// and `encode_nt_scalar_bitset_parts`.
+pub(crate) fn nt_scalar_field_count() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        crate::spvd_decode::count_structure_fields(&nt_scalar_desc(&ScalarValue::I32(0)))
+    })
+}
+
+/// Field-bit count for a `PvValue` field list. Mirrors `count_structure_fields`
+/// over `pv_value_field_type`: only `PvValue::Structure` becomes a
+/// `FieldType::Structure`, so only it contributes nested bits.
+fn pv_value_field_count(fields: &[(String, PvValue)]) -> usize {
+    let mut count = 0;
+    for (_, val) in fields {
+        count += 1;
+        if let PvValue::Structure { fields: nested, .. } = val {
+            count += pv_value_field_count(nested);
+        }
+    }
+    count
+}
+
+/// A size-prefixed bitset with `total_bits` bits set, written a byte at a time.
+///
+/// The old loop set one bit per iteration; whole bytes are `0xFF` by
+/// construction and only the final partial byte needs a mask.
+pub(crate) fn encode_all_ones_bitset(total_bits: usize, is_be: bool) -> Vec<u8> {
+    let bitset_size = total_bits.div_ceil(8);
+    let mut bitset = vec![0xFFu8; bitset_size];
+    let remainder = total_bits % 8;
+    if remainder != 0 {
+        // Trailing bits beyond `total_bits` must stay clear: the reference
+        // implementation never set them.
+        if let Some(last) = bitset.last_mut() {
+            *last = (1u8 << remainder) - 1;
+        }
+    }
+    let mut out = Vec::with_capacity(bitset_size + 5);
     out.extend_from_slice(&encode_size_pvd(bitset_size, is_be));
     out.extend_from_slice(&bitset);
     out
 }
 
-fn encode_structure_with_bitset(desc: &StructureDesc, nt: &NtScalar, is_be: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&encode_structure_bitset(desc, is_be));
+pub fn encode_nt_scalar_bitset(nt: &NtScalar, is_be: bool) -> Vec<u8> {
+    let mut out = encode_all_ones_bitset(1 + nt_scalar_field_count(), is_be);
     out.extend_from_slice(&encode_nt_scalar_full(nt, is_be));
     out
 }
 
-pub fn encode_nt_scalar_bitset(nt: &NtScalar, is_be: bool) -> Vec<u8> {
-    let desc = nt_scalar_desc(&nt.value);
-    encode_structure_with_bitset(&desc, nt, is_be)
-}
-
 pub fn encode_nt_scalar_bitset_parts(nt: &NtScalar, is_be: bool) -> (Vec<u8>, Vec<u8>) {
-    let desc = nt_scalar_desc(&nt.value);
-    let bitset = encode_structure_bitset(&desc, is_be);
-    let values = encode_nt_scalar_full(nt, is_be);
-    (bitset, values)
+    (
+        encode_all_ones_bitset(1 + nt_scalar_field_count(), is_be),
+        encode_nt_scalar_full(nt, is_be),
+    )
 }
 
 fn alarm_desc() -> StructureDesc {
@@ -1289,17 +1370,14 @@ pub fn encode_nt_payload_full(payload: &NtPayload, is_be: bool) -> Vec<u8> {
 }
 
 pub fn encode_nt_payload_bitset(payload: &NtPayload, is_be: bool) -> Vec<u8> {
-    let desc = nt_payload_desc(payload);
-    let mut out = Vec::new();
-    out.extend_from_slice(&encode_structure_bitset(&desc, is_be));
+    let mut out = encode_all_ones_bitset(1 + nt_payload_field_count(payload), is_be);
     out.extend_from_slice(&encode_nt_payload_full(payload, is_be));
     out
 }
 
 pub fn encode_nt_payload_bitset_parts(payload: &NtPayload, is_be: bool) -> (Vec<u8>, Vec<u8>) {
-    let desc = nt_payload_desc(payload);
     (
-        encode_structure_bitset(&desc, is_be),
+        encode_all_ones_bitset(1 + nt_payload_field_count(payload), is_be),
         encode_nt_payload_full(payload, is_be),
     )
 }
@@ -2452,6 +2530,135 @@ fn path_tree_to_field_descs(node: &PathNode) -> Vec<FieldDesc> {
 mod tests {
     use super::*;
     use crate::spvd_decode::PvdDecoder;
+
+    #[test]
+    fn nt_payload_field_count_matches_the_descriptor_for_every_variant() {
+        for (i, payload) in all_payload_samples().into_iter().enumerate() {
+            let desc = nt_payload_desc(&payload);
+            assert_eq!(
+                nt_payload_field_count(&payload),
+                crate::spvd_decode::count_structure_fields(&desc),
+                "sample {i}: field count disagrees with nt_payload_desc"
+            );
+        }
+    }
+
+    /// The memoised counts assume the four fixed-shape normative types have a
+    /// descriptor whose *shape* does not depend on the payload — only the leaf
+    /// `TypeCode`s vary. If that ever stops being true the memoised value would be
+    /// silently wrong for every payload after the first, so pin it directly.
+    #[test]
+    fn fixed_shape_descriptors_have_payload_independent_bit_counts() {
+        let scalar_baseline =
+            crate::spvd_decode::count_structure_fields(&nt_scalar_desc(&ScalarValue::I32(0)));
+        let array_baseline = crate::spvd_decode::count_structure_fields(&nt_scalar_array_desc(
+            &ScalarArrayValue::I32(Vec::new()),
+        ));
+        for (i, payload) in all_payload_samples().into_iter().enumerate() {
+            match &payload {
+                NtPayload::Scalar(nt) => assert_eq!(
+                    crate::spvd_decode::count_structure_fields(&nt_scalar_desc(&nt.value)),
+                    scalar_baseline,
+                    "sample {i}: NTScalar descriptor shape varies with the value type"
+                ),
+                NtPayload::ScalarArray(nt) => assert_eq!(
+                    crate::spvd_decode::count_structure_fields(&nt_scalar_array_desc(&nt.value)),
+                    array_baseline,
+                    "sample {i}: NTScalarArray descriptor shape varies with the value type"
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    /// Tables are shaped by their column list; the memoised part must be the
+    /// column-independent remainder. Two column counts, so an off-by-one in the
+    /// fixed part cannot hide.
+    #[test]
+    fn table_field_count_tracks_the_column_list() {
+        for columns in [
+            Vec::new(),
+            vec![NtTableColumn {
+                name: "a".to_string(),
+                values: ScalarArrayValue::I32(vec![1, 2]),
+            }],
+            vec![
+                NtTableColumn {
+                    name: "a".to_string(),
+                    values: ScalarArrayValue::I32(vec![1, 2]),
+                },
+                NtTableColumn {
+                    name: "b".to_string(),
+                    values: ScalarArrayValue::F64(vec![1.0, 2.0]),
+                },
+                NtTableColumn {
+                    name: "c".to_string(),
+                    values: ScalarArrayValue::Str(vec!["x".to_string(), "y".to_string()]),
+                },
+            ],
+        ] {
+            let table = NtTable {
+                labels: columns.iter().map(|c| c.name.clone()).collect(),
+                columns,
+                descriptor: None,
+                alarm: None,
+                time_stamp: None,
+            };
+            let payload = NtPayload::Table(table);
+            assert_eq!(
+                nt_payload_field_count(&payload),
+                crate::spvd_decode::count_structure_fields(&nt_payload_desc(&payload))
+            );
+        }
+    }
+
+    #[test]
+    fn all_ones_bitset_matches_the_byte_at_a_time_reference() {
+        /// The pre-Task-1 implementation, retained verbatim as the reference.
+        fn reference_all_ones(total_bits: usize, is_be: bool) -> Vec<u8> {
+            let bitset_size = total_bits.div_ceil(8);
+            let mut bitset = vec![0u8; bitset_size];
+            for bit in 0..total_bits {
+                let byte_idx = bit / 8;
+                let bit_idx = bit % 8;
+                bitset[byte_idx] |= 1 << bit_idx;
+            }
+            let mut out = Vec::new();
+            out.extend_from_slice(&encode_size_pvd(bitset_size, is_be));
+            out.extend_from_slice(&bitset);
+            out
+        }
+
+        for total_bits in 0..=300usize {
+            for is_be in [false, true] {
+                assert_eq!(
+                    encode_all_ones_bitset(total_bits, is_be),
+                    reference_all_ones(total_bits, is_be),
+                    "total_bits={total_bits}, is_be={is_be}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bitset_parts_bytes_unchanged_for_every_sample() {
+        /// The pre-Task-1 implementation of `encode_nt_payload_bitset_parts`.
+        fn reference_parts(payload: &NtPayload, is_be: bool) -> (Vec<u8>, Vec<u8>) {
+            let desc = nt_payload_desc(payload);
+            (
+                encode_structure_bitset(&desc, is_be),
+                encode_nt_payload_full(payload, is_be),
+            )
+        }
+
+        for (i, payload) in all_payload_samples().into_iter().enumerate() {
+            for is_be in [false, true] {
+                let (bitset, _) = encode_nt_payload_bitset_parts(&payload, is_be);
+                let (want_bitset, _) = reference_parts(&payload, is_be);
+                assert_eq!(bitset, want_bitset, "sample {i}, is_be={is_be}");
+            }
+        }
+    }
 
     #[test]
     fn nt_scalar_roundtrip() {
