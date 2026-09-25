@@ -48,29 +48,6 @@ pub fn command_name(code: u8) -> &'static str {
         .unwrap_or("Unknown")
 }
 
-/// Look up a PVA command code by its name.  Returns 255 for unknown names.
-pub fn command_to_integer(command: &str) -> u8 {
-    PVA_COMMAND_NAMES
-        .iter()
-        .position(|&name| name == command)
-        .map(|i| i as u8)
-        .unwrap_or(255)
-}
-
-/// Convenience wrapper that matches the pre-existing `PvaCommands` API.
-/// Prefer calling [`command_name`] directly for new code.
-#[derive(Debug)]
-pub struct PvaCommands;
-
-impl PvaCommands {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn get_command(&self, code: u8) -> &'static str {
-        command_name(code)
-    }
-}
 #[derive(Debug)]
 pub struct PvaControlFlags {
     pub raw: u8,

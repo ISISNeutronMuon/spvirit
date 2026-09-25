@@ -361,7 +361,7 @@ pub(crate) fn nt_payload_field_count(payload: &NtPayload) -> usize {
         }
         NtPayload::NdArray(_) => {
             static N: OnceLock<usize> = OnceLock::new();
-            *N.get_or_init(|| count_structure_fields(&nt_ndarray_desc_default()))
+            *N.get_or_init(|| count_structure_fields(&nt_ndarray_desc()))
         }
         NtPayload::Enum(_) => {
             static N: OnceLock<usize> = OnceLock::new();
@@ -445,7 +445,7 @@ pub fn encode_nt_scalar_bitset_parts(nt: &NtScalar, is_be: bool) -> (Vec<u8>, Ve
     )
 }
 
-fn alarm_desc() -> StructureDesc {
+pub fn alarm_desc() -> StructureDesc {
     StructureDesc {
         struct_id: Some("alarm_t".to_string()),
         fields: vec![
@@ -465,7 +465,7 @@ fn alarm_desc() -> StructureDesc {
     }
 }
 
-fn timestamp_desc() -> StructureDesc {
+pub fn timestamp_desc() -> StructureDesc {
     StructureDesc {
         struct_id: Some("time_t".to_string()),
         fields: vec![
@@ -966,11 +966,9 @@ fn encode_codec_parameters(
     out
 }
 
-pub fn nt_ndarray_desc_default() -> StructureDesc {
-    nt_ndarray_desc(&NtNdArray::empty())
-}
-
-pub fn nt_ndarray_desc(_nt: &NtNdArray) -> StructureDesc {
+/// The NTNDArray descriptor. Constant — NTNDArray's shape does not vary with
+/// its payload; the `value` field is a union covering every element type.
+pub fn nt_ndarray_desc() -> StructureDesc {
     StructureDesc {
         struct_id: Some("epics:nt/NTNDArray:1.0".to_string()),
         fields: vec![
@@ -1327,7 +1325,7 @@ fn pv_value_field_type(val: &PvValue) -> FieldType {
 }
 
 /// Encode a [`PvValue`] tree to PVA wire bytes (values only, no descriptor).
-pub fn encode_pv_value(val: &PvValue, is_be: bool) -> Vec<u8> {
+pub(crate) fn encode_pv_value(val: &PvValue, is_be: bool) -> Vec<u8> {
     match val {
         PvValue::Scalar(sv) => encode_scalar_value(sv, is_be),
         PvValue::ScalarArray(sa) => encode_scalar_array_value_pvd(sa, is_be),
@@ -1346,7 +1344,7 @@ pub fn nt_payload_desc(payload: &NtPayload) -> StructureDesc {
         NtPayload::Scalar(nt) => nt_scalar_desc(&nt.value),
         NtPayload::ScalarArray(nt) => nt_scalar_array_desc(&nt.value),
         NtPayload::Table(nt) => nt_table_desc(nt),
-        NtPayload::NdArray(nt) => nt_ndarray_desc(nt),
+        NtPayload::NdArray(_) => nt_ndarray_desc(),
         NtPayload::Enum(_) => nt_enum_desc(),
         NtPayload::Generic { struct_id, fields } => pv_value_desc(struct_id, fields),
     }
@@ -2972,7 +2970,7 @@ mod tests {
             display: None,
         };
 
-        let desc = nt_ndarray_desc(&nt);
+        let desc = nt_ndarray_desc();
         let desc_bytes = encode_structure_desc(&desc, false);
         let data_bytes = encode_nt_ndarray_full(&nt, false);
 
@@ -3777,5 +3775,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `nt_ndarray_desc` ignored its `NtNdArray` argument entirely: the NTNDArray
+    /// descriptor is constant. Pin that so the parameter cannot creep back.
+    #[test]
+    fn ndarray_descriptor_is_constant() {
+        let a = NtNdArray::empty();
+        let mut b = NtNdArray::empty();
+        b.value = ScalarArrayValue::F64(vec![1.0, 2.0, 3.0]);
+        b.compressed_size = 24;
+        b.uncompressed_size = 24;
+        b.dimension = vec![NdDimension {
+            size: 3,
+            offset: 0,
+            full_size: 3,
+            binning: 1,
+            reverse: false,
+        }];
+        let _ = (&a, &b);
+        let desc = nt_ndarray_desc();
+        assert_eq!(desc.struct_id.as_deref(), Some("epics:nt/NTNDArray:1.0"));
+        assert_eq!(desc.fields.len(), 12);
+        assert_eq!(
+            crate::spvd_decode::count_structure_fields(&desc),
+            nt_payload_field_count(&NtPayload::NdArray(a))
+        );
+        assert_eq!(
+            crate::spvd_decode::count_structure_fields(&desc),
+            nt_payload_field_count(&NtPayload::NdArray(b))
+        );
     }
 }

@@ -16,9 +16,7 @@ pub mod spvd_encode;
 pub mod spvirit_encode;
 
 // --- Re-exports: PVA wire-format decode types ---
-pub use epics_decode::{
-    PvaCommands, PvaHeader, PvaPacket, PvaPacketCommand, PvaStatus, decode_string,
-};
+pub use epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand, PvaStatus, decode_string};
 
 // --- Re-exports: decode errors ---
 pub use error::{DecodeError, DecodeResult};
