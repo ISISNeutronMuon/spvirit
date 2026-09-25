@@ -14,7 +14,6 @@ pub mod segment;
 pub mod spvd_decode;
 pub mod spvd_encode;
 pub mod spvirit_encode;
-pub mod spvirit_state;
 
 // --- Re-exports: PVA wire-format decode types ---
 pub use epics_decode::{
@@ -35,9 +34,6 @@ pub use segment::{DEFAULT_MAX_MESSAGE_BYTES, SegmentOutcome, SegmentReassembler}
 pub use spvirit_encode::{
     encode_control_message, encode_header, format_pva_address, ip_from_bytes, ip_to_bytes,
 };
-
-// --- Re-exports: connection state tracking ---
-pub use spvirit_state::{ConnectionKey, PvaStateConfig, PvaStateStats, PvaStateTracker};
 
 // --- Re-exports: pvData structure decode ---
 pub use spvd_decode::{
