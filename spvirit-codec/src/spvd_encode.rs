@@ -3887,4 +3887,38 @@ mod tests {
             }
         }
     }
+
+    /// Characterisation of `nt_payload_to_decoded`, written before it was split
+    /// into per-type builders. Compares the projected *encoded bytes* — the only
+    /// thing the caller of this function ever observes — for the full descriptor
+    /// and for three progressively narrower ones.
+    #[test]
+    fn decoded_tree_projection_is_stable_for_every_sample() {
+        for (i, payload) in pinned_time_samples().into_iter().enumerate() {
+            let full = nt_payload_desc(&payload);
+            let mut one_field = full.clone();
+            one_field.fields.truncate(1);
+            let mut two_fields = full.clone();
+            two_fields.fields.truncate(2);
+            for desc in [&full, &two_fields, &one_field] {
+                for is_be in [false, true] {
+                    let decoded = nt_payload_to_decoded(&payload, is_be);
+                    let projected = encode_decoded_projected(&decoded, desc, is_be);
+                    // Independent route to the same bytes: encode the payload for
+                    // real and decode it back. Byte-identity between the two is the
+                    // invariant `nt_payload_to_decoded` exists to preserve.
+                    // NOTE: `decode_payload_to_structure` returns `Option<DecodedValue>`
+                    // (`spvd_encode.rs:1667`), so it MUST be unwrapped here — passing
+                    // the `Option` by reference does not compile.
+                    let round_tripped = decode_payload_to_structure(&payload, is_be)
+                        .expect("round-trip decode must succeed for a full encode");
+                    assert_eq!(
+                        projected,
+                        encode_decoded_projected(&round_tripped, desc, is_be),
+                        "sample {i}: decoded tree diverged from the round trip, is_be={is_be}"
+                    );
+                }
+            }
+        }
+    }
 }
