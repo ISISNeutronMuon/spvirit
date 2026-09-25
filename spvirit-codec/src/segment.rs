@@ -43,8 +43,20 @@ impl SegmentReassembler {
     }
 
     /// A reassembler with a custom cap on the reassembled message size.
+    ///
+    /// The cap is clamped to `u32::MAX`: [`finish`] rewrites the first
+    /// segment's `payload_length`, which is a `u32` on the wire, so a larger
+    /// cap could only produce a silently wrong header.
     pub fn with_max_bytes(max_bytes: usize) -> Self {
-        Self { max_bytes, pending: None }
+        Self {
+            max_bytes: max_bytes.min(u32::MAX as usize),
+            pending: None,
+        }
+    }
+
+    /// The effective cap, after clamping. See [`SegmentReassembler::with_max_bytes`].
+    pub fn max_message_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     /// Bytes of payload currently held for an in-progress message.
@@ -145,6 +157,9 @@ fn finish(p: Pending) -> Vec<u8> {
     let mut header = p.header;
     let is_be = (header[2] & 0x80) != 0;
     header[2] &= !0x30;
+    // `push` rejects anything over `max_bytes`, and `with_max_bytes` clamps
+    // that to `u32::MAX`, so this cast cannot truncate.
+    debug_assert!(p.total <= u32::MAX as usize, "reassembled total exceeds u32");
     let total = p.total as u32;
     let len = if is_be { total.to_be_bytes() } else { total.to_le_bytes() };
     header[4..8].copy_from_slice(&len);
@@ -178,6 +193,19 @@ mod tests {
         let l = if is_be { payload_len.to_be_bytes() } else { payload_len.to_le_bytes() };
         h[4..8].copy_from_slice(&l);
         h
+    }
+
+    #[test]
+    fn an_oversized_cap_is_clamped_to_what_payload_length_can_hold() {
+        let r = SegmentReassembler::with_max_bytes(usize::MAX);
+        assert_eq!(r.max_message_bytes(), u32::MAX as usize);
+
+        // A cap that fits is kept exactly.
+        let r = SegmentReassembler::with_max_bytes(1024);
+        assert_eq!(r.max_message_bytes(), 1024);
+
+        // The default must already be representable.
+        assert!(DEFAULT_MAX_MESSAGE_BYTES <= u32::MAX as usize);
     }
 
     fn control_hdr() -> [u8; 8] {
