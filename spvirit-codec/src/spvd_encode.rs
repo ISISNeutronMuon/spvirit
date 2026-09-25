@@ -1965,14 +1965,11 @@ fn nt_payload_to_decoded_for(
     })
 }
 
-/// Direct, allocation-only projection of an [`NtPayload`] into the
-/// `DecodedValue::Structure` tree that the encode→decode round-trip would
-/// yield. Byte-identity with [`decode_payload_to_structure`] is enforced by the
-/// differential tests; the two callers on the monitor delta hot path use this
-/// to avoid the redundant wire serialization (finding codec-C1).
-///
-/// Unfiltered form — builds every field. Retained so the differential tests and
-/// `decode_payload_to_structure` comparisons keep their exact meaning.
+/// Unfiltered (`desc: None`) form of [`nt_payload_to_decoded_for`], builds
+/// every field. Test-only: production code calls `nt_payload_to_decoded_for`
+/// directly. Retained so the differential tests and
+/// [`decode_payload_to_structure`] comparisons keep their exact meaning.
+#[cfg(test)]
 fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
     nt_payload_to_decoded_for(payload, None, is_be)
 }
