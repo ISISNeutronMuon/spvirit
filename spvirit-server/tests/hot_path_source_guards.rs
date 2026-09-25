@@ -74,13 +74,21 @@ fn deferred_search_reply_captures_a_weak_replier_not_a_strong_one() {
 fn events_drain_does_not_busy_spin() {
     let src = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/events.rs"))
         .expect("events.rs must be readable");
+    // Normalise CRLF -> LF first: on a `core.autocrlf=true` checkout this
+    // file is checked out with CRLF line endings, and the "\n    }\n" end
+    // marker below is LF-only. Without this, the marker never matches, the
+    // body-end fallback silently runs to EOF, and the scan then includes the
+    // `mod tests` block below `drain` (which legitimately uses `yield_now`
+    // elsewhere in the file) — a false failure that blames `drain` for
+    // spinning when it does not.
+    let src = src.replace("\r\n", "\n");
     let start = src
         .find("pub async fn drain(&self)")
         .expect("Events::drain must exist");
     let end = src[start..]
         .find("\n    }\n")
         .map(|e| start + e)
-        .unwrap_or(src.len());
+        .expect("Events::drain's closing brace (\"\\n    }\\n\") not found");
     let body = &src[start..end];
 
     assert!(

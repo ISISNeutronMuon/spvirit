@@ -271,11 +271,14 @@ impl Events {
         }
         let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
         loop {
-            // `notify_waiters()` wakes only waiters that have ALREADY
-            // registered, so constructing the future is not enough — pin it
-            // and `enable()` it, which registers interest immediately. Doing
-            // that before re-reading `inflight` is what closes the
-            // lost-wakeup window between the check and the await.
+            // tokio guarantees a `Notified` created here already catches any
+            // `notify_waiters()` that runs before its first poll, so this is
+            // already safe against the lost-wakeup window between the check
+            // and the await without `enable()`. `enable()` is kept anyway as
+            // belt-and-braces, explicit-intent registration (it is what
+            // actually matters if this ever switches to `notify_one`, whose
+            // single stored permit `enable()` claims immediately rather than
+            // leaving to be raced for on first poll).
             let notified = self.idle.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -801,6 +804,39 @@ mod tests {
             hits.load(Ordering::SeqCst),
             5,
             "drain must not return until every posted handler has finished"
+        );
+    }
+
+    /// A lost wakeup (the notify call dropped from a decrement site) does
+    /// not make `drain` panic or hang forever — it just makes it sleep to
+    /// the 10s deadline before its post-timeout re-check sees `inflight ==
+    /// 0` and returns normally. That silent slowdown is otherwise
+    /// undetectable, so run under a paused clock: a real wait completes in
+    /// well under a second of virtual time, while a lost wakeup makes the
+    /// clock jump straight to the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn drain_does_not_sleep_to_the_deadline_for_a_normal_completion() {
+        let events = Events::new();
+        events.add_handler(
+            "GO",
+            Arc::new(|_s, _e| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                })
+            }),
+        );
+        events.start_dispatcher(test_store());
+
+        events.post("GO").await;
+        let t0 = tokio::time::Instant::now();
+        events.drain().await;
+
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "drain took {:?} of virtual time; a real notify-driven wait \
+             completes in well under 1s, a lost wakeup sleeps to the 10s \
+             deadline",
+            t0.elapsed()
         );
     }
 }
