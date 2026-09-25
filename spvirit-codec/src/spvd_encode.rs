@@ -1728,7 +1728,7 @@ pub fn encode_nt_payload_values_for_desc(
             return encode_nt_payload_full(payload, is_be);
         }
     }
-    let decoded = nt_payload_to_decoded(payload, is_be);
+    let decoded = nt_payload_to_decoded_for(payload, Some(desc), is_be);
     encode_decoded_projected(&decoded, desc, is_be)
 }
 
@@ -1935,40 +1935,66 @@ fn ndarray_union_field_name(v: &ScalarArrayValue) -> &'static str {
     }
 }
 
-/// Direct, allocation-only projection of an [`NtPayload`] into the
-/// `DecodedValue::Structure` tree that the encode→decode round-trip would
-/// yield. Byte-identity with [`decode_payload_to_structure`] is enforced by the
-/// differential tests; the two callers on the monitor delta hot path use this
-/// to avoid the redundant wire serialization (finding codec-C1).
-/// Direct, allocation-only projection of an [`NtPayload`] into the
-/// `DecodedValue::Structure` tree that the encode→decode round-trip would
-/// yield. Byte-identity with [`decode_payload_to_structure`] is enforced by the
-/// differential tests; the two callers on the monitor delta hot path use this
-/// to avoid the redundant wire serialization (finding codec-C1).
-fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
-    // `is_be` is irrelevant to the in-memory tree (endianness only affects the
-    // wire bytes, which we skip); kept for signature parity with the round-trip.
+/// True when the caller wants a top-level field named `name`.
+///
+/// `None` means "unfiltered — build everything". `Some(desc)` means the caller
+/// will project onto `desc`, so any top-level field `desc` does not name is
+/// going to be discarded and need never be built.
+fn wants_field(desc: Option<&StructureDesc>, name: &str) -> bool {
+    match desc {
+        None => true,
+        Some(d) => d.fields.iter().any(|f| f.name == name),
+    }
+}
+
+fn nt_payload_to_decoded_for(
+    payload: &NtPayload,
+    desc: Option<&StructureDesc>,
+    is_be: bool,
+) -> DecodedValue {
+    // Endianness only affects wire bytes, which this tree skips; the parameter
+    // is kept for signature parity with `decode_payload_to_structure`.
     let _ = is_be;
     DecodedValue::Structure(match payload {
-        NtPayload::Scalar(nt) => dv_nt_scalar_fields(nt),
-        NtPayload::ScalarArray(nt) => dv_nt_scalar_array_fields(nt),
-        NtPayload::Table(nt) => dv_nt_table_fields(nt),
-        NtPayload::NdArray(nt) => dv_nt_ndarray_fields(nt),
-        NtPayload::Enum(nt) => dv_nt_enum_fields(nt),
-        NtPayload::Generic { fields, .. } => dv_generic_fields(fields),
+        NtPayload::Scalar(nt) => dv_nt_scalar_fields(nt, desc),
+        NtPayload::ScalarArray(nt) => dv_nt_scalar_array_fields(nt, desc),
+        NtPayload::Table(nt) => dv_nt_table_fields(nt, desc),
+        NtPayload::NdArray(nt) => dv_nt_ndarray_fields(nt, desc),
+        NtPayload::Enum(nt) => dv_nt_enum_fields(nt, desc),
+        NtPayload::Generic { fields, .. } => dv_generic_fields(fields, desc),
     })
 }
 
-/// The `epics:nt/NTScalar:1.0` field list. Mirrors `encode_nt_scalar_full`.
-fn dv_nt_scalar_fields(nt: &NtScalar) -> Vec<(String, DecodedValue)> {
-    vec![
-        ("value".to_string(), dv_scalar(&nt.value)),
-        (
+/// Direct, allocation-only projection of an [`NtPayload`] into the
+/// `DecodedValue::Structure` tree that the encode→decode round-trip would
+/// yield. Byte-identity with [`decode_payload_to_structure`] is enforced by the
+/// differential tests; the two callers on the monitor delta hot path use this
+/// to avoid the redundant wire serialization (finding codec-C1).
+///
+/// Unfiltered form — builds every field. Retained so the differential tests and
+/// `decode_payload_to_structure` comparisons keep their exact meaning.
+fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
+    nt_payload_to_decoded_for(payload, None, is_be)
+}
+
+/// The `epics:nt/NTScalar:1.0` field list, restricted to the top-level fields
+/// `desc` names. Mirrors `encode_nt_scalar_full`.
+fn dv_nt_scalar_fields(nt: &NtScalar, desc: Option<&StructureDesc>) -> Vec<(String, DecodedValue)> {
+    let mut out: Vec<(String, DecodedValue)> = Vec::with_capacity(6);
+    if wants_field(desc, "value") {
+        out.push(("value".to_string(), dv_scalar(&nt.value)));
+    }
+    if wants_field(desc, "alarm") {
+        out.push((
             "alarm".to_string(),
             dv_alarm(nt.alarm_severity, nt.alarm_status, &nt.alarm_message),
-        ),
-        ("timeStamp".to_string(), dv_scalar_timestamp(nt)),
-        (
+        ));
+    }
+    if wants_field(desc, "timeStamp") {
+        out.push(("timeStamp".to_string(), dv_scalar_timestamp(nt)));
+    }
+    if wants_field(desc, "display") {
+        out.push((
             "display".to_string(),
             DecodedValue::Structure(vec![
                 ("limitLow".to_string(), DecodedValue::Float64(nt.display_low)),
@@ -1999,8 +2025,10 @@ fn dv_nt_scalar_fields(nt: &NtScalar) -> Vec<(String, DecodedValue)> {
                     ]),
                 ),
             ]),
-        ),
-        (
+        ));
+    }
+    if wants_field(desc, "control") {
+        out.push((
             "control".to_string(),
             DecodedValue::Structure(vec![
                 ("limitLow".to_string(), DecodedValue::Float64(nt.control_low)),
@@ -2013,8 +2041,10 @@ fn dv_nt_scalar_fields(nt: &NtScalar) -> Vec<(String, DecodedValue)> {
                     DecodedValue::Float64(nt.control_min_step),
                 ),
             ]),
-        ),
-        (
+        ));
+    }
+    if wants_field(desc, "valueAlarm") {
+        out.push((
             "valueAlarm".to_string(),
             DecodedValue::Structure(vec![
                 (
@@ -2058,21 +2088,35 @@ fn dv_nt_scalar_fields(nt: &NtScalar) -> Vec<(String, DecodedValue)> {
                     DecodedValue::UInt8(nt.value_alarm_hysteresis),
                 ),
             ]),
-        ),
-    ]
+        ));
+    }
+    out
 }
 
-/// The `epics:nt/NTScalarArray:1.0` field list.
-fn dv_nt_scalar_array_fields(nt: &NtScalarArray) -> Vec<(String, DecodedValue)> {
-    vec![
-        ("value".to_string(), dv_scalar_array(&nt.value)),
-        (
+/// The `epics:nt/NTScalarArray:1.0` field list, restricted to the top-level
+/// fields `desc` names.
+fn dv_nt_scalar_array_fields(
+    nt: &NtScalarArray,
+    desc: Option<&StructureDesc>,
+) -> Vec<(String, DecodedValue)> {
+    let mut out: Vec<(String, DecodedValue)> = Vec::with_capacity(5);
+    if wants_field(desc, "value") {
+        out.push(("value".to_string(), dv_scalar_array(&nt.value)));
+    }
+    if wants_field(desc, "alarm") {
+        out.push((
             "alarm".to_string(),
             dv_alarm(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
-        ),
-        ("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)),
-        ("display".to_string(), dv_display(&nt.display)),
-        (
+        ));
+    }
+    if wants_field(desc, "timeStamp") {
+        out.push(("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)));
+    }
+    if wants_field(desc, "display") {
+        out.push(("display".to_string(), dv_display(&nt.display)));
+    }
+    if wants_field(desc, "control") {
+        out.push((
             "control".to_string(),
             DecodedValue::Structure(vec![
                 (
@@ -2088,149 +2132,201 @@ fn dv_nt_scalar_array_fields(nt: &NtScalarArray) -> Vec<(String, DecodedValue)> 
                     DecodedValue::Float64(nt.control.min_step),
                 ),
             ]),
-        ),
-    ]
+        ));
+    }
+    out
 }
 
-/// The `epics:nt/NTTable:1.0` field list.
-fn dv_nt_table_fields(nt: &NtTable) -> Vec<(String, DecodedValue)> {
-    let value_fields: Vec<(String, DecodedValue)> = nt
-        .columns
-        .iter()
-        .map(|c| (c.name.clone(), dv_scalar_array(&c.values)))
-        .collect();
-    let alarm = nt.alarm.clone().unwrap_or_default();
-    let ts = nt.time_stamp.clone().unwrap_or_default();
-    vec![
-        ("labels".to_string(), dv_string_array(&nt.labels)),
-        ("value".to_string(), DecodedValue::Structure(value_fields)),
-        (
+/// The `epics:nt/NTTable:1.0` field list, restricted to the top-level fields
+/// `desc` names.
+fn dv_nt_table_fields(nt: &NtTable, desc: Option<&StructureDesc>) -> Vec<(String, DecodedValue)> {
+    let mut out: Vec<(String, DecodedValue)> = Vec::with_capacity(5);
+    if wants_field(desc, "labels") {
+        out.push(("labels".to_string(), dv_string_array(&nt.labels)));
+    }
+    if wants_field(desc, "value") {
+        let value_fields: Vec<(String, DecodedValue)> = nt
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), dv_scalar_array(&c.values)))
+            .collect();
+        out.push(("value".to_string(), DecodedValue::Structure(value_fields)));
+    }
+    if wants_field(desc, "descriptor") {
+        out.push((
             "descriptor".to_string(),
             DecodedValue::String(nt.descriptor.clone().unwrap_or_default()),
-        ),
-        (
+        ));
+    }
+    if wants_field(desc, "alarm") {
+        let alarm = nt.alarm.clone().unwrap_or_default();
+        out.push((
             "alarm".to_string(),
             dv_alarm(alarm.severity, alarm.status, &alarm.message),
-        ),
-        ("timeStamp".to_string(), dv_nt_timestamp(&ts)),
-    ]
+        ));
+    }
+    if wants_field(desc, "timeStamp") {
+        let ts = nt.time_stamp.clone().unwrap_or_default();
+        out.push(("timeStamp".to_string(), dv_nt_timestamp(&ts)));
+    }
+    out
 }
 
-/// The `epics:nt/NTNDArray:1.0` field list.
-fn dv_nt_ndarray_fields(nt: &NtNdArray) -> Vec<(String, DecodedValue)> {
-    // value — union member selected by element type
-    let value = DecodedValue::Structure(vec![(
-        ndarray_union_field_name(&nt.value).to_string(),
-        dv_scalar_array(&nt.value),
-    )]);
-    // codec.parameters — Variant: empty -> Null, else Structure of
-    // string key/value pairs (HashMap iteration order matches encode).
-    let codec_parameters = if nt.codec.parameters.is_empty() {
-        DecodedValue::Null
-    } else {
-        DecodedValue::Structure(
-            nt.codec
-                .parameters
-                .iter()
-                .map(|(k, v)| (k.clone(), DecodedValue::String(v.clone())))
-                .collect(),
-        )
-    };
-    let codec = DecodedValue::Structure(vec![
-        (
-            "name".to_string(),
-            DecodedValue::String(nt.codec.name.clone()),
-        ),
-        ("parameters".to_string(), codec_parameters),
-    ]);
-    let dimension = DecodedValue::Array(
-        nt.dimension
-            .iter()
-            .map(|d| {
-                DecodedValue::Structure(vec![
-                    ("size".to_string(), DecodedValue::Int32(d.size)),
-                    ("offset".to_string(), DecodedValue::Int32(d.offset)),
-                    ("fullSize".to_string(), DecodedValue::Int32(d.full_size)),
-                    ("binning".to_string(), DecodedValue::Int32(d.binning)),
-                    ("reverse".to_string(), DecodedValue::Boolean(d.reverse)),
-                ])
-            })
-            .collect(),
-    );
-    let attribute = DecodedValue::Array(
-        nt.attribute
-            .iter()
-            .map(|a| {
-                DecodedValue::Structure(vec![
-                    ("name".to_string(), DecodedValue::String(a.name.clone())),
-                    ("value".to_string(), dv_scalar(&a.value)),
-                    (
-                        "descriptor".to_string(),
-                        DecodedValue::String(a.descriptor.clone()),
-                    ),
-                    ("sourceType".to_string(), DecodedValue::Int32(a.source_type)),
-                    ("source".to_string(), DecodedValue::String(a.source.clone())),
-                ])
-            })
-            .collect(),
-    );
-    let alarm = nt.alarm.clone().unwrap_or_default();
-    let ts = nt.time_stamp.clone().unwrap_or_default();
-    let display = nt.display.clone().unwrap_or_default();
-    vec![
-        ("value".to_string(), value),
-        ("codec".to_string(), codec),
-        (
+/// The `epics:nt/NTNDArray:1.0` field list, restricted to the top-level fields
+/// `desc` names.
+fn dv_nt_ndarray_fields(
+    nt: &NtNdArray,
+    desc: Option<&StructureDesc>,
+) -> Vec<(String, DecodedValue)> {
+    let mut out: Vec<(String, DecodedValue)> = Vec::with_capacity(12);
+    if wants_field(desc, "value") {
+        // value — union member selected by element type
+        let value = DecodedValue::Structure(vec![(
+            ndarray_union_field_name(&nt.value).to_string(),
+            dv_scalar_array(&nt.value),
+        )]);
+        out.push(("value".to_string(), value));
+    }
+    if wants_field(desc, "codec") {
+        // codec.parameters — Variant: empty -> Null, else Structure of
+        // string key/value pairs (HashMap iteration order matches encode).
+        let codec_parameters = if nt.codec.parameters.is_empty() {
+            DecodedValue::Null
+        } else {
+            DecodedValue::Structure(
+                nt.codec
+                    .parameters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), DecodedValue::String(v.clone())))
+                    .collect(),
+            )
+        };
+        let codec = DecodedValue::Structure(vec![
+            (
+                "name".to_string(),
+                DecodedValue::String(nt.codec.name.clone()),
+            ),
+            ("parameters".to_string(), codec_parameters),
+        ]);
+        out.push(("codec".to_string(), codec));
+    }
+    if wants_field(desc, "compressedSize") {
+        out.push((
             "compressedSize".to_string(),
             DecodedValue::Int64(nt.compressed_size),
-        ),
-        (
+        ));
+    }
+    if wants_field(desc, "uncompressedSize") {
+        out.push((
             "uncompressedSize".to_string(),
             DecodedValue::Int64(nt.uncompressed_size),
-        ),
-        ("dimension".to_string(), dimension),
-        ("uniqueId".to_string(), DecodedValue::Int32(nt.unique_id)),
-        (
+        ));
+    }
+    if wants_field(desc, "dimension") {
+        let dimension = DecodedValue::Array(
+            nt.dimension
+                .iter()
+                .map(|d| {
+                    DecodedValue::Structure(vec![
+                        ("size".to_string(), DecodedValue::Int32(d.size)),
+                        ("offset".to_string(), DecodedValue::Int32(d.offset)),
+                        ("fullSize".to_string(), DecodedValue::Int32(d.full_size)),
+                        ("binning".to_string(), DecodedValue::Int32(d.binning)),
+                        ("reverse".to_string(), DecodedValue::Boolean(d.reverse)),
+                    ])
+                })
+                .collect(),
+        );
+        out.push(("dimension".to_string(), dimension));
+    }
+    if wants_field(desc, "uniqueId") {
+        out.push(("uniqueId".to_string(), DecodedValue::Int32(nt.unique_id)));
+    }
+    if wants_field(desc, "dataTimeStamp") {
+        out.push((
             "dataTimeStamp".to_string(),
             dv_nt_timestamp(&nt.data_time_stamp),
-        ),
-        ("attribute".to_string(), attribute),
-        (
+        ));
+    }
+    if wants_field(desc, "attribute") {
+        let attribute = DecodedValue::Array(
+            nt.attribute
+                .iter()
+                .map(|a| {
+                    DecodedValue::Structure(vec![
+                        ("name".to_string(), DecodedValue::String(a.name.clone())),
+                        ("value".to_string(), dv_scalar(&a.value)),
+                        (
+                            "descriptor".to_string(),
+                            DecodedValue::String(a.descriptor.clone()),
+                        ),
+                        ("sourceType".to_string(), DecodedValue::Int32(a.source_type)),
+                        ("source".to_string(), DecodedValue::String(a.source.clone())),
+                    ])
+                })
+                .collect(),
+        );
+        out.push(("attribute".to_string(), attribute));
+    }
+    if wants_field(desc, "descriptor") {
+        out.push((
             "descriptor".to_string(),
             DecodedValue::String(nt.descriptor.clone().unwrap_or_default()),
-        ),
-        (
+        ));
+    }
+    if wants_field(desc, "alarm") {
+        let alarm = nt.alarm.clone().unwrap_or_default();
+        out.push((
             "alarm".to_string(),
             dv_alarm(alarm.severity, alarm.status, &alarm.message),
-        ),
-        ("timeStamp".to_string(), dv_nt_timestamp(&ts)),
-        ("display".to_string(), dv_display(&display)),
-    ]
+        ));
+    }
+    if wants_field(desc, "timeStamp") {
+        let ts = nt.time_stamp.clone().unwrap_or_default();
+        out.push(("timeStamp".to_string(), dv_nt_timestamp(&ts)));
+    }
+    if wants_field(desc, "display") {
+        let display = nt.display.clone().unwrap_or_default();
+        out.push(("display".to_string(), dv_display(&display)));
+    }
+    out
 }
 
-/// The `epics:nt/NTEnum:1.0` field list.
-fn dv_nt_enum_fields(nt: &NtEnum) -> Vec<(String, DecodedValue)> {
-    vec![
-        (
+/// The `epics:nt/NTEnum:1.0` field list, restricted to the top-level fields
+/// `desc` names.
+fn dv_nt_enum_fields(nt: &NtEnum, desc: Option<&StructureDesc>) -> Vec<(String, DecodedValue)> {
+    let mut out: Vec<(String, DecodedValue)> = Vec::with_capacity(3);
+    if wants_field(desc, "value") {
+        out.push((
             "value".to_string(),
             DecodedValue::Structure(vec![
                 ("index".to_string(), DecodedValue::Int32(nt.index)),
                 ("choices".to_string(), dv_string_array(&nt.choices)),
             ]),
-        ),
-        (
+        ));
+    }
+    if wants_field(desc, "alarm") {
+        out.push((
             "alarm".to_string(),
             dv_alarm(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
-        ),
-        ("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)),
-    ]
+        ));
+    }
+    if wants_field(desc, "timeStamp") {
+        out.push(("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)));
+    }
+    out
 }
 
-/// The `Generic` payload's field list — a flat pass-through of `PvValue`s.
-fn dv_generic_fields(fields: &[(String, PvValue)]) -> Vec<(String, DecodedValue)> {
+/// The `Generic` payload's field list — a flat pass-through of `PvValue`s,
+/// restricted to the entries `desc` names.
+fn dv_generic_fields(
+    fields: &[(String, PvValue)],
+    desc: Option<&StructureDesc>,
+) -> Vec<(String, DecodedValue)> {
     fields
         .iter()
-        .map(|(n, v)| (n.clone(), dv_pv_value(v)))
+        .filter(|(name, _)| wants_field(desc, name))
+        .map(|(name, val)| (name.clone(), dv_pv_value(val)))
         .collect()
 }
 
@@ -2270,7 +2366,7 @@ pub fn encode_decoded_projected(
 /// that contains only the fields represented in `desc`. Missing descriptor
 /// fields are silently dropped.
 fn project_payload_on_desc(payload: &NtPayload, desc: &StructureDesc, is_be: bool) -> DecodedValue {
-    let decoded = nt_payload_to_decoded(payload, is_be);
+    let decoded = nt_payload_to_decoded_for(payload, Some(desc), is_be);
     project_decoded(&decoded, desc)
 }
 
@@ -3949,5 +4045,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Skipping a top-level field the target descriptor does not name must not
+    /// change one byte of the projected output — `encode_decoded_projected` walks
+    /// the descriptor, so an unnamed field was already being discarded.
+    #[test]
+    fn descriptor_gated_build_projects_identically() {
+        for (i, payload) in pinned_time_samples().into_iter().enumerate() {
+            let full = nt_payload_desc(&payload);
+            let mut one_field = full.clone();
+            one_field.fields.truncate(1);
+            let mut middle = full.clone();
+            middle.fields.remove(0);
+            for desc in [&full, &one_field, &middle] {
+                for is_be in [false, true] {
+                    let gated = nt_payload_to_decoded_for(&payload, Some(desc), is_be);
+                    let ungated = nt_payload_to_decoded_for(&payload, None, is_be);
+                    assert_eq!(
+                        encode_decoded_projected(&gated, desc, is_be),
+                        encode_decoded_projected(&ungated, desc, is_be),
+                        "sample {i}: gating changed the projected bytes, is_be={is_be}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The point of the gate: a `field(value)` subscription must not build the
+    /// display subtree at all, so the 7 standard form choices are never allocated.
+    #[test]
+    fn value_only_descriptor_builds_no_display_subtree() {
+        let payload = pinned_time_samples()
+            .into_iter()
+            .find(|p| matches!(p, NtPayload::Scalar(_)))
+            .expect("a scalar sample");
+        let full = nt_payload_desc(&payload);
+        let mut value_only = full.clone();
+        value_only.fields.retain(|f| f.name == "value");
+        let gated = nt_payload_to_decoded_for(&payload, Some(&value_only), false);
+        let DecodedValue::Structure(fields) = &gated else {
+            panic!("expected a structure");
+        };
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].0, "value");
     }
 }
