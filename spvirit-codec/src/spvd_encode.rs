@@ -939,6 +939,12 @@ fn encode_ndarray_union(value: &ScalarArrayValue, is_be: bool) -> Vec<u8> {
     out
 }
 
+/// The `codec.parameters` variant: a `0x80` full-structure introspection whose
+/// fields are the parameter names, followed by the values in the same order.
+///
+/// Keys are sorted so the frame is byte-stable across processes and so the two
+/// walks below cannot disagree — `HashMap` iteration order is unspecified and
+/// `dv_nt_ndarray_fields` walks the same map a third time.
 fn encode_codec_parameters(
     parameters: &std::collections::HashMap<String, String>,
     is_be: bool,
@@ -946,22 +952,23 @@ fn encode_codec_parameters(
     if parameters.is_empty() {
         return vec![0xFF];
     }
-    let mut out = Vec::new();
-    out.push(0x80);
-    let mut fields = Vec::new();
-    for key in parameters.keys() {
-        fields.push(FieldDesc {
-            name: key.clone(),
-            field_type: FieldType::String,
-        });
-    }
+    let mut keys: Vec<&String> = parameters.keys().collect();
+    keys.sort();
     let desc = StructureDesc {
         struct_id: None,
-        fields,
+        fields: keys
+            .iter()
+            .map(|key| FieldDesc {
+                name: (*key).clone(),
+                field_type: FieldType::String,
+            })
+            .collect(),
     };
+    let mut out = Vec::new();
+    out.push(0x80);
     out.extend_from_slice(&encode_structure_desc(&desc, is_be));
-    for value in parameters.values() {
-        out.extend_from_slice(&encode_string_pvd(value, is_be));
+    for key in &keys {
+        out.extend_from_slice(&encode_string_pvd(&parameters[*key], is_be));
     }
     out
 }
@@ -2195,17 +2202,24 @@ fn dv_nt_ndarray_fields(
     }
     if wants_field(desc, "codec") {
         // codec.parameters — Variant: empty -> Null, else Structure of
-        // string key/value pairs (HashMap iteration order matches encode).
+        // string key/value pairs.
         let codec_parameters = if nt.codec.parameters.is_empty() {
             DecodedValue::Null
         } else {
-            DecodedValue::Structure(
-                nt.codec
-                    .parameters
-                    .iter()
-                    .map(|(k, v)| (k.clone(), DecodedValue::String(v.clone())))
-                    .collect(),
-            )
+            DecodedValue::Structure({
+                // Keys sorted, matching `encode_codec_parameters`. Both
+                // walks must agree, and `HashMap` order is unspecified.
+                let mut keys: Vec<&String> = nt.codec.parameters.keys().collect();
+                keys.sort();
+                keys.into_iter()
+                    .map(|k| {
+                        (
+                            k.clone(),
+                            DecodedValue::String(nt.codec.parameters[k].clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
         };
         let codec = DecodedValue::Structure(vec![
             (
@@ -2714,6 +2728,63 @@ fn path_tree_to_field_descs(node: &PathNode) -> Vec<FieldDesc> {
 mod tests {
     use super::*;
     use crate::spvd_decode::PvdDecoder;
+
+    #[test]
+    fn codec_parameters_encode_in_sorted_key_order() {
+        use std::collections::HashMap;
+        let mut params = HashMap::new();
+        // Deliberately inserted out of order, and chosen so sorted order differs
+        // from insertion order under any hasher.
+        params.insert("zlevel".to_string(), "9".to_string());
+        params.insert("algo".to_string(), "blosc".to_string());
+        params.insert("mode".to_string(), "shuffle".to_string());
+
+        for is_be in [false, true] {
+            let bytes = encode_codec_parameters(&params, is_be);
+            // 0x80 (full structure, no id) then the structure descriptor.
+            assert_eq!(bytes[0], 0x80);
+            let decoder = PvdDecoder::new(is_be);
+            // NOTE: `PvdDecoder::parse_structure_desc` is PRIVATE to `spvd_decode`
+            // and is not reachable from this module's tests. `parse_introspection`
+            // is the public entry point and consumes the leading 0x80 itself.
+            let desc = decoder
+                .parse_introspection(&bytes)
+                .expect("descriptor parses");
+            let names: Vec<&str> = desc.fields.iter().map(|f| f.name.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["algo", "mode", "zlevel"],
+                "codec.parameters must encode in sorted key order, is_be={is_be}"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_parameters_values_follow_their_keys() {
+        use std::collections::HashMap;
+        let mut params = HashMap::new();
+        params.insert("zlevel".to_string(), "9".to_string());
+        params.insert("algo".to_string(), "blosc".to_string());
+        params.insert("mode".to_string(), "shuffle".to_string());
+
+        let mut nt = NtNdArray::empty();
+        nt.codec.parameters = params;
+        let payload = pin_timestamps(NtPayload::NdArray(nt));
+        for is_be in [false, true] {
+            let desc = nt_payload_desc(&payload);
+            assert_eq!(
+                encode_decoded_projected(&nt_payload_to_decoded(&payload, is_be), &desc, is_be),
+                encode_decoded_projected(
+                    // `decode_payload_to_structure` returns `Option<DecodedValue>`
+                    // (`spvd_encode.rs:1667`) — it must be unwrapped.
+                    &decode_payload_to_structure(&payload, is_be).expect("round trip"),
+                    &desc,
+                    is_be
+                ),
+                "decoded tree and round trip disagree on parameter order, is_be={is_be}"
+            );
+        }
+    }
 
     /// The cheap pre-check must never reject a descriptor that `structure_desc_equal`
     /// would have accepted — that would silently switch the encoder from the full
