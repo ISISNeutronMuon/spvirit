@@ -1940,269 +1940,298 @@ fn ndarray_union_field_name(v: &ScalarArrayValue) -> &'static str {
 /// yield. Byte-identity with [`decode_payload_to_structure`] is enforced by the
 /// differential tests; the two callers on the monitor delta hot path use this
 /// to avoid the redundant wire serialization (finding codec-C1).
+/// Direct, allocation-only projection of an [`NtPayload`] into the
+/// `DecodedValue::Structure` tree that the encode→decode round-trip would
+/// yield. Byte-identity with [`decode_payload_to_structure`] is enforced by the
+/// differential tests; the two callers on the monitor delta hot path use this
+/// to avoid the redundant wire serialization (finding codec-C1).
 fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
     // `is_be` is irrelevant to the in-memory tree (endianness only affects the
     // wire bytes, which we skip); kept for signature parity with the round-trip.
     let _ = is_be;
-    match payload {
-        NtPayload::Scalar(nt) => DecodedValue::Structure(vec![
-            ("value".to_string(), dv_scalar(&nt.value)),
-            (
-                "alarm".to_string(),
-                dv_alarm(nt.alarm_severity, nt.alarm_status, &nt.alarm_message),
-            ),
-            ("timeStamp".to_string(), dv_scalar_timestamp(nt)),
-            (
-                "display".to_string(),
-                DecodedValue::Structure(vec![
-                    ("limitLow".to_string(), DecodedValue::Float64(nt.display_low)),
-                    (
-                        "limitHigh".to_string(),
-                        DecodedValue::Float64(nt.display_high),
-                    ),
-                    (
-                        "description".to_string(),
-                        DecodedValue::String(nt.display_description.clone()),
-                    ),
-                    ("units".to_string(), DecodedValue::String(nt.units.clone())),
-                    (
-                        "precision".to_string(),
-                        DecodedValue::Int32(nt.display_precision),
-                    ),
-                    (
-                        "form".to_string(),
-                        DecodedValue::Structure(vec![
-                            (
-                                "index".to_string(),
-                                DecodedValue::Int32(nt.display_form_index),
-                            ),
-                            (
-                                "choices".to_string(),
-                                dv_form_choices(&nt.display_form_choices),
-                            ),
-                        ]),
-                    ),
-                ]),
-            ),
-            (
-                "control".to_string(),
-                DecodedValue::Structure(vec![
-                    ("limitLow".to_string(), DecodedValue::Float64(nt.control_low)),
-                    (
-                        "limitHigh".to_string(),
-                        DecodedValue::Float64(nt.control_high),
-                    ),
-                    (
-                        "minStep".to_string(),
-                        DecodedValue::Float64(nt.control_min_step),
-                    ),
-                ]),
-            ),
-            (
-                "valueAlarm".to_string(),
-                DecodedValue::Structure(vec![
-                    (
-                        "active".to_string(),
-                        DecodedValue::Boolean(nt.value_alarm_active),
-                    ),
-                    (
-                        "lowAlarmLimit".to_string(),
-                        DecodedValue::Float64(nt.value_alarm_low_alarm_limit),
-                    ),
-                    (
-                        "lowWarningLimit".to_string(),
-                        DecodedValue::Float64(nt.value_alarm_low_warning_limit),
-                    ),
-                    (
-                        "highWarningLimit".to_string(),
-                        DecodedValue::Float64(nt.value_alarm_high_warning_limit),
-                    ),
-                    (
-                        "highAlarmLimit".to_string(),
-                        DecodedValue::Float64(nt.value_alarm_high_alarm_limit),
-                    ),
-                    (
-                        "lowAlarmSeverity".to_string(),
-                        DecodedValue::Int32(nt.value_alarm_low_alarm_severity),
-                    ),
-                    (
-                        "lowWarningSeverity".to_string(),
-                        DecodedValue::Int32(nt.value_alarm_low_warning_severity),
-                    ),
-                    (
-                        "highWarningSeverity".to_string(),
-                        DecodedValue::Int32(nt.value_alarm_high_warning_severity),
-                    ),
-                    (
-                        "highAlarmSeverity".to_string(),
-                        DecodedValue::Int32(nt.value_alarm_high_alarm_severity),
-                    ),
-                    (
-                        "hysteresis".to_string(),
-                        DecodedValue::UInt8(nt.value_alarm_hysteresis),
-                    ),
-                ]),
-            ),
-        ]),
-        NtPayload::ScalarArray(nt) => DecodedValue::Structure(vec![
-            ("value".to_string(), dv_scalar_array(&nt.value)),
-            (
-                "alarm".to_string(),
-                dv_alarm(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
-            ),
-            ("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)),
-            ("display".to_string(), dv_display(&nt.display)),
-            (
-                "control".to_string(),
-                DecodedValue::Structure(vec![
-                    (
-                        "limitLow".to_string(),
-                        DecodedValue::Float64(nt.control.limit_low),
-                    ),
-                    (
-                        "limitHigh".to_string(),
-                        DecodedValue::Float64(nt.control.limit_high),
-                    ),
-                    (
-                        "minStep".to_string(),
-                        DecodedValue::Float64(nt.control.min_step),
-                    ),
-                ]),
-            ),
-        ]),
-        NtPayload::Table(nt) => {
-            let value_fields: Vec<(String, DecodedValue)> = nt
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), dv_scalar_array(&c.values)))
-                .collect();
-            let alarm = nt.alarm.clone().unwrap_or_default();
-            let ts = nt.time_stamp.clone().unwrap_or_default();
-            DecodedValue::Structure(vec![
-                ("labels".to_string(), dv_string_array(&nt.labels)),
-                ("value".to_string(), DecodedValue::Structure(value_fields)),
-                (
-                    "descriptor".to_string(),
-                    DecodedValue::String(nt.descriptor.clone().unwrap_or_default()),
-                ),
-                (
-                    "alarm".to_string(),
-                    dv_alarm(alarm.severity, alarm.status, &alarm.message),
-                ),
-                ("timeStamp".to_string(), dv_nt_timestamp(&ts)),
-            ])
-        }
-        NtPayload::NdArray(nt) => {
-            // value — union member selected by element type
-            let value = DecodedValue::Structure(vec![(
-                ndarray_union_field_name(&nt.value).to_string(),
-                dv_scalar_array(&nt.value),
-            )]);
-            // codec.parameters — Variant: empty -> Null, else Structure of
-            // string key/value pairs (HashMap iteration order matches encode).
-            let codec_parameters = if nt.codec.parameters.is_empty() {
-                DecodedValue::Null
-            } else {
-                DecodedValue::Structure(
-                    nt.codec
-                        .parameters
-                        .iter()
-                        .map(|(k, v)| (k.clone(), DecodedValue::String(v.clone())))
-                        .collect(),
-                )
-            };
-            let codec = DecodedValue::Structure(vec![
-                (
-                    "name".to_string(),
-                    DecodedValue::String(nt.codec.name.clone()),
-                ),
-                ("parameters".to_string(), codec_parameters),
-            ]);
-            let dimension = DecodedValue::Array(
-                nt.dimension
-                    .iter()
-                    .map(|d| {
-                        DecodedValue::Structure(vec![
-                            ("size".to_string(), DecodedValue::Int32(d.size)),
-                            ("offset".to_string(), DecodedValue::Int32(d.offset)),
-                            ("fullSize".to_string(), DecodedValue::Int32(d.full_size)),
-                            ("binning".to_string(), DecodedValue::Int32(d.binning)),
-                            ("reverse".to_string(), DecodedValue::Boolean(d.reverse)),
-                        ])
-                    })
-                    .collect(),
-            );
-            let attribute = DecodedValue::Array(
-                nt.attribute
-                    .iter()
-                    .map(|a| {
-                        DecodedValue::Structure(vec![
-                            ("name".to_string(), DecodedValue::String(a.name.clone())),
-                            ("value".to_string(), dv_scalar(&a.value)),
-                            (
-                                "descriptor".to_string(),
-                                DecodedValue::String(a.descriptor.clone()),
-                            ),
-                            ("sourceType".to_string(), DecodedValue::Int32(a.source_type)),
-                            ("source".to_string(), DecodedValue::String(a.source.clone())),
-                        ])
-                    })
-                    .collect(),
-            );
-            let alarm = nt.alarm.clone().unwrap_or_default();
-            let ts = nt.time_stamp.clone().unwrap_or_default();
-            let display = nt.display.clone().unwrap_or_default();
-            DecodedValue::Structure(vec![
-                ("value".to_string(), value),
-                ("codec".to_string(), codec),
-                (
-                    "compressedSize".to_string(),
-                    DecodedValue::Int64(nt.compressed_size),
-                ),
-                (
-                    "uncompressedSize".to_string(),
-                    DecodedValue::Int64(nt.uncompressed_size),
-                ),
-                ("dimension".to_string(), dimension),
-                ("uniqueId".to_string(), DecodedValue::Int32(nt.unique_id)),
-                (
-                    "dataTimeStamp".to_string(),
-                    dv_nt_timestamp(&nt.data_time_stamp),
-                ),
-                ("attribute".to_string(), attribute),
-                (
-                    "descriptor".to_string(),
-                    DecodedValue::String(nt.descriptor.clone().unwrap_or_default()),
-                ),
-                (
-                    "alarm".to_string(),
-                    dv_alarm(alarm.severity, alarm.status, &alarm.message),
-                ),
-                ("timeStamp".to_string(), dv_nt_timestamp(&ts)),
-                ("display".to_string(), dv_display(&display)),
-            ])
-        }
-        NtPayload::Enum(nt) => DecodedValue::Structure(vec![
-            (
-                "value".to_string(),
-                DecodedValue::Structure(vec![
-                    ("index".to_string(), DecodedValue::Int32(nt.index)),
-                    ("choices".to_string(), dv_string_array(&nt.choices)),
-                ]),
-            ),
-            (
-                "alarm".to_string(),
-                dv_alarm(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
-            ),
-            ("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)),
-        ]),
-        NtPayload::Generic { fields, .. } => DecodedValue::Structure(
-            fields
-                .iter()
-                .map(|(n, v)| (n.clone(), dv_pv_value(v)))
-                .collect(),
+    DecodedValue::Structure(match payload {
+        NtPayload::Scalar(nt) => dv_nt_scalar_fields(nt),
+        NtPayload::ScalarArray(nt) => dv_nt_scalar_array_fields(nt),
+        NtPayload::Table(nt) => dv_nt_table_fields(nt),
+        NtPayload::NdArray(nt) => dv_nt_ndarray_fields(nt),
+        NtPayload::Enum(nt) => dv_nt_enum_fields(nt),
+        NtPayload::Generic { fields, .. } => dv_generic_fields(fields),
+    })
+}
+
+/// The `epics:nt/NTScalar:1.0` field list. Mirrors `encode_nt_scalar_full`.
+fn dv_nt_scalar_fields(nt: &NtScalar) -> Vec<(String, DecodedValue)> {
+    vec![
+        ("value".to_string(), dv_scalar(&nt.value)),
+        (
+            "alarm".to_string(),
+            dv_alarm(nt.alarm_severity, nt.alarm_status, &nt.alarm_message),
         ),
-    }
+        ("timeStamp".to_string(), dv_scalar_timestamp(nt)),
+        (
+            "display".to_string(),
+            DecodedValue::Structure(vec![
+                ("limitLow".to_string(), DecodedValue::Float64(nt.display_low)),
+                (
+                    "limitHigh".to_string(),
+                    DecodedValue::Float64(nt.display_high),
+                ),
+                (
+                    "description".to_string(),
+                    DecodedValue::String(nt.display_description.clone()),
+                ),
+                ("units".to_string(), DecodedValue::String(nt.units.clone())),
+                (
+                    "precision".to_string(),
+                    DecodedValue::Int32(nt.display_precision),
+                ),
+                (
+                    "form".to_string(),
+                    DecodedValue::Structure(vec![
+                        (
+                            "index".to_string(),
+                            DecodedValue::Int32(nt.display_form_index),
+                        ),
+                        (
+                            "choices".to_string(),
+                            dv_form_choices(&nt.display_form_choices),
+                        ),
+                    ]),
+                ),
+            ]),
+        ),
+        (
+            "control".to_string(),
+            DecodedValue::Structure(vec![
+                ("limitLow".to_string(), DecodedValue::Float64(nt.control_low)),
+                (
+                    "limitHigh".to_string(),
+                    DecodedValue::Float64(nt.control_high),
+                ),
+                (
+                    "minStep".to_string(),
+                    DecodedValue::Float64(nt.control_min_step),
+                ),
+            ]),
+        ),
+        (
+            "valueAlarm".to_string(),
+            DecodedValue::Structure(vec![
+                (
+                    "active".to_string(),
+                    DecodedValue::Boolean(nt.value_alarm_active),
+                ),
+                (
+                    "lowAlarmLimit".to_string(),
+                    DecodedValue::Float64(nt.value_alarm_low_alarm_limit),
+                ),
+                (
+                    "lowWarningLimit".to_string(),
+                    DecodedValue::Float64(nt.value_alarm_low_warning_limit),
+                ),
+                (
+                    "highWarningLimit".to_string(),
+                    DecodedValue::Float64(nt.value_alarm_high_warning_limit),
+                ),
+                (
+                    "highAlarmLimit".to_string(),
+                    DecodedValue::Float64(nt.value_alarm_high_alarm_limit),
+                ),
+                (
+                    "lowAlarmSeverity".to_string(),
+                    DecodedValue::Int32(nt.value_alarm_low_alarm_severity),
+                ),
+                (
+                    "lowWarningSeverity".to_string(),
+                    DecodedValue::Int32(nt.value_alarm_low_warning_severity),
+                ),
+                (
+                    "highWarningSeverity".to_string(),
+                    DecodedValue::Int32(nt.value_alarm_high_warning_severity),
+                ),
+                (
+                    "highAlarmSeverity".to_string(),
+                    DecodedValue::Int32(nt.value_alarm_high_alarm_severity),
+                ),
+                (
+                    "hysteresis".to_string(),
+                    DecodedValue::UInt8(nt.value_alarm_hysteresis),
+                ),
+            ]),
+        ),
+    ]
+}
+
+/// The `epics:nt/NTScalarArray:1.0` field list.
+fn dv_nt_scalar_array_fields(nt: &NtScalarArray) -> Vec<(String, DecodedValue)> {
+    vec![
+        ("value".to_string(), dv_scalar_array(&nt.value)),
+        (
+            "alarm".to_string(),
+            dv_alarm(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
+        ),
+        ("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)),
+        ("display".to_string(), dv_display(&nt.display)),
+        (
+            "control".to_string(),
+            DecodedValue::Structure(vec![
+                (
+                    "limitLow".to_string(),
+                    DecodedValue::Float64(nt.control.limit_low),
+                ),
+                (
+                    "limitHigh".to_string(),
+                    DecodedValue::Float64(nt.control.limit_high),
+                ),
+                (
+                    "minStep".to_string(),
+                    DecodedValue::Float64(nt.control.min_step),
+                ),
+            ]),
+        ),
+    ]
+}
+
+/// The `epics:nt/NTTable:1.0` field list.
+fn dv_nt_table_fields(nt: &NtTable) -> Vec<(String, DecodedValue)> {
+    let value_fields: Vec<(String, DecodedValue)> = nt
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), dv_scalar_array(&c.values)))
+        .collect();
+    let alarm = nt.alarm.clone().unwrap_or_default();
+    let ts = nt.time_stamp.clone().unwrap_or_default();
+    vec![
+        ("labels".to_string(), dv_string_array(&nt.labels)),
+        ("value".to_string(), DecodedValue::Structure(value_fields)),
+        (
+            "descriptor".to_string(),
+            DecodedValue::String(nt.descriptor.clone().unwrap_or_default()),
+        ),
+        (
+            "alarm".to_string(),
+            dv_alarm(alarm.severity, alarm.status, &alarm.message),
+        ),
+        ("timeStamp".to_string(), dv_nt_timestamp(&ts)),
+    ]
+}
+
+/// The `epics:nt/NTNDArray:1.0` field list.
+fn dv_nt_ndarray_fields(nt: &NtNdArray) -> Vec<(String, DecodedValue)> {
+    // value — union member selected by element type
+    let value = DecodedValue::Structure(vec![(
+        ndarray_union_field_name(&nt.value).to_string(),
+        dv_scalar_array(&nt.value),
+    )]);
+    // codec.parameters — Variant: empty -> Null, else Structure of
+    // string key/value pairs (HashMap iteration order matches encode).
+    let codec_parameters = if nt.codec.parameters.is_empty() {
+        DecodedValue::Null
+    } else {
+        DecodedValue::Structure(
+            nt.codec
+                .parameters
+                .iter()
+                .map(|(k, v)| (k.clone(), DecodedValue::String(v.clone())))
+                .collect(),
+        )
+    };
+    let codec = DecodedValue::Structure(vec![
+        (
+            "name".to_string(),
+            DecodedValue::String(nt.codec.name.clone()),
+        ),
+        ("parameters".to_string(), codec_parameters),
+    ]);
+    let dimension = DecodedValue::Array(
+        nt.dimension
+            .iter()
+            .map(|d| {
+                DecodedValue::Structure(vec![
+                    ("size".to_string(), DecodedValue::Int32(d.size)),
+                    ("offset".to_string(), DecodedValue::Int32(d.offset)),
+                    ("fullSize".to_string(), DecodedValue::Int32(d.full_size)),
+                    ("binning".to_string(), DecodedValue::Int32(d.binning)),
+                    ("reverse".to_string(), DecodedValue::Boolean(d.reverse)),
+                ])
+            })
+            .collect(),
+    );
+    let attribute = DecodedValue::Array(
+        nt.attribute
+            .iter()
+            .map(|a| {
+                DecodedValue::Structure(vec![
+                    ("name".to_string(), DecodedValue::String(a.name.clone())),
+                    ("value".to_string(), dv_scalar(&a.value)),
+                    (
+                        "descriptor".to_string(),
+                        DecodedValue::String(a.descriptor.clone()),
+                    ),
+                    ("sourceType".to_string(), DecodedValue::Int32(a.source_type)),
+                    ("source".to_string(), DecodedValue::String(a.source.clone())),
+                ])
+            })
+            .collect(),
+    );
+    let alarm = nt.alarm.clone().unwrap_or_default();
+    let ts = nt.time_stamp.clone().unwrap_or_default();
+    let display = nt.display.clone().unwrap_or_default();
+    vec![
+        ("value".to_string(), value),
+        ("codec".to_string(), codec),
+        (
+            "compressedSize".to_string(),
+            DecodedValue::Int64(nt.compressed_size),
+        ),
+        (
+            "uncompressedSize".to_string(),
+            DecodedValue::Int64(nt.uncompressed_size),
+        ),
+        ("dimension".to_string(), dimension),
+        ("uniqueId".to_string(), DecodedValue::Int32(nt.unique_id)),
+        (
+            "dataTimeStamp".to_string(),
+            dv_nt_timestamp(&nt.data_time_stamp),
+        ),
+        ("attribute".to_string(), attribute),
+        (
+            "descriptor".to_string(),
+            DecodedValue::String(nt.descriptor.clone().unwrap_or_default()),
+        ),
+        (
+            "alarm".to_string(),
+            dv_alarm(alarm.severity, alarm.status, &alarm.message),
+        ),
+        ("timeStamp".to_string(), dv_nt_timestamp(&ts)),
+        ("display".to_string(), dv_display(&display)),
+    ]
+}
+
+/// The `epics:nt/NTEnum:1.0` field list.
+fn dv_nt_enum_fields(nt: &NtEnum) -> Vec<(String, DecodedValue)> {
+    vec![
+        (
+            "value".to_string(),
+            DecodedValue::Structure(vec![
+                ("index".to_string(), DecodedValue::Int32(nt.index)),
+                ("choices".to_string(), dv_string_array(&nt.choices)),
+            ]),
+        ),
+        (
+            "alarm".to_string(),
+            dv_alarm(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
+        ),
+        ("timeStamp".to_string(), dv_nt_timestamp(&nt.time_stamp)),
+    ]
+}
+
+/// The `Generic` payload's field list — a flat pass-through of `PvValue`s.
+fn dv_generic_fields(fields: &[(String, PvValue)]) -> Vec<(String, DecodedValue)> {
+    fields
+        .iter()
+        .map(|(n, v)| (n.clone(), dv_pv_value(v)))
+        .collect()
 }
 
 /// Re-encode a `DecodedValue::Structure` against a (possibly narrowed)
