@@ -1159,6 +1159,7 @@ impl PvdDecoder {
             desc: &StructureDesc,
             bitset: &[u8],
             bit_offset: &mut usize,
+            counts: &[usize],
             fields: &mut Vec<(String, DecodedValue)>,
         ) -> bool {
             for field in &desc.fields {
@@ -1180,7 +1181,7 @@ impl PvdDecoder {
 
                 if let FieldType::Structure(nested_desc) = &field.field_type {
                     let child_start_bit = *bit_offset;
-                    let child_field_count = count_structure_fields(nested_desc);
+                    let child_field_count = counts[current_bit - 1];
 
                     let mut any_child_bits_set = false;
                     for i in 0..child_field_count {
@@ -1228,6 +1229,7 @@ impl PvdDecoder {
                             nested_desc,
                             bitset,
                             bit_offset,
+                            counts,
                             &mut nested_fields,
                         ) {
                             return false;
@@ -1265,6 +1267,7 @@ impl PvdDecoder {
             true
         }
 
+        let counts = subtree_field_counts(desc);
         let mut bit_offset = 1;
         decode_with_bitset_recursive(
             self,
@@ -1273,6 +1276,7 @@ impl PvdDecoder {
             desc,
             bitset,
             &mut bit_offset,
+            &counts,
             &mut fields,
         );
         Ok((DecodedValue::Structure(fields), offset))
@@ -1292,6 +1296,29 @@ pub(crate) fn count_structure_fields(desc: &StructureDesc) -> usize {
         }
     }
     count
+}
+
+/// Descendant field-bit counts in bitset-bit order.
+///
+/// `counts[n]` is the number of bits owned by the *subtree* of the field
+/// addressed by bit `n + 1` (bit 0 is the whole structure and has no entry).
+/// Built once per decode so the bitset walk stops re-running
+/// `count_structure_fields` for every nested field of every frame.
+pub(crate) fn subtree_field_counts(desc: &StructureDesc) -> Vec<usize> {
+    let mut out = Vec::with_capacity(count_structure_fields(desc));
+    push_subtree_counts(desc, &mut out);
+    out
+}
+
+fn push_subtree_counts(desc: &StructureDesc, out: &mut Vec<usize>) {
+    for field in &desc.fields {
+        let slot = out.len();
+        out.push(0);
+        if let FieldType::Structure(nested) = &field.field_type {
+            push_subtree_counts(nested, out);
+        }
+        out[slot] = out.len() - slot - 1;
+    }
 }
 
 /// Extract a sub-field from a StructureDesc by dot-separated path.
@@ -1524,6 +1551,52 @@ fn format_scalar_value(val: &DecodedValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `counts[n]` must equal what `count_structure_fields` returns for the field
+    /// addressed by bit `n + 1`. Walk the descriptor independently and compare.
+    #[test]
+    fn subtree_field_counts_match_count_structure_fields() {
+        fn walk(desc: &StructureDesc, out: &mut Vec<usize>) {
+            for field in &desc.fields {
+                match &field.field_type {
+                    FieldType::Structure(nested) => {
+                        out.push(count_structure_fields(nested));
+                        walk(nested, out);
+                    }
+                    _ => out.push(0),
+                }
+            }
+        }
+
+        let mut leaf = StructureDesc::new();
+        leaf.fields.push(FieldDesc {
+            name: "deep".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+        let mut mid = StructureDesc::new();
+        mid.fields.push(FieldDesc {
+            name: "a".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+        mid.fields.push(FieldDesc {
+            name: "leaf".to_string(),
+            field_type: FieldType::Structure(leaf),
+        });
+        let mut top = StructureDesc::new();
+        top.fields.push(FieldDesc {
+            name: "mid".to_string(),
+            field_type: FieldType::Structure(mid),
+        });
+        top.fields.push(FieldDesc {
+            name: "z".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+
+        let mut expected = Vec::new();
+        walk(&top, &mut expected);
+        assert_eq!(subtree_field_counts(&top), expected);
+        assert_eq!(subtree_field_counts(&top).len(), count_structure_fields(&top));
+    }
 
     #[test]
     fn test_decode_size() {
