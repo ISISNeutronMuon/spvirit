@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tracing::debug;
 
-use crate::auth::{default_authnz_host, default_authnz_user};
+use crate::auth::AuthnzCreds;
 use crate::transport::read_packet;
 use crate::types::{PvGetError, PvGetOptions};
 use spvirit_codec::SegmentReassembler;
@@ -308,6 +308,18 @@ fn decode_search_response_addr(addr: [u8; 16], port: u16, src: SocketAddr) -> So
         .unwrap_or_else(|| SocketAddr::new(src.ip(), port))
 }
 
+/// Receive scratch size. PVA search traffic is far smaller than this; a
+/// datagram longer than this is truncated, exactly as before.
+const UDP_DATAGRAM_SCRATCH: usize = 2048;
+
+/// Copy the received bytes onto the heap at their actual length.
+///
+/// Kept separate so the "no 2 KiB allocation per datagram" property is
+/// directly testable.
+fn datagram_to_owned(received: &[u8]) -> Vec<u8> {
+    received.to_vec()
+}
+
 fn normalize_discovered_servers(items: Vec<DiscoveredServer>) -> Vec<DiscoveredServer> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -316,7 +328,10 @@ fn normalize_discovered_servers(items: Vec<DiscoveredServer>) -> Vec<DiscoveredS
             out.push(item);
         }
     }
-    out.sort_by(|a, b| a.tcp_addr.to_string().cmp(&b.tcp_addr.to_string()));
+    // `SocketAddr` is `Ord` — compare the value, not its text, so that
+    // 10.0.0.2 sorts before 10.0.0.10 and IPv6 addresses are not ordered by
+    // their formatting.
+    out.sort_by(|a, b| a.tcp_addr.cmp(&b.tcp_addr));
     out
 }
 
@@ -517,16 +532,16 @@ where
         let sock = Arc::clone(sock);
         let tx = tx.clone();
         recv_tasks.spawn(async move {
-            loop {
-                let mut buf = vec![0u8; 2048];
-                match sock.recv_from(&mut buf).await {
-                    Ok((len, src)) => {
-                        buf.truncate(len);
-                        if tx.send((buf, src)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            // One scratch buffer for the life of the task. Only the bytes a
+            // datagram actually occupies are copied onto the heap.
+            let mut scratch = [0u8; UDP_DATAGRAM_SCRATCH];
+            while let Ok((len, src)) = sock.recv_from(&mut scratch).await {
+                if tx
+                    .send((datagram_to_owned(&scratch[..len]), src))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
         });
@@ -651,6 +666,19 @@ where
     Ok(None)
 }
 
+/// Whether a search response names the search we sent.
+///
+/// `seq` is already matched by `run_search_recv_loop`, but it is derived from
+/// the wall clock and the pid (see `search_pv`) and so is guessable. The
+/// search-instance ID is the per-request identifier, and the PVA
+/// specification requires a response to echo the IDs it answers. A response
+/// that echoes none is not evidence about our request, so it is rejected —
+/// accepting it would let anything on the network that can guess `seq`
+/// redirect the client to a server of its choosing.
+fn search_response_identifies(cids: &[u32], cid: u32) -> bool {
+    cids.contains(&cid)
+}
+
 pub async fn search_pv(
     pv_name: &str,
     udp_port: u16,
@@ -699,7 +727,7 @@ pub async fn search_pv(
             if !payload.found {
                 return ControlFlow::Continue(());
             }
-            if !payload.cids.is_empty() && !payload.cids.contains(&cid) {
+            if !search_response_identifies(&payload.cids, cid) {
                 return ControlFlow::Continue(());
             }
             let addr = decode_search_response_addr(payload.addr, payload.port, src);
@@ -756,21 +784,50 @@ pub fn parse_name_servers(env_val: &str) -> Vec<SocketAddr> {
 }
 
 /// Build a minimal PVA ConnectionValidation response for name server search.
-fn encode_search_validation(version: u8, is_be: bool) -> Vec<u8> {
-    let user = default_authnz_user();
-    let host = default_authnz_host();
-    encode_client_connection_validation(87_040, 32_767, 0, "ca", &user, &host, version, is_be)
+fn encode_search_validation(creds: &AuthnzCreds, version: u8, is_be: bool) -> Vec<u8> {
+    encode_client_connection_validation(
+        87_040,
+        32_767,
+        0,
+        "ca",
+        &creds.user,
+        &creds.host,
+        version,
+        is_be,
+    )
 }
 
-/// Search for a PV via a TCP connection to a PVA name server.
+/// Search for a PV via a TCP connection to a PVA name server, authenticating
+/// with the environment-derived defaults.
 ///
-/// Connects to the name server, performs the PVA handshake, sends a search
-/// request over TCP, and returns the server address from the search response.
+/// Kept at this exact signature because it is public API and `spvirit-py`
+/// calls it with four arguments (`spvirit-py/src/discovery.rs:172`). To
+/// present configured credentials instead, see [`search_pv_tcp_with_creds`].
 pub async fn search_pv_tcp(
     pv_name: &str,
     name_server: SocketAddr,
     timeout_dur: Duration,
     debug_enabled: bool,
+) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
+    let creds = AuthnzCreds::from_env();
+    search_pv_tcp_with_creds(pv_name, name_server, timeout_dur, debug_enabled, &creds).await
+}
+
+/// Search for a PV via a TCP connection to a PVA name server, presenting the
+/// caller's configured `ca` credentials.
+///
+/// Connects to the name server, performs the PVA handshake, sends a search
+/// request over TCP, and returns the server address from the search response.
+///
+/// Prefer this over [`search_pv_tcp`] anywhere a `PvOptions` is in hand: the
+/// four-argument form authenticates as whatever the *environment* says, which
+/// silently diverges from every other connection in this crate.
+pub async fn search_pv_tcp_with_creds(
+    pv_name: &str,
+    name_server: SocketAddr,
+    timeout_dur: Duration,
+    debug_enabled: bool,
+    creds: &AuthnzCreds,
 ) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
     let deadline = tokio::time::Instant::now() + timeout_dur;
 
@@ -810,7 +867,7 @@ pub async fn search_pv_tcp(
         }
     }
 
-    let validation = encode_search_validation(version, is_be);
+    let validation = encode_search_validation(creds, version, is_be);
     stream.write_all(&validation).await?;
 
     // Wait for ConnectionValidated.
@@ -914,10 +971,14 @@ pub async fn resolve_pv_server(opts: &PvGetOptions) -> Result<(SocketAddr, [u8; 
 
     let mut set = tokio::task::JoinSet::new();
 
+    let creds = AuthnzCreds::from_options(opts);
+
     for ns in name_servers {
         let pv = pv.clone();
+        let creds = creds.clone();
         set.spawn(async move {
-            let result = search_pv_tcp(&pv, ns, timeout_dur, debug_enabled).await?;
+            let result =
+                search_pv_tcp_with_creds(&pv, ns, timeout_dur, debug_enabled, &creds).await?;
             Ok::<(SocketAddr, [u8; 12]), PvGetError>(result)
         });
     }
@@ -1370,5 +1431,141 @@ mod tests {
             }
             other => panic!("expected Decode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn search_validation_carries_the_configured_credentials() {
+        use spvirit_codec::epics_decode::PvaConnectionValidationPayload;
+
+        let creds = crate::auth::AuthnzCreds {
+            user: "configured-user".to_string(),
+            host: "configured-host".to_string(),
+        };
+        let frame = encode_search_validation(&creds, 2, false);
+
+        // Skip the 8-byte PVA header; decode the client->server payload.
+        let payload = PvaConnectionValidationPayload::new(&frame[8..], false, false)
+            .expect("validation payload decodes");
+        assert_eq!(payload.user.as_deref(), Some("configured-user"));
+        assert_eq!(payload.host.as_deref(), Some("configured-host"));
+    }
+
+    #[test]
+    fn authnz_creds_from_options_prefer_the_configured_values() {
+        // `search.rs` imports the alias `PvGetOptions`, not `PvOptions`
+        // (`search.rs:16`), so `use super::*` gives you that spelling.
+        let mut opts = PvGetOptions::new("X".to_string());
+        opts.authnz_user = Some("u1".to_string());
+        opts.authnz_host = Some("h1".to_string());
+
+        let creds = crate::auth::AuthnzCreds::from_options(&opts);
+        assert_eq!(creds.user, "u1");
+        assert_eq!(creds.host, "h1");
+    }
+
+    /// End to end: a name server that reads the client's ConnectionValidation
+    /// must see the credentials the caller configured, not the environment's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn name_server_search_sends_the_configured_credentials() {
+        use spvirit_codec::epics_decode::PvaPacket;
+        use spvirit_codec::spvirit_encode::{encode_connection_validation, encode_control_message};
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ns_addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<(Option<String>, Option<String>)>();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Server side of the handshake: SET_BYTE_ORDER then
+            // CONNECTION_VALIDATION, little-endian, version 2.
+            let sbo = encode_control_message(true, false, 2, 2, 0);
+            stream.write_all(&sbo).await.unwrap();
+            let cv = encode_connection_validation(16_384, 0, &["ca", "anonymous"], 2, false);
+            stream.write_all(&cv).await.unwrap();
+
+            // Read exactly one frame back: the client's validation response.
+            let mut reassembler = SegmentReassembler::new();
+            let bytes = read_packet(&mut stream, Duration::from_secs(5), &mut reassembler)
+                .await
+                .expect("client validation frame");
+            let mut pkt = PvaPacket::new(&bytes);
+            let creds = match pkt.decode_payload() {
+                Some(PvaPacketCommand::ConnectionValidation(p)) => (p.user, p.host),
+                other => panic!("expected ConnectionValidation, got {other:?}"),
+            };
+            let _ = tx.send(creds);
+            // Never answer: the client times out, which is the outcome this
+            // test expects. The stream MUST be held open — dropping it here
+            // would close the socket and turn the client's next read into
+            // `PvGetError::Io(UnexpectedEof)` instead of a timeout.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+
+        let creds = crate::auth::AuthnzCreds {
+            user: "search-user".to_string(),
+            host: "search-host".to_string(),
+        };
+        let err =
+            search_pv_tcp_with_creds("ANY:PV", ns_addr, Duration::from_secs(2), false, &creds)
+                .await
+                .expect_err("the fake name server never answers the search");
+        assert!(matches!(err, PvGetError::Timeout(_)), "got {err:?}");
+
+        let (user, host) = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("name server did not report the credentials")
+            .expect("oneshot dropped");
+        assert_eq!(user.as_deref(), Some("search-user"));
+        assert_eq!(host.as_deref(), Some("search-host"));
+    }
+
+    #[test]
+    fn discovered_servers_sort_numerically_not_by_formatted_string() {
+        let mk = |ip: &str, port: u16, guid: u8| DiscoveredServer {
+            guid: [guid; 12],
+            tcp_addr: format!("{ip}:{port}").parse().unwrap(),
+        };
+        // "10.0.0.10" < "10.0.0.2" as text, but 2 < 10 numerically.
+        let out = normalize_discovered_servers(vec![
+            mk("10.0.0.10", 5075, 1),
+            mk("10.0.0.2", 5075, 2),
+            mk("10.0.0.2", 5076, 3),
+        ]);
+        let got: Vec<String> = out.iter().map(|d| d.tcp_addr.to_string()).collect();
+        assert_eq!(got, vec!["10.0.0.2:5075", "10.0.0.2:5076", "10.0.0.10:5075"]);
+    }
+
+    #[test]
+    fn a_received_datagram_is_copied_at_its_actual_length() {
+        let scratch = [7u8; 2048];
+        let owned = datagram_to_owned(&scratch[..48]);
+        assert_eq!(owned.len(), 48);
+        assert_eq!(
+            owned.capacity(),
+            48,
+            "the receive scratch must not be handed on as a 2 KiB allocation"
+        );
+        assert!(owned.iter().all(|b| *b == 7));
+    }
+
+    #[test]
+    fn a_response_echoing_our_cid_is_accepted() {
+        assert!(search_response_identifies(&[0xDEAD_BEEF], 0xDEAD_BEEF));
+        assert!(search_response_identifies(&[1, 0xDEAD_BEEF, 2], 0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn a_response_echoing_someone_elses_cid_is_rejected() {
+        assert!(!search_response_identifies(&[1, 2, 3], 0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn a_response_echoing_no_cid_is_rejected() {
+        // `seq` is derived from the clock and the pid, so it is guessable.
+        // A response that does not name the search it answers must not be
+        // allowed to redirect us to an arbitrary server.
+        assert!(!search_response_identifies(&[], 0xDEAD_BEEF));
     }
 }

@@ -969,6 +969,21 @@ async fn handle_get_field_request(
         (sid, pv)
     };
 
+    // A request that explicitly names a channel this connection does not have
+    // is refused, with the same text GET/PUT use. Falling through to the
+    // listing below would hand the client the PV list as if it were that
+    // channel's introspection. Sid 0 is never allocated (sids start at 1) and
+    // is how a listing request names "no channel" — spvirit's own `pvlist`
+    // sends `encode_get_field_request(0, 0, ..)` — so it keeps listing.
+    if let Some(named) = payload.sid
+        && named != 0
+        && resolved_pv.is_none()
+    {
+        let resp = encode_get_field_error(request_id, "Unknown SID", version, is_be);
+        replier.send(resp).await;
+        return;
+    }
+
     if let Some(sid) = sid {
         if let Some(pv_name) = resolved_pv.as_ref() {
             if let Some(nt) = get_nt_snapshot(state, pv_name).await {

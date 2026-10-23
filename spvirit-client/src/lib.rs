@@ -37,6 +37,7 @@
 
 pub mod auth;
 pub mod byte_sink;
+pub mod cache;
 pub mod client;
 pub mod format;
 pub mod put_encode;
@@ -51,12 +52,13 @@ pub use byte_sink::ByteSink;
 
 // --- Re-exports: high-level API ---
 pub use pva_client::{
-    MonitorOptions, PvaChannel, PvaClient, PvaClientBuilder, client_from_opts, pvinfo, pvmonitor,
-    pvmonitor_fields, pvput, pvput_fields,
+    MonitorEnd, MonitorHandle, MonitorOptions, PvaChannel, PvaClient, PvaClientBuilder,
+    client_from_opts, pvinfo, pvmonitor, pvmonitor_fields, pvput, pvput_fields,
 };
 pub use pvlist::PvListSource;
 
 // --- Re-exports: client core ---
+pub use cache::{CacheConfig, CacheStats};
 pub use client::{ChannelConn, build_client_validation, establish_channel, pvget, pvget_fields};
 pub use format::{OutputFormat, RenderOptions, format_output};
 pub use search::{SearchTarget, build_auto_broadcast_targets, resolve_pv_server, search_pv};
@@ -67,4 +69,4 @@ pub use spvirit_codec::{DecodeError, SegmentOutcome, SegmentReassembler};
 
 // --- Re-exports: monitor updates (callbacks take a &MonitorUpdate) ---
 pub use spvirit_codec::MonitorUpdate;
-pub use types::{PvGetError, PvGetOptions, PvGetResult, PvMonitorEvent, PvOptions};
+pub use types::{PvGetError, PvGetOptions, PvGetResult, PvOptions};
