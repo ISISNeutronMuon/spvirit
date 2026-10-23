@@ -736,12 +736,11 @@ impl PvdDecoder {
             } else {
                 u16::from_le_bytes([data[1], data[2]])
             };
-            if let Some((ft, height)) = self.registry.borrow().get(&key) {
-                if let FieldType::Structure(desc) = ft {
+            if let Some((ft, height)) = self.registry.borrow().get(&key)
+                && let FieldType::Structure(desc) = ft {
                     self.check_resolved_height(*height)?;
                     return Ok((desc.clone(), 3));
                 }
-            }
             debug!(
                 "Introspection ONLY_ID (0xFE) key={} not found in registry",
                 key
@@ -1153,11 +1152,10 @@ impl PvdDecoder {
                 }
             }
         }
-        if !has_field_bits && !bitset.is_empty() && (bitset[0] & 0x01) != 0 {
-            if let Ok((value, consumed)) = self.decode_structure(data, desc) {
+        if !has_field_bits && !bitset.is_empty() && (bitset[0] & 0x01) != 0
+            && let Ok((value, consumed)) = self.decode_structure(data, desc) {
                 return Ok((value, consumed));
             }
-        }
 
         let mut fields: Vec<(String, DecodedValue)> = Vec::new();
         let mut offset = 0usize;
@@ -1469,16 +1467,14 @@ fn format_field_value_compact(name: &str, val: &DecodedValue) -> String {
                     let severity = fields.iter().find(|(n, _)| n == "severity");
                     let message = fields.iter().find(|(n, _)| n == "message");
                     let mut parts = Vec::new();
-                    if let Some((_, DecodedValue::Int32(s))) = severity {
-                        if *s != 0 {
+                    if let Some((_, DecodedValue::Int32(s))) = severity
+                        && *s != 0 {
                             parts.push(format!("sev={}", s));
                         }
-                    }
-                    if let Some((_, DecodedValue::String(m))) = message {
-                        if !m.is_empty() {
+                    if let Some((_, DecodedValue::String(m))) = message
+                        && !m.is_empty() {
                             parts.push(format!("\"{}\"", m));
                         }
-                    }
                     if parts.is_empty() {
                         String::new() // Don't show alarm if it's OK
                     } else {
@@ -1539,7 +1535,7 @@ fn format_scalar_value(val: &DecodedValue) -> String {
             if arr.is_empty() {
                 "[]".to_string()
             } else {
-                let items: Vec<String> = arr.iter().map(|v| format_scalar_value(v)).collect();
+                let items: Vec<String> = arr.iter().map(format_scalar_value).collect();
                 format!("[{}]", items.join(", "))
             }
         }

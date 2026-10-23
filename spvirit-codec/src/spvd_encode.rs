@@ -1527,8 +1527,8 @@ pub fn decode_pv_request_fields(body: &[u8], is_be: bool) -> Option<Vec<String>>
     let decoder = crate::spvd_decode::PvdDecoder::new(is_be);
     let desc = decoder.parse_introspection(body).ok()?;
     for field in &desc.fields {
-        if field.name == "field" {
-            if let FieldType::Structure(ref inner) = field.field_type {
+        if field.name == "field"
+            && let FieldType::Structure(ref inner) = field.field_type {
                 if inner.fields.is_empty() {
                     return None;
                 }
@@ -1539,7 +1539,6 @@ pub fn decode_pv_request_fields(body: &[u8], is_be: bool) -> Option<Vec<String>>
                 }
                 return Some(paths);
             }
-        }
     }
     None
 }
@@ -2573,18 +2572,17 @@ fn encode_values_for_bits(
                 encode_values_for_bits(v, inner, bits, idx, is_be, out);
             }
             _ => {
-                if bits[this] {
-                    if let Some(v) = sub {
+                if bits[this]
+                    && let Some(v) = sub {
                         out.extend_from_slice(&encode_decoded_value(v, is_be));
                     }
-                }
             }
         }
     }
 }
 
 fn encode_bitset_from_flags(bits: &[bool], is_be: bool) -> Vec<u8> {
-    let bitset_size = (bits.len() + 7) / 8;
+    let bitset_size = bits.len().div_ceil(8);
     let mut bitset = vec![0u8; bitset_size];
     for (i, b) in bits.iter().enumerate() {
         if *b {

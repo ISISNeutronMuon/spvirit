@@ -308,13 +308,12 @@ fn score_decoded(value: &DecodedValue) -> i32 {
             "timeStamp" => {
                 has_ts = true;
                 score += 2;
-                if let DecodedValue::Structure(ts_fields) = val {
-                    if let Some(secs) = ts_fields.iter().find_map(|(n, v)| {
-                        if n == "secondsPastEpoch" {
-                            if let DecodedValue::Int64(s) = v {
+                if let DecodedValue::Structure(ts_fields) = val
+                    && let Some(secs) = ts_fields.iter().find_map(|(n, v)| {
+                        if n == "secondsPastEpoch"
+                            && let DecodedValue::Int64(s) = v {
                                 return Some(*s);
                             }
-                        }
                         None
                     }) {
                         if (0..=4_000_000_000i64).contains(&secs) {
@@ -323,7 +322,6 @@ fn score_decoded(value: &DecodedValue) -> i32 {
                             score -= 2;
                         }
                     }
-                }
             }
             "display" | "control" => {
                 score += 1;
