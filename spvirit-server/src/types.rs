@@ -782,8 +782,26 @@ fn scalar_to_string(v: &ScalarValue) -> String {
 ///
 /// `None` means the value is not representable in the target type and the
 /// write must be refused — the same rule the wire PUT path applies through
-/// `crate::convert`. The two paths must not disagree. Every refusal is
-/// logged once at debug so a refused client write is visible in logs.
+/// `crate::convert`. The two paths must not disagree.
+///
+/// Every refusal from THIS function is logged once at debug so a refused
+/// client write is visible in logs; success and same-variant writes are not
+/// logged. The rule applies to `coerce_into` only: the `NtEnum` early return
+/// in `set_scalar_value` keeps its previous behaviour and refuses a
+/// non-integer or out-of-range index without logging.
+///
+/// Behaviour changes relative to the explicit-arm implementation this
+/// replaced (each pinned by a test in `mod tests`):
+/// 1. `U64`/`I64` into a `Str` target is exact (no f64 round-trip).
+/// 2. `F32` into a `Str` target is formatted from the f32, not a widened f64.
+/// 3. An out-of-range integer into a narrower integer target is refused
+///    (previously wrapped via `as`).
+/// 4. A non-finite or out-of-range float into an integer target is refused
+///    (previously saturated via `as`; NaN stored 0).
+/// 5. An unparsable string into an `F64` target currently holding NaN is
+///    refused. Previously the current NaN was "re-assigned", `NaN != NaN`
+///    reported a change and the timestamp was re-stamped for a write that
+///    changed nothing.
 fn coerce_into(target: &ScalarValue, incoming: ScalarValue) -> Option<ScalarValue> {
     if std::mem::discriminant(target) == std::mem::discriminant(&incoming) {
         return Some(incoming);
@@ -1534,7 +1552,12 @@ mod tests {
         assert_eq!(u.current_value(), ScalarValue::U16(3));
     }
 
-    // --- the two deliberate improvements ---
+    // --- deliberate behaviour changes (see `coerce_into`'s doc) ---
+    // 1. U64/I64 into Str is exact; 2. F32 into Str formats as f32;
+    // 3. out-of-range integer into a narrower integer is refused;
+    // 4. non-finite / out-of-range float into an integer is refused;
+    // 5. unparsable string into an F64 holding NaN is refused, not a
+    //    spurious change report. A refusal returns false and logs at debug.
 
     #[test]
     fn a_large_integer_written_to_a_string_record_is_exact() {
@@ -1558,6 +1581,106 @@ mod tests {
             "widening to f64 before formatting leaks f32 representation error"
         );
     }
+
+    #[test]
+    fn an_out_of_range_integer_into_a_narrower_integer_is_refused() {
+        // Change 3: the old code wrapped these via `as`.
+        let cases = [
+            (ScalarValue::U8(7), ScalarValue::I32(300)),
+            (ScalarValue::I8(7), ScalarValue::I64(-200)),
+            (ScalarValue::U16(7), ScalarValue::I32(-1)),
+        ];
+        for (target, incoming) in cases {
+            let mut rec = ai_record_of(target.clone());
+            assert!(
+                !rec.set_scalar_value(incoming.clone(), false),
+                "{incoming:?} into {target:?} must be refused"
+            );
+            assert_eq!(rec.current_value(), target, "refused write must not mutate");
+        }
+    }
+
+    #[test]
+    fn a_non_finite_or_out_of_range_float_into_an_integer_is_refused() {
+        // Change 4: the old code saturated these via `as` (NaN stored 0).
+        let cases = [
+            (ScalarValue::I32(7), ScalarValue::F64(f64::NAN)),
+            (ScalarValue::I32(7), ScalarValue::F64(f64::INFINITY)),
+            (ScalarValue::I32(7), ScalarValue::F64(1e10)),
+            (ScalarValue::U8(7), ScalarValue::F64(-1.0)),
+        ];
+        for (target, incoming) in cases {
+            let mut rec = ai_record_of(target.clone());
+            assert!(
+                !rec.set_scalar_value(incoming.clone(), false),
+                "{incoming:?} into {target:?} must be refused"
+            );
+            assert_eq!(rec.current_value(), target, "refused write must not mutate");
+        }
+    }
+
+    #[test]
+    fn an_unparsable_string_into_an_f64_holding_nan_is_refused() {
+        // Change 5: the old code re-assigned the current NaN, `NaN != NaN`
+        // reported a change, and the timestamp was re-stamped.
+        let mut rec = ai_record_of(ScalarValue::F64(f64::NAN));
+        let stamp_before = match &rec.data {
+            RecordData::Ai { nt, .. } => nt.time_stamp.clone(),
+            _ => unreachable!(),
+        };
+        assert!(!rec.set_scalar_value(ScalarValue::Str("abc".to_string()), false));
+        match rec.current_value() {
+            ScalarValue::F64(x) => assert!(x.is_nan(), "value must still be NaN, got {x}"),
+            other => panic!("target variant changed: {other:?}"),
+        }
+        let stamp_after = match &rec.data {
+            RecordData::Ai { nt, .. } => nt.time_stamp.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(stamp_after, stamp_before, "a refused write must not re-stamp");
+    }
+
+    #[test]
+    fn a_refused_coercion_is_logged_once_at_debug_and_success_is_not() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            let mut ok = ai_record_of(ScalarValue::I32(0));
+            assert!(ok.set_scalar_value(ScalarValue::F64(5.0), false));
+            let mut refused = ai_record_of(ScalarValue::U8(7));
+            assert!(!refused.set_scalar_value(ScalarValue::I32(300), false));
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).expect("utf8");
+        let lines: Vec<&str> = out.lines().filter(|l| l.contains("write refused")).collect();
+        assert_eq!(lines.len(), 1, "exactly one refusal line expected; got:
+{out}");
+        assert!(lines[0].contains("DEBUG"), "refusal must log at debug: {}", lines[0]);
+        assert!(lines[0].contains("U8(7)"), "log must name the target: {}", lines[0]);
+        assert!(lines[0].contains("I32(300)"), "log must name the incoming value: {}", lines[0]);
+    }
+
+    // --- preserved behaviour ---
 
     #[test]
     fn a_bool_written_to_a_string_record_stores_one_or_zero() {
