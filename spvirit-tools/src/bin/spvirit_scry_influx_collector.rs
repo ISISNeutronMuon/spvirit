@@ -144,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config: Config = toml::from_str(&std::fs::read_to_string(influxdb_config_file)?)?;
 
-    let loki_enabled = false;
+    let _loki_enabled = false;
 
     let loki_logger = LokiLogger::new(config.loki_url);
 
@@ -152,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         InfluxDB::new(config.url, config.bucket, config.org, config.token);
 
     let influxdb_ping = influxdb_client.ping();
-    let loki_ping = loki_logger.ping();
+    let _loki_ping = loki_logger.ping();
 
     if verbose {
         if debug_mode {

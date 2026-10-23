@@ -407,14 +407,13 @@ impl ExploreApp {
         if self.pv_index >= self.pvs.len() {
             self.pv_index = self.pvs.len().saturating_sub(1);
         }
-        if let Some(selected) = self.selected_pv.clone() {
-            if !self.pvs.contains(&selected) {
+        if let Some(selected) = self.selected_pv.clone()
+            && !self.pvs.contains(&selected) {
                 self.selected_pv = None;
                 self.last_snapshot = None;
                 self.snapshot_in_flight = false;
                 self.clear_chart_samples();
             }
-        }
     }
 
     fn start_filter_input(&mut self) {
@@ -688,8 +687,8 @@ impl ExploreApp {
                         if self.server_index >= self.servers.len() {
                             self.server_index = self.servers.len().saturating_sub(1);
                         }
-                        if let Some(prev) = self.selected_server {
-                            if !self.servers.contains(&prev) {
+                        if let Some(prev) = self.selected_server
+                            && !self.servers.contains(&prev) {
                                 self.selected_server = None;
                                 self.selected_pv = None;
                                 self.all_pvs.clear();
@@ -699,7 +698,6 @@ impl ExploreApp {
                                 self.list_in_flight = false;
                                 self.snapshot_in_flight = false;
                             }
-                        }
                         self.push_status(format!("Discovered {} server(s)", self.servers.len()));
                     }
                     Err(err) => {
@@ -1249,8 +1247,8 @@ fn run_ui(
             app.handle_event(evt);
         }
 
-        if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(tick_rate)?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -1329,7 +1327,6 @@ fn run_ui(
                     _ => {}
                 }
             }
-        }
     }
     Ok(())
 }

@@ -361,7 +361,7 @@ impl FingerprintEngine {
         // `HashMap` iteration order varies per process, and this vector feeds
         // export lines and TUI rows; sort so the output is a function of the
         // traffic alone.
-        out.sort_by(|a, b| a.key().cmp(&b.key()));
+        out.sort_by_key(|a| a.key());
         out
     }
 
@@ -373,7 +373,7 @@ impl FingerprintEngine {
             .iter()
             .map(|(key, acc)| self.finish(key, acc, now_unix_nanos))
             .collect();
-        out.sort_by(|a, b| a.key().cmp(&b.key()));
+        out.sort_by_key(|a| a.key());
         out
     }
 

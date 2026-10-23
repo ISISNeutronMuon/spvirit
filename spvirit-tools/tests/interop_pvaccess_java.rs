@@ -46,11 +46,10 @@ fn gradle_cmd(project_dir: &Path) -> Option<String> {
         "gradle"
     };
     let check = Command::new(name).arg("--version").output();
-    if let Ok(output) = check {
-        if output.status.success() {
+    if let Ok(output) = check
+        && output.status.success() {
             return Some(name.to_string());
         }
-    }
     None
 }
 

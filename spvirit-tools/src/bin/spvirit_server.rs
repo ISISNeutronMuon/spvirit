@@ -33,7 +33,7 @@ use spvirit_codec::spvirit_encode::{
     encode_op_put_get_init_error_response, encode_op_put_get_init_response,
     encode_op_put_getput_response_payload, encode_op_put_response, encode_op_put_status_response,
     encode_op_rpc_data_response_payload, encode_op_status_error_response,
-    encode_op_status_response, encode_search_response, ip_from_bytes, ip_to_bytes,
+    encode_op_status_response, encode_search_response, ip_to_bytes,
 };
 use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
@@ -439,95 +439,92 @@ async fn run_udp_search(
         };
         let version = pkt.header.version;
         let is_be = pkt.header.flags.is_msb;
-        match cmd {
-            PvaPacketCommand::Search(payload) => {
-                debug!(
-                    "UDP search from {}: pv_count={} mask=0x{:02x}",
-                    peer,
-                    payload.pv_requests.len(),
-                    payload.mask
-                );
-                let accepts_tcp = payload.protocols.is_empty()
-                    || payload
-                        .protocols
-                        .iter()
-                        .any(|p| p.eq_ignore_ascii_case("tcp"));
-                if !accepts_tcp {
-                    debug!("UDP search: no compatible protocol (tcp not accepted)");
-                    continue;
-                }
-                let pv_store = state.pv_store.read().await;
-                let cids = resolve_search_cids(
-                    &payload.pv_requests,
-                    state.pvlist_mode,
-                    |name| {
-                        pv_store.contains_key(name)
-                            || resolve_field_nt(&pv_store, name).is_some()
-                            || is_virtual_event_pv(name)
-                            || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
-                            || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
-                    },
-                    || {
-                        collect_visible_pv_names_iter(
-                            pv_store.keys().map(String::as_str),
-                            state.pvlist_mode,
-                            state.pvlist_allow_pattern.as_ref(),
-                            state.pvlist_max,
-                        )
-                    },
-                );
-                let response_required = (payload.mask & 0x01) != 0;
-                let server_discovery_ping = payload.pv_requests.is_empty();
-                let found = server_discovery_ping || !cids.is_empty();
-                if !found && !response_required {
-                    debug!("UDP search: no matches and response not required");
-                    continue;
-                }
-                let resp_ip = if let Some(ip) = advertise_ip {
-                    ip
-                } else if !addr.ip().is_unspecified() {
-                    addr.ip()
-                } else if let Some(ip) = infer_udp_response_ip(peer) {
-                    debug!("UDP search: inferred response address {}", ip);
-                    ip
-                } else {
-                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-                };
-                let addr_bytes = if resp_ip.is_unspecified() {
-                    debug!("UDP search: responding with zero address (unspecified listen)");
-                    [0u8; 16]
-                } else {
-                    ip_to_bytes(resp_ip)
-                };
-                let response = encode_search_response(
-                    guid,
-                    payload.seq,
-                    addr_bytes,
-                    tcp_port,
-                    "tcp",
-                    found,
-                    &cids,
-                    version,
-                    is_be,
-                );
-                let reply_target = search_reply_target(&payload.addr, payload.port, peer);
-                if let Err(e) = socket.send_to(&response, reply_target).await {
-                    debug!(
-                        "UDP search: failed sending {} matches to {}: {}",
-                        cids.len(),
-                        reply_target,
-                        e
-                    );
-                    continue;
-                }
-                debug!(
-                    "UDP search: responded found={} with {} matches to {}",
-                    found,
-                    cids.len(),
-                    reply_target
-                );
+        if let PvaPacketCommand::Search(payload) = cmd {
+            debug!(
+                "UDP search from {}: pv_count={} mask=0x{:02x}",
+                peer,
+                payload.pv_requests.len(),
+                payload.mask
+            );
+            let accepts_tcp = payload.protocols.is_empty()
+                || payload
+                    .protocols
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case("tcp"));
+            if !accepts_tcp {
+                debug!("UDP search: no compatible protocol (tcp not accepted)");
+                continue;
             }
-            _ => {}
+            let pv_store = state.pv_store.read().await;
+            let cids = resolve_search_cids(
+                &payload.pv_requests,
+                state.pvlist_mode,
+                |name| {
+                    pv_store.contains_key(name)
+                        || resolve_field_nt(&pv_store, name).is_some()
+                        || is_virtual_event_pv(name)
+                        || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
+                        || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
+                },
+                || {
+                    collect_visible_pv_names_iter(
+                        pv_store.keys().map(String::as_str),
+                        state.pvlist_mode,
+                        state.pvlist_allow_pattern.as_ref(),
+                        state.pvlist_max,
+                    )
+                },
+            );
+            let response_required = (payload.mask & 0x01) != 0;
+            let server_discovery_ping = payload.pv_requests.is_empty();
+            let found = server_discovery_ping || !cids.is_empty();
+            if !found && !response_required {
+                debug!("UDP search: no matches and response not required");
+                continue;
+            }
+            let resp_ip = if let Some(ip) = advertise_ip {
+                ip
+            } else if !addr.ip().is_unspecified() {
+                addr.ip()
+            } else if let Some(ip) = infer_udp_response_ip(peer) {
+                debug!("UDP search: inferred response address {}", ip);
+                ip
+            } else {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            };
+            let addr_bytes = if resp_ip.is_unspecified() {
+                debug!("UDP search: responding with zero address (unspecified listen)");
+                [0u8; 16]
+            } else {
+                ip_to_bytes(resp_ip)
+            };
+            let response = encode_search_response(
+                guid,
+                payload.seq,
+                addr_bytes,
+                tcp_port,
+                "tcp",
+                found,
+                &cids,
+                version,
+                is_be,
+            );
+            let reply_target = search_reply_target(&payload.addr, payload.port, peer);
+            if let Err(e) = socket.send_to(&response, reply_target).await {
+                debug!(
+                    "UDP search: failed sending {} matches to {}: {}",
+                    cids.len(),
+                    reply_target,
+                    e
+                );
+                continue;
+            }
+            debug!(
+                "UDP search: responded found={} with {} matches to {}",
+                found,
+                cids.len(),
+                reply_target
+            );
         }
     }
 }
@@ -1271,12 +1268,11 @@ async fn handle_connection(
                                 pipeline_ack,
                                 nfree
                             );
-                            if start {
-                                if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
+                            if start
+                                && let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     send_monitor_update_for(&state, &pv_name, conn_id, ioid, &nt)
                                         .await;
                                 }
-                            }
                         }
                     }
                     20 => {
@@ -1756,8 +1752,8 @@ async fn send_monitor_update_for(
     // Enqueue outside the lock; commit baseline + credit only on delivery.
     if send_msg(state, conn_id, msg).await {
         let mut monitors = state.monitors.lock().await;
-        if let Some(list) = monitors.get_mut(pv_name) {
-            if let Some(sub) = list
+        if let Some(list) = monitors.get_mut(pv_name)
+            && let Some(sub) = list
                 .iter_mut()
                 .find(|s| s.conn_id == conn_id && s.ioid == ioid)
             {
@@ -1766,7 +1762,6 @@ async fn send_monitor_update_for(
                 }
                 sub.last_snapshot = Some(payload.clone());
             }
-        }
     }
 }
 
@@ -1787,8 +1782,8 @@ async fn update_monitor_subscription(
     pipeline_enabled: Option<bool>,
 ) -> bool {
     let mut monitors = state.monitors.lock().await;
-    if let Some(list) = monitors.get_mut(pv_name) {
-        if let Some(sub) = list
+    if let Some(list) = monitors.get_mut(pv_name)
+        && let Some(sub) = list
             .iter_mut()
             .find(|s| s.conn_id == conn_id && s.ioid == ioid)
         {
@@ -1796,14 +1791,12 @@ async fn update_monitor_subscription(
             if let Some(v) = nfree {
                 sub.nfree = v.min(MAX_PIPELINE_WINDOW);
             }
-            if let Some(enabled) = pipeline_enabled {
-                if enabled {
+            if let Some(enabled) = pipeline_enabled
+                && enabled {
                     sub.pipeline_enabled = true;
                 }
-            }
             return true;
         }
-    }
     false
 }
 
@@ -1930,8 +1923,8 @@ async fn handle_get_field_request(
         (sid, pv)
     };
 
-    if let Some(sid) = sid {
-        if let Some(pv_name) = resolved_pv.as_ref() {
+    if let Some(sid) = sid
+        && let Some(pv_name) = resolved_pv.as_ref() {
             if let Some(nt) = get_nt_snapshot(state, pv_name).await {
                 let full_desc = nt_payload_desc(&nt);
                 // If a sub-field name was requested, filter the introspection
@@ -1973,7 +1966,6 @@ async fn handle_get_field_request(
             send_msg(state, conn_id, resp).await;
             return;
         }
-    }
 
     if state.pvlist_mode != PvListMode::List {
         let resp = encode_get_field_error(
@@ -2483,15 +2475,13 @@ fn process_record_by_name(
     };
 
     let mut disabled = disa;
-    if !disabled {
-        if let Some(link) = sdis.as_ref() {
-            if let Some(ScalarValue::Bool(true)) =
+    if !disabled
+        && let Some(link) = sdis.as_ref()
+            && let Some(ScalarValue::Bool(true)) =
                 read_link_value(store, link, compute_alarms, active, changed_names)
             {
                 disabled = true;
             }
-        }
-    }
     if disabled {
         if let Some(record) = store.get_mut(pv_name) {
             let nt = record.nt_mut();
@@ -2738,13 +2728,10 @@ fn process_record_body(
             if let Some(link) = chosen {
                 if let Some(value) =
                     read_link_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(v) = scalar_to_f64(&value) {
-                        if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(v) = scalar_to_f64(&value)
+                        && let Some(record) = store.get_mut(pv_name) {
                             record.set_scalar_value(ScalarValue::F64(v), compute_alarms);
                         }
-                    }
-                }
             } else if simm {
                 let _ = siml;
             }
@@ -2764,39 +2751,32 @@ fn process_record_body(
                 .get(pv_name)
                 .and_then(|rec| scalar_to_f64(&rec.current_value()))
                 .unwrap_or(0.0);
-            if matches!(omsl, OutputMode::ClosedLoop) {
-                if let Some(link) = dol.as_ref() {
-                    if let Some(value) =
+            if matches!(omsl, OutputMode::ClosedLoop)
+                && let Some(link) = dol.as_ref()
+                    && let Some(value) =
                         read_link_value(store, link, compute_alarms, active, changed_names)
-                    {
-                        if let Some(v) = scalar_to_f64(&value) {
+                        && let Some(v) = scalar_to_f64(&value) {
                             next = v;
                         }
-                    }
-                }
-            }
-            if let Some(min) = drvl {
-                if next < min {
+            if let Some(min) = drvl
+                && next < min {
                     next = min;
                 }
-            }
-            if let Some(max) = drvh {
-                if next > max {
+            if let Some(max) = drvh
+                && next > max {
                     next = max;
                 }
-            }
             let prev = store
                 .get(pv_name)
                 .and_then(|rec| scalar_to_f64(&rec.current_value()))
                 .unwrap_or(next);
-            if let Some(limit) = oroc {
-                if limit > 0.0 {
+            if let Some(limit) = oroc
+                && limit > 0.0 {
                     let delta = next - prev;
                     if delta.abs() > limit {
                         next = prev + delta.signum() * limit;
                     }
                 }
-            }
             if let Some(record) = store.get_mut(pv_name) {
                 record.set_scalar_value(ScalarValue::F64(next), compute_alarms);
             }
@@ -2824,17 +2804,13 @@ fn process_record_body(
             } else {
                 inp.as_ref()
             };
-            if let Some(link) = chosen {
-                if let Some(value) =
+            if let Some(link) = chosen
+                && let Some(value) =
                     read_link_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(v) = scalar_to_bool(&value) {
-                        if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(v) = scalar_to_bool(&value)
+                        && let Some(record) = store.get_mut(pv_name) {
                             record.set_scalar_value(ScalarValue::Bool(v), compute_alarms);
                         }
-                    }
-                }
-            }
         }
         RecordPlan::Bo {
             out,
@@ -2848,17 +2824,13 @@ fn process_record_body(
                 .get(pv_name)
                 .and_then(|rec| scalar_to_bool(&rec.current_value()))
                 .unwrap_or(false);
-            if matches!(omsl, OutputMode::ClosedLoop) {
-                if let Some(link) = dol.as_ref() {
-                    if let Some(value) =
+            if matches!(omsl, OutputMode::ClosedLoop)
+                && let Some(link) = dol.as_ref()
+                    && let Some(value) =
                         read_link_value(store, link, compute_alarms, active, changed_names)
-                    {
-                        if let Some(v) = scalar_to_bool(&value) {
+                        && let Some(v) = scalar_to_bool(&value) {
                             next = v;
                         }
-                    }
-                }
-            }
             if let Some(record) = store.get_mut(pv_name) {
                 record.set_scalar_value(ScalarValue::Bool(next), compute_alarms);
             }
@@ -2886,17 +2858,13 @@ fn process_record_body(
             } else {
                 inp.as_ref()
             };
-            if let Some(link) = chosen {
-                if let Some(value) =
+            if let Some(link) = chosen
+                && let Some(value) =
                     read_link_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(v) = scalar_to_string(&value) {
-                        if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(v) = scalar_to_string(&value)
+                        && let Some(record) = store.get_mut(pv_name) {
                             record.set_scalar_value(ScalarValue::Str(v), compute_alarms);
                         }
-                    }
-                }
-            }
         }
         RecordPlan::StringOut {
             out,
@@ -2910,17 +2878,13 @@ fn process_record_body(
                 .get(pv_name)
                 .and_then(|rec| scalar_to_string(&rec.current_value()))
                 .unwrap_or_default();
-            if matches!(omsl, OutputMode::ClosedLoop) {
-                if let Some(link) = dol.as_ref() {
-                    if let Some(value) =
+            if matches!(omsl, OutputMode::ClosedLoop)
+                && let Some(link) = dol.as_ref()
+                    && let Some(value) =
                         read_link_value(store, link, compute_alarms, active, changed_names)
-                    {
-                        if let Some(v) = scalar_to_string(&value) {
+                        && let Some(v) = scalar_to_string(&value) {
                             next = v;
                         }
-                    }
-                }
-            }
             if let Some(record) = store.get_mut(pv_name) {
                 record.set_scalar_value(ScalarValue::Str(next.clone()), compute_alarms);
             }
@@ -2941,30 +2905,25 @@ fn process_record_body(
             }
         }
         RecordPlan::Waveform { inp } => {
-            if let Some(link) = inp.as_ref() {
-                if let Some(arr) =
+            if let Some(link) = inp.as_ref()
+                && let Some(arr) =
                     read_link_array_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(record) = store.get_mut(pv_name) {
                         set_record_array_value(record, arr);
                     }
-                }
-            }
         }
         RecordPlan::Aao { out, dol, omsl } => {
             let mut next = store.get(pv_name).and_then(record_array_value).unwrap_or(
                 // Keep default deterministic in case parser left this empty.
                 ScalarArrayValue::F64(Vec::new()),
             );
-            if matches!(omsl, OutputMode::ClosedLoop) {
-                if let Some(link) = dol.as_ref() {
-                    if let Some(arr) =
+            if matches!(omsl, OutputMode::ClosedLoop)
+                && let Some(link) = dol.as_ref()
+                    && let Some(arr) =
                         read_link_array_value(store, link, compute_alarms, active, changed_names)
                     {
                         next = arr;
                     }
-                }
-            }
             if let Some(record) = store.get_mut(pv_name) {
                 set_record_array_value(record, next.clone());
             }
@@ -2994,21 +2953,18 @@ fn process_record_body(
             }
         }
         RecordPlan::NtTable { inp, out, omsl } => {
-            if let Some(link) = inp.as_ref() {
-                if let Some(arr) =
+            if let Some(link) = inp.as_ref()
+                && let Some(arr) =
                     read_link_array_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(record) = store.get_mut(pv_name) {
                         set_record_array_value(record, arr);
                     }
-                }
-            }
             if matches!(omsl, OutputMode::ClosedLoop) {
                 // closed-loop NtTable: intentionally no-op for now (table DOL not supported)
             }
-            if let Some(link) = out.as_ref() {
-                if let Some(record) = store.get(pv_name) {
-                    if let NtPayload::Table(nt) = record.data.payload() {
+            if let Some(link) = out.as_ref()
+                && let Some(record) = store.get(pv_name)
+                    && let NtPayload::Table(nt) = record.data.payload() {
                         for col in &nt.columns {
                             write_link_array_value(
                                 store,
@@ -3020,25 +2976,20 @@ fn process_record_body(
                             );
                         }
                     }
-                }
-            }
         }
         RecordPlan::NtNdArray { inp, out, omsl } => {
-            if let Some(link) = inp.as_ref() {
-                if let Some(arr) =
+            if let Some(link) = inp.as_ref()
+                && let Some(arr) =
                     read_link_array_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(record) = store.get_mut(pv_name) {
                         set_record_array_value(record, arr);
                     }
-                }
-            }
             if matches!(omsl, OutputMode::ClosedLoop) {
                 // closed-loop NtNdArray: intentionally no-op for now (ndarray DOL not supported)
             }
-            if let Some(link) = out.as_ref() {
-                if let Some(record) = store.get(pv_name) {
-                    if let NtPayload::NdArray(nt) = record.data.payload() {
+            if let Some(link) = out.as_ref()
+                && let Some(record) = store.get(pv_name)
+                    && let NtPayload::NdArray(nt) = record.data.payload() {
                         write_link_array_value(
                             store,
                             link,
@@ -3048,8 +2999,6 @@ fn process_record_body(
                             changed_names,
                         );
                     }
-                }
-            }
         }
         RecordPlan::Inert => {
             // NtEnum and Generic records do not participate in link processing.
@@ -3146,11 +3095,10 @@ fn write_link_value(
     } = link
     {
         let resolved = normalize_link_target(target);
-        if let Some(target_record) = store.get_mut(&resolved) {
-            if target_record.set_scalar_value(value, compute_alarms) {
+        if let Some(target_record) = store.get_mut(&resolved)
+            && target_record.set_scalar_value(value, compute_alarms) {
                 changed_names.insert(resolved.clone());
             }
-        }
         if *process_passive {
             process_record_by_name(store, &resolved, compute_alarms, active, changed_names);
         }
@@ -3290,6 +3238,10 @@ async fn handle_control_message(state: &Arc<ServerState>, conn_id: u64, header: 
         );
         send_msg(state, conn_id, resp).await;
     }
+}
+
+fn file_mtime(path: &str) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 #[cfg(test)]
@@ -4246,8 +4198,4 @@ record(ai, "I") {{
             "should_post_update must run on a value change so last_posted stays current"
         );
     }
-}
-
-fn file_mtime(path: &str) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }

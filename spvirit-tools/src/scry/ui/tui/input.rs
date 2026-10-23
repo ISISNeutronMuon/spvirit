@@ -259,11 +259,10 @@ pub fn handle_key_event(state: &mut AppState, key: KeyCode) -> InputOutcome {
         state.open_interface_menu();
         return InputOutcome::Handled;
     }
-    if key == KeyCode::Char('i') && state.current_page != Page::Decoded {
-        if state.cycle_interface() {
+    if key == KeyCode::Char('i') && state.current_page != Page::Decoded
+        && state.cycle_interface() {
             return InputOutcome::Handled;
         }
-    }
 
     if state.current_page == Page::Connections {
         match key {

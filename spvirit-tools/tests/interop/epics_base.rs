@@ -150,10 +150,10 @@ record(ao, "{}") {{
         .child_mut()
         .stdout
         .take()
-        .and_then(|stdout| {
+        .map(|stdout| {
             let reader = std::io::BufReader::new(stdout);
             let lines: Vec<String> = reader.lines().flatten().collect();
-            Some(lines.join("\n"))
+            lines.join("\n")
         })
         .unwrap_or_default();
     assert!(
@@ -254,10 +254,10 @@ record(ao, "{}") {{
         .child_mut()
         .stdout
         .take()
-        .and_then(|stdout| {
+        .map(|stdout| {
             let reader = std::io::BufReader::new(stdout);
             let lines: Vec<String> = reader.lines().flatten().collect();
-            Some(lines.join("\n"))
+            lines.join("\n")
         })
         .unwrap_or_default();
     // First frame is the full filtered projection (contains severity). Any

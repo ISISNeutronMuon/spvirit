@@ -26,8 +26,8 @@ fn parse_cli_value(raw: &str) -> Value {
     if lowered == "false" {
         return Value::Bool(false);
     }
-    if raw.contains('.') || raw.contains('e') || raw.contains('E') {
-        if let Ok(f) = raw.parse::<f64>() {
+    if (raw.contains('.') || raw.contains('e') || raw.contains('E'))
+        && let Ok(f) = raw.parse::<f64>() {
             // `Number::from_f64` is None for inf/NaN, and `"1e999".parse()`
             // is `Ok(inf)`. Fall through to the string path rather than
             // panicking on user CLI input.
@@ -35,7 +35,6 @@ fn parse_cli_value(raw: &str) -> Value {
                 return Value::Number(n);
             }
         }
-    }
     if let Ok(i) = raw.parse::<i64>() {
         return Value::Number(serde_json::Number::from(i));
     }
@@ -164,7 +163,7 @@ async fn pvput_full_flow(opts: &PvGetOptions, input: &Value) -> Result<(), PvGet
         }
     };
 
-    let payload = encode_put_payload(&desc, input, is_be).map_err(|e| PvGetError::Protocol(e))?;
+    let payload = encode_put_payload(&desc, input, is_be).map_err(PvGetError::Protocol)?;
 
     // EPICS-base-style probe/readback step before writing value.
     let put_get_req = encode_put_request(sid, put_ioid, 0x40, &[], version, is_be);
@@ -296,15 +295,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Support PV=VALUE syntax: split on the first '=' in the pv_name argument.
     // This allows negative numbers (e.g. pvput COUNTER=-1) that would otherwise
     // be mis-parsed as flags.
-    if value_arg.is_none() && json_arg.is_none() {
-        if let Some(eq_pos) = pv_name.find('=') {
+    if value_arg.is_none() && json_arg.is_none()
+        && let Some(eq_pos) = pv_name.find('=') {
             let val = pv_name[eq_pos + 1..].to_string();
             pv_name.truncate(eq_pos);
             if !val.is_empty() {
                 value_arg = Some(val);
             }
         }
-    }
 
     let input = match (json_arg, value_arg) {
         (Some(json), None) => serde_json::from_str(&json)?,

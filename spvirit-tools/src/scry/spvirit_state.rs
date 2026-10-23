@@ -554,9 +554,8 @@ impl PvaStateTracker {
         conn.touch();
 
         // Only add if not already present
-        if !conn.channels_by_cid.contains_key(&cid) {
-            conn.channels_by_cid
-                .insert(cid, ChannelInfo::new_pending(cid, pv_name));
+        if let std::collections::hash_map::Entry::Vacant(e) = conn.channels_by_cid.entry(cid) {
+            e.insert(ChannelInfo::new_pending(cid, pv_name));
             self.total_channels += 1;
             self.stats.channels_created += 1;
             debug!("CREATE_CHANNEL request: cid={}", cid);
@@ -675,11 +674,10 @@ impl PvaStateTracker {
 
     /// Handle operation DESTROY (subcmd & 0x10)
     pub fn on_op_destroy(&mut self, conn_key: &ConnectionKey, ioid: u32) {
-        if let Some(conn) = self.connections.get_mut(conn_key) {
-            if conn.operations.remove(&ioid).is_some() {
+        if let Some(conn) = self.connections.get_mut(conn_key)
+            && conn.operations.remove(&ioid).is_some() {
                 self.stats.operations_completed += 1;
             }
-        }
     }
 
     /// Touch connection, operation, and channel activity for any op message (data updates, etc.)
@@ -725,12 +723,11 @@ impl PvaStateTracker {
             created_placeholder = true;
         }
 
-        if let Some(sid_val) = channel_sid {
-            if let Some(channel) = conn.get_channel_by_sid_mut(sid_val) {
+        if let Some(sid_val) = channel_sid
+            && let Some(channel) = conn.get_channel_by_sid_mut(sid_val) {
                 channel.touch();
                 Self::record_update(&mut channel.update_times, max_update_rate);
             }
-        }
 
         // Deferred stat update — can't touch self.stats while conn borrows self
         if created_placeholder {
@@ -765,8 +762,8 @@ impl PvaStateTracker {
         let mut retroactive_count: u64 = 0;
         for conn in self.connections.values_mut() {
             for (cid, channel) in conn.channels_by_cid.iter_mut() {
-                if channel.pv_name.starts_with("<unknown") {
-                    if let Some(pv_name) = cid_to_pv.get(cid) {
+                if channel.pv_name.starts_with("<unknown")
+                    && let Some(pv_name) = cid_to_pv.get(cid) {
                         debug!(
                             "Retroactive PV resolve from SEARCH: cid={} {} -> {}",
                             cid, channel.pv_name, pv_name
@@ -775,7 +772,6 @@ impl PvaStateTracker {
                         channel.fully_established = true;
                         retroactive_count += 1;
                     }
-                }
             }
 
             // Also update placeholder operations that have pv_name=None
@@ -785,13 +781,11 @@ impl PvaStateTracker {
                     None => true,
                     Some(name) => name.starts_with("<unknown"),
                 };
-                if needs_update && op.sid != 0 {
-                    if let Some(&cid) = conn.sid_to_cid.get(&op.sid) {
-                        if let Some(pv_name) = cid_to_pv.get(&cid) {
+                if needs_update && op.sid != 0
+                    && let Some(&cid) = conn.sid_to_cid.get(&op.sid)
+                        && let Some(pv_name) = cid_to_pv.get(&cid) {
                             op.pv_name = Some(pv_name.clone());
                         }
-                    }
-                }
             }
         }
         if retroactive_count > 0 {
@@ -874,11 +868,10 @@ impl PvaStateTracker {
                 channel_sid = Some(op.sid);
             }
         }
-        if let Some(sid_val) = channel_sid {
-            if let Some(channel) = conn.get_channel_by_sid_mut(sid_val) {
+        if let Some(sid_val) = channel_sid
+            && let Some(channel) = conn.get_channel_by_sid_mut(sid_val) {
                 Self::push_message(&mut channel.recent_messages, full_message);
             }
-        }
     }
 
     fn record_update(times: &mut VecDeque<Instant>, max_update_rate: usize) {
@@ -916,20 +909,17 @@ impl PvaStateTracker {
         let conn = self.connections.get(conn_key)?;
 
         // First try by IOID (operation state) - works for server responses
-        if let Some(op) = conn.operations.get(&ioid) {
-            if let Some(ref name) = op.pv_name {
-                if !name.starts_with("<unknown") {
+        if let Some(op) = conn.operations.get(&ioid)
+            && let Some(ref name) = op.pv_name
+                && !name.starts_with("<unknown") {
                     return Some(name.clone());
                 }
-            }
-        }
 
         // Fall back to SID lookup - works for client requests
-        if sid != 0 {
-            if let Some(name) = conn.get_pv_name_by_sid(sid) {
+        if sid != 0
+            && let Some(name) = conn.get_pv_name_by_sid(sid) {
                 return Some(name.to_string());
             }
-        }
 
         // Last resort: if there's exactly one channel AND at most one operation,
         // use that channel's PV name. This handles simple single-PV connections
@@ -940,13 +930,11 @@ impl PvaStateTracker {
         // Phoebus). If we only captured one CREATE_CHANNEL but there are many
         // ops, the other ops likely belong to different PVs that were established
         // before our capture started.
-        if conn.channels_by_cid.len() == 1 && conn.operations.len() <= 1 {
-            if let Some(ch) = conn.channels_by_cid.values().next() {
-                if !ch.pv_name.starts_with("<unknown") {
+        if conn.channels_by_cid.len() == 1 && conn.operations.len() <= 1
+            && let Some(ch) = conn.channels_by_cid.values().next()
+                && !ch.pv_name.starts_with("<unknown") {
                     return Some(ch.pv_name.clone());
                 }
-            }
-        }
 
         None
     }
@@ -1008,8 +996,8 @@ impl PvaStateTracker {
         // Remove oldest
         let mut evicted = 0;
         for (conn_key, cid, _) in oldest.into_iter().take(count) {
-            if let Some(conn) = self.connections.get_mut(&conn_key) {
-                if let Some(channel) = conn.channels_by_cid.remove(&cid) {
+            if let Some(conn) = self.connections.get_mut(&conn_key)
+                && let Some(channel) = conn.channels_by_cid.remove(&cid) {
                     if let Some(sid) = channel.sid {
                         conn.sid_to_cid.remove(&sid);
                         conn.operations.retain(|_, op| op.sid != sid);
@@ -1018,7 +1006,6 @@ impl PvaStateTracker {
                     self.stats.channels_evicted += 1;
                     evicted += 1;
                 }
-            }
         }
         evicted
     }

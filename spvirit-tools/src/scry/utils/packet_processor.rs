@@ -264,9 +264,9 @@ pub fn process_packets(
 
     debug!("Starting packet processing loop");
     loop {
-        if let Some(selection) = interface_selection.as_ref() {
-            if let Some(next_device) = selection.current_name() {
-                if next_device != current_device {
+        if let Some(selection) = interface_selection.as_ref()
+            && let Some(next_device) = selection.current_name()
+                && next_device != current_device {
                     match try_create_capture(&next_device) {
                         Ok(new_cap) => {
                             debug!("Switching capture interface to {}", next_device);
@@ -322,8 +322,6 @@ pub fn process_packets(
                         }
                     }
                 }
-            }
-        }
         match cap.next_packet() {
             Ok(packet) => {
                 // Capture timestamp for observable O4. Read before the packet
@@ -332,7 +330,7 @@ pub fn process_packets(
                 let observed_unix_nanos: i128 = (packet.header.ts.tv_sec as i128)
                     * 1_000_000_000
                     + (packet.header.ts.tv_usec as i128) * 1_000;
-                let parsed = match parse_packet(&packet.data) {
+                let parsed = match parse_packet(packet.data) {
                     Some(parsed) => parsed,
                     None => continue,
                 };
@@ -380,12 +378,11 @@ pub fn process_packets(
                         stream_dropped = stream_dropped.saturating_add(1);
                     }
                     ranges = find_pva_message_ranges(buffer);
-                    if let Some((first_start, _)) = ranges.first() {
-                        if *first_start > 0 {
+                    if let Some((first_start, _)) = ranges.first()
+                        && *first_start > 0 {
                             buffer.drain(0..*first_start);
                             ranges = find_pva_message_ranges(buffer);
                         }
-                    }
                 } else if parsed.protocol == 17 {
                     ranges = find_pva_message_ranges(payload);
                 }
@@ -616,9 +613,9 @@ pub fn process_packets(
                         let mut is_tracked = false;
 
                         // For Op packets, try to decode values using stored field description
-                        if let Some(ref mut command) = decoded_packet {
-                            if let PvaPacketCommand::Op(op_payload) = command {
-                                if let Some(ref ck) = conn_key {
+                        if let Some(ref mut command) = decoded_packet
+                            && let PvaPacketCommand::Op(op_payload) = command
+                                && let Some(ref ck) = conn_key {
                                     // Touch connection/op/channel activity on any op message
                                     // Pass command so mid-stream joins auto-create placeholder ops
                                     pva_state.on_op_activity(
@@ -686,8 +683,6 @@ pub fn process_packets(
                                         }
                                     }
                                 }
-                            }
-                        }
 
                         // Extract structured fields for normalized Loki output
                         let mut event_pv_name: Option<String> = None;
@@ -809,7 +804,7 @@ pub fn process_packets(
                                 ck,
                                 sid,
                                 ioid,
-                                &message_command,
+                                message_command,
                                 context_string.clone(),
                                 is_server,
                             );
@@ -893,8 +888,8 @@ pub fn process_packets(
                         // client's polling rather than the source's scan rate
                         // and would corrupt O3. Do not "fix" this by widening
                         // the command match.
-                        if fp_enabled {
-                            if let Some(PvaPacketCommand::Op(ref op_payload)) = decoded_packet {
+                        if fp_enabled
+                            && let Some(PvaPacketCommand::Op(ref op_payload)) = decoded_packet {
                                 // subcmd 0x00 = data update, 0x40 = pipeline
                                 // data. INIT (0x08) and DESTROY (0x10) carry
                                 // no sample and are never admitted.
@@ -982,7 +977,6 @@ pub fn process_packets(
                                     }
                                 }
                             }
-                        }
                         if_stats.add_event(event);
 
                         if last_snapshot.elapsed().as_secs() >= 1 {
@@ -1126,11 +1120,10 @@ pub fn process_packets(
                         }
                     }
 
-                if is_tcp && last_tcp_end > 0 {
-                    if let Some(buffer) = stream_buffers.get_mut(&stream_key) {
+                if is_tcp && last_tcp_end > 0
+                    && let Some(buffer) = stream_buffers.get_mut(&stream_key) {
                         buffer.drain(0..last_tcp_end);
                     }
-                }
 
                 if handled_any && !counted {
                     accumulator += packet.data.len() as u64;

@@ -150,11 +150,10 @@ fn join_multicast_v4(socket: &std::net::UdpSocket) {
         Err(_) => return,
     };
     for iface in &ifaces {
-        if let IfAddr::V4(v4) = &iface.addr {
-            if !v4.ip.is_loopback() {
+        if let IfAddr::V4(v4) = &iface.addr
+            && !v4.ip.is_loopback() {
                 let _ = socket.join_multicast_v4(&PVA_MULTICAST_V4, &v4.ip);
             }
-        }
     }
 }
 
@@ -928,8 +927,8 @@ fn run_ui(
         }
         app.rebuild_sorted_keys();
 
-        if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(tick_rate)?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -999,7 +998,6 @@ fn run_ui(
                     _ => {}
                 }
             }
-        }
     }
     Ok(())
 }
