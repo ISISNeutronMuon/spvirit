@@ -92,6 +92,34 @@ fn monitor_data_body(bytes: &[u8], expect_ioid: u32, is_be: bool) -> Option<&[u8
     Some(&body[IOID_LEN + SUBCMD_LEN..])
 }
 
+/// Write one ECHO control frame and advance the token.
+///
+/// Returns the write error rather than swallowing it: a socket that cannot
+/// accept an 8-byte keepalive is not going to deliver updates either, so the
+/// caller ends the subscription.
+async fn write_echo<W>(stream: &mut W, token: &mut u32, is_be: bool) -> Result<(), PvGetError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let msg = encode_control_message(false, is_be, PVA_VERSION, 3, *token);
+    *token = token.wrapping_add(1);
+    stream.write_all(&msg).await?;
+    Ok(())
+}
+
+/// The monitor loop's 10 s keepalive interval.
+///
+/// Default `Burst` fires one catch-up tick per missed period, so any stall
+/// longer than 10 s emits a burst of ECHOs at once (prior audit item C6).
+/// `Delay` emits one and re-bases the schedule. Extracted so the behaviour is
+/// testable without driving a whole subscription.
+fn new_echo_interval() -> tokio::time::Interval {
+    let mut i = interval(Duration::from_secs(10));
+    i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    i
+}
+
 /// Marks the point at which an operation stops being safe to re-run, and
 /// whether its connection may go back into the pool.
 ///
@@ -953,7 +981,7 @@ impl PvaClient {
         let ack_threshold: u32 = pipeline_queue.map(|q| (q / 2).max(1)).unwrap_or(0);
 
         // Event loop — with echo keepalive and timeout resilience
-        let mut echo_interval = interval(Duration::from_secs(10));
+        let mut echo_interval = new_echo_interval();
         let mut echo_token: u32 = 1;
 
         // Persistent partial-read state: the echo branch below drops the read
@@ -965,9 +993,7 @@ impl PvaClient {
         loop {
             tokio::select! {
                 _ = echo_interval.tick() => {
-                    let msg = encode_control_message(false, is_be, PVA_VERSION, 3, echo_token);
-                    echo_token = echo_token.wrapping_add(1);
-                    let _ = stream.write_all(&msg).await;
+                    write_echo(&mut stream, &mut echo_token, is_be).await?;
                 }
                 res = read_frame_resumable(&mut stream, self.timeout, &mut reassembler, &mut frame_buf) => {
                     let bytes = match res {
@@ -2617,6 +2643,76 @@ mod tests {
             assert_eq!(pv, PV);
             assert_eq!(host, &server_addr.to_string());
         }
+    }
+
+    // ─── echo keepalive ────────────────────────────────────────────────
+
+    /// The echo keepalive surfaces its write error instead of swallowing it: a
+    /// socket that cannot take an 8-byte control frame is not going to deliver updates, and the
+    /// monitor loop propagates this with `?` to end the subscription.
+    #[tokio::test]
+    async fn write_echo_surfaces_the_write_error() {
+        // A duplex pair whose far half is dropped: every write fails.
+        let (mut near, far) = tokio::io::duplex(64);
+        drop(far);
+
+        let mut token = 1u32;
+        let result = write_echo(&mut near, &mut token, false).await;
+        assert!(
+            result.is_err(),
+            "writing to a dropped duplex half must return Err, not be discarded"
+        );
+    }
+
+    /// The echo keepalive advances its token so successive ECHOs are
+    /// distinguishable, and it writes a control frame each time.
+    #[tokio::test]
+    async fn write_echo_advances_the_token() {
+        let (mut near, mut far) = tokio::io::duplex(256);
+        let mut token = 1u32;
+        write_echo(&mut near, &mut token, false)
+            .await
+            .expect("first echo");
+        write_echo(&mut near, &mut token, false)
+            .await
+            .expect("second echo");
+        assert_eq!(token, 3, "token must advance once per echo");
+
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 16];
+        far.read_exact(&mut buf)
+            .await
+            .expect("two 8-byte control frames");
+        assert_eq!(buf[2] & 0x01, 0x01, "an ECHO is a control frame");
+        assert_eq!(buf[3], 3, "control command 3 is ECHO");
+    }
+
+    /// Guards prior audit item C6 on the interval the monitor loop actually uses:
+    /// with tokio's default `Burst`, a stall longer than the 10 s period makes
+    /// `tick()` return immediately once per missed period, emitting a burst of
+    /// ECHOs. `new_echo_interval` must set `Delay`.
+    #[test]
+    fn missed_echo_ticks_do_not_burst() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut i = new_echo_interval();
+                i.tick().await; // immediate first tick
+
+                tokio::time::advance(Duration::from_secs(35)).await;
+                i.tick().await; // the one catch-up tick
+
+                // With Delay, the next tick is a full period away; with Burst two
+                // more catch-up ticks would already be ready.
+                let immediate = tokio::time::timeout(Duration::from_millis(1), i.tick()).await;
+                assert!(
+                    immediate.is_err(),
+                    "a second tick must not be ready at once"
+                );
+            });
     }
 
     // ─── monitor_data_body ─────────────────────────────────────────────
