@@ -1637,10 +1637,12 @@ async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPa
     }
 
     // Phase 2: enqueue outside the lock; remember which subs actually took delivery.
-    let mut delivered: Vec<(u64, u32)> = Vec::new();
+    // Set, not Vec: phase 3 walks every sub and asks "was this one delivered?",
+    // so a linear scan per sub makes the commit phase O(delivered × subs).
+    let mut delivered: HashSet<(u64, u32)> = HashSet::new();
     for (conn_id, ioid, msg) in to_send {
         if send_msg(state, conn_id, msg).await {
-            delivered.push((conn_id, ioid));
+            delivered.insert((conn_id, ioid));
             debug!("Monitor update pv='{}' conn={} ", pv_name, conn_id);
         }
     }
@@ -1650,10 +1652,7 @@ async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPa
         let mut monitors = state.monitors.lock().await;
         if let Some(list) = monitors.get_mut(pv_name) {
             for sub in list.iter_mut() {
-                if delivered
-                    .iter()
-                    .any(|&(c, i)| c == sub.conn_id && i == sub.ioid)
-                {
+                if delivered.contains(&(sub.conn_id, sub.ioid)) {
                     if sub.pipeline_enabled && sub.nfree > 0 {
                         sub.nfree -= 1;
                     }
@@ -3726,6 +3725,53 @@ record(ai, "I") {{
             .try_recv()
             .expect("healthy client should receive its monitor update");
         assert!(!got.is_empty(), "healthy client frame should be non-empty");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_delivered_sub_commits_exactly_once_across_many_subs() {
+        let record = mdel_ai_record("test_pv", 1.0, "0");
+        let payload = record.to_ntpayload();
+        let state = test_state(record);
+
+        // Keep the receivers alive for the whole test so every channel stays
+        // open (Ok, not Closed) and none of the 8-deep queues fills.
+        let mut rxs = Vec::new();
+        for conn_id in 0..64u64 {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+            state.conns.lock().await.insert(conn_id, tx);
+            rxs.push(rx);
+        }
+        {
+            let mut monitors = state.monitors.lock().await;
+            let list = monitors.entry("test_pv".to_string()).or_default();
+            for conn_id in 0..64u64 {
+                list.push(MonitorSub {
+                    conn_id,
+                    ioid: 100 + conn_id as u32,
+                    version: 2,
+                    is_be: false,
+                    running: true,
+                    pipeline_enabled: true,
+                    nfree: 4,
+                    filtered_desc: None,
+                    last_snapshot: None,
+                });
+            }
+        }
+
+        notify_monitors(&state, "test_pv", &payload).await;
+
+        let monitors = state.monitors.lock().await;
+        let list = monitors.get("test_pv").expect("subs");
+        assert_eq!(list.len(), 64);
+        for sub in list {
+            assert_eq!(
+                sub.nfree, 3,
+                "conn {} must spend exactly one credit",
+                sub.conn_id
+            );
+            assert!(sub.last_snapshot.is_some());
+        }
     }
 
     // Regression test for finding R2-H1 (premature commit): when a pipelined
