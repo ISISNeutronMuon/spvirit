@@ -25,6 +25,11 @@ shadowing `pvget`, `pvput`, and friends.
 | [`sptable`](sptable.md) | server, TUI | an interactive spreadsheet IOC |
 | [`spdodeca`](spdodeca.md) | server | serve a rotating wireframe as an image |
 | [`spgateway`](spgateway.md) | client, server | p4p-compatible PVAccess gateway |
+| [`spvirit-scry`](spvirit-scry.md) | capture, TUI | passively capture and decode PVA traffic |
+| [`spvirit-scry_influx_collector`](spvirit-scry.md) | capture | the same capture, exported to InfluxDB and Loki |
+
+The last two need the `scry` feature and libpcap (Linux) or the Npcap SDK
+(Windows); they are not part of the Python wheel.
 
 ## Building them
 
@@ -35,6 +40,10 @@ The binaries are gated behind Cargo features, so a plain
 cargo build -p spvirit-tools --all-features
 ```
 
+`--all-features` includes `scry`, so it needs libpcap or the Npcap SDK
+(see [spvirit-scry](spvirit-scry.md)). Without them, ask for the rest:
+`--features client,server,tui`.
+
 | Feature | Tools it enables |
 |---|---|
 | `client` | `spget`, `spput`, `spmonitor`, `spinfo`, `splist`, `spsine`, `spget_compare` |
@@ -42,6 +51,7 @@ cargo build -p spvirit-tools --all-features
 | `client` + `server` | `spgateway` |
 | `client` + `tui` | `spexplore`, `spsearch` |
 | `server` + `tui` | `sptable` |
+| `scry` (needs libpcap / Npcap SDK) | `spvirit-scry`, `spvirit-scry_influx_collector` |
 
 ## Flags every client shares
 

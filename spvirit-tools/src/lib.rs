@@ -12,6 +12,11 @@ pub mod spvirit_client;
 pub mod spvirit_server;
 #[cfg(feature = "tui")]
 pub mod tui;
+/// Packet capture and PVA traffic analysis, folded in from spvirit-scry.
+///
+/// Backs the `spvirit-scry` and `spvirit-scry_influx_collector` binaries.
+#[cfg(feature = "scry")]
+pub mod scry;
 
 // --- Re-exports: client core ---
 pub use spvirit_client::client::{build_client_validation, pvget};

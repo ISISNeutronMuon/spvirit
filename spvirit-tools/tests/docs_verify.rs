@@ -457,11 +457,16 @@ fn the_tools_crate_does_not_depend_on_all_of_tokio() {
         !features.iter().any(|f| f.as_str() == Some("full")),
         "spvirit-tools is the only crate pulling all of tokio; list what it uses"
     );
-    assert!(
-        manifest
-            .get("dependencies")
-            .and_then(|d| d.get("dns-lookup"))
-            .is_none(),
-        "dns-lookup has no uses in this crate"
-    );
+    // Only the opt-in `scry` tools resolve hostnames; the default build must
+    // not carry dns-lookup.
+    if let Some(dns) = manifest
+        .get("dependencies")
+        .and_then(|d| d.get("dns-lookup"))
+    {
+        assert_eq!(
+            dns.get("optional").and_then(|o| o.as_bool()),
+            Some(true),
+            "dns-lookup is used only by the `scry` feature; keep it optional"
+        );
+    }
 }
