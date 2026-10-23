@@ -1492,10 +1492,13 @@ async fn cleanup_connection(state: &Arc<ServerState>, conn_id: u64) {
 
 /// Compute which PVs a reloaded store changed.
 ///
-/// Pure, so it runs under a *read* lock: the write lock then only has to cover
-/// the pointer swap. Each side's `NtPayload` is materialised exactly once, where
-/// the old code called `to_ntpayload()` twice and cloned the result a third time
-/// per PV, all while holding the write lock.
+/// Each side's `NtPayload` is materialised exactly once, where the old code
+/// called `to_ntpayload()` twice and cloned the result a third time per PV.
+///
+/// Production code must reach this only through [`swap_store_and_diff`], under
+/// the same write guard as the swap. Diffing under a separate read lock opens a
+/// window in which a client PUT can land and then be reverted by the swap with
+/// no monitor update (fixed in e98ac0c). Tests may call it directly.
 fn diff_stores(
     old: &HashMap<String, RecordInstance>,
     new: &HashMap<String, RecordInstance>,
@@ -1514,8 +1517,10 @@ fn diff_stores(
 }
 
 /// Replace `store` with `new_store`, returning the PVs whose payload changed.
-/// The diff is taken against the live `store` immediately before the swap; the
-/// caller holds the write guard across both.
+/// The diff is taken against the live `store` immediately before the swap.
+/// The caller must hold the store write guard for the whole call and bump the
+/// db generation before releasing it; see [`diff_stores`] for why the diff may
+/// not run under a separate lock.
 fn swap_store_and_diff(
     store: &mut HashMap<String, RecordInstance>,
     new_store: HashMap<String, RecordInstance>,
