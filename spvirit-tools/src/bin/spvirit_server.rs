@@ -1513,6 +1513,18 @@ fn diff_stores(
     changed
 }
 
+/// Replace `store` with `new_store`, returning the PVs whose payload changed.
+/// The diff is taken against the live `store` immediately before the swap; the
+/// caller holds the write guard across both.
+fn swap_store_and_diff(
+    store: &mut HashMap<String, RecordInstance>,
+    new_store: HashMap<String, RecordInstance>,
+) -> Vec<(String, NtPayload)> {
+    let changed = diff_stores(store, &new_store);
+    *store = new_store;
+    changed
+}
+
 async fn run_db_reload(
     state: Arc<ServerState>,
     db_file: String,
@@ -1573,15 +1585,15 @@ async fn run_db_reload(
             new_store.len()
         );
 
+        // Diff, swap and generation bump share one write guard, so no PUT can
+        // land between the diff and the swap. Notifications go out after the
+        // guard is released.
         let changed: Vec<(String, NtPayload)> = {
-            let store = state.pv_store.read().await;
-            diff_stores(&store, &new_store)
-        };
-        {
             let mut store = state.pv_store.write().await;
-            *store = new_store;
+            let changed = swap_store_and_diff(&mut store, new_store);
             state.bump_db_generation();
-        }
+            changed
+        };
 
         for (name, payload) in changed {
             info!("PV changed: {}", name);
@@ -3650,6 +3662,25 @@ mod tests {
         changed.sort_by(|a, b| a.0.cmp(&b.0));
         let names: Vec<&str> = changed.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, vec!["B:PV", "C:PV"]);
+    }
+
+    #[test]
+    fn swap_store_and_diff_reports_a_pv_a_put_moved_away_from_the_new_value() {
+        let mut live = HashMap::new();
+        live.insert("A:PV".to_string(), ai_record_with_value("A:PV", 1.0));
+        let mut reloaded = HashMap::new();
+        reloaded.insert("A:PV".to_string(), ai_record_with_value("A:PV", 1.0));
+
+        // A PUT lands before the reload's swap: live now differs from the DB.
+        live.insert("A:PV".to_string(), ai_record_with_value("A:PV", 7.0));
+
+        let changed = swap_store_and_diff(&mut live, reloaded);
+        let names: Vec<&str> = changed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["A:PV"], "the revert must be notified");
+        assert_eq!(
+            live["A:PV"].current_value(),
+            spvirit_tools::spvirit_server::types::ScalarValue::F64(1.0)
+        );
     }
 
     fn mdel_ai_record(name: &str, val: f64, mdel: &str) -> RecordInstance {
