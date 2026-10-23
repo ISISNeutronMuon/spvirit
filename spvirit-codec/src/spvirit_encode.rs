@@ -63,15 +63,16 @@ pub fn encode_message_error(message: &str, version: u8, is_be: bool) -> Vec<u8> 
     out
 }
 
-pub fn encode_header(
+/// Append an 8-byte PVA header to `out`.
+pub fn push_header(
+    out: &mut Vec<u8>,
     is_server: bool,
     is_be: bool,
     is_control: bool,
     version: u8,
     command: u8,
     payload_length: u32,
-) -> Vec<u8> {
-    let magic = 0xCA;
+) {
     let mut flags = 0u8;
     if is_control {
         flags |= 0x01;
@@ -82,14 +83,54 @@ pub fn encode_header(
     if is_be {
         flags |= 0x80;
     }
-    let mut out = vec![magic, version, flags, command];
-    let len_bytes = if is_be {
+    out.extend_from_slice(&[0xCA, version, flags, command]);
+    out.extend_from_slice(&if is_be {
         payload_length.to_be_bytes()
     } else {
         payload_length.to_le_bytes()
-    };
-    out.extend_from_slice(&len_bytes);
+    });
+}
+
+pub fn encode_header(
+    is_server: bool,
+    is_be: bool,
+    is_control: bool,
+    version: u8,
+    command: u8,
+    payload_length: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    push_header(
+        &mut out,
+        is_server,
+        is_be,
+        is_control,
+        version,
+        command,
+        payload_length,
+    );
     out
+}
+
+/// Reserve a server-direction header at the end of `out` and return its
+/// offset. The length field is zero until [`finish_frame`] backfills it.
+fn begin_frame(out: &mut Vec<u8>, is_be: bool, version: u8, command: u8) -> usize {
+    let at = out.len();
+    push_header(out, true, is_be, false, version, command, 0);
+    at
+}
+
+/// Write the real payload length into the header `begin_frame` reserved.
+// `&mut Vec<u8>` (not `&mut [u8]`) keeps the pair symmetric with `begin_frame`.
+#[allow(clippy::ptr_arg)]
+fn finish_frame(out: &mut Vec<u8>, header_at: usize, is_be: bool) {
+    let len = (out.len() - header_at - 8) as u32;
+    let bytes = if is_be {
+        len.to_be_bytes()
+    } else {
+        len.to_le_bytes()
+    };
+    out[header_at + 4..header_at + 8].copy_from_slice(&bytes);
 }
 
 pub fn encode_search_response(
@@ -618,17 +659,18 @@ pub fn encode_op_data_response_payload(
     version: u8,
     is_be: bool,
 ) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&if is_be {
+    let body = encode_nt_payload_bitset(payload_value, is_be);
+    let mut out = Vec::with_capacity(8 + 6 + body.len());
+    let header_at = begin_frame(&mut out, is_be, version, command);
+    out.extend_from_slice(&if is_be {
         ioid.to_be_bytes()
     } else {
         ioid.to_le_bytes()
     });
-    payload.push(0x00);
-    payload.extend_from_slice(&encode_status_ok());
-    payload.extend_from_slice(&encode_nt_payload_bitset(payload_value, is_be));
-    let mut out = encode_header(true, is_be, false, version, command, payload.len() as u32);
-    out.extend_from_slice(&payload);
+    out.push(0x00);
+    out.extend_from_slice(&encode_status_ok());
+    out.extend_from_slice(&body);
+    finish_frame(&mut out, header_at, is_be);
     out
 }
 
@@ -643,18 +685,18 @@ pub fn encode_op_data_response_filtered(
     is_be: bool,
 ) -> Vec<u8> {
     let (bitset, values) = encode_nt_payload_filtered(payload_value, filtered_desc, is_be);
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&if is_be {
+    let mut out = Vec::with_capacity(8 + 6 + bitset.len() + values.len());
+    let header_at = begin_frame(&mut out, is_be, version, command);
+    out.extend_from_slice(&if is_be {
         ioid.to_be_bytes()
     } else {
         ioid.to_le_bytes()
     });
-    payload.push(0x00);
-    payload.extend_from_slice(&encode_status_ok());
-    payload.extend_from_slice(&bitset);
-    payload.extend_from_slice(&values);
-    let mut out = encode_header(true, is_be, false, version, command, payload.len() as u32);
-    out.extend_from_slice(&payload);
+    out.push(0x00);
+    out.extend_from_slice(&encode_status_ok());
+    out.extend_from_slice(&bitset);
+    out.extend_from_slice(&values);
+    finish_frame(&mut out, header_at, is_be);
     out
 }
 
@@ -901,22 +943,22 @@ pub fn encode_monitor_data_response_payload(
     is_be: bool,
 ) -> Vec<u8> {
     let (changed_bitset, values) = encode_nt_payload_bitset_parts(payload_value, is_be);
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&if is_be {
+    let mut out = Vec::with_capacity(8 + 6 + changed_bitset.len() + values.len());
+    let header_at = begin_frame(&mut out, is_be, version, 13);
+    out.extend_from_slice(&if is_be {
         ioid.to_be_bytes()
     } else {
         ioid.to_le_bytes()
     });
-    payload.push(subcmd);
+    out.push(subcmd);
     if (subcmd & 0x10) != 0 {
-        payload.extend_from_slice(&encode_status_ok());
+        out.extend_from_slice(&encode_status_ok());
     }
-    payload.extend_from_slice(&changed_bitset);
-    payload.extend_from_slice(&values);
+    out.extend_from_slice(&changed_bitset);
+    out.extend_from_slice(&values);
     // overrun bitset: empty (after data per spec)
-    payload.extend_from_slice(&encode_size_pva(0, is_be));
-    let mut out = encode_header(true, is_be, false, version, 13, payload.len() as u32);
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(&encode_size_pva(0, is_be));
+    finish_frame(&mut out, header_at, is_be);
     out
 }
 
@@ -931,21 +973,21 @@ pub fn encode_monitor_data_response_filtered(
     is_be: bool,
 ) -> Vec<u8> {
     let (bitset, values) = encode_nt_payload_filtered(payload_value, filtered_desc, is_be);
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&if is_be {
+    let mut out = Vec::with_capacity(8 + 6 + bitset.len() + values.len());
+    let header_at = begin_frame(&mut out, is_be, version, 13);
+    out.extend_from_slice(&if is_be {
         ioid.to_be_bytes()
     } else {
         ioid.to_le_bytes()
     });
-    payload.push(subcmd);
+    out.push(subcmd);
     if (subcmd & 0x10) != 0 {
-        payload.extend_from_slice(&encode_status_ok());
+        out.extend_from_slice(&encode_status_ok());
     }
-    payload.extend_from_slice(&bitset);
-    payload.extend_from_slice(&values);
-    payload.extend_from_slice(&encode_size_pva(0, is_be));
-    let mut out = encode_header(true, is_be, false, version, 13, payload.len() as u32);
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(&bitset);
+    out.extend_from_slice(&values);
+    out.extend_from_slice(&encode_size_pva(0, is_be));
+    finish_frame(&mut out, header_at, is_be);
     out
 }
 
@@ -963,21 +1005,21 @@ pub fn encode_monitor_data_response_delta(
     is_be: bool,
 ) -> Option<Vec<u8>> {
     let (bitset, values) = encode_nt_payload_delta(prev_value, next_value, filtered_desc, is_be)?;
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&if is_be {
+    let mut out = Vec::with_capacity(8 + 6 + bitset.len() + values.len());
+    let header_at = begin_frame(&mut out, is_be, version, 13);
+    out.extend_from_slice(&if is_be {
         ioid.to_be_bytes()
     } else {
         ioid.to_le_bytes()
     });
-    payload.push(subcmd);
+    out.push(subcmd);
     if (subcmd & 0x10) != 0 {
-        payload.extend_from_slice(&encode_status_ok());
+        out.extend_from_slice(&encode_status_ok());
     }
-    payload.extend_from_slice(&bitset);
-    payload.extend_from_slice(&values);
-    payload.extend_from_slice(&encode_size_pva(0, is_be));
-    let mut out = encode_header(true, is_be, false, version, 13, payload.len() as u32);
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(&bitset);
+    out.extend_from_slice(&values);
+    out.extend_from_slice(&encode_size_pva(0, is_be));
+    finish_frame(&mut out, header_at, is_be);
     Some(out)
 }
 
