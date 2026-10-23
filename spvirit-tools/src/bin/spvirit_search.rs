@@ -1092,3 +1092,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(worker_handle);
     ui_result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::bind_udp_reuse;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn bind_udp_reuse_sets_so_reuseaddr() {
+        let addr: SocketAddr = "0.0.0.0:0".parse().expect("addr");
+        let sock = bind_udp_reuse(addr).expect("bind");
+        assert!(sock.local_addr().expect("local addr").port() > 0);
+        assert!(
+            socket2::SockRef::from(&sock)
+                .reuse_address()
+                .expect("read SO_REUSEADDR"),
+            "SO_REUSEADDR must be set on every platform"
+        );
+    }
+
+    /// Windows-only: SO_REUSEADDR permits a second bind to the same addr:port.
+    /// On Unix that needs SO_REUSEPORT, so this is not asserted there.
+    #[cfg(windows)]
+    #[test]
+    fn two_binds_share_the_same_port_on_windows() {
+        let first = bind_udp_reuse("0.0.0.0:0".parse().expect("addr")).expect("first bind");
+        let port = first.local_addr().expect("local addr").port();
+        let second = bind_udp_reuse(format!("0.0.0.0:{port}").parse().expect("addr"));
+        assert!(second.is_ok(), "second bind to {port} failed: {:?}", second.err());
+    }
+}
