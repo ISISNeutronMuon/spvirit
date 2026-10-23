@@ -290,7 +290,6 @@ use spvirit_codec::spvd_decode::{DecodedValue, FieldDesc, FieldType, StructureDe
 use spvirit_types::{NtPayload, PvValue, ScalarArrayValue, ScalarValue};
 
 use crate::pvstore::{PvInfo, Source, SourceRegistry, TryClaim};
-use crate::simple_store::descriptor_for_payload;
 
 /// A [`Source`] that serves group PVs composed from multiple member PVs.
 ///
@@ -330,15 +329,25 @@ impl GroupSource {
         }
     }
 
-    /// Build a structure descriptor for a group PV.
-    async fn group_descriptor(&self, def: &GroupPvDef) -> StructureDesc {
+    /// Build a group PV's descriptor and writability with ONE registry
+    /// resolution per member. `claim` already answers both questions, so the
+    /// old shape — a `get` per member for the descriptor plus an
+    /// `is_writable` per member afterwards — resolved every channel twice and
+    /// threw away a full payload clone each time.
+    async fn group_claim_info(&self, def: &GroupPvDef) -> PvInfo {
         let mut field_descs = Vec::with_capacity(def.members.len());
+        // A group PV is writable if any non-proc non-meta member is writable.
+        let mut writable = false;
         for member in &def.members {
+            let info = self.sources.claim(&member.channel).await;
+            if member.mapping != FieldMapping::Proc && member.mapping != FieldMapping::Meta {
+                writable |= info.as_ref().is_some_and(|i| i.writable);
+            }
             if member.mapping == FieldMapping::Proc {
                 continue;
             }
-            let field_type = match self.sources.get(&member.channel).await {
-                Some(snap) => payload_field_type(&snap, member.mapping),
+            let field_type = match &info {
+                Some(i) => field_type_from_descriptor(&i.descriptor, member.mapping),
                 None => FieldType::Scalar(TypeCode::Int32), // disconnected fallback
             };
             field_descs.push(FieldDesc {
@@ -346,9 +355,12 @@ impl GroupSource {
                 field_type,
             });
         }
-        StructureDesc {
-            struct_id: def.struct_id.clone(),
-            fields: field_descs,
+        PvInfo {
+            descriptor: StructureDesc {
+                struct_id: def.struct_id.clone(),
+                fields: field_descs,
+            },
+            writable,
         }
     }
 }
@@ -373,22 +385,7 @@ impl Source for GroupSource {
         let name = name.to_string();
         Box::pin(async move {
             let def = self.groups.get(&name)?;
-            let descriptor = self.group_descriptor(def).await;
-            // A group PV is writable if any non-proc non-meta member is writable.
-            let mut writable = false;
-            for member in &def.members {
-                if member.mapping == FieldMapping::Proc || member.mapping == FieldMapping::Meta {
-                    continue;
-                }
-                if self.sources.is_writable(&member.channel).await {
-                    writable = true;
-                    break;
-                }
-            }
-            Some(PvInfo {
-                descriptor,
-                writable,
-            })
+            Some(self.group_claim_info(def).await)
         })
     }
 
@@ -571,59 +568,37 @@ fn build_trigger_map(def: &GroupPvDef) -> HashMap<String, Vec<String>> {
 
 /// Wait for any member receiver to produce a value, returning the field name
 /// of the member that updated. Returns `None` when all channels are closed.
+///
+/// `mpsc::Receiver::recv` is cancel-safe, so dropping the losing futures each
+/// round loses nothing. After a win the list is rotated so the next round
+/// starts after the winner: `select_all` polls in order, and without the
+/// rotation a chatty low-index member starves everything behind it.
 async fn poll_any_member(members: &mut Vec<(String, mpsc::Receiver<NtPayload>)>) -> Option<String> {
-    if members.is_empty() {
-        return None;
-    }
-
-    // Create pinned futures for each member.
-    let futs: Vec<_> = members
-        .iter_mut()
-        .map(|(name, rx)| {
-            let name = name.clone();
-            Box::pin(async move { (name, rx.recv().await) })
-                as std::pin::Pin<Box<dyn Future<Output = (String, Option<NtPayload>)> + Send + '_>>
-        })
-        .collect();
-
-    let (field_name, payload) = race_all(futs).await;
-
-    if payload.is_none() {
-        // This member channel is closed; remove it.
-        members.retain(|(n, _)| n != &field_name);
+    loop {
         if members.is_empty() {
             return None;
         }
-        return Box::pin(poll_any_member(members)).await;
-    }
-
-    Some(field_name)
-}
-
-/// Race a vec of pinned futures, returning the result of the first to complete.
-async fn race_all<T>(futs: Vec<std::pin::Pin<Box<dyn Future<Output = T> + Send + '_>>>) -> T {
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    assert!(!futs.is_empty());
-
-    struct RaceAll<'a, T> {
-        futs: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>,
-    }
-
-    impl<T> Future for RaceAll<'_, T> {
-        type Output = T;
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            for fut in &mut self.futs {
-                if let Poll::Ready(val) = fut.as_mut().poll(cx) {
-                    return Poll::Ready(val);
-                }
+        let (result, idx) = {
+            let futs: Vec<_> = members
+                .iter_mut()
+                .map(|(_, rx)| Box::pin(rx.recv()))
+                .collect();
+            let (result, idx, _losers) = futures::future::select_all(futs).await;
+            (result, idx)
+        };
+        match result {
+            Some(_) => {
+                let field_name = members[idx].0.clone();
+                members.rotate_left(idx + 1);
+                return Some(field_name);
             }
-            Poll::Pending
+            // Closed channel: drop that member and race the rest. This is a
+            // loop, not recursion, so a burst of closures allocates nothing.
+            None => {
+                members.remove(idx);
+            }
         }
     }
-
-    RaceAll { futs }.await
 }
 
 // ---------------------------------------------------------------------------
@@ -813,118 +788,45 @@ fn payload_to_meta_only(payload: &NtPayload) -> PvValue {
     }
 }
 
-/// Build a FieldType for a member's contribution to the group descriptor.
-fn payload_field_type(payload: &NtPayload, mapping: FieldMapping) -> FieldType {
+/// A member's contribution to the group descriptor, derived from the member's
+/// own advertised descriptor rather than from a fetched value.
+///
+/// Reproduces the old value-derived mapping exactly. The `Plain` arm keys off
+/// the NT struct id because only NTScalar and NTScalarArray have a directly
+/// usable `value` field; NTEnum, NTTable, NTNDArray and generic structures all
+/// reported `Int32` before and must keep doing so.
+fn field_type_from_descriptor(desc: &StructureDesc, mapping: FieldMapping) -> FieldType {
     match mapping {
-        FieldMapping::Scalar | FieldMapping::Any => {
-            FieldType::Structure(descriptor_for_payload(payload))
+        FieldMapping::Scalar | FieldMapping::Any => FieldType::Structure(desc.clone()),
+        FieldMapping::Plain => {
+            let is_flat_nt = matches!(
+                desc.struct_id.as_deref(),
+                Some("epics:nt/NTScalar:1.0") | Some("epics:nt/NTScalarArray:1.0")
+            );
+            if is_flat_nt {
+                desc.fields
+                    .iter()
+                    .find(|f| f.name == "value")
+                    .map(|f| f.field_type.clone())
+                    .unwrap_or(FieldType::Scalar(TypeCode::Int32))
+            } else {
+                FieldType::Scalar(TypeCode::Int32)
+            }
         }
-        FieldMapping::Plain => match payload {
-            NtPayload::Scalar(nt) => value_field_type(&nt.value),
-            NtPayload::ScalarArray(nt) => array_field_type(&nt.value),
-            NtPayload::Enum(_) => FieldType::Scalar(TypeCode::Int32),
-            _ => FieldType::Scalar(TypeCode::Int32),
-        },
         FieldMapping::Meta => FieldType::Structure(StructureDesc {
             struct_id: None,
             fields: vec![
                 FieldDesc {
                     name: "alarm".to_string(),
-                    field_type: FieldType::Structure(alarm_struct_desc()),
+                    field_type: FieldType::Structure(spvirit_codec::spvd_encode::alarm_desc()),
                 },
                 FieldDesc {
                     name: "timeStamp".to_string(),
-                    field_type: FieldType::Structure(timestamp_struct_desc()),
+                    field_type: FieldType::Structure(spvirit_codec::spvd_encode::timestamp_desc()),
                 },
             ],
         }),
         FieldMapping::Proc => FieldType::Scalar(TypeCode::Int32),
-    }
-}
-
-fn value_field_type(sv: &ScalarValue) -> FieldType {
-    match sv {
-        ScalarValue::Str(_) => FieldType::String,
-        sv => {
-            let tc = match sv {
-                ScalarValue::Bool(_) => TypeCode::Boolean,
-                ScalarValue::I8(_) => TypeCode::Int8,
-                ScalarValue::I16(_) => TypeCode::Int16,
-                ScalarValue::I32(_) => TypeCode::Int32,
-                ScalarValue::I64(_) => TypeCode::Int64,
-                ScalarValue::U8(_) => TypeCode::UInt8,
-                ScalarValue::U16(_) => TypeCode::UInt16,
-                ScalarValue::U32(_) => TypeCode::UInt32,
-                ScalarValue::U64(_) => TypeCode::UInt64,
-                ScalarValue::F32(_) => TypeCode::Float32,
-                ScalarValue::F64(_) => TypeCode::Float64,
-                ScalarValue::Str(_) => unreachable!(),
-            };
-            FieldType::Scalar(tc)
-        }
-    }
-}
-
-fn array_field_type(sav: &ScalarArrayValue) -> FieldType {
-    match sav {
-        ScalarArrayValue::Str(_) => FieldType::StringArray,
-        sav => {
-            let tc = match sav {
-                ScalarArrayValue::Bool(_) => TypeCode::Boolean,
-                ScalarArrayValue::I8(_) => TypeCode::Int8,
-                ScalarArrayValue::I16(_) => TypeCode::Int16,
-                ScalarArrayValue::I32(_) => TypeCode::Int32,
-                ScalarArrayValue::I64(_) => TypeCode::Int64,
-                ScalarArrayValue::U8(_) => TypeCode::UInt8,
-                ScalarArrayValue::U16(_) => TypeCode::UInt16,
-                ScalarArrayValue::U32(_) => TypeCode::UInt32,
-                ScalarArrayValue::U64(_) => TypeCode::UInt64,
-                ScalarArrayValue::F32(_) => TypeCode::Float32,
-                ScalarArrayValue::F64(_) => TypeCode::Float64,
-                ScalarArrayValue::Str(_) => unreachable!(),
-            };
-            FieldType::ScalarArray(tc)
-        }
-    }
-}
-
-fn alarm_struct_desc() -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("alarm_t".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "severity".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "status".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "message".to_string(),
-                field_type: FieldType::String,
-            },
-        ],
-    }
-}
-
-fn timestamp_struct_desc() -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("time_t".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "secondsPastEpoch".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int64),
-            },
-            FieldDesc {
-                name: "nanoseconds".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "userTag".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-        ],
     }
 }
 
@@ -1325,5 +1227,211 @@ mod tests {
             .await
             .expect("nothing was attempted, so nothing failed");
         assert!(out.is_empty());
+    }
+
+    /// A registry holding one real scalar PV and one real waveform PV, so the
+    /// group descriptor is built from genuine member descriptors.
+    async fn registry_with_members() -> Arc<SourceRegistry> {
+        use crate::simple_store::SimplePvStore;
+        use crate::types::{DbCommonState, RecordData, RecordInstance, RecordType};
+        use spvirit_types::{NtScalar, NtScalarArray, ScalarArrayValue, ScalarValue};
+
+        let mut records = HashMap::new();
+        records.insert(
+            "R:a".to_string(),
+            RecordInstance {
+                name: "R:a".to_string(),
+                record_type: RecordType::Ai,
+                common: DbCommonState::default(),
+                data: RecordData::Ai {
+                    nt: NtScalar::from_value(ScalarValue::F64(1.0)),
+                    inp: None,
+                    siml: None,
+                    siol: None,
+                    simm: false,
+                },
+                raw_fields: HashMap::new(),
+            },
+        );
+        records.insert(
+            "R:w".to_string(),
+            RecordInstance {
+                name: "R:w".to_string(),
+                record_type: RecordType::Waveform,
+                common: DbCommonState::default(),
+                data: RecordData::Waveform {
+                    nt: NtScalarArray::from_value(ScalarArrayValue::I32(vec![1, 2, 3])),
+                    inp: None,
+                    ftvl: "LONG".to_string(),
+                    nelm: 3,
+                    nord: 3,
+                },
+                raw_fields: HashMap::new(),
+            },
+        );
+        let store = SimplePvStore::new(records, HashMap::new(), Vec::new(), false);
+        let registry = Arc::new(SourceRegistry::new());
+        registry.add("store", 0, Arc::new(store)).await;
+        registry
+    }
+
+    #[tokio::test]
+    async fn group_claim_advertises_the_same_descriptor_and_writability() {
+        let json = r#"{
+            "GRP:desc": {
+                "sc":   { "+channel": "R:a", "+type": "scalar" },
+                "pl":   { "+channel": "R:a", "+type": "plain" },
+                "wf":   { "+channel": "R:w", "+type": "plain" },
+                "meta": { "+channel": "R:a", "+type": "meta" },
+                "gone": { "+channel": "R:absent", "+type": "plain" }
+            }
+        }"#;
+        let groups: HashMap<String, GroupPvDef> = parse_group_config(json)
+            .unwrap()
+            .into_iter()
+            .map(|g| (g.name.clone(), g))
+            .collect();
+        let registry = registry_with_members().await;
+        // The old claim asked the registry directly, per non-proc non-meta
+        // member; compute the expectation that way, independently of the
+        // group's own resolution path.
+        let mut expected_writable = false;
+        for ch in ["R:a", "R:w", "R:absent"] {
+            expected_writable |= registry.is_writable(ch).await;
+        }
+        let source = GroupSource::new(registry, groups);
+
+        let info = Source::claim(&source, "GRP:desc").await.expect("claimed");
+        assert_eq!(info.writable, expected_writable);
+        let by_name = |n: &str| {
+            info.descriptor
+                .fields
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap_or_else(|| panic!("no field {n}"))
+                .field_type
+                .clone()
+        };
+
+        assert_eq!(by_name("pl"), FieldType::Scalar(TypeCode::Float64));
+        assert_eq!(by_name("wf"), FieldType::ScalarArray(TypeCode::Int32));
+        assert!(matches!(by_name("sc"), FieldType::Structure(_)));
+        assert!(matches!(by_name("meta"), FieldType::Structure(_)));
+        // A member that resolves to nothing keeps the disconnected fallback.
+        assert_eq!(by_name("gone"), FieldType::Scalar(TypeCode::Int32));
+    }
+
+    /// `Plain` reads the `value` type only from NTScalar / NTScalarArray
+    /// descriptors; every other shape keeps the historical `Int32` fallback.
+    #[test]
+    fn plain_mapping_reads_value_type_only_from_flat_nt_descriptors() {
+        let with_value = |id: Option<&str>, ty: FieldType| StructureDesc {
+            struct_id: id.map(str::to_string),
+            fields: vec![FieldDesc {
+                name: "value".to_string(),
+                field_type: ty,
+            }],
+        };
+        let plain = |d: &StructureDesc| field_type_from_descriptor(d, FieldMapping::Plain);
+
+        assert_eq!(
+            plain(&with_value(
+                Some("epics:nt/NTScalar:1.0"),
+                FieldType::Scalar(TypeCode::Float64)
+            )),
+            FieldType::Scalar(TypeCode::Float64)
+        );
+        assert_eq!(
+            plain(&with_value(
+                Some("epics:nt/NTScalarArray:1.0"),
+                FieldType::ScalarArray(TypeCode::Int16)
+            )),
+            FieldType::ScalarArray(TypeCode::Int16)
+        );
+        // Same `value` field, but not a flat NT id: the fallback applies.
+        for id in [None, Some("epics:nt/NTEnum:1.0"), Some("my:custom:1.0")] {
+            assert_eq!(
+                plain(&with_value(id, FieldType::Scalar(TypeCode::Float64))),
+                FieldType::Scalar(TypeCode::Int32),
+                "struct id {id:?}"
+            );
+        }
+        // A flat NT id with no `value` field also falls back.
+        let no_value = StructureDesc {
+            struct_id: Some("epics:nt/NTScalar:1.0".to_string()),
+            fields: vec![],
+        };
+        assert_eq!(plain(&no_value), FieldType::Scalar(TypeCode::Int32));
+    }
+
+    #[test]
+    fn the_meta_mapping_uses_the_codec_alarm_and_timestamp_descriptors() {
+        let desc = StructureDesc {
+            struct_id: Some("epics:nt/NTScalar:1.0".to_string()),
+            fields: vec![],
+        };
+        let FieldType::Structure(meta) = field_type_from_descriptor(&desc, FieldMapping::Meta)
+        else {
+            panic!("meta mapping must produce a structure");
+        };
+        let sub = |n: &str| match &meta.fields.iter().find(|f| f.name == n).unwrap().field_type {
+            FieldType::Structure(s) => s.clone(),
+            other => panic!("{n} is not a structure: {other:?}"),
+        };
+        assert_eq!(sub("alarm"), spvirit_codec::spvd_encode::alarm_desc());
+        assert_eq!(sub("timeStamp"), spvirit_codec::spvd_encode::timestamp_desc());
+    }
+
+    #[tokio::test]
+    async fn poll_any_member_is_fair_across_members() {
+        // Two members both always ready. A poll that always starts at index 0
+        // returns "a" every time; a fair one alternates.
+        let (tx_a, rx_a) = mpsc::channel(8);
+        let (tx_b, rx_b) = mpsc::channel(8);
+        for _ in 0..4 {
+            tx_a.send(NtPayload::Scalar(spvirit_types::NtScalar::from_value(
+                ScalarValue::I32(1),
+            )))
+            .await
+            .unwrap();
+            tx_b.send(NtPayload::Scalar(spvirit_types::NtScalar::from_value(
+                ScalarValue::I32(2),
+            )))
+            .await
+            .unwrap();
+        }
+        let mut members = vec![("a".to_string(), rx_a), ("b".to_string(), rx_b)];
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(poll_any_member(&mut members).await.unwrap());
+        }
+        assert!(
+            seen.iter().any(|f| f == "b"),
+            "member b was starved: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_any_member_drops_closed_members_and_keeps_going() {
+        let (tx_a, rx_a) = mpsc::channel(8);
+        let (tx_b, rx_b) = mpsc::channel(8);
+        drop(tx_a); // a is closed from the start
+        tx_b.send(NtPayload::Scalar(spvirit_types::NtScalar::from_value(
+            ScalarValue::I32(2),
+        )))
+        .await
+        .unwrap();
+        let mut members = vec![("a".to_string(), rx_a), ("b".to_string(), rx_b)];
+
+        assert_eq!(poll_any_member(&mut members).await.as_deref(), Some("b"));
+        assert_eq!(members.len(), 1, "the closed member must be removed");
+
+        drop(tx_b);
+        assert_eq!(
+            poll_any_member(&mut members).await,
+            None,
+            "all members closed must yield None"
+        );
     }
 }

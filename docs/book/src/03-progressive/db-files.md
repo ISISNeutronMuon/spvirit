@@ -112,9 +112,10 @@ rejected at construction. Build enum records in code — see
 **`longin`/`longout` are not recognised by the `.db` parser either.** They
 exist in the handle API only (`spvirit-server/src/types.rs:48`).
 
-**Loading is best-effort per record.** A record spvirit cannot build logs
-to stderr and is skipped; the rest of the file still serves. Check the log
-rather than assuming every PV made it.
+**Loading stops at the first record spvirit cannot build.** The load
+returns an error naming that record and its type, and `spserver` exits
+without serving any record from the file. Remove the record or create it
+through the host API instead.
 
 ## Run it
 

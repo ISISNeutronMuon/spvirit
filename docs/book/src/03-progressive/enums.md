@@ -53,17 +53,15 @@ file. If you need the labels on the wire, use `mbbi`/`mbbo`.
 accepted. An `NtEnum` has no engineering units to carry.
 
 **`.db` files cannot define enum records.** `mbbi` and `mbbo` parse, then
-fail at construction with:
+the load fails at construction with:
 
 ```text
-Record 'DEMO:STATE': type 'mbbi' is not a standard EPICS Base record type
-and cannot be loaded from .db files
+record 'DEMO:STATE' of type 'mbbi' is not yet supported by the .db loader; create it through the host API instead
 ```
 
-The message is misleading — `mbbi` *is* a standard EPICS Base record type;
-it is spvirit's `.db` loader that does not build it — the `mbbi`/`mbbo` arm
-at `spvirit-server/src/db.rs:550` (message at db.rs:558). Build enum records
-in code.
+`mbbi` is a standard EPICS Base record type; it is spvirit's `.db` loader
+that does not build it yet (`to_record` in `spvirit-server/src/db.rs`).
+Build enum records in code.
 
 **Writing to an `mbbo` from a client does not work today.** The record is
 advertised writable and the PUT is accepted on the wire — `spput` prints

@@ -9,6 +9,22 @@ use crate::types::{
     RecordType, ScalarArrayValue, ScalarValue, ScanMode,
 };
 
+use std::sync::LazyLock;
+
+// Compiled once per process. `parse_db_inner` recurses once per `include`
+// directive, so building these per call meant recompiling three regexes for
+// every file in a .db include tree.
+static RECORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^record\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([^"]*)"\s*\)\s*\{?$"#)
+        .expect("static record regex")
+});
+static FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^field\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([\s\S]*)"\s*\)$"#)
+        .expect("static field regex")
+});
+static INCLUDE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^include\s+"?([^"]+)"?$"#).expect("static include regex"));
+
 #[derive(Debug, Clone)]
 pub struct DbRecord {
     pub name: String,
@@ -547,6 +563,12 @@ fn to_record(record: &DbRecord) -> Option<RecordInstance> {
         // LongOut today, so these arms are unreachable; they're only here to
         // satisfy exhaustiveness. Wiring longin/longout .db loading is
         // tracked as follow-up work.
+        // NtTable/NtNdArray/Generic have no `.db` spelling at all, and
+        // mbbi/mbbo/longin/longout are standard EPICS Base record types this
+        // loader does not construct yet. Either way the caller
+        // (`typed_from_raw`) turns the `None` into an error that names the
+        // record and the type - an `eprintln!` here duplicated it, and it
+        // also bypassed the crate's `tracing` configuration entirely.
         RecordType::NtTable
         | RecordType::NtNdArray
         | RecordType::Mbbi
@@ -554,10 +576,6 @@ fn to_record(record: &DbRecord) -> Option<RecordInstance> {
         | RecordType::Generic
         | RecordType::LongIn
         | RecordType::LongOut => {
-            eprintln!(
-                "Record '{}': type '{}' is not a standard EPICS Base record type and cannot be loaded from .db files",
-                record.name, record.record_type
-            );
             return None;
         }
     };
@@ -730,11 +748,9 @@ fn parse_db_inner(
     macros: &HashMap<String, String>,
     visiting: &mut Vec<String>,
 ) -> Result<Vec<DbRecord>, DbParseError> {
-    let record_re = Regex::new(r#"^record\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([^"]*)"\s*\)\s*\{?$"#)
-        .expect("static record regex");
-    let field_re = Regex::new(r#"^field\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([\s\S]*)"\s*\)$"#)
-        .expect("static field regex");
-    let include_re = Regex::new(r#"^include\s+"?([^"]+)"?$"#).expect("static include regex");
+    let record_re = &*RECORD_RE;
+    let field_re = &*FIELD_RE;
+    let include_re = &*INCLUDE_RE;
 
     let mut records: Vec<DbRecord> = Vec::new();
     let mut current: Option<DbRecord> = None;
@@ -829,8 +845,10 @@ fn typed_from_raw(raw: &[DbRecord]) -> Result<HashMap<String, RecordInstance>, S
     for rec in raw {
         let Some(parsed) = to_record(rec) else {
             return Err(format!(
-                "record '{}' of type '{}' is not supported",
-                rec.name, rec.record_type
+                "record '{}' of type '{}' is not yet supported by the .db loader; {}",
+                rec.name,
+                rec.record_type,
+                "create it through the host API instead"
             ));
         };
         map.insert(parsed.name.clone(), parsed);
@@ -1086,5 +1104,80 @@ mod tests {
         );
         load_db(path.to_str().expect("utf8 path"))
             .expect("archiver_demo.db must load as typed records");
+    }
+
+    #[test]
+    fn parsing_an_include_tree_yields_the_same_records_and_fields() {
+        // Characterisation: the regexes move to statics, so the parse result
+        // must be untouched — record names, include ordering AND field
+        // capture, since all three regexes are being moved.
+        //
+        // NOTE the directory name. `include_pulls_in_a_sibling_file`
+        // already uses `spvirit_db_include_test`, and cargo runs
+        // tests in parallel — reusing that name makes both tests flaky.
+        let dir = std::env::temp_dir().join("spvirit_db_lazyregex_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(
+            dir.join("inner.db"),
+            "record(ai, \"INC:one\") {\n    field(DESC, \"from include\")\n}\n",
+        )
+        .expect("write inner");
+        std::fs::write(
+            dir.join("outer.db"),
+            "record(ai, \"TOP:one\") {\n    field(DESC, \"top\")\n}\ninclude \"inner.db\"\n",
+        )
+        .expect("write outer");
+
+        let recs = load_db_records(
+            dir.join("outer.db").to_str().expect("utf8 path"),
+            &HashMap::new(),
+        )
+        .expect("parsed");
+        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["TOP:one", "INC:one"]);
+        assert_eq!(
+            recs[1].fields.get("DESC").map(String::as_str),
+            Some("from include"),
+            "the field regex must still capture through an include"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_mbbi_record_is_reported_as_unsupported_not_as_non_standard() {
+        // mbbi IS a standard EPICS Base record type; `RecordType::from_db_name`
+        // maps it, so the untyped parse succeeds and this diagnostic arm
+        // really is reachable - the operator is not making a typo, the loader
+        // just cannot construct the record yet.
+        let src = "record(mbbi, \"M:one\") {
+    field(DESC, \"m\")
+}
+";
+        let raw = parse_db_records(src, "test.db", &HashMap::new()).expect("raw parse succeeds");
+        assert_eq!(raw.len(), 1);
+        assert!(
+            to_record(&raw[0]).is_none(),
+            "mbbi is not constructible from .db yet"
+        );
+
+        // The operator-facing text is the `Err` from the typed load. Assert on
+        // that returned String, which is a production value - NOT on the file's
+        // own source text, which a test containing the same literal could never
+        // fail against.
+        let err = parse_db(src).expect_err("the typed load must abort");
+        assert!(err.contains("M:one"), "the error must name the record: {err}");
+        assert!(err.contains("mbbi"), "the error must name the type: {err}");
+        // Exact text, so a regression to a `\`-continued literal (which in a
+        // CRLF checkout keeps the CR and the next line's indent) fails here.
+        assert_eq!(
+            err,
+            "record 'M:one' of type 'mbbi' is not yet supported by the .db loader; create it through the host API instead",
+        );
+        assert!(
+            !err.contains("standard"),
+            "the diagnostic still calls a standard record type non-standard: {err}"
+        );
     }
 }

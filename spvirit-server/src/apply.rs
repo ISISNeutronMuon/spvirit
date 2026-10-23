@@ -4,7 +4,7 @@ use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_types::*;
 
 use crate::convert::*;
-use crate::types::{RecordData, RecordInstance, now_nt_timestamp};
+use crate::types::{now_nt_timestamp, RecordData, RecordInstance};
 
 /// Apply a scalar value update from a decoded PUT body to an `NtScalar`.
 pub fn apply_value_update(nt: &mut NtScalar, val: &DecodedValue, compute_alarms: bool) -> bool {
@@ -506,30 +506,27 @@ pub struct PutOutcome {
     pub client_stamped: bool,
 }
 
-/// Pull a usable `timeStamp` out of a decoded PUT body.
+/// Pull a usable timestamp field out of a decoded PUT body.
 ///
 /// Returns `None` when the field is absent or decodes to the epoch-0 default:
 /// that is the untouched value a client sends when it does not care about the
 /// timestamp, never a real acquisition time.
-fn client_timestamp(value: &DecodedValue) -> Option<NtTimeStamp> {
+fn client_timestamp_named(value: &DecodedValue, field_name: &str) -> Option<NtTimeStamp> {
     let DecodedValue::Structure(fields) = value else {
         return None;
     };
-    let (_, field) = fields.iter().find(|(name, _)| name == "timeStamp")?;
-    let ts = decode_nt_timestamp(field)?;
+    let ts = decode_nt_timestamp(crate::convert::field(fields, field_name)?)?;
     (ts != NtTimeStamp::default()).then_some(ts)
 }
 
-/// Pull a usable `dataTimeStamp` out of a decoded PUT body — the NdArray
-/// acquisition time, distinct from the relay `timeStamp`. Same absent/default
-/// handling as [`client_timestamp`].
+/// Pull a usable `timeStamp` out of a decoded PUT body.
+fn client_timestamp(value: &DecodedValue) -> Option<NtTimeStamp> {
+    client_timestamp_named(value, "timeStamp")
+}
+
+/// The NdArray acquisition time, distinct from the relay `timeStamp`.
 fn client_data_timestamp(value: &DecodedValue) -> Option<NtTimeStamp> {
-    let DecodedValue::Structure(fields) = value else {
-        return None;
-    };
-    let (_, field) = fields.iter().find(|(name, _)| name == "dataTimeStamp")?;
-    let ts = decode_nt_timestamp(field)?;
-    (ts != NtTimeStamp::default()).then_some(ts)
+    client_timestamp_named(value, "dataTimeStamp")
 }
 
 impl RecordInstance {

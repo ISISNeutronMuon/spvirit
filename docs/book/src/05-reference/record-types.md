@@ -41,12 +41,10 @@ If you are not sure whether you want a record at all, read
 (`spvirit-server/src/types.rs:308`).
 
 ² `RecordType::from_db_name` maps twelve `.db` spellings, including `mbbi`
-(also spelled `ntenum`) and `mbbo`. Those two then reach an arm in
-`spvirit-server/src/db.rs:550` that prints *"is not a standard EPICS Base
-record type and cannot be loaded from .db files"* (message at db.rs:558) and
-drops the record.
-`mbbi` and `mbbo` **are** standard EPICS Base record types; the message is
-wrong. See [Known gaps](known-gaps.md).
+(also spelled `ntenum`) and `mbbo`. The `.db` loader does not construct those
+two yet: loading a file that contains one fails with *"record '…' of type
+'mbbi' is not yet supported by the .db loader; create it through the host API
+instead"*. See [Known gaps](known-gaps.md).
 
 ³ Writable in the sense that the record accepts write access. A wire PUT of
 an enum index is currently dropped — see [Known gaps](known-gaps.md).

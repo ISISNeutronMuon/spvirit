@@ -237,7 +237,7 @@ lets any in-flight `notify_monitors` finish first.
 - `parse_db` (db.rs:579) is **line-oriented** (one statement per line). A
   packed one-liner `record(...){field(...)}` silently drops its fields.
 - `.db` **cannot** load longin/longout/mbbi/mbbo/table/ndarray/generic — the
-  two `TODO(follow-up)` markers in the codebase (types.rs:45, db.rs:546).
+  two `TODO(follow-up)` markers in the codebase (types.rs:45, db.rs:562).
   Those record types exist only via the builder/handle APIs.
 
 ## Typed handle layer (`pv.rs`)

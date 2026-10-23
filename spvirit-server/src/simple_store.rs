@@ -17,7 +17,7 @@ use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::{PvInfo, Source, TryClaim};
-use crate::types::{RecordData, RecordInstance};
+use crate::types::{NtPayloadRef, RecordData, RecordInstance};
 
 /// Callback invoked after a PUT value is applied to a record.
 pub type OnPutCallback = Arc<dyn Fn(&str, &DecodedValue) + Send + Sync>;
@@ -136,6 +136,22 @@ impl SimplePvStore {
     pub async fn get_record(&self, name: &str) -> Option<RecordInstance> {
         let pvs = self.pvs.read().await;
         pvs.get(name).map(|e| e.record.clone())
+    }
+
+    /// Run `f` against the named record while the read guard is held, and
+    /// return whatever it produces.
+    ///
+    /// This is the borrowing alternative to [`get_record`](Self::get_record),
+    /// which clones the whole `RecordInstance`. `f` is synchronous by
+    /// construction, so no borrow can escape the guard and none can be held
+    /// across an await.
+    pub async fn with_record<R>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&RecordInstance) -> R,
+    ) -> Option<R> {
+        let pvs = self.pvs.read().await;
+        pvs.get(name).map(|e| f(&e.record))
     }
 
     /// Read the full [`NtPayload`] of a PV.
@@ -414,7 +430,7 @@ impl Source for SimplePvStore {
         Box::pin(async move {
             let pvs = self.pvs.read().await;
             let entry = pvs.get(&name)?;
-            let descriptor = descriptor_for_payload(&entry.record.to_ntpayload());
+            let descriptor = descriptor_for_record(entry.record.payload_ref());
             Some(PvInfo {
                 descriptor,
                 writable: entry.record.writable(),
@@ -515,6 +531,13 @@ impl Source for SimplePvStore {
         Box::pin(async move {
             let mut pvs = self.pvs.write().await;
             let entry = pvs.get_mut(&name)?;
+            // The write guard is already held, so pruning here is free. A
+            // client that subscribes, drops and re-subscribes would otherwise
+            // leave a dead sender behind on every cycle, and every one of
+            // them gets walked on every post. `is_closed()` is the same
+            // "closed" test as `deliver_or_keep`'s `Closed` arm; a full but
+            // live sender is kept.
+            entry.subscribers.retain(|tx| !tx.is_closed());
             let (tx, rx) = mpsc::channel(64);
             entry.subscribers.push(tx);
             Some(rx)
@@ -571,8 +594,8 @@ fn scalar_as_f64(v: &ScalarValue) -> Option<f64> {
 /// initialises MLST from the initial VAL, so the first small change is
 /// already subject to the deadband).
 fn initial_posted(record: &RecordInstance) -> Option<f64> {
-    match record.to_ntpayload() {
-        NtPayload::Scalar(nt) => scalar_as_f64(&nt.value),
+    match record.payload_ref() {
+        NtPayloadRef::Scalar(nt) => scalar_as_f64(&nt.value),
         _ => None,
     }
 }
@@ -585,15 +608,15 @@ fn initial_posted(record: &RecordInstance) -> Option<f64> {
 /// alarm severity did not change, and the value moved less than MDEL from
 /// the last *posted* value — EPICS monitor-deadband semantics.
 fn should_post_update(entry: &mut PvEntry, prev_severity: i32) -> bool {
-    let new_f = match entry.record.to_ntpayload() {
-        NtPayload::Scalar(nt) => match scalar_as_f64(&nt.value) {
+    let new_f = match entry.record.payload_ref() {
+        NtPayloadRef::Scalar(nt) => match scalar_as_f64(&nt.value) {
             Some(f) => f,
             None => return true,
         },
         _ => return true,
     };
     let mdel = crate::record_fields::mdel_of(&entry.record);
-    let severity_changed = entry.record.to_ntscalar().alarm_severity != prev_severity;
+    let severity_changed = entry.record.alarm_severity() != prev_severity;
     let within_deadband = mdel > 0.0
         && !severity_changed
         && entry
@@ -622,6 +645,24 @@ fn should_post_update(entry: &mut PvEntry, prev_severity: i32) -> bool {
 /// that class of drift.
 pub fn descriptor_for_payload(payload: &NtPayload) -> StructureDesc {
     spvirit_codec::spvd_encode::nt_payload_desc(payload)
+}
+
+/// The advertised descriptor, built from a BORROWED payload.
+///
+/// Same result as [`descriptor_for_payload`], without cloning the record to
+/// get it — a claim on a large waveform used to clone every sample purely to
+/// read the array's element type. Every arm delegates to the codec for the
+/// same reason `descriptor_for_payload` does: one builder, no drift.
+pub(crate) fn descriptor_for_record(payload: NtPayloadRef<'_>) -> StructureDesc {
+    use spvirit_codec::spvd_encode as enc;
+    match payload {
+        NtPayloadRef::Scalar(nt) => enc::nt_scalar_desc(&nt.value),
+        NtPayloadRef::ScalarArray(nt) => enc::nt_scalar_array_desc(&nt.value),
+        NtPayloadRef::Table(nt) => enc::nt_table_desc(nt),
+        NtPayloadRef::NdArray(_) => enc::nt_ndarray_desc(),
+        NtPayloadRef::Enum(_) => enc::nt_enum_desc(),
+        NtPayloadRef::Generic { struct_id, fields } => enc::pv_value_desc(struct_id, fields),
+    }
 }
 
 #[cfg(test)]
@@ -1477,5 +1518,189 @@ record(ao, "DB:AO") {
         assert!(Source::claim(&store, "PRESENT").await.is_some());
         assert_eq!(store.try_claim("ABSENT"), TryClaim::No);
         assert!(Source::claim(&store, "ABSENT").await.is_none());
+    }
+
+    #[test]
+    fn deadband_gate_sees_a_severity_change_even_within_the_deadband() {
+        // MDEL suppression must be defeated by an alarm-severity change. This
+        // pins the behaviour that `should_post_update` gets its severity from
+        // the record, whichever accessor it uses to do so.
+        let mut record = make_ai("A:severity", 1.0);
+        record.raw_fields.insert("MDEL".to_string(), "10.0".to_string());
+        // `PvEntry` is a private struct in this module with no constructor
+        // (simple_store.rs:41-48); `mod tests` is a child module, so build it
+        // literally, exactly as `SimplePvStore::new` does at :66-79.
+        let mut entry = PvEntry {
+            record,
+            subscribers: Vec::new(),
+            last_posted: Some(1.0),
+        };
+
+        // A tiny move with no severity change is inside the deadband.
+        assert!(
+            !should_post_update(&mut entry, 0),
+            "a sub-MDEL move with no severity change must be suppressed"
+        );
+
+        // The same tiny move with a severity change must be posted.
+        if let Some(nt) = entry.record.nt_scalar_mut() {
+            nt.alarm_severity = 2;
+        }
+        assert!(
+            should_post_update(&mut entry, 0),
+            "a severity change must defeat the deadband"
+        );
+    }
+
+    /// The payload shapes `descriptor_payload_samples()` does not cover:
+    /// Table, NdArray, Enum and Generic. Without these the "every shape"
+    /// claim below would be false.
+    fn extra_descriptor_shapes() -> Vec<(&'static str, NtPayload)> {
+        use spvirit_types::{NtEnum, PvValue};
+        vec![
+            (
+                "NTTable",
+                NtPayload::Table(NtTable {
+                    labels: vec!["X".to_string()],
+                    columns: vec![NtTableColumn {
+                        name: "x".to_string(),
+                        values: ScalarArrayValue::F64(vec![1.0, 2.0]),
+                    }],
+                    descriptor: Some("table".to_string()),
+                    alarm: None,
+                    time_stamp: None,
+                }),
+            ),
+            ("NTNDArray", NtPayload::NdArray(NtNdArray::empty())),
+            (
+                "NTEnum",
+                NtPayload::Enum(NtEnum::new(1, vec!["OFF".to_string(), "ON".to_string()])),
+            ),
+            (
+                "Generic",
+                NtPayload::Generic {
+                    struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                    fields: vec![("value".to_string(), PvValue::Scalar(ScalarValue::I32(3)))],
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_borrowing_descriptor_matches_the_owning_one_for_every_shape() {
+        // `descriptor_for_record` must be byte-identical to
+        // `descriptor_for_payload`: the descriptor is what PUT bodies are
+        // decoded against, so any drift here breaks writes, exactly as the
+        // string-PUT regression did.
+        let all = descriptor_payload_samples()
+            .into_iter()
+            .chain(extra_descriptor_shapes());
+        for (label, payload) in all {
+            let borrowed = match &payload {
+                NtPayload::Scalar(nt) => descriptor_for_record(NtPayloadRef::Scalar(nt)),
+                NtPayload::ScalarArray(nt) => {
+                    descriptor_for_record(NtPayloadRef::ScalarArray(nt))
+                }
+                NtPayload::Table(nt) => descriptor_for_record(NtPayloadRef::Table(nt)),
+                NtPayload::NdArray(nt) => descriptor_for_record(NtPayloadRef::NdArray(nt)),
+                NtPayload::Enum(nt) => descriptor_for_record(NtPayloadRef::Enum(nt)),
+                NtPayload::Generic { struct_id, fields } => {
+                    descriptor_for_record(NtPayloadRef::Generic { struct_id, fields })
+                }
+            };
+            assert_eq!(
+                borrowed,
+                descriptor_for_payload(&payload),
+                "borrowed descriptor drifted from the owned one for {label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_advertises_the_same_descriptor_as_before() {
+        let mut records = std::collections::HashMap::new();
+        let wf = make_waveform("W:big", ScalarArrayValue::F64(vec![0.0; 1024]));
+        let expected = descriptor_for_payload(&wf.to_ntpayload());
+        records.insert("W:big".to_string(), wf);
+        let store = SimplePvStore::new(
+            records,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            false,
+        );
+
+        let info = Source::claim(&store, "W:big").await.expect("claimed");
+        assert_eq!(info.descriptor, expected);
+    }
+
+    #[tokio::test]
+    async fn with_record_runs_against_the_live_record_and_misses_cleanly() {
+        let mut records = HashMap::new();
+        records.insert("A:test".to_string(), make_ai("A:test", 4.5));
+        let store = SimplePvStore::new(records, HashMap::new(), Vec::new(), false);
+
+        let value = store
+            .with_record("A:test", |rec| rec.current_value())
+            .await
+            .expect("record present");
+        assert_eq!(value, store.get_value("A:test").await.unwrap());
+
+        assert!(
+            store.with_record("A:absent", |_| ()).await.is_none(),
+            "a missing record must yield None, not a default"
+        );
+    }
+
+    /// The `<rec>.<FIELD>` path itself, through the trait, so the migration
+    /// is pinned by behaviour and not just by the accessor's contract.
+    #[tokio::test]
+    async fn field_provider_serves_fields_from_the_borrowed_record() {
+        use crate::field_provider::RecordFieldProvider;
+        use crate::record_fields::FieldKind;
+
+        let mut records = HashMap::new();
+        records.insert("A:test".to_string(), make_ai("A:test", 4.5));
+        let store = SimplePvStore::new(records, HashMap::new(), Vec::new(), false);
+
+        assert_eq!(
+            store.field_value("A:test", "RTYP").await,
+            Some(ScalarValue::Str("ai".to_string()))
+        );
+        assert_eq!(
+            store.field_value("A:test", "NAME").await,
+            Some(ScalarValue::Str("A:test".to_string()))
+        );
+        assert_eq!(
+            store.field_descriptor("A:test", "RTYP").await.map(|d| d.kind),
+            Some(FieldKind::Str)
+        );
+        assert!(store.field_value("A:absent", "RTYP").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribing_prunes_senders_whose_receivers_are_gone() {
+        let mut records = std::collections::HashMap::new();
+        records.insert("A:sub".to_string(), make_ai("A:sub", 1.0));
+        let store = SimplePvStore::new(
+            records,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            false,
+        );
+
+        // Subscribe and immediately drop the receiver, three times over.
+        for _ in 0..3 {
+            let rx = Source::subscribe(&store, "A:sub").await.expect("subscribed");
+            drop(rx);
+        }
+        // A fourth subscribe must not leave the three dead senders behind.
+        let _live = Source::subscribe(&store, "A:sub").await.expect("subscribed");
+
+        let pvs = store.pvs.read().await;
+        assert_eq!(
+            pvs.get("A:sub").unwrap().subscribers.len(),
+            1,
+            "closed senders were not pruned"
+        );
     }
 }
