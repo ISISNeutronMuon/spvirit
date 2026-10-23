@@ -30,8 +30,9 @@ pub const MAX_INBOUND_PAYLOAD_BYTES: usize = spvirit_codec::DEFAULT_MAX_MESSAGE_
 /// consumes nothing), so the only state that has to survive a drop is this
 /// cursor.
 ///
-/// The `payload` allocation is also reused as the fill buffer across resumed
-/// reads of a single frame.
+/// The `payload` allocation is reused as the fill buffer across resumed reads
+/// of a single frame, and across frames when the caller donates the finished
+/// message back with [`FrameBuf::recycle`].
 pub struct FrameBuf {
     /// The 8-byte header being filled.
     header: [u8; 8],
@@ -80,12 +81,58 @@ impl FrameBuf {
         }
     }
 
-    /// Reset to await a new frame (keeps the `payload` allocation for reuse).
+    /// Reset to await a new frame. Note that `read_frame_into` takes the
+    /// payload buffer out before calling this, so there is nothing left to
+    /// keep unless the caller donates one back via [`FrameBuf::recycle`].
     fn reset(&mut self) {
         self.header_filled = 0;
         self.header_done = false;
         self.payload_filled = 0;
         self.payload_need = 0;
+    }
+
+    /// Donate a finished message buffer back for the next frame's payload.
+    ///
+    /// `read_frame_into` moves the payload allocation out into the message it
+    /// returns, so without this the next frame allocates from scratch. A
+    /// caller that is done with a message (the monitor loop, at the end of an
+    /// iteration) hands it back here.
+    ///
+    /// Ignored when a frame is partially read — replacing the buffer then
+    /// would discard bytes already taken off the socket, which would break
+    /// the cancel-safety invariant (prior audit item C1) — and ignored when
+    /// the donation is no larger than what is already held.
+    pub fn recycle(&mut self, buf: Vec<u8>) {
+        if self.header_filled != 0 || self.header_done || self.payload_filled != 0 {
+            return;
+        }
+        if buf.capacity() <= self.payload.capacity() {
+            return;
+        }
+        let mut buf = buf;
+        buf.clear();
+        self.payload = buf;
+    }
+
+    #[cfg(test)]
+    fn payload_capacity(&self) -> usize {
+        self.payload.capacity()
+    }
+
+    #[cfg(test)]
+    fn payload_ptr(&self) -> *const u8 {
+        self.payload.as_ptr()
+    }
+
+    /// Test hook: put the buffer into the "header parsed, payload partly
+    /// read" state that `recycle` must refuse to disturb.
+    #[cfg(test)]
+    fn begin_for_test(&mut self, need: usize, filled: usize) {
+        self.header_done = true;
+        self.payload_need = need;
+        self.payload.clear();
+        self.payload.resize(need, 0);
+        self.payload_filled = filled;
     }
 }
 
@@ -380,6 +427,46 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::time::sleep;
+
+    #[test]
+    fn recycle_reuses_the_donated_allocation_for_the_next_frame() {
+        let mut fb = FrameBuf::new();
+        let mut donated = Vec::with_capacity(4096);
+        donated.extend_from_slice(&[0u8; 16]);
+        let want = donated.as_ptr();
+
+        fb.recycle(donated);
+        assert_eq!(fb.payload_capacity(), 4096);
+        assert_eq!(fb.payload_ptr(), want, "the same allocation must be kept");
+    }
+
+    #[test]
+    fn recycle_is_ignored_while_a_partial_read_is_in_progress() {
+        let mut fb = FrameBuf::new();
+        // Simulate a frame whose header is parsed and whose payload is
+        // half-filled: donating here would drop bytes already read.
+        fb.begin_for_test(64, 10);
+        let before = fb.payload_capacity();
+
+        fb.recycle(Vec::with_capacity(4096));
+        assert_eq!(
+            fb.payload_capacity(),
+            before,
+            "an in-progress frame must not have its buffer replaced"
+        );
+    }
+
+    #[test]
+    fn recycle_keeps_the_larger_of_the_two_buffers() {
+        let mut fb = FrameBuf::new();
+        fb.recycle(Vec::with_capacity(8192));
+        fb.recycle(Vec::with_capacity(64));
+        assert_eq!(
+            fb.payload_capacity(),
+            8192,
+            "a smaller donation must not shrink the buffer"
+        );
+    }
 
     /// Site 2. `read_frame_into` resized straight to the peer-declared u32.
     /// Eight bytes of header from an upstream server made the gateway ask for

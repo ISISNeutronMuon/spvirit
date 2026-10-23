@@ -1154,9 +1154,6 @@ impl PvaClient {
                     if let (Some(sink), Some(host)) = (&self.byte_sink, &sink_host) {
                         sink.on_rx(pv_name, host, bytes.len() as u64);
                     }
-                    let Some(update_body) = monitor_data_body(&bytes, ioid, is_be) else {
-                        continue;
-                    };
                     // Decode the update, but do NOT gate credit accounting on
                     // a successful decode. Under pipelining the server charges
                     // exactly one credit for this MONITOR data message whether
@@ -1168,7 +1165,23 @@ impl PvaClient {
                     // server stops sending and the monitor stalls forever.
                     // Only the callback / break handling is gated on a
                     // successful decode.
-                    let decoded = decoder.decode_monitor_update(update_body, &field_desc);
+                    // Decode first: `monitor_data_body` borrows `bytes`, and
+                    // `recycle` needs it by value. `MonitorUpdate` is owned
+                    // (spvirit-codec/src/monitor.rs:19-34), so nothing borrows
+                    // `bytes` past this statement.
+                    let decoded = monitor_data_body(&bytes, ioid, is_be)
+                        .map(|body| decoder.decode_monitor_update(body, &field_desc));
+
+                    // The frame buffer is finished with: hand its allocation
+                    // back so the next frame does not allocate. `frame_buf` is
+                    // at a clean boundary here — `read_frame_resumable` only
+                    // returns a complete message after `FrameBuf::reset` — so
+                    // the guard inside `recycle` accepts the donation.
+                    frame_buf.recycle(bytes);
+
+                    // Not a MONITOR data message for our ioid: no credit was
+                    // consumed and there is nothing to hand the callback.
+                    let Some(decoded) = decoded else { continue };
 
                     if pipeline_queue.is_some() {
                         if let Some(ack) = pipeline_ack_on_consume(
