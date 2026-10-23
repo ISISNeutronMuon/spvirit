@@ -306,6 +306,22 @@ impl RecordData {
         }
     }
 
+    /// The record's `NtScalar`, for the six variants that carry one.
+    ///
+    /// Unlike the old `nt()` this returns `None` rather than panicking on the
+    /// eight variants that do not have one.
+    pub fn nt_scalar(&self) -> Option<&NtScalar> {
+        match self {
+            Self::Ai { nt, .. }
+            | Self::Ao { nt, .. }
+            | Self::Bi { nt, .. }
+            | Self::Bo { nt, .. }
+            | Self::StringIn { nt, .. }
+            | Self::StringOut { nt, .. } => Some(nt),
+            _ => None,
+        }
+    }
+
     /// Borrowing counterpart of [`payload`](Self::payload): the same variant
     /// mapping with no clones.
     pub fn payload_ref(&self) -> NtPayloadRef<'_> {
@@ -366,30 +382,46 @@ impl RecordInstance {
         self.data.payload()
     }
 
+    /// Borrowing counterpart of [`to_ntpayload`](Self::to_ntpayload).
+    pub fn payload_ref(&self) -> NtPayloadRef<'_> {
+        self.data.payload_ref()
+    }
+
+    /// The record's alarm severity without materialising an `NtScalar`.
+    ///
+    /// Non-scalar shapes have no severity of their own; `to_ntscalar` reports
+    /// 0 for them and so does this.
+    pub fn alarm_severity(&self) -> i32 {
+        match self.payload_ref() {
+            NtPayloadRef::Scalar(nt) => nt.alarm_severity,
+            _ => 0,
+        }
+    }
+
     pub fn to_ntscalar(&self) -> NtScalar {
-        match self.to_ntpayload() {
-            NtPayload::Scalar(nt) => nt,
-            NtPayload::ScalarArray(nt) => {
+        match self.payload_ref() {
+            NtPayloadRef::Scalar(nt) => nt.clone(),
+            NtPayloadRef::ScalarArray(nt) => {
                 let mut scalar = NtScalar::from_value(ScalarValue::I32(nt.value.len() as i32));
                 scalar.display_description = "Array length".to_string();
                 scalar
             }
-            NtPayload::Table(nt) => {
+            NtPayloadRef::Table(nt) => {
                 let mut scalar = NtScalar::from_value(ScalarValue::I32(nt.columns.len() as i32));
                 scalar.display_description = "Table columns".to_string();
                 scalar
             }
-            NtPayload::NdArray(nt) => {
+            NtPayloadRef::NdArray(nt) => {
                 let mut scalar = NtScalar::from_value(ScalarValue::I32(nt.dimension.len() as i32));
                 scalar.display_description = "NDArray dimensions".to_string();
                 scalar
             }
-            NtPayload::Enum(nt) => {
+            NtPayloadRef::Enum(nt) => {
                 let mut scalar = NtScalar::from_value(ScalarValue::I32(nt.index));
                 scalar.display_description = nt.selected().unwrap_or("").to_string();
                 scalar
             }
-            NtPayload::Generic { fields, .. } => {
+            NtPayloadRef::Generic { fields, .. } => {
                 let mut scalar = NtScalar::from_value(ScalarValue::I32(fields.len() as i32));
                 scalar.display_description = "Generic structure".to_string();
                 scalar
@@ -416,13 +448,13 @@ impl RecordInstance {
     }
 
     pub fn current_value(&self) -> ScalarValue {
-        match self.to_ntpayload() {
-            NtPayload::Scalar(nt) => nt.value,
-            NtPayload::ScalarArray(nt) => ScalarValue::I32(nt.value.len() as i32),
-            NtPayload::Table(nt) => ScalarValue::I32(nt.columns.len() as i32),
-            NtPayload::NdArray(nt) => ScalarValue::I32(nt.dimension.len() as i32),
-            NtPayload::Enum(nt) => ScalarValue::I32(nt.index),
-            NtPayload::Generic { fields, .. } => ScalarValue::I32(fields.len() as i32),
+        match self.payload_ref() {
+            NtPayloadRef::Scalar(nt) => nt.value.clone(),
+            NtPayloadRef::ScalarArray(nt) => ScalarValue::I32(nt.value.len() as i32),
+            NtPayloadRef::Table(nt) => ScalarValue::I32(nt.columns.len() as i32),
+            NtPayloadRef::NdArray(nt) => ScalarValue::I32(nt.dimension.len() as i32),
+            NtPayloadRef::Enum(nt) => ScalarValue::I32(nt.index),
+            NtPayloadRef::Generic { fields, .. } => ScalarValue::I32(fields.len() as i32),
         }
     }
 
@@ -1305,6 +1337,40 @@ mod tests {
                 rec.data.payload_ref().to_owned_payload(),
                 rec.data.payload(),
                 "borrowed and owned payload views disagree for {:?}",
+                rec.record_type
+            );
+        }
+    }
+
+    #[test]
+    fn alarm_severity_matches_the_owned_accessor_for_every_shape() {
+        for rec in one_record_per_shape() {
+            assert_eq!(
+                rec.alarm_severity(),
+                rec.to_ntscalar().alarm_severity,
+                "alarm_severity disagrees with to_ntscalar for {:?}",
+                rec.record_type
+            );
+        }
+    }
+
+    #[test]
+    fn alarm_severity_reads_a_real_scalar_severity() {
+        let mut rec = ai_record(1.0);
+        if let RecordData::Ai { nt, .. } = &mut rec.data {
+            nt.alarm_severity = 2;
+        }
+        assert_eq!(rec.alarm_severity(), 2);
+    }
+
+    #[test]
+    fn nt_scalar_is_none_where_nt_would_have_panicked() {
+        for rec in one_record_per_shape() {
+            let is_scalar_shape = matches!(rec.payload_ref(), NtPayloadRef::Scalar(_));
+            assert_eq!(
+                rec.data.nt_scalar().is_some(),
+                is_scalar_shape,
+                "nt_scalar disagrees with the payload shape for {:?}",
                 rec.record_type
             );
         }
