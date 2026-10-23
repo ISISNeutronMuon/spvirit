@@ -568,59 +568,37 @@ fn build_trigger_map(def: &GroupPvDef) -> HashMap<String, Vec<String>> {
 
 /// Wait for any member receiver to produce a value, returning the field name
 /// of the member that updated. Returns `None` when all channels are closed.
+///
+/// `mpsc::Receiver::recv` is cancel-safe, so dropping the losing futures each
+/// round loses nothing. After a win the list is rotated so the next round
+/// starts after the winner: `select_all` polls in order, and without the
+/// rotation a chatty low-index member starves everything behind it.
 async fn poll_any_member(members: &mut Vec<(String, mpsc::Receiver<NtPayload>)>) -> Option<String> {
-    if members.is_empty() {
-        return None;
-    }
-
-    // Create pinned futures for each member.
-    let futs: Vec<_> = members
-        .iter_mut()
-        .map(|(name, rx)| {
-            let name = name.clone();
-            Box::pin(async move { (name, rx.recv().await) })
-                as std::pin::Pin<Box<dyn Future<Output = (String, Option<NtPayload>)> + Send + '_>>
-        })
-        .collect();
-
-    let (field_name, payload) = race_all(futs).await;
-
-    if payload.is_none() {
-        // This member channel is closed; remove it.
-        members.retain(|(n, _)| n != &field_name);
+    loop {
         if members.is_empty() {
             return None;
         }
-        return Box::pin(poll_any_member(members)).await;
-    }
-
-    Some(field_name)
-}
-
-/// Race a vec of pinned futures, returning the result of the first to complete.
-async fn race_all<T>(futs: Vec<std::pin::Pin<Box<dyn Future<Output = T> + Send + '_>>>) -> T {
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-
-    assert!(!futs.is_empty());
-
-    struct RaceAll<'a, T> {
-        futs: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>,
-    }
-
-    impl<T> Future for RaceAll<'_, T> {
-        type Output = T;
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            for fut in &mut self.futs {
-                if let Poll::Ready(val) = fut.as_mut().poll(cx) {
-                    return Poll::Ready(val);
-                }
+        let (result, idx) = {
+            let futs: Vec<_> = members
+                .iter_mut()
+                .map(|(_, rx)| Box::pin(rx.recv()))
+                .collect();
+            let (result, idx, _losers) = futures::future::select_all(futs).await;
+            (result, idx)
+        };
+        match result {
+            Some(_) => {
+                let field_name = members[idx].0.clone();
+                members.rotate_left(idx + 1);
+                return Some(field_name);
             }
-            Poll::Pending
+            // Closed channel: drop that member and race the rest. This is a
+            // loop, not recursion, so a burst of closures allocates nothing.
+            None => {
+                members.remove(idx);
+            }
         }
     }
-
-    RaceAll { futs }.await
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,5 +1380,58 @@ mod tests {
         };
         assert_eq!(sub("alarm"), spvirit_codec::spvd_encode::alarm_desc());
         assert_eq!(sub("timeStamp"), spvirit_codec::spvd_encode::timestamp_desc());
+    }
+
+    #[tokio::test]
+    async fn poll_any_member_is_fair_across_members() {
+        // Two members both always ready. A poll that always starts at index 0
+        // returns "a" every time; a fair one alternates.
+        let (tx_a, rx_a) = mpsc::channel(8);
+        let (tx_b, rx_b) = mpsc::channel(8);
+        for _ in 0..4 {
+            tx_a.send(NtPayload::Scalar(spvirit_types::NtScalar::from_value(
+                ScalarValue::I32(1),
+            )))
+            .await
+            .unwrap();
+            tx_b.send(NtPayload::Scalar(spvirit_types::NtScalar::from_value(
+                ScalarValue::I32(2),
+            )))
+            .await
+            .unwrap();
+        }
+        let mut members = vec![("a".to_string(), rx_a), ("b".to_string(), rx_b)];
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(poll_any_member(&mut members).await.unwrap());
+        }
+        assert!(
+            seen.iter().any(|f| f == "b"),
+            "member b was starved: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_any_member_drops_closed_members_and_keeps_going() {
+        let (tx_a, rx_a) = mpsc::channel(8);
+        let (tx_b, rx_b) = mpsc::channel(8);
+        drop(tx_a); // a is closed from the start
+        tx_b.send(NtPayload::Scalar(spvirit_types::NtScalar::from_value(
+            ScalarValue::I32(2),
+        )))
+        .await
+        .unwrap();
+        let mut members = vec![("a".to_string(), rx_a), ("b".to_string(), rx_b)];
+
+        assert_eq!(poll_any_member(&mut members).await.as_deref(), Some("b"));
+        assert_eq!(members.len(), 1, "the closed member must be removed");
+
+        drop(tx_b);
+        assert_eq!(
+            poll_any_member(&mut members).await,
+            None,
+            "all members closed must yield None"
+        );
     }
 }
