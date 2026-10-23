@@ -473,8 +473,8 @@ impl Source for GatewaySource {
         value: &DecodedValue,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>> {
         let name = name.to_string();
-        // Converted eagerly (before `Box::pin`) only because `value` is
-        // borrowed and the future is `'static` in `value`; the RESULT is not
+        // Converted eagerly (before `Box::pin`) only because `value` is a
+        // borrow the returned future must not capture; the RESULT is not
         // inspected until after the access decision below, so a denied put
         // never surfaces a conversion error.
         let json = decoded_to_json(value);
@@ -778,7 +778,8 @@ mod tests {
     /// The access decision must run before the value conversion. A read-only
     /// gateway asked to put an unrepresentable value must answer "access
     /// denied" — not a conversion error that reveals the request got past the
-    /// gate, and not the cost of converting a value that will never be sent.
+    /// gate. (The conversion itself still runs eagerly; only its outcome is
+    /// held back until after the decision.)
     #[tokio::test]
     async fn put_decides_access_before_converting_the_value() {
         let read_only = Arc::new(AccessControl::new(true, None, None));
