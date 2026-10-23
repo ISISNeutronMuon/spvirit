@@ -652,11 +652,16 @@ impl<T: PvScalar> Pv<T> {
             .get_value(&self.shared.name)
             .await
             .ok_or_else(|| PvError::NotFound(self.shared.name.clone()))?;
-        let actual = format!("{v:?}");
-        T::from_scalar(v).ok_or(PvError::TypeMismatch {
-            expected: T::TYPE_NAME,
-            actual,
-        })
+        // Format only when the conversion actually failed: `get` is the hot
+        // read path and this used to allocate a diagnostic string on every
+        // successful read.
+        match T::from_scalar(v.clone()) {
+            Some(t) => Ok(t),
+            None => Err(PvError::TypeMismatch {
+                expected: T::TYPE_NAME,
+                actual: format!("{v:?}"),
+            }),
+        }
     }
 
     /// Mint a bound handle to an existing record (e.g. loaded from a `.db`).
@@ -682,11 +687,10 @@ impl<T: PvScalar> Pv<T> {
             .get_value(name)
             .await
             .ok_or_else(|| PvError::NotFound(name.to_string()))?;
-        let actual = format!("{v:?}");
-        if T::from_scalar(v).is_none() {
+        if T::from_scalar(v.clone()).is_none() {
             return Err(PvError::TypeMismatch {
                 expected: T::TYPE_NAME,
-                actual,
+                actual: format!("{v:?}"),
             });
         }
         Ok(Self {
@@ -1494,5 +1498,48 @@ mod tests {
             Some(ScalarValue::Str("hi".into()))
         );
         assert!(ScalarValue::from_decoded(&DecodedValue::Null).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_type_mismatch_still_reports_the_actual_value() {
+        // The `actual` string must survive the move of format! into the
+        // error path - it is user-facing diagnostic text.
+        let store = empty_store();
+        store
+            .insert(
+                "S:one".to_string(),
+                make_output_record(
+                    "S:one",
+                    RecordType::StringOut,
+                    ScalarValue::Str("hi".to_string()),
+                ),
+            )
+            .await;
+
+        // A String-valued record read as i32: `attach` gets past the payload
+        // sniff (it is an NtPayload::Scalar) and fails in `from_scalar`.
+        let err = match Pv::<i32>::attach(&store, "S:one").await {
+            Err(e) => e,
+            Ok(_) => panic!("expected attach to fail"),
+        };
+        match err {
+            PvError::TypeMismatch { actual, .. } => {
+                assert_eq!(actual, "Str(\"hi\")", "the actual-value text changed");
+            }
+            other => panic!("expected a TypeMismatch, got {other:?}"),
+        }
+
+        // Success path: same record read as String returns the same value.
+        let pv = Pv::<String>::attach(&store, "S:one").await.unwrap();
+        assert_eq!(pv.get().await.unwrap(), "hi");
+        // And `get` on a mismatched handle reports the same text.
+        let pv_i32: Pv<i32> = Pv {
+            shared: pv.shared.clone(),
+            _marker: PhantomData,
+        };
+        match pv_i32.get().await.unwrap_err() {
+            PvError::TypeMismatch { actual, .. } => assert_eq!(actual, "Str(\"hi\")"),
+            other => panic!("expected a TypeMismatch, got {other:?}"),
+        }
     }
 }
