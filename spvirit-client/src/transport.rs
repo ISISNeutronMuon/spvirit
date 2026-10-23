@@ -434,9 +434,10 @@ where
         let bytes = read_frame_into(stream, remaining, reassembler, &mut fb, true).await?;
         let mut pkt = PvaPacket::new(&bytes);
         if let Some(cmd) = pkt.decode_payload()
-            && predicate(&cmd) {
-                return Ok(bytes);
-            }
+            && predicate(&cmd)
+        {
+            return Ok(bytes);
+        }
     }
 }
 

@@ -120,9 +120,10 @@ impl ScenarioSession {
         match put_cmd {
             PvaPacketCommand::Op(op) => {
                 if let Some(status) = op.status
-                    && status.code != 0xFF {
-                        return Err(format_status("PUT failed", &status));
-                    }
+                    && status.code != 0xFF
+                {
+                    return Err(format_status("PUT failed", &status));
+                }
                 Ok(())
             }
             _ => Err("unexpected PUT response".to_string()),
@@ -174,9 +175,10 @@ fn extract_desc_or_status(init_cmd: PvaPacketCommand) -> Result<StructureDesc, S
     match init_cmd {
         PvaPacketCommand::Op(op) => {
             if let Some(status) = op.status
-                && status.code != 0xFF {
-                    return Err(format_status("PUT init failed", &status));
-                }
+                && status.code != 0xFF
+            {
+                return Err(format_status("PUT init failed", &status));
+            }
             op.introspection
                 .ok_or_else(|| "PUT init missing introspection".to_string())
         }

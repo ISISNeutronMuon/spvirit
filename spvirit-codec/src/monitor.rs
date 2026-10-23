@@ -311,17 +311,19 @@ fn score_decoded(value: &DecodedValue) -> i32 {
                 if let DecodedValue::Structure(ts_fields) = val
                     && let Some(secs) = ts_fields.iter().find_map(|(n, v)| {
                         if n == "secondsPastEpoch"
-                            && let DecodedValue::Int64(s) = v {
-                                return Some(*s);
-                            }
-                        None
-                    }) {
-                        if (0..=4_000_000_000i64).contains(&secs) {
-                            score += 2;
-                        } else if secs.abs() > 10_000_000_000i64 {
-                            score -= 2;
+                            && let DecodedValue::Int64(s) = v
+                        {
+                            return Some(*s);
                         }
+                        None
+                    })
+                {
+                    if (0..=4_000_000_000i64).contains(&secs) {
+                        score += 2;
+                    } else if secs.abs() > 10_000_000_000i64 {
+                        score -= 2;
                     }
+                }
             }
             "display" | "control" => {
                 score += 1;

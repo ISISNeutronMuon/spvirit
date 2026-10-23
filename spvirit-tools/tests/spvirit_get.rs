@@ -72,9 +72,7 @@ fn run_pvput(server: &str, pv: &str, value: &str) -> std::io::Result<()> {
         .stderr(Stdio::null())
         .status()?;
     if !status.success() {
-        return Err(std::io::Error::other(
-            "pvput failed",
-        ));
+        return Err(std::io::Error::other("pvput failed"));
     }
     Ok(())
 }

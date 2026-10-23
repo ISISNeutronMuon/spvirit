@@ -282,16 +282,18 @@ impl TestSession {
             let remain = deadline - now;
             let (_raw, cmd) = self.read_decoded_packet(remain).await?;
             if let PvaPacketCommand::CreateChannel(payload) = cmd
-                && payload.is_server && payload.cid == cid {
-                    if let Some(status) = payload.status {
-                        return Err(format!(
-                            "create channel failed code={} msg={}",
-                            status.code,
-                            status.message.unwrap_or_default()
-                        ));
-                    }
-                    return Ok(payload.sid);
+                && payload.is_server
+                && payload.cid == cid
+            {
+                if let Some(status) = payload.status {
+                    return Err(format!(
+                        "create channel failed code={} msg={}",
+                        status.code,
+                        status.message.unwrap_or_default()
+                    ));
                 }
+                return Ok(payload.sid);
+            }
         }
     }
 

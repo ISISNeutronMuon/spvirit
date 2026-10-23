@@ -203,14 +203,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             if let Some(sp) = store.get_value("CTRL:SETPOINT").await
                 && let ScalarValue::F64(target) = sp
-                    && let Some(ScalarValue::F64(current)) = store.get_value("CTRL:READBACK").await
-                    {
-                        // First-order exponential approach
-                        let next = current + 0.1 * (target - current);
-                        store
-                            .set_value("CTRL:READBACK", ScalarValue::F64(next))
-                            .await;
-                    }
+                && let Some(ScalarValue::F64(current)) = store.get_value("CTRL:READBACK").await
+            {
+                // First-order exponential approach
+                let next = current + 0.1 * (target - current);
+                store
+                    .set_value("CTRL:READBACK", ScalarValue::F64(next))
+                    .await;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     });

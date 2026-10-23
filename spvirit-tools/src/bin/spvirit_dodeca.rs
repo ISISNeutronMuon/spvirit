@@ -481,10 +481,11 @@ fn infer_response_ip(listen: IpAddr, peer: SocketAddr) -> IpAddr {
     };
     if let Ok(sock) = std::net::UdpSocket::bind(bind_addr)
         && sock.connect(peer).is_ok()
-            && let Ok(local) = sock.local_addr()
-                && !local.ip().is_unspecified() {
-                    return local.ip();
-                }
+        && let Ok(local) = sock.local_addr()
+        && !local.ip().is_unspecified()
+    {
+        return local.ip();
+    }
     IpAddr::V4(Ipv4Addr::UNSPECIFIED)
 }
 

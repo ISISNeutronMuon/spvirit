@@ -32,9 +32,10 @@ async fn pvsine(
         tick.tick().await;
         let t = start.elapsed().as_secs_f64();
         if let Some(dur) = duration
-            && t >= dur {
-                break;
-            }
+            && t >= dur
+        {
+            break;
+        }
         let value = offset + amp * (2.0 * PI * freq_hz * t + phase).sin();
         let number = serde_json::Number::from_f64(value).ok_or_else(|| {
             PvGetError::Protocol(format!(

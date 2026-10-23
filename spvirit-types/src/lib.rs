@@ -302,28 +302,32 @@ impl NtScalar {
         let mut message = String::new();
 
         if let Some(hihi) = self.alarm_hihi
-            && val >= hihi {
-                severity = 2;
-                message = "HIHI".to_string();
-            }
+            && val >= hihi
+        {
+            severity = 2;
+            message = "HIHI".to_string();
+        }
         if severity == 0
             && let Some(high) = self.alarm_high
-                && val >= high {
-                    severity = 1;
-                    message = "HIGH".to_string();
-                }
+            && val >= high
+        {
+            severity = 1;
+            message = "HIGH".to_string();
+        }
         if severity == 0
             && let Some(lolo) = self.alarm_lolo
-                && val <= lolo {
-                    severity = 2;
-                    message = "LOLO".to_string();
-                }
+            && val <= lolo
+        {
+            severity = 2;
+            message = "LOLO".to_string();
+        }
         if severity == 0
             && let Some(low) = self.alarm_low
-                && val <= low {
-                    severity = 1;
-                    message = "LOW".to_string();
-                }
+            && val <= low
+        {
+            severity = 1;
+            message = "LOW".to_string();
+        }
 
         if severity == 0 {
             self.alarm_severity = 0;

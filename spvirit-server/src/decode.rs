@@ -15,14 +15,17 @@ use spvirit_codec::spvirit_encode::encode_size_pva;
 pub fn decode_put_body(body: &[u8], desc: &StructureDesc, is_be: bool) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
     if let Ok((value, _)) = decoder.decode_structure_with_bitset(body, desc)
-        && !decoded_is_empty(&value) {
-            return Some(value);
-        }
-    if !body.is_empty() && body[0] == 0xFF
+        && !decoded_is_empty(&value)
+    {
+        return Some(value);
+    }
+    if !body.is_empty()
+        && body[0] == 0xFF
         && let Ok((value, _)) = decoder.decode_structure_with_bitset(&body[1..], desc)
-            && !decoded_is_empty(&value) {
-                return Some(value);
-            }
+        && !decoded_is_empty(&value)
+    {
+        return Some(value);
+    }
     if let Some(value) = decode_put_body_shifted_bitset(body, desc, is_be) {
         return Some(value);
     }
@@ -67,12 +70,13 @@ fn decode_put_body_value_only(
 ) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
     if let Ok((size, consumed)) = decoder.decode_size(body)
-        && consumed + size <= body.len() {
-            let data = &body[consumed + size..];
-            if let Some(value) = decode_value_only_from_data(data, desc, &decoder) {
-                return Some(value);
-            }
+        && consumed + size <= body.len()
+    {
+        let data = &body[consumed + size..];
+        if let Some(value) = decode_value_only_from_data(data, desc, &decoder) {
+            return Some(value);
         }
+    }
     decode_value_only_from_data(body, desc, &decoder)
 }
 

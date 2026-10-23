@@ -80,9 +80,10 @@ impl JsonSource {
     async fn persist(&self) {
         let pvs = self.pvs.read().await;
         if let Ok(json) = serde_json::to_string_pretty(&*pvs)
-            && let Err(e) = std::fs::write(&self.path, json) {
-                eprintln!("[json_source] failed to persist: {e}");
-            }
+            && let Err(e) = std::fs::write(&self.path, json)
+        {
+            eprintln!("[json_source] failed to persist: {e}");
+        }
     }
 }
 

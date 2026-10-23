@@ -8,8 +8,7 @@ use super::engine::FingerprintConfig;
 ///
 /// Bundled into one struct rather than added as loose parameters so that
 /// later additions do not churn the `process_packets` signature again.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FingerprintOptions {
     /// Master switch. Off by default: fingerprinting adds per-update work to
     /// the capture path, and an operator should opt into that.
@@ -19,7 +18,6 @@ pub struct FingerprintOptions {
     /// its own reason: spec §6.2.
     pub detector: DetectorConfig,
 }
-
 
 #[cfg(test)]
 mod tests {
