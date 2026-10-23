@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -126,8 +126,6 @@ enum WorkerEvent {
 // ---------------------------------------------------------------------------
 
 const PVA_MULTICAST_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
-#[allow(dead_code)]
-const PVA_MULTICAST_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0x42, 1);
 
 fn bind_udp_reuse(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let domain = if addr.is_ipv4() {
@@ -136,7 +134,9 @@ fn bind_udp_reuse(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
         Domain::IPV6
     };
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    #[cfg(unix)]
+    // SO_REUSEADDR on both platforms: this is a broadcast/multicast receiver on
+    // the well-known PVA port, which normally already has a local server bound
+    // to it. Windows' unicast-hijack caveat does not apply to that case.
     sock.set_reuse_address(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
