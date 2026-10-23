@@ -1313,9 +1313,18 @@ mod tests {
             .into_iter()
             .map(|g| (g.name.clone(), g))
             .collect();
-        let source = GroupSource::new(registry_with_members().await, groups);
+        let registry = registry_with_members().await;
+        // The old claim asked the registry directly, per non-proc non-meta
+        // member; compute the expectation that way, independently of the
+        // group's own resolution path.
+        let mut expected_writable = false;
+        for ch in ["R:a", "R:w", "R:absent"] {
+            expected_writable |= registry.is_writable(ch).await;
+        }
+        let source = GroupSource::new(registry, groups);
 
         let info = Source::claim(&source, "GRP:desc").await.expect("claimed");
+        assert_eq!(info.writable, expected_writable);
         let by_name = |n: &str| {
             info.descriptor
                 .fields
@@ -1332,6 +1341,49 @@ mod tests {
         assert!(matches!(by_name("meta"), FieldType::Structure(_)));
         // A member that resolves to nothing keeps the disconnected fallback.
         assert_eq!(by_name("gone"), FieldType::Scalar(TypeCode::Int32));
+    }
+
+    /// `Plain` reads the `value` type only from NTScalar / NTScalarArray
+    /// descriptors; every other shape keeps the historical `Int32` fallback.
+    #[test]
+    fn plain_mapping_reads_value_type_only_from_flat_nt_descriptors() {
+        let with_value = |id: Option<&str>, ty: FieldType| StructureDesc {
+            struct_id: id.map(str::to_string),
+            fields: vec![FieldDesc {
+                name: "value".to_string(),
+                field_type: ty,
+            }],
+        };
+        let plain = |d: &StructureDesc| field_type_from_descriptor(d, FieldMapping::Plain);
+
+        assert_eq!(
+            plain(&with_value(
+                Some("epics:nt/NTScalar:1.0"),
+                FieldType::Scalar(TypeCode::Float64)
+            )),
+            FieldType::Scalar(TypeCode::Float64)
+        );
+        assert_eq!(
+            plain(&with_value(
+                Some("epics:nt/NTScalarArray:1.0"),
+                FieldType::ScalarArray(TypeCode::Int16)
+            )),
+            FieldType::ScalarArray(TypeCode::Int16)
+        );
+        // Same `value` field, but not a flat NT id: the fallback applies.
+        for id in [None, Some("epics:nt/NTEnum:1.0"), Some("my:custom:1.0")] {
+            assert_eq!(
+                plain(&with_value(id, FieldType::Scalar(TypeCode::Float64))),
+                FieldType::Scalar(TypeCode::Int32),
+                "struct id {id:?}"
+            );
+        }
+        // A flat NT id with no `value` field also falls back.
+        let no_value = StructureDesc {
+            struct_id: Some("epics:nt/NTScalar:1.0".to_string()),
+            fields: vec![],
+        };
+        assert_eq!(plain(&no_value), FieldType::Scalar(TypeCode::Int32));
     }
 
     #[test]
