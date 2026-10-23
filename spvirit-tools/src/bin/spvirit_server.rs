@@ -1176,7 +1176,11 @@ async fn handle_connection(
                                     running: false,
                                     pipeline_enabled,
                                     nfree,
-                                    filtered_desc: Some(desc.clone()),
+                                    // Only a real field filter needs the
+                                    // projected descriptor; an unfiltered
+                                    // subscriber takes the single-encode
+                                    // branch of `build_monitor_frame`.
+                                    filtered_desc: pv_req_fields.is_some().then(|| desc.clone()),
                                     last_snapshot: None,
                                 });
                             info!(
@@ -3292,6 +3296,25 @@ async fn handle_control_message(state: &Arc<ServerState>, conn_id: u64, header: 
 mod tests {
     use super::*;
     use spvirit_tools::spvirit_server::types::NtScalar;
+
+    /// `filtered_desc` must be `Some` only when the client actually sent a
+    /// field filter; storing the full descriptor for every subscriber forces
+    /// `build_monitor_frame` down the two-encodes-per-update filtered branch.
+    /// Mirrors the library fix in `spvirit-server/src/handler.rs`.
+    #[test]
+    fn monitor_init_stores_a_filtered_desc_only_when_a_filter_was_requested() {
+        let src = include_str!("spvirit_server.rs");
+        let unconditional = concat!("filtered_desc: Some(desc", ".clone()),");
+        assert!(
+            !src.contains(unconditional),
+            "MONITOR INIT still stores filtered_desc unconditionally: {unconditional}"
+        );
+        // Positive precondition so the guard is proven to look at live code.
+        assert!(src.contains(concat!(
+            "filtered_desc: pv_req_fields.is_some().then(",
+            "|| desc.clone()),"
+        )));
+    }
 
     #[test]
     fn record_plan_carries_every_field_the_processing_arms_read() {
