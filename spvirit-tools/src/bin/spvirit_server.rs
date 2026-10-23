@@ -2427,6 +2427,195 @@ fn process_record_by_name(
     active.remove(pv_name);
 }
 
+/// The subset of a record that `process_record_body` actually reads.
+///
+/// `process_record_body` used to start with `store.get(pv_name).cloned()`,
+/// deep-copying the whole `RecordInstance` — `raw_fields`, and the entire value
+/// payload (`NtScalarArray`, `NtTable`, `NtNdArray`, `Generic::fields`) — on
+/// every PUT and every scan tick. None of it is used: every match arm binds
+/// only link expressions, a `bool`, an `OutputMode` and a few numeric limits.
+/// `RecordPlan` mirrors `RecordData`'s variant and field *names* exactly, so
+/// the arm bodies below are unchanged; only the arm heads say `RecordPlan::`.
+#[derive(Debug, Clone)]
+enum RecordPlan {
+    Ai {
+        inp: Option<LinkExpr>,
+        siml: Option<LinkExpr>,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    Ao {
+        out: Option<LinkExpr>,
+        dol: Option<LinkExpr>,
+        omsl: OutputMode,
+        drvl: Option<f64>,
+        drvh: Option<f64>,
+        oroc: Option<f64>,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    Bi {
+        inp: Option<LinkExpr>,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    Bo {
+        out: Option<LinkExpr>,
+        dol: Option<LinkExpr>,
+        omsl: OutputMode,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    StringIn {
+        inp: Option<LinkExpr>,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    StringOut {
+        out: Option<LinkExpr>,
+        dol: Option<LinkExpr>,
+        omsl: OutputMode,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    Waveform {
+        inp: Option<LinkExpr>,
+    },
+    Aao {
+        out: Option<LinkExpr>,
+        dol: Option<LinkExpr>,
+        omsl: OutputMode,
+    },
+    SubArray {
+        inp: Option<LinkExpr>,
+        indx: usize,
+        nelm: usize,
+        malm: usize,
+    },
+    NtTable {
+        inp: Option<LinkExpr>,
+        out: Option<LinkExpr>,
+        omsl: OutputMode,
+    },
+    NtNdArray {
+        inp: Option<LinkExpr>,
+        out: Option<LinkExpr>,
+        omsl: OutputMode,
+    },
+    /// `NtEnum` and `Generic` have no processing behaviour.
+    Inert,
+}
+
+fn record_plan(data: &RecordData) -> RecordPlan {
+    match data {
+        RecordData::Ai {
+            inp,
+            siml,
+            siol,
+            simm,
+            ..
+        } => RecordPlan::Ai {
+            inp: inp.clone(),
+            siml: siml.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::Ao {
+            out,
+            dol,
+            omsl,
+            drvl,
+            drvh,
+            oroc,
+            siol,
+            simm,
+            ..
+        } => RecordPlan::Ao {
+            out: out.clone(),
+            dol: dol.clone(),
+            omsl: omsl.clone(),
+            drvl: *drvl,
+            drvh: *drvh,
+            oroc: *oroc,
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::Bi {
+            inp, siol, simm, ..
+        } => RecordPlan::Bi {
+            inp: inp.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::Bo {
+            out,
+            dol,
+            omsl,
+            siol,
+            simm,
+            ..
+        } => RecordPlan::Bo {
+            out: out.clone(),
+            dol: dol.clone(),
+            omsl: omsl.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::StringIn {
+            inp, siol, simm, ..
+        } => RecordPlan::StringIn {
+            inp: inp.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::StringOut {
+            out,
+            dol,
+            omsl,
+            siol,
+            simm,
+            ..
+        } => RecordPlan::StringOut {
+            out: out.clone(),
+            dol: dol.clone(),
+            omsl: omsl.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::Waveform { inp, .. } | RecordData::Aai { inp, .. } => {
+            RecordPlan::Waveform { inp: inp.clone() }
+        }
+        RecordData::Aao { out, dol, omsl, .. } => RecordPlan::Aao {
+            out: out.clone(),
+            dol: dol.clone(),
+            omsl: omsl.clone(),
+        },
+        RecordData::SubArray {
+            inp,
+            indx,
+            nelm,
+            malm,
+            ..
+        } => RecordPlan::SubArray {
+            inp: inp.clone(),
+            indx: *indx,
+            nelm: *nelm,
+            malm: *malm,
+        },
+        RecordData::NtTable { inp, out, omsl, .. } => RecordPlan::NtTable {
+            inp: inp.clone(),
+            out: out.clone(),
+            omsl: omsl.clone(),
+        },
+        RecordData::NtNdArray { inp, out, omsl, .. } => RecordPlan::NtNdArray {
+            inp: inp.clone(),
+            out: out.clone(),
+            omsl: omsl.clone(),
+        },
+        RecordData::NtEnum { .. } | RecordData::Generic { .. } => RecordPlan::Inert,
+    }
+}
+
 fn process_record_body(
     store: &mut HashMap<String, RecordInstance>,
     pv_name: &str,
@@ -2434,12 +2623,15 @@ fn process_record_body(
     active: &mut HashSet<String>,
     changed_names: &mut HashSet<String>,
 ) {
-    let Some(record_snapshot) = store.get(pv_name).cloned() else {
+    // Extract only the fields the arms below read, under a short immutable
+    // borrow, then release it — the arms need `&mut store` for link reads and
+    // writes. See `RecordPlan` for why this is not `store.get(..).cloned()`.
+    let Some(plan) = store.get(pv_name).map(|record| record_plan(&record.data)) else {
         return;
     };
 
-    match record_snapshot.data {
-        RecordData::Ai {
+    match plan {
+        RecordPlan::Ai {
             inp,
             siml,
             siol,
@@ -2465,7 +2657,7 @@ fn process_record_body(
                 let _ = siml;
             }
         }
-        RecordData::Ao {
+        RecordPlan::Ao {
             out,
             dol,
             omsl,
@@ -2532,7 +2724,7 @@ fn process_record_body(
                 );
             }
         }
-        RecordData::Bi {
+        RecordPlan::Bi {
             inp, siol, simm, ..
         } => {
             let chosen = if simm {
@@ -2552,7 +2744,7 @@ fn process_record_body(
                 }
             }
         }
-        RecordData::Bo {
+        RecordPlan::Bo {
             out,
             dol,
             omsl,
@@ -2594,7 +2786,7 @@ fn process_record_body(
                 );
             }
         }
-        RecordData::StringIn {
+        RecordPlan::StringIn {
             inp, siol, simm, ..
         } => {
             let chosen = if simm {
@@ -2614,7 +2806,7 @@ fn process_record_body(
                 }
             }
         }
-        RecordData::StringOut {
+        RecordPlan::StringOut {
             out,
             dol,
             omsl,
@@ -2656,7 +2848,7 @@ fn process_record_body(
                 );
             }
         }
-        RecordData::Waveform { inp, .. } | RecordData::Aai { inp, .. } => {
+        RecordPlan::Waveform { inp } => {
             if let Some(link) = inp.as_ref() {
                 if let Some(arr) =
                     read_link_array_value(store, link, compute_alarms, active, changed_names)
@@ -2667,7 +2859,7 @@ fn process_record_body(
                 }
             }
         }
-        RecordData::Aao { out, dol, omsl, .. } => {
+        RecordPlan::Aao { out, dol, omsl } => {
             let mut next = store.get(pv_name).and_then(record_array_value).unwrap_or(
                 // Keep default deterministic in case parser left this empty.
                 ScalarArrayValue::F64(Vec::new()),
@@ -2688,7 +2880,7 @@ fn process_record_body(
                 write_link_array_value(store, link, next, compute_alarms, active, changed_names);
             }
         }
-        RecordData::SubArray {
+        RecordPlan::SubArray {
             inp,
             indx,
             nelm,
@@ -2709,7 +2901,7 @@ fn process_record_body(
                 }
             }
         }
-        RecordData::NtTable { inp, out, omsl, .. } => {
+        RecordPlan::NtTable { inp, out, omsl } => {
             if let Some(link) = inp.as_ref() {
                 if let Some(arr) =
                     read_link_array_value(store, link, compute_alarms, active, changed_names)
@@ -2739,7 +2931,7 @@ fn process_record_body(
                 }
             }
         }
-        RecordData::NtNdArray { inp, out, omsl, .. } => {
+        RecordPlan::NtNdArray { inp, out, omsl } => {
             if let Some(link) = inp.as_ref() {
                 if let Some(arr) =
                     read_link_array_value(store, link, compute_alarms, active, changed_names)
@@ -2767,7 +2959,7 @@ fn process_record_body(
                 }
             }
         }
-        RecordData::NtEnum { .. } | RecordData::Generic { .. } => {
+        RecordPlan::Inert => {
             // NtEnum and Generic records do not participate in link processing.
         }
     }
@@ -3012,6 +3204,84 @@ async fn handle_control_message(state: &Arc<ServerState>, conn_id: u64, header: 
 mod tests {
     use super::*;
     use spvirit_tools::spvirit_server::types::NtScalar;
+
+    #[test]
+    fn record_plan_carries_every_field_the_processing_arms_read() {
+        let ai = RecordData::Ai {
+            nt: NtScalar::from_value(ScalarValue::F64(1.0)),
+            inp: None,
+            siml: None,
+            siol: None,
+            simm: true,
+        };
+        assert!(matches!(
+            record_plan(&ai),
+            RecordPlan::Ai { simm: true, .. }
+        ));
+
+        let ao = RecordData::Ao {
+            nt: NtScalar::from_value(ScalarValue::F64(0.0)),
+            out: None,
+            dol: None,
+            omsl: OutputMode::ClosedLoop,
+            drvl: Some(-1.0),
+            drvh: Some(1.0),
+            oroc: Some(0.5),
+            siml: None,
+            siol: None,
+            simm: false,
+        };
+        match record_plan(&ao) {
+            RecordPlan::Ao {
+                omsl,
+                drvl,
+                drvh,
+                oroc,
+                simm,
+                ..
+            } => {
+                assert!(matches!(omsl, OutputMode::ClosedLoop));
+                assert_eq!(drvl, Some(-1.0));
+                assert_eq!(drvh, Some(1.0));
+                assert_eq!(oroc, Some(0.5));
+                assert!(!simm);
+            }
+            other => panic!("expected RecordPlan::Ao, got {:?}", other),
+        }
+
+        // `NtScalarArray` is NOT in the bin's top-level `use` list, so `use
+        // super::*` does not bring it into the test module. Spell it out, as
+        // `virtual_pvlist_nt` does.
+        use spvirit_tools::spvirit_server::types::NtScalarArray;
+
+        let subarray = RecordData::SubArray {
+            nt: NtScalarArray::from_value(ScalarArrayValue::F64(vec![1.0, 2.0, 3.0])),
+            inp: None,
+            ftvl: "DOUBLE".to_string(),
+            malm: 8,
+            nelm: 3,
+            nord: 3,
+            indx: 1,
+        };
+        assert!(matches!(
+            record_plan(&subarray),
+            RecordPlan::SubArray {
+                indx: 1,
+                nelm: 3,
+                malm: 8,
+                ..
+            }
+        ));
+
+        let generic = RecordData::Generic {
+            struct_id: "s".to_string(),
+            fields: Vec::new(),
+            inp: None,
+            out: None,
+            omsl: OutputMode::Supervisory,
+        };
+        assert!(matches!(record_plan(&generic), RecordPlan::Inert));
+    }
 
     #[test]
     fn packet_validation_and_hex_dump_are_total_functions() {
