@@ -340,79 +340,92 @@ impl Source for GatewaySource {
                 };
                 self.resolves
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Ok((descriptor, server_addr, guid)) = client.pvinfo_full(&target).await {
-                    // Loop / self-connection prevention: if this name resolved
-                    // back into one of our own downstream server sockets (or an
-                    // `ignoreaddr` host), or the responder's GUID matches one of
-                    // our own servers' GUIDs, do NOT bind it — forwarding would
-                    // loop a search into ourselves. Skip to the next client.
-                    if self.guard.is_banned(server_addr) || self.guard.is_guid_banned(&guid) {
+                let (descriptor, server_addr, guid) = match client.pvinfo_full(&target).await {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        // Downstream a failed resolve is indistinguishable from
+                        // "no such PV", so this line is the only place the
+                        // difference is recorded. `debug` rather than `warn`:
+                        // on a multi-client gateway most clients legitimately
+                        // do not host most names, so a miss here is routine.
+                        tracing::debug!(
+                            "gateway: upstream resolve failed for downstream={name:?} \
+                             real={target:?} via client={client_name:?}: {e}"
+                        );
                         continue;
                     }
-                    {
-                        let mut bindings = self.bindings.lock().unwrap();
-                        // Two statements, not one `match` with an `insert` in
-                        // its fallback arm: `get_mut`'s borrow of `bindings`
-                        // would still be live in that arm, and the borrow
-                        // checker rejects it (NLL problem case 3). Reducing
-                        // the match to a `bool` ends the borrow at the
-                        // semicolon.
-                        let refreshed = match bindings.get_mut(&name) {
-                            // Refresh in place. Replacing the whole `Binding`
-                            // (what this used to do) resets `last_get` to
-                            // `None` — and `SourceRegistry` claims immediately
-                            // before every `get`, so the getholdoff cache was
-                            // wiped before every read it was meant to serve.
-                            Some(existing)
-                                if existing.client_name == *client_name
-                                    && existing.real_name == target =>
-                            {
-                                // An upstream that restructured invalidates the
-                                // cached value: `handler.rs` encodes whatever
-                                // `last_get` holds against the descriptor this
-                                // binding currently advertises, so serving a
-                                // payload cached against the superseded one
-                                // emits a frame whose data does not match its
-                                // own introspection — and in this protocol one
-                                // malformed frame takes the whole TCP
-                                // connection down, not just that value. Do NOT
-                                // simplify this to an unconditional refresh:
-                                // the equality check is what keeps a stale
-                                // payload from outliving its structure. It is
-                                // equally not an unconditional clear — that
-                                // would wipe the cache on every claim and so
-                                // disable getholdoff altogether, which is the
-                                // very bug the in-place refresh above fixes.
-                                if existing.descriptor != descriptor {
-                                    *existing.last_get.lock().unwrap() = None;
-                                }
-                                existing.descriptor = descriptor.clone();
-                                existing.bound_at = Instant::now();
-                                true
-                            }
-                            // A different client or a different upstream target
-                            // is a different binding: the cached value came
-                            // from somewhere else and must not carry over.
-                            _ => false,
-                        };
-                        if !refreshed {
-                            bindings.insert(
-                                name.clone(),
-                                Binding {
-                                    client_name: client_name.clone(),
-                                    real_name: target.clone(),
-                                    descriptor: descriptor.clone(),
-                                    bound_at: Instant::now(),
-                                    last_get: Mutex::new(None),
-                                },
-                            );
-                        }
-                    }
-                    return Some(PvInfo {
-                        descriptor,
-                        writable: true,
-                    });
+                };
+                // Loop / self-connection prevention: if this name resolved
+                // back into one of our own downstream server sockets (or an
+                // `ignoreaddr` host), or the responder's GUID matches one of
+                // our own servers' GUIDs, do NOT bind it — forwarding would
+                // loop a search into ourselves. Skip to the next client.
+                if self.guard.is_banned(server_addr) || self.guard.is_guid_banned(&guid) {
+                    continue;
                 }
+                {
+                    let mut bindings = self.bindings.lock().unwrap();
+                    // Two statements, not one `match` with an `insert` in
+                    // its fallback arm: `get_mut`'s borrow of `bindings`
+                    // would still be live in that arm, and the borrow
+                    // checker rejects it (NLL problem case 3). Reducing
+                    // the match to a `bool` ends the borrow at the
+                    // semicolon.
+                    let refreshed = match bindings.get_mut(&name) {
+                        // Refresh in place. Replacing the whole `Binding`
+                        // (what this used to do) resets `last_get` to
+                        // `None` — and `SourceRegistry` claims immediately
+                        // before every `get`, so the getholdoff cache was
+                        // wiped before every read it was meant to serve.
+                        Some(existing)
+                            if existing.client_name == *client_name
+                                && existing.real_name == target =>
+                        {
+                            // An upstream that restructured invalidates the
+                            // cached value: `handler.rs` encodes whatever
+                            // `last_get` holds against the descriptor this
+                            // binding currently advertises, so serving a
+                            // payload cached against the superseded one
+                            // emits a frame whose data does not match its
+                            // own introspection — and in this protocol one
+                            // malformed frame takes the whole TCP
+                            // connection down, not just that value. Do NOT
+                            // simplify this to an unconditional refresh:
+                            // the equality check is what keeps a stale
+                            // payload from outliving its structure. It is
+                            // equally not an unconditional clear — that
+                            // would wipe the cache on every claim and so
+                            // disable getholdoff altogether, which is the
+                            // very bug the in-place refresh above fixes.
+                            if existing.descriptor != descriptor {
+                                *existing.last_get.lock().unwrap() = None;
+                            }
+                            existing.descriptor = descriptor.clone();
+                            existing.bound_at = Instant::now();
+                            true
+                        }
+                        // A different client or a different upstream target
+                        // is a different binding: the cached value came
+                        // from somewhere else and must not carry over.
+                        _ => false,
+                    };
+                    if !refreshed {
+                        bindings.insert(
+                            name.clone(),
+                            Binding {
+                                client_name: client_name.clone(),
+                                real_name: target.clone(),
+                                descriptor: descriptor.clone(),
+                                bound_at: Instant::now(),
+                                last_get: Mutex::new(None),
+                            },
+                        );
+                    }
+                }
+                return Some(PvInfo {
+                    descriptor,
+                    writable: true,
+                });
             }
 
             // Stamped now, not with the `now` taken at entry: the loop above
@@ -470,7 +483,17 @@ impl Source for GatewaySource {
                     }
                     Some(payload)
                 }
-                Err(_) => None,
+                Err(e) => {
+                    // `warn`, not `debug`: unlike `claim`, this PV is already
+                    // bound — the upstream answered a resolve for it moments
+                    // ago — so a failing read is a real fault, not a routine
+                    // miss.
+                    tracing::warn!(
+                        "gateway: upstream get failed for downstream={name:?} \
+                             real={real_name:?} via client={client_name:?}: {e}"
+                    );
+                    None
+                }
             }
         })
     }
@@ -989,5 +1012,74 @@ mod tests {
         let src = test_source(open_neg(), access);
         assert_eq!(src.try_claim("SECRET:PV"), TryClaim::No);
         assert_eq!(src.try_claim("PUBLIC:PV"), TryClaim::Unknown);
+    }
+
+    /// An `io::Write` sink over a shared buffer, for capturing `tracing`
+    /// output during a test. Only ever touched synchronously by the
+    /// subscriber's own formatting call — never held across an `.await`.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Both upstream failure paths must leave a record. Downstream they are
+    /// indistinguishable from "no such PV", so without a log an upstream that
+    /// is up but erroring cannot be told apart from one that is absent.
+    ///
+    /// Current-thread runtime on purpose: `tracing::subscriber::set_default`
+    /// is thread-local, so a multi-thread runtime could run the gateway's log
+    /// calls on a worker that does not see this subscriber.
+    #[tokio::test]
+    async fn a_failing_upstream_is_logged_by_both_claim_and_get() {
+        let buffer = CaptureWriter::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let Some(src) = dead_upstream_source(open_neg()) else {
+            eprintln!("Skipping test: cannot bind a UDP port in this environment");
+            return;
+        };
+
+        // claim: every configured client fails to resolve.
+        assert!(src.claim("GONE:PV").await.is_none());
+
+        // get: insert a binding by hand — the upstream is dead, so no claim
+        // can create one — then `get` reaches `pvget` and fails there.
+        src.bindings.lock().unwrap().insert(
+            "BOUND:PV".to_string(),
+            Binding {
+                client_name: "dead-client".to_string(),
+                real_name: "BOUND:REAL".to_string(),
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
+                last_get: Mutex::new(None),
+            },
+        );
+        assert!(src.get("BOUND:PV").await.is_none());
+
+        let captured = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("GONE:PV") && captured.contains("dead-client"),
+            "claim's upstream failure must name the PV and the client: {captured:?}"
+        );
+        assert!(
+            captured.contains("BOUND:PV") && captured.contains("BOUND:REAL"),
+            "get's upstream failure must name the downstream and upstream names: {captured:?}"
+        );
     }
 }
