@@ -40,9 +40,9 @@ use spvirit_codec::spvirit_encode::{
 use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
 use spvirit_server::handler::{
-    PvListMode, infer_udp_response_ip, is_pattern_query, is_pvlist_virtual_pv, is_server_rpc_pv,
-    is_virtual_event_pv, rand_guid, search_reply_target, virtual_event_nt, virtual_pvlist_nt,
-    wildcard_match,
+    PvListMode, dump_hex_packet, infer_udp_response_ip, is_pattern_query, is_pvlist_virtual_pv,
+    is_server_rpc_pv, is_virtual_event_pv, rand_guid, search_reply_target, validate_encoded_packet,
+    virtual_event_nt, virtual_pvlist_nt, wildcard_match,
 };
 use spvirit_server::monitor::MonitorRegistry;
 
@@ -3082,6 +3082,27 @@ mod tests {
     use spvirit_tools::spvirit_server::types::NtScalar;
 
     #[test]
+    fn packet_validation_and_hex_dump_are_total_functions() {
+        // Both are pure diagnostics: they return `()` and only emit `debug!`
+        // lines. The property worth pinning is therefore totality: neither may
+        // panic or index out of bounds on a header that lies about its payload
+        // length, which is exactly the input a hostile or buggy peer sends.
+        let good = encode_header(false, false, false, 2, 1, 0);
+        validate_encoded_packet(1, "well-formed", &good);
+        dump_hex_packet(1, "->", "well-formed", 2, false, &good);
+
+        let mut truncated = encode_header(false, false, false, 2, 1, 16);
+        truncated.truncate(8);
+        validate_encoded_packet(1, "truncated", &truncated);
+        dump_hex_packet(1, "->", "truncated", 2, false, &truncated);
+
+        // A payload that is not a multiple of the 16-byte dump line width.
+        dump_hex_packet(1, "<-", "ragged", 2, true, &[0u8; 37]);
+        validate_encoded_packet(1, "empty", &[]);
+        dump_hex_packet(1, "<-", "empty", 2, false, &[]);
+    }
+
+    #[test]
     fn virtual_pv_helpers_come_from_the_library() {
         // Same names, same answers: proving the local copies are gone and the
         // library's are wired in. `virtual_pvlist_nt` is the one with a body
@@ -3459,52 +3480,4 @@ mod tests {
 
 fn file_mtime(path: &str) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-fn validate_encoded_packet(conn_id: u64, label: &str, bytes: &[u8]) {
-    let mut pkt = PvaPacket::new(bytes);
-    let decoded = pkt.decode_payload();
-    match decoded {
-        Some(PvaPacketCommand::ConnectionValidation(payload)) => {
-            debug!(
-                "Conn {}: {} decoded as cmd=1 buffer_size={} qos={} authz={:?}",
-                conn_id, label, payload.buffer_size, payload.qos, payload.authz
-            );
-        }
-        Some(PvaPacketCommand::ConnectionValidated(_)) => {
-            debug!("Conn {}: {} decoded as cmd=9", conn_id, label);
-        }
-        Some(other) => {
-            debug!("Conn {}: {} decoded as {:?}", conn_id, label, other);
-        }
-        None => {
-            debug!("Conn {}: {} failed to decode", conn_id, label);
-        }
-    }
-}
-
-fn dump_hex_packet(conn_id: u64, dir: &str, label: &str, version: u8, is_be: bool, bytes: &[u8]) {
-    debug!(
-        "Conn {}: {} {} ver={} be={} len={}",
-        conn_id,
-        dir,
-        label,
-        version,
-        is_be,
-        bytes.len()
-    );
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let end = usize::min(offset + 16, bytes.len());
-        let chunk = &bytes[offset..end];
-        let mut line = String::new();
-        for (i, b) in chunk.iter().enumerate() {
-            if i > 0 {
-                line.push(' ');
-            }
-            line.push_str(&format!("{:02x}", b));
-        }
-        debug!("Conn {}: {:04x} {}", conn_id, offset, line);
-        offset += 16;
-    }
 }
