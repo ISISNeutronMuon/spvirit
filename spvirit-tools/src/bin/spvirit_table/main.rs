@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Table
 
 use spvirit_tools::spvirit_server::pv::AnyPv;
 use spvirit_tools::spvirit_server::pva_server::{PvaServer, RunningServer};
+use spvirit_tools::tui::centered_rect;
 use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 mod parse;
@@ -773,9 +774,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     if let Some((title, content)) = prompt_text(&app.mode) {
         let is_help = matches!(app.mode, Mode::Help);
         let area = if is_help {
-            centered(90, 90, frame.area())
+            centered_rect(90, 90, frame.area())
         } else {
-            centered(64, 30, frame.area())
+            centered_rect(64, 30, frame.area())
         };
         frame.render_widget(Clear, area);
         let mut para = Paragraph::new(content)
@@ -876,25 +877,6 @@ Patterns: {{1..8}} {{8..1}} {{0..100..10}} {{01..12}} {{A,B,C}}  and products S{
 {gens}  e.g. :anim RING:BPM{{01..99}} noise min=-1 max=1
 Value forms: enum -> OFF,ON,TRIP 1   table -> id:i32=1,2,3 x:f64=0.5,1.5"
     )
-}
-
-fn centered(pct_w: u16, pct_h: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - pct_h) / 2),
-            Constraint::Percentage(pct_h),
-            Constraint::Percentage((100 - pct_h) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - pct_w) / 2),
-            Constraint::Percentage(pct_w),
-            Constraint::Percentage((100 - pct_w) / 2),
-        ])
-        .split(v[1])[1]
 }
 
 fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {

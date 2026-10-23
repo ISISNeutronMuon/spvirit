@@ -10,6 +10,8 @@
 
 pub mod spvirit_client;
 pub mod spvirit_server;
+#[cfg(feature = "tui")]
+pub mod tui;
 
 // --- Re-exports: client core ---
 pub use spvirit_client::client::{build_client_validation, pvget};
