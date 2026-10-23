@@ -444,30 +444,25 @@ async fn run_udp_search(
                     continue;
                 }
                 let pv_store = state.pv_store.read().await;
-                let visible_names = collect_visible_pv_names_iter(
-                    pv_store.keys().map(String::as_str),
+                let cids = resolve_search_cids(
+                    &payload.pv_requests,
                     state.pvlist_mode,
-                    state.pvlist_allow_pattern.as_ref(),
-                    state.pvlist_max,
+                    |name| {
+                        pv_store.contains_key(name)
+                            || resolve_field_nt(&pv_store, name).is_some()
+                            || is_virtual_event_pv(name)
+                            || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
+                            || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
+                    },
+                    || {
+                        collect_visible_pv_names_iter(
+                            pv_store.keys().map(String::as_str),
+                            state.pvlist_mode,
+                            state.pvlist_allow_pattern.as_ref(),
+                            state.pvlist_max,
+                        )
+                    },
                 );
-                let mut cids = Vec::new();
-                for (cid, name) in &payload.pv_requests {
-                    if pv_store.contains_key(name)
-                        || resolve_field_nt(&pv_store, name).is_some()
-                        || is_virtual_event_pv(name)
-                        || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
-                        || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
-                    {
-                        cids.push(*cid);
-                        continue;
-                    }
-                    if state.pvlist_mode != PvListMode::Off
-                        && is_pattern_query(name)
-                        && visible_names.iter().any(|pv| wildcard_match(name, pv))
-                    {
-                        cids.push(*cid);
-                    }
-                }
                 let response_required = (payload.mask & 0x01) != 0;
                 let server_discovery_ping = payload.pv_requests.is_empty();
                 let found = server_discovery_ping || !cids.is_empty();
@@ -1401,30 +1396,25 @@ async fn handle_connection(
                         .any(|p| p.eq_ignore_ascii_case("tcp"));
                 if accepts_tcp {
                     let pv_store = state.pv_store.read().await;
-                    let visible_names = collect_visible_pv_names_iter(
-                        pv_store.keys().map(String::as_str),
+                    let cids = resolve_search_cids(
+                        &payload.pv_requests,
                         state.pvlist_mode,
-                        state.pvlist_allow_pattern.as_ref(),
-                        state.pvlist_max,
+                        |name| {
+                            pv_store.contains_key(name)
+                                || resolve_field_nt(&pv_store, name).is_some()
+                                || is_virtual_event_pv(name)
+                                || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
+                                || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
+                        },
+                        || {
+                            collect_visible_pv_names_iter(
+                                pv_store.keys().map(String::as_str),
+                                state.pvlist_mode,
+                                state.pvlist_allow_pattern.as_ref(),
+                                state.pvlist_max,
+                            )
+                        },
                     );
-                    let mut cids = Vec::new();
-                    for (cid, name) in &payload.pv_requests {
-                        if pv_store.contains_key(name)
-                            || resolve_field_nt(&pv_store, name).is_some()
-                            || is_virtual_event_pv(name)
-                            || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
-                            || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
-                        {
-                            cids.push(*cid);
-                            continue;
-                        }
-                        if state.pvlist_mode != PvListMode::Off
-                            && is_pattern_query(name)
-                            && visible_names.iter().any(|pv| wildcard_match(name, pv))
-                        {
-                            cids.push(*cid);
-                        }
-                    }
                     drop(pv_store);
                     let server_discovery_ping = payload.pv_requests.is_empty();
                     let found = server_discovery_ping || !cids.is_empty();
@@ -1990,6 +1980,40 @@ fn parse_virtual_event(pv_name: &str) -> Option<PostedEvent> {
     } else {
         Some(PostedEvent::Event(suffix.to_string()))
     }
+}
+
+/// Decide which of a SEARCH packet's CIDs this server can answer.
+///
+/// `visible` is a *thunk*: it is invoked at most once per packet, and only if
+/// a pattern query is actually present. Materialising the visible-PV list means
+/// filtering, sorting and cloning every name in the store - far too expensive
+/// to pay on every SEARCH broadcast, when the common packet is a handful of
+/// exact names that never consults the list at all.
+fn resolve_search_cids<D, V>(
+    requests: &[(u32, String)],
+    mode: PvListMode,
+    mut direct_hit: D,
+    mut visible: V,
+) -> Vec<u32>
+where
+    D: FnMut(&str) -> bool,
+    V: FnMut() -> Vec<String>,
+{
+    let mut cids = Vec::new();
+    let mut visible_names: Option<Vec<String>> = None;
+    for (cid, name) in requests {
+        if direct_hit(name) {
+            cids.push(*cid);
+            continue;
+        }
+        if mode != PvListMode::Off && is_pattern_query(name) {
+            let names = visible_names.get_or_insert_with(&mut visible);
+            if names.iter().any(|pv| wildcard_match(name, pv)) {
+                cids.push(*cid);
+            }
+        }
+    }
+    cids
 }
 
 /// Resolve an IOC-style `<record>.<FIELD>[$]` reference against the store.
@@ -2979,6 +3003,64 @@ mod tests {
             parse_pvlist_mode_arg("nope"),
             Err("Invalid --pvlist-mode 'nope'; expected off|discover|list".to_string())
         );
+    }
+
+    #[test]
+    fn search_does_not_enumerate_the_store_for_exact_names() {
+        let mut enumerations = 0usize;
+        let requests = vec![
+            (1u32, "A:PV".to_string()),
+            (2u32, "MISSING:PV".to_string()),
+        ];
+        let cids = resolve_search_cids(
+            &requests,
+            PvListMode::Discover,
+            |name| name == "A:PV",
+            || {
+                enumerations += 1;
+                vec!["A:PV".to_string(), "B:PV".to_string()]
+            },
+        );
+        assert_eq!(cids, vec![1]);
+        assert_eq!(enumerations, 0, "no pattern query, so no enumeration");
+    }
+
+    #[test]
+    fn search_enumerates_at_most_once_for_many_pattern_queries() {
+        let mut enumerations = 0usize;
+        let requests = vec![
+            (1u32, "A:*".to_string()),
+            (2u32, "B:*".to_string()),
+            (3u32, "Z:*".to_string()),
+        ];
+        let cids = resolve_search_cids(
+            &requests,
+            PvListMode::Discover,
+            |_| false,
+            || {
+                enumerations += 1;
+                vec!["A:PV".to_string(), "B:PV".to_string()]
+            },
+        );
+        assert_eq!(cids, vec![1, 2]);
+        assert_eq!(enumerations, 1, "the list is built once and reused");
+    }
+
+    #[test]
+    fn search_skips_pattern_matching_entirely_when_pvlist_is_off() {
+        let mut enumerations = 0usize;
+        let requests = vec![(1u32, "A:*".to_string())];
+        let cids = resolve_search_cids(
+            &requests,
+            PvListMode::Off,
+            |_| false,
+            || {
+                enumerations += 1;
+                vec!["A:PV".to_string()]
+            },
+        );
+        assert!(cids.is_empty());
+        assert_eq!(enumerations, 0);
     }
 
     #[test]
