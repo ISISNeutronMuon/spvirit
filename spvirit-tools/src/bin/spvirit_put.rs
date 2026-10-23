@@ -9,7 +9,7 @@ use spvirit_client::pvput as high_level_pvput;
 use spvirit_client::pvput_fields as high_level_pvput_fields;
 use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvirit_encode::encode_header;
-use spvirit_tools::spvirit_client::cli::CommonClientArgs;
+use spvirit_tools::spvirit_client::cli::{CommonClientArgs, require_pv_name};
 use spvirit_tools::spvirit_client::client::{
     ChannelConn, encode_get_request, encode_put_request, ensure_status_ok, establish_channel,
 };
@@ -28,7 +28,12 @@ fn parse_cli_value(raw: &str) -> Value {
     }
     if raw.contains('.') || raw.contains('e') || raw.contains('E') {
         if let Ok(f) = raw.parse::<f64>() {
-            return Value::Number(serde_json::Number::from_f64(f).unwrap());
+            // `Number::from_f64` is None for inf/NaN, and `"1e999".parse()`
+            // is `Ok(inf)`. Fall through to the string path rather than
+            // panicking on user CLI input.
+            if let Some(n) = serde_json::Number::from_f64(f) {
+                return Value::Number(n);
+            }
         }
     }
     if let Ok(i) = raw.parse::<i64>() {
@@ -320,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    require_pv_name(&pv_name)?;
     let fields = common.fields_list();
     let opts = common.into_pv_get_options(pv_name.clone())?;
 

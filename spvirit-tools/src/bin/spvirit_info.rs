@@ -6,7 +6,7 @@ use spvirit_client::{pvget, pvinfo as high_level_pvinfo};
 use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::{StructureDesc, extract_subfield_desc, format_structure_tree};
 use spvirit_codec::spvirit_encode::encode_header;
-use spvirit_tools::spvirit_client::cli::CommonClientArgs;
+use spvirit_tools::spvirit_client::cli::{CommonClientArgs, require_pv_name};
 use spvirit_tools::spvirit_client::client::{ChannelConn, establish_channel};
 use spvirit_tools::spvirit_client::search::resolve_pv_server;
 use spvirit_tools::spvirit_client::transport::read_until;
@@ -157,8 +157,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ap.parse_args_or_exit();
     }
 
-    if pv_name.is_empty() {
-        eprintln!("Error: PV name is required");
+    if let Err(e) = require_pv_name(&pv_name) {
+        eprintln!("Error: {e}");
         std::process::exit(1);
     }
 
