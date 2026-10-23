@@ -840,55 +840,15 @@ fn field_type_from_descriptor(desc: &StructureDesc, mapping: FieldMapping) -> Fi
             fields: vec![
                 FieldDesc {
                     name: "alarm".to_string(),
-                    field_type: FieldType::Structure(alarm_struct_desc()),
+                    field_type: FieldType::Structure(spvirit_codec::spvd_encode::alarm_desc()),
                 },
                 FieldDesc {
                     name: "timeStamp".to_string(),
-                    field_type: FieldType::Structure(timestamp_struct_desc()),
+                    field_type: FieldType::Structure(spvirit_codec::spvd_encode::timestamp_desc()),
                 },
             ],
         }),
         FieldMapping::Proc => FieldType::Scalar(TypeCode::Int32),
-    }
-}
-
-fn alarm_struct_desc() -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("alarm_t".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "severity".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "status".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "message".to_string(),
-                field_type: FieldType::String,
-            },
-        ],
-    }
-}
-
-fn timestamp_struct_desc() -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("time_t".to_string()),
-        fields: vec![
-            FieldDesc {
-                name: "secondsPastEpoch".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int64),
-            },
-            FieldDesc {
-                name: "nanoseconds".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-            FieldDesc {
-                name: "userTag".to_string(),
-                field_type: FieldType::Scalar(TypeCode::Int32),
-            },
-        ],
     }
 }
 
@@ -1372,5 +1332,23 @@ mod tests {
         assert!(matches!(by_name("meta"), FieldType::Structure(_)));
         // A member that resolves to nothing keeps the disconnected fallback.
         assert_eq!(by_name("gone"), FieldType::Scalar(TypeCode::Int32));
+    }
+
+    #[test]
+    fn the_meta_mapping_uses_the_codec_alarm_and_timestamp_descriptors() {
+        let desc = StructureDesc {
+            struct_id: Some("epics:nt/NTScalar:1.0".to_string()),
+            fields: vec![],
+        };
+        let FieldType::Structure(meta) = field_type_from_descriptor(&desc, FieldMapping::Meta)
+        else {
+            panic!("meta mapping must produce a structure");
+        };
+        let sub = |n: &str| match &meta.fields.iter().find(|f| f.name == n).unwrap().field_type {
+            FieldType::Structure(s) => s.clone(),
+            other => panic!("{n} is not a structure: {other:?}"),
+        };
+        assert_eq!(sub("alarm"), spvirit_codec::spvd_encode::alarm_desc());
+        assert_eq!(sub("timeStamp"), spvirit_codec::spvd_encode::timestamp_desc());
     }
 }
