@@ -84,12 +84,10 @@ pub fn extract_ts_units(value: &DecodedValue) -> (Option<String>, Option<String>
 
     if let Some((_, DecodedValue::Structure(d_fields))) =
         fields.iter().find(|(n, _)| n == "display")
+        && let Some((_, DecodedValue::String(u))) = d_fields.iter().find(|(n, _)| n == "units")
+        && !u.is_empty()
     {
-        if let Some((_, DecodedValue::String(u))) = d_fields.iter().find(|(n, _)| n == "units") {
-            if !u.is_empty() {
-                units = Some(u.clone());
-            }
-        }
+        units = Some(u.clone());
     }
 
     (ts, units)
@@ -121,19 +119,19 @@ pub fn extract_alarm(value: &DecodedValue) -> Option<AlarmInfo> {
     };
 
     let severity = alarm_fields.iter().find_map(|(n, v)| {
-        if n == "severity" {
-            if let DecodedValue::Int32(s) = v {
-                return Some(*s);
-            }
+        if n == "severity"
+            && let DecodedValue::Int32(s) = v
+        {
+            return Some(*s);
         }
         None
     })?;
 
     let status = alarm_fields.iter().find_map(|(n, v)| {
-        if n == "status" {
-            if let DecodedValue::Int32(s) = v {
-                return Some(*s);
-            }
+        if n == "status"
+            && let DecodedValue::Int32(s) = v
+        {
+            return Some(*s);
         }
         None
     })?;
@@ -141,10 +139,10 @@ pub fn extract_alarm(value: &DecodedValue) -> Option<AlarmInfo> {
     let message = alarm_fields
         .iter()
         .find_map(|(n, v)| {
-            if n == "message" {
-                if let DecodedValue::String(s) = v {
-                    return Some(s.clone());
-                }
+            if n == "message"
+                && let DecodedValue::String(s) = v
+            {
+                return Some(s.clone());
             }
             None
         })
@@ -236,10 +234,10 @@ fn trim_float(mut s: String) -> String {
 
 fn format_value_with_units(value: &DecodedValue, units: Option<&str>) -> String {
     let base = format_value(value);
-    if let Some(u) = units {
-        if !u.is_empty() {
-            return format!("{} {}", base, u);
-        }
+    if let Some(u) = units
+        && !u.is_empty()
+    {
+        return format!("{} {}", base, u);
     }
     base
 }
@@ -268,10 +266,10 @@ pub fn format_output(pv: &str, value: &DecodedValue, opts: &RenderOptions) -> St
 }
 
 fn format_text_output(pv: &str, value: &DecodedValue, opts: &RenderOptions) -> String {
-    if opts.multiline {
-        if let Some(table) = format_table_output(pv, value) {
-            return table;
-        }
+    if opts.multiline
+        && let Some(table) = format_table_output(pv, value)
+    {
+        return table;
     }
 
     let (ts, units) = extract_ts_units(value);
@@ -286,19 +284,18 @@ fn format_text_output(pv: &str, value: &DecodedValue, opts: &RenderOptions) -> S
 
     let mut parts: Vec<String> = Vec::new();
     parts.push(pv.to_string());
-    if opts.include_timestamp {
-        if let Some(ts) = ts {
-            parts.push(ts);
-        }
+    if opts.include_timestamp
+        && let Some(ts) = ts
+    {
+        parts.push(ts);
     }
     parts.push(format!("{:>3}", val_str));
 
-    if opts.include_alarm {
-        if let Some(alarm) = alarm {
-            if !alarm_is_normal(&alarm) {
-                parts.extend(alarm_tokens(&alarm, true));
-            }
-        }
+    if opts.include_alarm
+        && let Some(alarm) = alarm
+        && !alarm_is_normal(&alarm)
+    {
+        parts.extend(alarm_tokens(&alarm, true));
     }
 
     parts.join(" ")
@@ -328,10 +325,10 @@ fn format_table_output(pv: &str, value: &DecodedValue) -> Option<String> {
     };
 
     let value_fields = fields.iter().find_map(|(name, val)| {
-        if name == "value" {
-            if let DecodedValue::Structure(cols) = val {
-                return Some(cols);
-            }
+        if name == "value"
+            && let DecodedValue::Structure(cols) = val
+        {
+            return Some(cols);
         }
         None
     })?;
@@ -371,26 +368,26 @@ fn format_table_output(pv: &str, value: &DecodedValue) -> Option<String> {
     let descriptor = fields
         .iter()
         .find_map(|(name, val)| {
-            if name == "descriptor" {
-                if let DecodedValue::String(s) = val {
-                    return Some(s.clone());
-                }
+            if name == "descriptor"
+                && let DecodedValue::String(s) = val
+            {
+                return Some(s.clone());
             }
             None
         })
         .or_else(|| {
             fields.iter().find_map(|(name, val)| {
-                if name == "display" {
-                    if let DecodedValue::Structure(d_fields) = val {
-                        return d_fields.iter().find_map(|(n, v)| {
-                            if n == "description" {
-                                if let DecodedValue::String(s) = v {
-                                    return Some(s.clone());
-                                }
-                            }
-                            None
-                        });
-                    }
+                if name == "display"
+                    && let DecodedValue::Structure(d_fields) = val
+                {
+                    return d_fields.iter().find_map(|(n, v)| {
+                        if n == "description"
+                            && let DecodedValue::String(s) = v
+                        {
+                            return Some(s.clone());
+                        }
+                        None
+                    });
                 }
                 None
             })
@@ -411,10 +408,10 @@ fn format_table_output(pv: &str, value: &DecodedValue) -> Option<String> {
         pv.to_string()
     };
     lines.push(header);
-    if let Some(desc) = descriptor {
-        if !desc.is_empty() {
-            lines.push(format!("     PV \"{}\"", desc));
-        }
+    if let Some(desc) = descriptor
+        && !desc.is_empty()
+    {
+        lines.push(format!("     PV \"{}\"", desc));
     }
 
     let name_width = std::cmp::max(16, name_col.iter().map(|s| s.len()).max().unwrap_or(0));

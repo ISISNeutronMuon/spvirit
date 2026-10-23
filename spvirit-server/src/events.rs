@@ -84,6 +84,13 @@ pub struct Events {
     inflight: Arc<AtomicU64>,
     /// The dispatcher task, so a shutting-down server can actually stop it.
     dispatcher: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set by `abort_dispatcher` *before* it aborts the task. The dispatcher
+    /// checks it after every `recv()`, because `JoinHandle::abort()` only
+    /// takes effect at the task's next yield and `recv()` on a non-empty
+    /// queue does not yield: without this flag a handler posted while the
+    /// dispatcher poll is still in flight would run after `abort()`
+    /// returned. `post()` and `drain()` read it too.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
     /// Signalled whenever `inflight` reaches zero, so `drain` can wait rather
     /// than spin. `Arc` because `start_dispatcher` clones it into the spawned
     /// dispatcher task, which has no `self`.
@@ -103,6 +110,7 @@ impl Events {
             dispatcher_started: std::sync::atomic::AtomicBool::new(false),
             inflight: Arc::new(AtomicU64::new(0)),
             dispatcher: std::sync::Mutex::new(None),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idle: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -149,9 +157,19 @@ impl Events {
         let inflight = self.inflight.clone();
         let failed = self.failed.clone();
         let idle = self.idle.clone();
+        let stopped = self.stopped.clone();
         self.dispatcher_started.store(true, Ordering::SeqCst);
         let handle = tokio::spawn(async move {
             while let Some(Dispatch { handler, event }) = rx.recv().await {
+                // `abort_dispatcher` may have run while this poll was still
+                // in flight; the task-level abort has not landed yet, so
+                // stop here rather than start a handler after it returned.
+                if stopped.load(Ordering::SeqCst) {
+                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        idle.notify_waiters();
+                    }
+                    break;
+                }
                 let fut = handler(store.clone(), event.clone());
                 // AssertUnwindSafe: on panic we drop the handler's state and
                 // continue; the store's own invariants are upheld by its locks.
@@ -172,10 +190,23 @@ impl Events {
     }
 
     /// Stop the dispatcher task. Idempotent.
+    ///
+    /// Once this returns, no handler for an event posted afterwards will
+    /// run, and the dispatcher starts no further queued handler. A handler
+    /// already running when this is called is cancelled at its next yield
+    /// point (or completes if it never yields). Inline sinks are unaffected:
+    /// they run on the posting task, not the dispatcher.
     pub fn abort_dispatcher(&self) {
+        // Order matters: the flag must be visible before the abort request,
+        // so a dispatcher poll that is still in flight sees it on its next
+        // `recv()` instead of running the dequeued handler.
+        self.stopped.store(true, Ordering::SeqCst);
         if let Some(h) = self.dispatcher.lock().unwrap().take() {
             h.abort();
         }
+        // Wake any `drain()` already waiting: the aborted task will never
+        // decrement `inflight` for what was left in its queue.
+        self.idle.notify_waiters();
     }
 
     /// Post `event`: await every sink, then queue handlers and return.
@@ -210,6 +241,14 @@ impl Events {
             let map = self.handlers.read().unwrap();
             map.get(event).cloned().unwrap_or_default()
         };
+        if !handlers.is_empty() && self.stopped.load(Ordering::SeqCst) {
+            tracing::debug!(
+                "posted '{}' after the event dispatcher was aborted; {} handler(s) not queued",
+                event,
+                handlers.len()
+            );
+            return;
+        }
         // Count the whole batch as in-flight before enqueueing any of it, so
         // a concurrent drain() can never observe inflight == 0 partway
         // through this loop (e.g. because the dispatcher already finished
@@ -247,6 +286,9 @@ impl Events {
 
     /// Wait until every queued handler has finished. Test helper.
     ///
+    /// After [`Self::abort_dispatcher`] nothing queued will ever run, so this
+    /// returns immediately instead of waiting.
+    ///
     /// Bounded rather than an unconditional spin: this doubles as a deadlock
     /// detector. If a future change ever breaks the invariant that the
     /// dispatcher always decrements `inflight` (e.g. removing the
@@ -282,7 +324,7 @@ impl Events {
             let notified = self.idle.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.inflight.load(Ordering::SeqCst) == 0 {
+            if self.inflight.load(Ordering::SeqCst) == 0 || self.stopped.load(Ordering::SeqCst) {
                 return;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -838,5 +880,63 @@ mod tests {
              deadline",
             t0.elapsed()
         );
+    }
+
+    /// `abort_dispatcher()` must stop handlers deterministically, even when
+    /// the dispatcher task is mid-poll at the moment it is called.
+    /// `JoinHandle::abort()` alone only takes effect at the task's next
+    /// yield, and `rx.recv()` on a non-empty queue does not yield — so a
+    /// handler posted while the poll is still running would run after
+    /// `abort_dispatcher()` returned. Made deterministic by blocking the
+    /// dispatcher's worker thread inside the first handler (a synchronous
+    /// wait, so the poll stays in flight) while the test aborts and posts
+    /// again, then releasing it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_stops_handlers_even_while_the_dispatcher_is_mid_poll() {
+        let events = Events::new();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        let r = ran.clone();
+        events.add_handler(
+            "GO",
+            Arc::new(move |_s, _e| {
+                let r = r.clone();
+                let entered_tx = entered_tx.clone();
+                let release_rx = release_rx.clone();
+                Box::pin(async move {
+                    if let Some(tx) = entered_tx.lock().unwrap().take() {
+                        // First invocation: hold the dispatcher's poll open
+                        // by blocking its worker thread until released.
+                        let _ = tx.send(());
+                        let _ = release_rx.lock().unwrap().recv();
+                    }
+                    r.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        events.start_dispatcher(test_store());
+
+        events.post("GO").await;
+        entered_rx.await.expect("first handler entered");
+
+        // The dispatcher's poll is in flight on the other worker.
+        events.abort_dispatcher();
+        events.post("GO").await;
+        release_tx.send(()).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "a handler posted after abort_dispatcher() ran"
+        );
+        // drain() after a stop must return promptly, not hang to its deadline.
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.drain())
+            .await
+            .expect("drain() after abort_dispatcher() must not hang");
     }
 }

@@ -168,11 +168,7 @@ pub fn parse_packet(data: &[u8]) -> Option<ParsedPacket> {
                 let dst_port = u16::from_be_bytes([data[l4_offset + 2], data[l4_offset + 3]]);
                 let payload_offset = l4_offset + data_offset;
                 let ip_end = ip_offset + total_len as usize;
-                let payload_length = if ip_end > payload_offset {
-                    ip_end - payload_offset
-                } else {
-                    0
-                };
+                let payload_length = ip_end.saturating_sub(payload_offset);
                 return Some(ParsedPacket {
                     source: format!("{}.{}.{}.{}", src[0], src[1], src[2], src[3]),
                     destination: format!("{}.{}.{}.{}", dst[0], dst[1], dst[2], dst[3]),
@@ -191,11 +187,7 @@ pub fn parse_packet(data: &[u8]) -> Option<ParsedPacket> {
                 let dst_port = u16::from_be_bytes([data[l4_offset + 2], data[l4_offset + 3]]);
                 let payload_offset = l4_offset + 8;
                 let ip_end = ip_offset + total_len as usize;
-                let payload_length = if ip_end > payload_offset {
-                    ip_end - payload_offset
-                } else {
-                    0
-                };
+                let payload_length = ip_end.saturating_sub(payload_offset);
                 return Some(ParsedPacket {
                     source: format!("{}.{}.{}.{}", src[0], src[1], src[2], src[3]),
                     destination: format!("{}.{}.{}.{}", dst[0], dst[1], dst[2], dst[3]),
@@ -342,6 +334,12 @@ pub struct PvaReassembler {
     stream_trim_target: usize,
 }
 
+impl Default for PvaReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PvaReassembler {
     pub fn new() -> Self {
         Self {
@@ -396,12 +394,11 @@ impl PvaReassembler {
                 self.stream_dropped = self.stream_dropped.saturating_add(1);
             }
             ranges = find_pva_message_ranges(buffer);
-            if let Some((first_start, _)) = ranges.first() {
-                if *first_start > 0 {
+            if let Some((first_start, _)) = ranges.first()
+                && *first_start > 0 {
                     buffer.drain(0..*first_start);
                     ranges = find_pva_message_ranges(buffer);
                 }
-            }
         } else if parsed.protocol == 17 {
             ranges = find_pva_message_ranges(payload);
         } else {
@@ -457,11 +454,10 @@ impl PvaReassembler {
         }
 
         // Drain consumed bytes from TCP stream buffer
-        if is_tcp && last_tcp_end > 0 {
-            if let Some(buffer) = self.stream_buffers.get_mut(&stream_key) {
+        if is_tcp && last_tcp_end > 0
+            && let Some(buffer) = self.stream_buffers.get_mut(&stream_key) {
                 buffer.drain(0..last_tcp_end);
             }
-        }
 
         messages
     }

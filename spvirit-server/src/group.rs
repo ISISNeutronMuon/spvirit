@@ -172,11 +172,10 @@ pub fn parse_info_group(record_name: &str, json: &str) -> Result<Vec<GroupPvDef>
     for (name, mut raw_group) in raw {
         // Prefix bare channel names.
         for member in raw_group.members.values_mut() {
-            if let Some(ref mut ch) = member.channel {
-                if !ch.contains(':') {
+            if let Some(ref mut ch) = member.channel
+                && !ch.contains(':') {
                     *ch = format!("{record_name}.{ch}");
                 }
-            }
         }
         groups.push(raw_to_group_def(name, raw_group)?);
     }

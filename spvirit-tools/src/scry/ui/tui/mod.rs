@@ -99,8 +99,8 @@ impl App {
             terminal.draw(|frame| render::draw(frame, &mut self.state))?;
 
             let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-            if event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
+            if event::poll(timeout)?
+                && let Event::Key(key) = event::read()? {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
@@ -110,7 +110,6 @@ impl App {
                         InputOutcome::Continue => {}
                     }
                 }
-            }
             if self.state.pause {
                 self.state.ui_last_tick_lag_ms = 0;
                 self.state.ui_is_lagging = false;

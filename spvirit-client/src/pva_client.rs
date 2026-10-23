@@ -898,16 +898,13 @@ impl PvaClient {
                 };
                 let hdr = spvirit_codec::epics_decode::PvaHeader::new(&msg[..8]);
                 let payload = &msg[8..];
-                if hdr.command == 11 && !hdr.flags.is_control && payload.len() >= 5 {
-                    if let Some(st) =
+                if hdr.command == 11 && !hdr.flags.is_control && payload.len() >= 5
+                    && let Some(st) =
                         spvirit_codec::epics_decode::decode_status(&payload[5..], reader_is_be).0
-                    {
-                        if st.code != 0 {
+                        && st.code != 0 {
                             let msg = st.message.unwrap_or_else(|| format!("code={}", st.code));
                             tracing::warn!(pv_error = %msg, "pva channel put returned an error status");
                         }
-                    }
-                }
             }
         });
 
@@ -1197,8 +1194,8 @@ impl PvaClient {
                     // consumed and there is nothing to hand the callback.
                     let Some(decoded) = decoded else { continue };
 
-                    if pipeline_queue.is_some() {
-                        if let Some(ack) = pipeline_ack_on_consume(
+                    if pipeline_queue.is_some()
+                        && let Some(ack) = pipeline_ack_on_consume(
                             &mut consumed_since_ack,
                             ack_threshold,
                             sid,
@@ -1210,10 +1207,9 @@ impl PvaClient {
                             // connection is gone, not cleanly finished.
                             stream.write_all(&ack).await?;
                         }
-                    }
 
-                    if let Ok(update) = decoded {
-                        if callback(&update).is_break() {
+                    if let Ok(update) = decoded
+                        && callback(&update).is_break() {
                             // Best-effort DESTROY so the server releases
                             // its per-subscription state promptly.
                             let destroy = encode_monitor_request(
@@ -1232,7 +1228,6 @@ impl PvaClient {
                             .await;
                             return Ok(MonitorEnd::CallbackBreak);
                         }
-                    }
                 }
             }
         }
@@ -1282,8 +1277,8 @@ impl PvaClient {
                 })?;
                 match cmd {
                     PvaPacketCommand::GetField(payload) => {
-                        if let Some(ref st) = payload.status {
-                            if st.is_error() {
+                        if let Some(ref st) = payload.status
+                            && st.is_error() {
                                 let msg = st
                                     .message
                                     .clone()
@@ -1292,7 +1287,6 @@ impl PvaClient {
                                     "GET_FIELD error: {msg}"
                                 )));
                             }
-                        }
                         let desc = payload.introspection.ok_or_else(|| {
                             PvGetError::Decode("missing GET_FIELD introspection".to_string())
                         })?;
@@ -1512,15 +1506,14 @@ pub fn decode_init_introspection(raw: &[u8], label: &str) -> Result<StructureDes
 
     match cmd {
         PvaPacketCommand::Op(op) => {
-            if let Some(ref st) = op.status {
-                if st.is_error() {
+            if let Some(ref st) = op.status
+                && st.is_error() {
                     let msg = st
                         .message
                         .clone()
                         .unwrap_or_else(|| format!("code={}", st.code));
                     return Err(PvGetError::Protocol(format!("{label} init error: {msg}")));
                 }
-            }
             op.introspection
                 .ok_or_else(|| PvGetError::Decode(format!("missing {label} introspection")))
         }

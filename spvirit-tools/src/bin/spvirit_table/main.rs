@@ -522,9 +522,8 @@ fn exec_rename(app: &mut App, srv: &ServerHandle, old: &str, new: &str) {
     match &app.rows[i].spec {
         PvSpec::Scalar(ty) => {
             let ty = *ty;
-            if let Some(cur) = srv.read_scalar(old) {
-                if let Ok(v) = parse_scalar(ty, &cur) { srv.add_scalar(new, v, writable); }
-            }
+            if let Some(cur) = srv.read_scalar(old)
+                && let Ok(v) = parse_scalar(ty, &cur) { srv.add_scalar(new, v, writable); }
         }
         PvSpec::Enum { choices } => {
             let choices = choices.clone();
@@ -555,13 +554,12 @@ fn exec_access(app: &mut App, srv: &ServerHandle, pattern: &str, writable: bool)
         // Only scalar/enum have a meaningful access recreate.
         match app.rows[i].spec {
             PvSpec::Scalar(ty) => {
-                if let Some(cur) = srv.read_scalar(&name) {
-                    if let Ok(v) = parse_scalar(ty, &cur) {
+                if let Some(cur) = srv.read_scalar(&name)
+                    && let Ok(v) = parse_scalar(ty, &cur) {
                         srv.add_scalar(&name, v, writable);
                         app.rows[i].writable = writable;
                         changed += 1;
                     }
-                }
             }
             PvSpec::Enum { .. } => {
                 if let PvSpec::Enum { choices } = &app.rows[i].spec {

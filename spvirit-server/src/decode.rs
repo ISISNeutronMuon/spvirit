@@ -14,17 +14,17 @@ use spvirit_codec::spvirit_encode::encode_size_pva;
 /// value-only).
 pub fn decode_put_body(body: &[u8], desc: &StructureDesc, is_be: bool) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
-    if let Ok((value, _)) = decoder.decode_structure_with_bitset(body, desc) {
-        if !decoded_is_empty(&value) {
-            return Some(value);
-        }
+    if let Ok((value, _)) = decoder.decode_structure_with_bitset(body, desc)
+        && !decoded_is_empty(&value)
+    {
+        return Some(value);
     }
-    if !body.is_empty() && body[0] == 0xFF {
-        if let Ok((value, _)) = decoder.decode_structure_with_bitset(&body[1..], desc) {
-            if !decoded_is_empty(&value) {
-                return Some(value);
-            }
-        }
+    if !body.is_empty()
+        && body[0] == 0xFF
+        && let Ok((value, _)) = decoder.decode_structure_with_bitset(&body[1..], desc)
+        && !decoded_is_empty(&value)
+    {
+        return Some(value);
     }
     if let Some(value) = decode_put_body_shifted_bitset(body, desc, is_be) {
         return Some(value);
@@ -69,12 +69,12 @@ fn decode_put_body_value_only(
     is_be: bool,
 ) -> Option<DecodedValue> {
     let decoder = PvdDecoder::new(is_be);
-    if let Ok((size, consumed)) = decoder.decode_size(body) {
-        if consumed + size <= body.len() {
-            let data = &body[consumed + size..];
-            if let Some(value) = decode_value_only_from_data(data, desc, &decoder) {
-                return Some(value);
-            }
+    if let Ok((size, consumed)) = decoder.decode_size(body)
+        && consumed + size <= body.len()
+    {
+        let data = &body[consumed + size..];
+        if let Some(value) = decode_value_only_from_data(data, desc, &decoder) {
+            return Some(value);
         }
     }
     decode_value_only_from_data(body, desc, &decoder)
@@ -99,7 +99,7 @@ pub fn shift_bitset_left(bitset: &[u8], shift: usize) -> Vec<u8> {
     }
     let total_bits = bitset.len() * 8;
     let new_bits = total_bits + shift;
-    let mut out = vec![0u8; (new_bits + 7) / 8];
+    let mut out = vec![0u8; new_bits.div_ceil(8)];
     for bit in 0..total_bits {
         if (bitset[bit / 8] & (1 << (bit % 8))) != 0 {
             let new_bit = bit + shift;

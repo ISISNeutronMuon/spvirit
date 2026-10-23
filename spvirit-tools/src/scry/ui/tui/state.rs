@@ -532,11 +532,10 @@ impl AppState {
                 self.data2 = vec![0.; 200];
             }
             OptionId::EventFilter(idx) => {
-                if let Some(key) = self.event_filter_keys.get(idx) {
-                    if let Some(value) = self.event_filter.get_mut(key) {
+                if let Some(key) = self.event_filter_keys.get(idx)
+                    && let Some(value) = self.event_filter.get_mut(key) {
                         *value = !*value;
                     }
-                }
             }
             OptionId::ConnView => {
                 self.connections_view = match self.connections_view {
@@ -1100,8 +1099,8 @@ impl AppState {
             return;
         }
 
-        if let Some(ref selected_id) = self.decoded_selected_id {
-            if let Some((idx, _)) = rows
+        if let Some(ref selected_id) = self.decoded_selected_id
+            && let Some((idx, _)) = rows
                 .iter()
                 .enumerate()
                 .find(|(_, row)| &row.id == selected_id)
@@ -1109,7 +1108,6 @@ impl AppState {
                 self.decoded_selected_index = idx as i32;
                 return;
             }
-        }
 
         let max_idx = rows.len().saturating_sub(1) as i32;
         if self.decoded_selected_index < 0 {
@@ -1122,11 +1120,10 @@ impl AppState {
     }
 
     pub fn selected_decoded_row<'a>(&self, rows: &'a [DecodedRow]) -> Option<&'a DecodedRow> {
-        if let Some(ref selected_id) = self.decoded_selected_id {
-            if let Some(row) = rows.iter().find(|row| &row.id == selected_id) {
+        if let Some(ref selected_id) = self.decoded_selected_id
+            && let Some(row) = rows.iter().find(|row| &row.id == selected_id) {
                 return Some(row);
             }
-        }
         let idx = self.decoded_selected_index.max(0) as usize;
         rows.get(idx).or_else(|| rows.first())
     }

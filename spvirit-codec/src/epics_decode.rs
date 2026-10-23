@@ -1420,19 +1420,17 @@ pub fn extract_pv_names(raw: &[u8]) -> Vec<String> {
                 }
             }
             let len = i - start;
-            if len >= 3 && len <= 128 {
-                if let Ok(s) = std::str::from_utf8(&raw[start..start + len]) {
+            if (3..=128).contains(&len)
+                && let Ok(s) = std::str::from_utf8(&raw[start..start + len]) {
                     // validate candidate contains at least one alphabetic char
-                    if s.chars().any(|c| c.is_ascii_alphabetic()) {
-                        if !names.contains(&s.to_string()) {
+                    if s.chars().any(|c| c.is_ascii_alphabetic())
+                        && !names.contains(&s.to_string()) {
                             names.push(s.to_string());
                             if names.len() >= 8 {
                                 break;
                             }
                         }
-                    }
                 }
-            }
         } else {
             i += 1;
         }
@@ -1519,7 +1517,9 @@ impl PvaOpPayload {
         // NB: pv_names is NOT computed here. The heuristic `extract_pv_names`
         // scan is deferred to `Display` (only when there is no decoded value),
         // so it costs nothing on the normal op path.
-        let result = Some(Self {
+        
+
+        Some(Self {
             sid_or_cid,
             ioid,
             subcmd,
@@ -1529,9 +1529,7 @@ impl PvaOpPayload {
             status,
             introspection,
             decoded_value: None, // Will be set by packet processor with field_desc
-        });
-
-        result
+        })
     }
 
     /// Decode the body using provided field description.
