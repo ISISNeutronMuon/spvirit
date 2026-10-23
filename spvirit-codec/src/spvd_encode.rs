@@ -4112,6 +4112,108 @@ pub(crate) mod tests {
         all_payload_samples().into_iter().map(pin_timestamps).collect()
     }
 
+    /// FNV-1a 64-bit digest, inline so the frozen oracle needs no dependency.
+    fn fnv1a_64(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// `(sample, is_be, full_len, full_fnv1a_64, bitset_len, bitset_fnv1a_64)`
+    /// for every `pinned_time_samples()` entry, COMPUTED AT 99deee5 — before
+    /// the value block was converted to sink form. Never regenerate this from
+    /// HEAD: it is the byte guard the sink conversion is checked against.
+    const PRE_SINK_VALUE_BLOCK_ORACLE: &[(usize, bool, usize, u64, usize, u64)] = &[
+        (0, false, 194, 0x2dae694e3cd3c725, 200, 0xb382bec3407ede2d),
+        (0, true, 194, 0xe1176a1e3cf23fe7, 200, 0x5dbf7597765f9b2f),
+        (1, false, 194, 0x4b671876619a1717, 200, 0x52a406c152cfb74f),
+        (1, true, 194, 0x166fdc9c05795bd1, 200, 0x5742b8c587af8f89),
+        (2, false, 195, 0x18fd7ca769f01df0, 201, 0x4df7e18ac579bf78),
+        (2, true, 195, 0x7f28d6e7db4d2eae, 201, 0x2b702eeb6dc77d36),
+        (3, false, 197, 0x168c65b3f9dd5af1, 203, 0x560fc10538fd0359),
+        (3, true, 197, 0x3961906999aefe85, 203, 0x3e52fb97efb4d4cd),
+        (4, false, 201, 0x3b350975e6ee9740, 207, 0x7ac71205f4cb49d8),
+        (4, true, 201, 0xf696701cbcc3d6a6, 207, 0x45ff88c038c00e9e),
+        (5, false, 194, 0xee82b17087f61672, 200, 0x3c311e3914e2a5aa),
+        (5, true, 194, 0x0b2ca8f04b698860, 200, 0x8bd4ff0827c1d4d8),
+        (6, false, 195, 0x2e4c0799b02db668, 201, 0x1882e231caf31fd0),
+        (6, true, 195, 0x8f829bf6a1213156, 201, 0xabf4827fc75ea2fe),
+        (7, false, 197, 0x8b3c88a00a7b9b35, 203, 0xa8c89bf4a2d813bd),
+        (7, true, 197, 0x11982e99ea2fe82d, 203, 0x37d619355d75f555),
+        (8, false, 201, 0x05222dd7624db7b9, 207, 0xecb95514efd3bed1),
+        (8, true, 201, 0xed91ef180c231785, 207, 0x313aa63cbaf593fd),
+        (9, false, 197, 0xe07cbe21c60ef8b1, 203, 0xf9c54e26847c3199),
+        (9, true, 197, 0x4acbca889237d811, 203, 0xd29ecc20fa3a3a59),
+        (10, false, 201, 0x8b0f9fedc5d980a6, 207, 0x605c12ff3ed762fe),
+        (10, true, 201, 0x7f7b5e9f8566880c, 207, 0xd5b308b593fd1524),
+        (11, false, 199, 0xacaa44a68d281751, 205, 0x175f7690013a9b69),
+        (11, true, 199, 0x35e83bb9f2552ad3, 205, 0xd4bdf80dc5ea410b),
+        (12, false, 143, 0x6736f6edc3d9d88f, 147, 0xd54f94003609eaef),
+        (12, true, 143, 0xc00c014175108e8d, 147, 0xb9f7ddcf4936266d),
+        (13, false, 143, 0xf645fb74512f58f7, 147, 0xfbdfa643894ad2d7),
+        (13, true, 143, 0x3ac03435c8e1f115, 147, 0xf744116b071fd675),
+        (14, false, 146, 0xb70c95aed2e0c3ee, 150, 0x74eee2526d68b48e),
+        (14, true, 146, 0xe897b92f2d86fa22, 150, 0xbe3067313dda74c2),
+        (15, false, 148, 0xbfd045e9f4dc74a0, 152, 0xed1c86e7ae571980),
+        (15, true, 148, 0x1c656b39c16abae2, 152, 0xb0ff5ace0d047b42),
+        (16, false, 156, 0x12d792919555ff16, 160, 0x8a73171bde7981b6),
+        (16, true, 156, 0x2551b692e95d5658, 160, 0x2efd997ef790b078),
+        (17, false, 143, 0x2d23442683198f6a, 147, 0xbefece3bfd8c550a),
+        (17, true, 143, 0x77492e3ff987d714, 147, 0x3d8708a46bcc53b4),
+        (18, false, 144, 0xf5aae1a16a40f1c3, 148, 0x622055dcfa065d63),
+        (18, true, 144, 0xc641f92aa9a4c05f, 148, 0xde6cab7f4335a17f),
+        (19, false, 148, 0xfa58da65343252ea, 152, 0xbc85a3e1162a264a),
+        (19, true, 148, 0x6cde1124b8e28ea0, 152, 0x92b1d365f2e47900),
+        (20, false, 156, 0x3a511d50b110efaa, 160, 0x3c8c9d99e174cd4a),
+        (20, true, 156, 0x24a0b3cef0ab413c, 160, 0x4b8a617089e7f55c),
+        (21, false, 148, 0x9e7264197203b6e9, 152, 0x7a4fce635e347989),
+        (21, true, 148, 0x2f4bf4e02588fc39, 152, 0x99b1b90d8757da59),
+        (22, false, 164, 0x863a33c34e7a00fc, 168, 0xa7793ee9cc77da1c),
+        (22, true, 164, 0x1bc1b55683212080, 168, 0x910dcfa66f3a76a0),
+        (23, false, 145, 0x3999d6302f9ddb10, 149, 0xe15ebb48fb64d330),
+        (23, true, 145, 0x1ad81954a3755472, 149, 0x4aa3bd57f55aac92),
+        (24, false, 84, 0xd32d25aa5f106f8b, 87, 0x3fbd2823b0944499),
+        (24, true, 84, 0x48c7fc27960ac185, 87, 0x74dd548410e8b1a3),
+        (25, false, 37, 0xf55f6953f33e5ca7, 40, 0xcb3a549831cb36d9),
+        (25, true, 37, 0x9895b4859c83e92d, 40, 0x9361254d286db40f),
+        (26, false, 281, 0xff31b20edaf173f5, 286, 0x5a7697d58333c60f),
+        (26, true, 281, 0x43b57a44eadc930b, 286, 0x0b065570943f79d5),
+        (27, false, 157, 0x5bd2fdbb0e0f7caf, 162, 0x68b14ffa83efb77d),
+        (27, true, 157, 0xa07d2d119bc9ad87, 162, 0x4c7983f8fd32e525),
+        (28, false, 43, 0xb9121811c252f3fe, 46, 0x53b89caac59d5b40),
+        (28, true, 43, 0x47a67c0520bb46f6, 46, 0xe8fa8b6734c4e048),
+        (29, false, 43, 0x372258954369ccfd, 46, 0x7333b735318511b5),
+        (29, true, 43, 0x988ee285d0963ce7, 46, 0x8720c62f13db901f),
+    ];
+
+    #[test]
+    fn value_block_bytes_match_the_frozen_pre_sink_oracle() {
+        let samples = pinned_time_samples();
+        assert_eq!(
+            PRE_SINK_VALUE_BLOCK_ORACLE.len(),
+            samples.len() * 2,
+            "sample set changed; the oracle no longer covers it"
+        );
+        for &(i, is_be, full_len, full_fnv, bitset_len, bitset_fnv) in PRE_SINK_VALUE_BLOCK_ORACLE {
+            let full = encode_nt_payload_full(&samples[i], is_be);
+            assert_eq!(
+                (full.len(), fnv1a_64(&full)),
+                (full_len, full_fnv),
+                "sample {i} full, is_be={is_be}"
+            );
+            let bitset = encode_nt_payload_bitset(&samples[i], is_be);
+            assert_eq!(
+                (bitset.len(), fnv1a_64(&bitset)),
+                (bitset_len, bitset_fnv),
+                "sample {i} bitset+full, is_be={is_be}"
+            );
+        }
+    }
+
+    // The frozen oracle above is the real byte guard; this only checks push == wrapper.
     #[test]
     fn push_and_encode_forms_agree_byte_for_byte() {
         for (i, payload) in pinned_time_samples().into_iter().enumerate() {
@@ -4137,6 +4239,11 @@ pub(crate) mod tests {
                 push_nt_payload_full(&mut sunk, &payload, is_be);
                 assert_eq!(&sunk[..2], &[0xAA, 0xBB]);
                 assert_eq!(&sunk[2..], &encode_nt_payload_full(&payload, is_be)[..]);
+
+                let mut sunk = vec![0xAA, 0xBB];
+                push_nt_payload_bitset(&mut sunk, &payload, is_be);
+                assert_eq!(&sunk[..2], &[0xAA, 0xBB]);
+                assert_eq!(&sunk[2..], &encode_nt_payload_bitset(&payload, is_be)[..]);
             }
         }
     }
