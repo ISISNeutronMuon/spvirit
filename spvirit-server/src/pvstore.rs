@@ -37,6 +37,11 @@ const RESOLVED_TTL: Duration = Duration::from_secs(10);
 /// that a client's search already raced past once.
 const RESOLVED_NEGATIVE_TTL: Duration = Duration::from_secs(2);
 
+/// Upper bound on `shadow_checked`. The set is a diagnostic aid, not a
+/// correctness mechanism: dropping it wholesale at the cap costs at most a
+/// repeated warning, and bounds a client-controlled allocation.
+const SHADOW_CHECKED_CAP: usize = 10_000;
+
 /// Upper bound on remembered outcomes, so an unbounded stream of distinct
 /// miss-names cannot grow the memo without limit.
 const RESOLVED_CAPACITY: usize = 4096;
@@ -317,10 +322,14 @@ struct MemoKey {
 
 pub struct SourceRegistry {
     sources: RwLock<Vec<SourceEntry>>,
-    /// PVs whose shadowing status has already been determined. Bounded by
-    /// the number of distinct names clients search for, and only ever grown
-    /// by a claim that a non-store source won.
-    shadow_checked: RwLock<HashSet<String>>,
+    /// PVs whose shadowing status has already been determined.
+    ///
+    /// A plain `std::sync::Mutex`: both uses are statement-scoped and no
+    /// `.await` happens while the guard is held, and the *synchronous*
+    /// `invalidate_memo` has to be able to clear it. Capped, because it
+    /// otherwise grows with the number of distinct names any client has ever
+    /// searched for.
+    shadow_checked: std::sync::Mutex<HashSet<String>>,
     /// Outcomes of background resolutions, keyed by identity as well as name.
     ///
     /// `std::sync::Mutex`, never held across an `.await`, and only ever
@@ -336,7 +345,7 @@ impl SourceRegistry {
     pub fn new() -> Self {
         Self {
             sources: RwLock::new(Vec::new()),
-            shadow_checked: RwLock::new(HashSet::new()),
+            shadow_checked: std::sync::Mutex::new(HashSet::new()),
             resolved: Mutex::new(HashMap::new()),
             positive_ttl: RESOLVED_TTL,
             negative_ttl: RESOLVED_NEGATIVE_TTL,
@@ -370,6 +379,28 @@ impl SourceRegistry {
     /// this task exists to fix.
     fn lock_resolved(&self) -> std::sync::MutexGuard<'_, HashMap<MemoKey, (Instant, bool)>> {
         self.resolved.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_shadow_checked(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.shadow_checked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record that `name`'s shadowing status has been determined. Returns
+    /// `true` when this call is the one that determined it.
+    pub(crate) fn note_shadow_checked(&self, name: &str) -> bool {
+        let mut set = self.lock_shadow_checked();
+        if set.len() >= SHADOW_CHECKED_CAP {
+            set.clear();
+        }
+        set.insert(name.to_string())
+    }
+
+    /// Number of names currently recorded. Test-only.
+    #[cfg(test)]
+    pub(crate) fn shadow_checked_len(&self) -> usize {
+        self.lock_shadow_checked().len()
     }
 
     /// Memo key for `name` under the current request identity. The one
@@ -477,6 +508,10 @@ impl SourceRegistry {
     /// full TTL after `add`/`add_store`/`remove`.
     fn invalidate_memo(&self) {
         self.lock_resolved().clear();
+        // Who serves a name has changed, so a previously determined
+        // shadowing status is stale for exactly the same reason the resolve
+        // memo is.
+        self.lock_shadow_checked().clear();
     }
 
     // ── Delegating operations ────────────────────────────────────────
@@ -521,11 +556,8 @@ impl SourceRegistry {
         winner: &str,
         name: &str,
     ) {
-        if self.shadow_checked.read().await.contains(name) {
-            return;
-        }
-        if !self.shadow_checked.write().await.insert(name.to_string()) {
-            // Another task got there between the read and the write.
+        if !self.note_shadow_checked(name) {
+            // Already determined, here or by another task.
             return;
         }
         for (label, source, _) in snapshot.iter().filter(|(_, _, is_store)| *is_store) {
@@ -1338,5 +1370,45 @@ mod tests {
         let seen_again =
             crate::request_ctx::scope_with(alice, async move { r.try_claim("OWN:PV") }).await;
         assert_eq!(seen_again, TryClaim::Yes);
+    }
+
+    #[tokio::test]
+    async fn adding_a_source_re_arms_the_shadow_check() {
+        let registry = SourceRegistry::new();
+        // Determine the status of a name once, through the same helper the
+        // production path (`warn_if_shadowing_a_store`) uses.
+        assert!(
+            registry.note_shadow_checked("SHADOW:one"),
+            "the first call is the one that determines the status"
+        );
+        assert!(
+            !registry.note_shadow_checked("SHADOW:one"),
+            "a second call must report the status as already determined"
+        );
+        assert_eq!(registry.shadow_checked_len(), 1);
+
+        // `add` changes who can serve that name, so the cached shadow
+        // determination must be discarded along with the resolve memo.
+        registry
+            .add("later", 0, Arc::new(StubSource::new(&["SHADOW:one"])))
+            .await;
+        assert_eq!(
+            registry.shadow_checked_len(),
+            0,
+            "add()/invalidate_memo must clear shadow_checked, not just the resolve memo"
+        );
+    }
+
+    #[test]
+    fn shadow_checked_is_bounded() {
+        let registry = SourceRegistry::new();
+        for i in 0..(SHADOW_CHECKED_CAP * 2) {
+            registry.note_shadow_checked(&format!("PV:{i}"));
+        }
+        assert!(
+            registry.shadow_checked_len() <= SHADOW_CHECKED_CAP,
+            "shadow_checked grew past its cap: {}",
+            registry.shadow_checked_len()
+        );
     }
 }
