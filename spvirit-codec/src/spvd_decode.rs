@@ -1590,8 +1590,12 @@ mod tests {
         let (parsed, _consumed) = decoder
             .parse_structure_desc(cut)
             .expect("lenient parse returns Ok, not Err");
-        assert!(
-            parsed.fields.len() < 3,
+        // 11 bytes = 1 (0x80) + 1 (field count 3) + 3 x 3-byte fields; cutting
+        // 6 leaves exactly one complete field, so the lenient loop must stop
+        // after it. Pinned exactly: salvaging a second field would be a change.
+        assert_eq!(
+            parsed.fields.len(),
+            1,
             "the test buffer must actually be short"
         );
         assert_eq!(parsed.fields[0].name, "a");
