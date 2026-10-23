@@ -1636,16 +1636,16 @@ async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPa
         }
     }
 
-    // Phase 2: enqueue outside the lock; remember which subs actually took delivery.
-    // Set, not Vec: phase 3 walks every sub and asks "was this one delivered?",
-    // so a linear scan per sub makes the commit phase O(delivered × subs).
-    let mut delivered: HashSet<(u64, u32)> = HashSet::new();
-    for (conn_id, ioid, msg) in to_send {
-        if send_msg(state, conn_id, msg).await {
-            delivered.insert((conn_id, ioid));
-            debug!("Monitor update pv='{}' conn={} ", pv_name, conn_id);
-        }
-    }
+    // Phase 2: enqueue outside the monitors lock, under one `conns` lock.
+    // The result is a set, not a Vec: phase 3 walks every sub and asks "was this
+    // one delivered?", so a linear scan per sub would make the commit phase
+    // O(delivered x subs).
+    let delivered = send_msgs(state, to_send).await;
+    debug!(
+        "Monitor update pv='{}' delivered to {} conn(s)",
+        pv_name,
+        delivered.len()
+    );
 
     // Phase 3: commit delta baseline + pipeline credit ONLY for delivered frames.
     if !delivered.is_empty() {
@@ -1794,6 +1794,42 @@ async fn send_msg(state: &Arc<ServerState>, conn_id: u64, msg: Vec<u8>) -> bool 
     } else {
         false
     }
+}
+
+/// Enqueue many frames under a single `conns` lock acquisition.
+///
+/// `send_msg` locks once per recipient, which turns a fan-out to N monitor
+/// subscribers into N lock round-trips on the same mutex. Returns the
+/// `(conn_id, ioid)` pairs that were actually enqueued - a full queue (slow
+/// client) or a closed/unknown connection is a non-delivery, exactly as in
+/// `send_msg`, so pipeline credits and delta baselines are not advanced for it.
+async fn send_msgs(
+    state: &Arc<ServerState>,
+    msgs: Vec<(u64, u32, Vec<u8>)>,
+) -> HashSet<(u64, u32)> {
+    let mut delivered = HashSet::new();
+    if msgs.is_empty() {
+        return delivered;
+    }
+    let conns = state.conns.lock().await;
+    for (conn_id, ioid, msg) in msgs {
+        let Some(tx) = conns.get(&conn_id) else {
+            continue;
+        };
+        match tx.try_send(msg) {
+            Ok(()) => {
+                delivered.insert((conn_id, ioid));
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "Dropping monitor update for conn={}: send queue full (slow client)",
+                    conn_id
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+    delivered
 }
 
 async fn handle_get_field_request(
@@ -3511,6 +3547,34 @@ mod tests {
 
         let target = search_reply_target(&addr, 60292, peer);
         assert_eq!(target, "130.246.90.69:60292".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn send_msgs_reports_only_the_frames_it_enqueued() {
+        let state = test_state(mdel_ai_record("test_pv", 1.0, "0"));
+        let (open_tx, mut open_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (full_tx, _full_rx_kept_but_never_drained) = mpsc::channel::<Vec<u8>>(1);
+        full_tx.try_send(vec![0u8]).expect("prime the queue to full");
+        {
+            let mut conns = state.conns.lock().await;
+            conns.insert(1, open_tx);
+            conns.insert(2, full_tx);
+        }
+
+        let delivered = send_msgs(
+            &state,
+            vec![
+                (1, 10, vec![0xAA]),
+                (2, 20, vec![0xBB]),
+                (3, 30, vec![0xCC]), // no such conn
+            ],
+        )
+        .await;
+
+        assert!(delivered.contains(&(1, 10)));
+        assert!(!delivered.contains(&(2, 20)), "full queue must not count as delivered");
+        assert!(!delivered.contains(&(3, 30)), "unknown conn must not count as delivered");
+        assert_eq!(open_rx.recv().await, Some(vec![0xAA]));
     }
 
     fn test_state(record: RecordInstance) -> Arc<ServerState> {
