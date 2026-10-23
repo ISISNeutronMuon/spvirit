@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex};
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
 
+use crate::lockutil::lock_or_recover;
+
 // NOTE (item 4d): a write-only `latest: Mutex<Option<NtPayload>>` field used to
 // live here to cache the most recent payload for a hypothetical "late-subscriber
 // replay". It was written on every `dispatch` (an extra `payload.clone()` plus a
@@ -78,8 +80,8 @@ impl MonitorEntry {
     /// an intermediate update is safe specifically because `subscribe`
     /// re-accumulates a full snapshot each tick, so a subscriber that misses
     /// one Full update is not left with a torn/partial view.
-    pub fn dispatch(&self, payload: NtPayload) -> bool {
-        let mut subs = self.subs.lock().unwrap();
+    pub fn dispatch(&self, payload: &NtPayload) -> bool {
+        let mut subs = lock_or_recover(&self.subs);
         subs.retain(|tx| match tx.try_send(payload.clone()) {
             Ok(()) => true,
             // Slow but live: keep the subscriber, drop only this update.
@@ -99,7 +101,7 @@ impl MonitorEntry {
     /// senders here is what makes the server-side pump's `rx.recv()` return
     /// `None`, which is the signal Layer 2 turns into DESTROY_CHANNEL.
     pub fn close_all(&self) {
-        self.subs.lock().unwrap().clear();
+        lock_or_recover(&self.subs).clear();
     }
 }
 
@@ -134,14 +136,26 @@ impl MonitorCache {
         spawn_upstream: impl FnOnce(Arc<MonitorEntry>),
     ) -> mpsc::Receiver<NtPayload> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = lock_or_recover(&self.entries);
         match entries.get(&key) {
             Some(entry) => {
-                entry.subs.lock().unwrap().push(tx);
+                let mut subs = lock_or_recover(&entry.subs);
+                // Prune before pushing. `dispatch` is the only other pruner
+                // and it runs only on an upstream tick — and the idle-linger
+                // case is precisely a PV that stops ticking, so without this a
+                // quiet PV with subscribe/drop churn accumulates dead senders
+                // forever. (`spvirit-server`'s monitor registry drops the
+                // receiver outright whenever a live pump for the PV already
+                // exists, so a dead sender per re-subscribe is the normal case.)
+                //
+                // Lock ordering is unchanged: map lock, then `subs` — the same
+                // order `dispatch_or_retire` uses.
+                subs.retain(|tx| !tx.is_closed());
+                subs.push(tx);
             }
             None => {
                 let entry = Arc::new(MonitorEntry::new());
-                entry.subs.lock().unwrap().push(tx);
+                lock_or_recover(&entry.subs).push(tx);
                 entries.insert(key, entry.clone());
                 // Release the map lock before spawning: `spawn_upstream` is
                 // expected to `tokio::spawn` a task that will eventually
@@ -186,7 +200,7 @@ impl MonitorCache {
         &self,
         key: &MonitorKey,
         entry: &Arc<MonitorEntry>,
-        payload: NtPayload,
+        payload: &NtPayload,
     ) -> bool {
         if entry.dispatch(payload) {
             return true;
@@ -196,8 +210,8 @@ impl MonitorCache {
         // re-check under it before deciding to retire, so a concurrent
         // `subscribe()` that attaches a sender while we're mid-decision is
         // never lost.
-        let mut entries = self.entries.lock().unwrap();
-        if !entry.subs.lock().unwrap().is_empty() {
+        let mut entries = lock_or_recover(&self.entries);
+        if !lock_or_recover(&entry.subs).is_empty() {
             // A new subscriber attached between our fan-out and taking the
             // map lock: keep the entry (and the upstream loop) alive.
             return true;
@@ -224,7 +238,7 @@ impl MonitorCache {
     /// a replacement entry created for the same key while this teardown was in
     /// flight must never be removed by the dead upstream's cleanup.
     pub fn retire(&self, key: &MonitorKey, entry: &Arc<MonitorEntry>) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = lock_or_recover(&self.entries);
         if let Some(current) = entries.get(key)
             && Arc::ptr_eq(current, entry)
         {
@@ -236,7 +250,7 @@ impl MonitorCache {
     /// entries, i.e. keys with at least one past-or-present subscriber that
     /// have not yet been torn down). Used by tests to prove dedup.
     pub fn upstream_count(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        lock_or_recover(&self.entries).len()
     }
 
     /// PV names of all live upstream monitor entries — the "channel cache"
@@ -245,9 +259,7 @@ impl MonitorCache {
     /// possible when the same real name is reached through more than one
     /// client, matching p4p's per-channel listing.
     pub fn names(&self) -> Vec<String> {
-        self.entries
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.entries)
             .keys()
             .map(|(_client, real_name)| real_name.clone())
             .collect()
@@ -264,6 +276,31 @@ mod tests {
             struct_id: String::new(),
             fields: vec![("value".to_string(), PvValue::Scalar(ScalarValue::F64(v)))],
         }
+    }
+
+    /// A subscriber whose receiver is dropped leaves a dead `Sender` behind,
+    /// and only `dispatch` prunes it — which requires an upstream tick. On a
+    /// quiet PV (the documented idle-linger case) that tick may never come, so
+    /// subscribe/drop churn would grow this vector without bound.
+    #[test]
+    fn subscribing_prunes_senders_whose_receiver_is_already_gone() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let mut captured_entry = None;
+        let rx1 = cache.subscribe(key.clone(), |entry| captured_entry = Some(entry));
+        let entry = captured_entry.expect("spawn_upstream captured the entry");
+
+        drop(rx1);
+        for _ in 0..10 {
+            drop(cache.subscribe(key.clone(), |_| unreachable!("entry already exists")));
+        }
+        let _rx_live = cache.subscribe(key.clone(), |_| unreachable!("entry already exists"));
+
+        assert_eq!(
+            entry.subs.lock().unwrap().len(),
+            1,
+            "dead senders must be pruned when a new subscriber attaches, not left to              accumulate until an upstream tick that may never come"
+        );
     }
 
     #[test]
@@ -296,7 +333,7 @@ mod tests {
         let mut rx2 = cache.subscribe(key.clone(), |_| {});
 
         let entry = captured_entry.expect("spawn_upstream captured the entry");
-        let still_live = entry.dispatch(payload(3.5));
+        let still_live = entry.dispatch(&payload(3.5));
         assert!(still_live);
 
         let NtPayload::Generic { fields, .. } = rx1.try_recv().unwrap() else {
@@ -318,7 +355,7 @@ mod tests {
         drop(rx);
 
         let entry = captured_entry.expect("spawn_upstream captured the entry");
-        let still_live = entry.dispatch(payload(1.0));
+        let still_live = entry.dispatch(&payload(1.0));
         assert!(!still_live, "no live subscribers left after drop");
     }
 
@@ -341,7 +378,7 @@ mod tests {
         // Fill BOTH subscribers' buffers right up to capacity.
         for i in 0..CHANNEL_CAPACITY {
             assert!(
-                entry.dispatch(payload(i as f64)),
+                entry.dispatch(&payload(i as f64)),
                 "filling buffers must keep the entry live"
             );
         }
@@ -349,7 +386,7 @@ mod tests {
         // Every subscriber's buffer is now Full. A further update must be
         // dropped for those subscribers WITHOUT pruning them and WITHOUT
         // retiring the entry.
-        let still_live = entry.dispatch(payload(1000.0));
+        let still_live = entry.dispatch(&payload(1000.0));
         assert!(
             still_live,
             "an all-Full burst must not report the entry empty (no upstream teardown)"
@@ -361,7 +398,7 @@ mod tests {
         );
 
         // And through the full retire path: the upstream must survive.
-        let should_continue = cache.dispatch_or_retire(&key, &entry, payload(1001.0));
+        let should_continue = cache.dispatch_or_retire(&key, &entry, &payload(1001.0));
         assert!(
             should_continue,
             "dispatch_or_retire must not tear down the upstream on an all-Full burst"
@@ -391,11 +428,11 @@ mod tests {
 
         // Fill the slow subscriber's buffer to capacity.
         for i in 0..CHANNEL_CAPACITY {
-            entry.dispatch(payload(i as f64));
+            entry.dispatch(&payload(i as f64));
         }
 
         // Slow sub is now Full (kept), closed sub is Closed (pruned).
-        let still_live = entry.dispatch(payload(1000.0));
+        let still_live = entry.dispatch(&payload(1000.0));
         assert!(
             still_live,
             "the slow-but-live subscriber must keep the upstream alive"
@@ -432,7 +469,7 @@ mod tests {
         // Last (only) subscriber drops.
         drop(rx1);
 
-        let should_continue = cache.dispatch_or_retire(&key, &entry, payload(1.0));
+        let should_continue = cache.dispatch_or_retire(&key, &entry, &payload(1.0));
         assert!(
             !should_continue,
             "upstream loop must break once its last subscriber is gone"
@@ -507,7 +544,7 @@ mod tests {
             "attaching to a still-present entry must not spawn a second upstream"
         );
 
-        let should_continue = cache.dispatch_or_retire(&key, &entry, payload(2.0));
+        let should_continue = cache.dispatch_or_retire(&key, &entry, &payload(2.0));
         assert!(
             should_continue,
             "a subscriber attached in the meantime must save the entry from retirement"

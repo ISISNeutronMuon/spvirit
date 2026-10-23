@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use crate::lockutil::lock_or_recover;
+
 use std::time::{Duration, Instant};
 
 /// Bounded cache of PV names known to have recently missed upstream
@@ -33,7 +35,7 @@ impl NegativeCache {
     /// `capacity`, the entry with the soonest deadline is evicted first.
     pub fn record_miss(&self, name: &str, now: Instant) {
         let deadline = now + self.ttl;
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = lock_or_recover(&self.entries);
         if !entries.contains_key(name)
             && entries.len() >= self.capacity
             && let Some(evict) = entries
@@ -49,7 +51,7 @@ impl NegativeCache {
     /// Returns true if `name` was recorded as missing and its deadline has
     /// not yet passed as of `now`.
     pub fn is_missing(&self, name: &str, now: Instant) -> bool {
-        let entries = self.entries.lock().unwrap();
+        let entries = lock_or_recover(&self.entries);
         match entries.get(name) {
             Some(deadline) => now < *deadline,
             None => false,
@@ -60,7 +62,7 @@ impl NegativeCache {
     /// removed; they count until overwritten or evicted).
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        lock_or_recover(&self.entries).len()
     }
 }
 
