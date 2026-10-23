@@ -615,7 +615,10 @@ pub fn validate_encoded_packet(conn_id: u64, label: &str, bytes: &[u8]) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
-    let mut pkt = PvaPacket::new(bytes);
+    let Some(mut pkt) = PvaPacket::try_new(bytes) else {
+        debug!("Conn {}: {} failed to decode", conn_id, label);
+        return;
+    };
     let decoded = pkt.decode_payload();
     match decoded {
         Some(PvaPacketCommand::ConnectionValidation(payload)) => {
@@ -2623,6 +2626,23 @@ fn purge_channel_requests(conn_state: &mut ConnState, cid: u32, sid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both diagnostics must be total. With a DEBUG subscriber installed the
+    /// decode path actually runs, so a short frame must not reach a panicking
+    /// header constructor.
+    #[test]
+    fn packet_diagnostics_never_panic_on_short_frames() {
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            for bytes in [&[][..], &[0xca, 0x02, 0x00][..], &[0xca, 0x02, 0, 1, 0, 0, 0][..]] {
+                validate_encoded_packet(1, "short", bytes);
+                dump_hex_packet(1, "->", "short", 2, false, bytes);
+            }
+        });
+    }
     use crate::monitor::MonitorRegistry;
     use crate::pvstore::PvInfo;
     use crate::request_ctx::RequestContext;
