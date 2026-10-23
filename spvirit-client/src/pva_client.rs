@@ -270,6 +270,11 @@ impl MonitorHandle {
     /// Ask the subscription to stop. Idempotent and non-blocking; safe from a
     /// `Drop` impl. The subscription sends a best-effort MONITOR DESTROY
     /// before it returns.
+    ///
+    /// This does not silence the callback synchronously: updates already
+    /// buffered may still reach it after `cancel()` returns. Once
+    /// [`join`](Self::join) or [`cancel_and_join`](Self::cancel_and_join)
+    /// resolves, the callback has been dropped and can no longer fire.
     pub fn cancel(&self) {
         let _ = self.cancel_tx.send(true);
     }
@@ -282,6 +287,10 @@ impl MonitorHandle {
     }
 
     /// Wait for the subscription to end on its own terms.
+    ///
+    /// Dropping the returned future before it resolves (for example when a
+    /// `tokio::time::timeout` around it fires) drops the handle, and
+    /// therefore cancels the subscription.
     pub async fn join(mut self) -> Result<MonitorEnd, PvGetError> {
         match self.join.take() {
             Some(h) => h
@@ -1139,7 +1148,10 @@ impl PvaClient {
                 } => {
                     let destroy =
                         encode_monitor_request(sid, ioid, 0x10, &[], PVA_VERSION, is_be);
-                    let _ = stream.write_all(&destroy).await;
+                    // Bounded: against an upstream that stopped reading, a
+                    // full send buffer would otherwise hang this write — and
+                    // `cancel_and_join` with it.
+                    let _ = tokio::time::timeout(self.timeout, stream.write_all(&destroy)).await;
                     return Ok(MonitorEnd::Cancelled);
                 }
                 _ = echo_interval.tick() => {
@@ -1210,7 +1222,12 @@ impl PvaClient {
                                 PVA_VERSION,
                                 is_be,
                             );
-                            let _ = stream.write_all(&destroy).await;
+                            // Bounded for the same reason as the cancel path.
+                            let _ = tokio::time::timeout(
+                                self.timeout,
+                                stream.write_all(&destroy),
+                            )
+                            .await;
                             return Ok(MonitorEnd::CallbackBreak);
                         }
                     }
