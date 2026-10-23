@@ -55,6 +55,7 @@
 - [sptable](04-tools/sptable.md)
 - [spdodeca](04-tools/spdodeca.md)
 - [spgateway](04-tools/spgateway.md)
+- [spvirit-scry](04-tools/spvirit-scry.md)
 
 ---
 

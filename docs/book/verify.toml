@@ -258,7 +258,7 @@ anchors = [
 tools = [
   "spget", "spput", "spmonitor", "spinfo", "splist", "spexplore",
   "spsearch", "spsine", "spget_compare", "spserver", "sptable", "spdodeca",
-  "spgateway",
+  "spgateway", "spvirit-scry", "spvirit-scry_influx_collector",
 ]
 
 [chapters."04-tools/spget.md"]
@@ -299,6 +299,9 @@ tools = ["spdodeca"]
 
 [chapters."04-tools/spgateway.md"]
 tools = ["spgateway"]
+
+[chapters."04-tools/spvirit-scry.md"]
+tools = ["spvirit-scry", "spvirit-scry_influx_collector"]
 
 # --- Part V: Reference ---------------------------------------------------
 # Prose reference pages. No {{#include}}s, so their badges read

@@ -15,6 +15,19 @@ default = ["client", "server", "tui"]
 client = []
 server = []
 tui = ["dep:ratatui", "dep:color-eyre"]
+# Packet capture + analysis (`spvirit-scry`, `spvirit-scry_influx_collector`).
+# Off by default: pcap links against the Npcap SDK (Windows) or libpcap
+# (Linux), which neither the default build, CI nor the wheel should need.
+scry = [
+    "tui",
+    "dep:pcap",
+    "dep:colored",
+    "dep:dns-lookup",
+    "dep:gethostname",
+    "dep:reqwest",
+    "dep:toml",
+    "dep:vergen-git2",
+]
 
 [dependencies]
 spvirit-types.workspace = true
@@ -44,6 +57,17 @@ socket2 = { version = "0.5", features = ["all"] }
 argparse = "0.2.2"
 ratatui = { version = "0.29.0", optional = true }
 color-eyre = { version = "0.6.5", optional = true }
+
+# scry-only
+pcap = { version = "2.3.0", features = ["capture-stream"], optional = true }
+colored = { version = "3.0.0", optional = true }
+dns-lookup = { version = "3.0.0", optional = true }
+gethostname = { version = "1.0.2", optional = true }
+reqwest = { version = "0.12.23", features = ["json"], optional = true }
+toml = { version = "0.8", optional = true }
+
+[build-dependencies]
+vergen-git2 = { version = "1.0.7", features = ["build", "rustc"], optional = true }
 
 [dev-dependencies]
 toml = "0.8"
@@ -117,3 +141,13 @@ required-features = ["client", "server"]
 name = "spload"
 path = "src/bin/spvirit_load.rs"
 required-features = ["client"]
+
+[[bin]]
+name = "spvirit-scry"
+path = "src/bin/spvirit_scry.rs"
+required-features = ["scry"]
+
+[[bin]]
+name = "spvirit-scry_influx_collector"
+path = "src/bin/spvirit_scry_influx_collector.rs"
+required-features = ["scry"]

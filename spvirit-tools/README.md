@@ -42,6 +42,30 @@ friends.
 
 Each accepts `--help`.
 
+### Packet capture: `spvirit-scry`
+
+Two more binaries, folded in from the former `spvirit-scry` crate, capture
+and decode live PVAccess traffic off a network interface:
+
+| Tool | Kind | What it does |
+| --- | --- | --- |
+| `spvirit-scry` | capture, TUI | passively capture and decode PVA traffic |
+| `spvirit-scry_influx_collector` | capture | the same capture, exported to InfluxDB and Loki |
+
+They are behind the optional `scry` feature and are **not** in the pip
+wheel or a default build, because they link against libpcap (Linux,
+`libpcap-dev`) or the Npcap SDK (Windows, found automatically or via
+`NPCAP_SDK`):
+
+```sh
+cargo install spvirit-tools --features scry
+```
+
+Capturing needs `sudo`/`CAP_NET_RAW` on Linux or administrator rights on
+Windows. The book's
+[spvirit-scry chapter](https://isisneutronmuon.github.io/spvirit/04-tools/spvirit-scry.html)
+covers flags, source fingerprinting and the collector's configuration.
+
 ## Documentation
 
 The [spvirit book](https://isisneutronmuon.github.io/spvirit/) covers the tools
