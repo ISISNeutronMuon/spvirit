@@ -327,6 +327,42 @@ mod tests {
     fn f64_to_u64_checked_boundary() {
         assert_eq!(f64_to_u64_checked(18_446_744_073_709_551_616.0), None); // 2^64
     }
+
+    #[test]
+    fn decoding_a_partial_alarm_structure_uses_the_documented_defaults() {
+        // Only `severity` present: the other two fields must fall back, and
+        // must keep falling back after the lookup is factored out.
+        let val = DecodedValue::Structure(vec![("severity".to_string(), DecodedValue::Int32(2))]);
+        let alarm = decode_nt_alarm(&val).expect("decoded");
+        assert_eq!(alarm.severity, 2);
+        assert_eq!(alarm.status, 0);
+        assert_eq!(alarm.message, "");
+    }
+
+    #[test]
+    fn decoding_a_non_structure_alarm_is_none() {
+        assert!(decode_nt_alarm(&DecodedValue::Int32(1)).is_none());
+    }
+
+    #[test]
+    fn the_field_helper_finds_and_misses_correctly() {
+        let fields = vec![
+            ("a".to_string(), DecodedValue::Int32(1)),
+            ("b".to_string(), DecodedValue::Int32(2)),
+        ];
+        assert!(matches!(field(&fields, "b"), Some(DecodedValue::Int32(2))));
+        assert!(field(&fields, "c").is_none());
+    }
+}
+
+/// Look up one field of a decoded structure by name.
+///
+/// Every `decode_nt_*` below used to spell this out inline, once per field.
+pub(crate) fn field<'a>(
+    fields: &'a [(String, DecodedValue)],
+    name: &str,
+) -> Option<&'a DecodedValue> {
+    fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
 }
 
 /// Decode an `NtAlarm` from a decoded PVA alarm structure.
@@ -334,20 +370,14 @@ pub fn decode_nt_alarm(val: &DecodedValue) -> Option<spvirit_types::NtAlarm> {
     let DecodedValue::Structure(fields) = val else {
         return None;
     };
-    let severity = fields
-        .iter()
-        .find(|(n, _)| n == "severity")
-        .and_then(|(_, v)| decoded_to_i32(v))
+    let severity = field(fields, "severity")
+        .and_then(decoded_to_i32)
         .unwrap_or(0);
-    let status = fields
-        .iter()
-        .find(|(n, _)| n == "status")
-        .and_then(|(_, v)| decoded_to_i32(v))
+    let status = field(fields, "status")
+        .and_then(decoded_to_i32)
         .unwrap_or(0);
-    let message = fields
-        .iter()
-        .find(|(n, _)| n == "message")
-        .and_then(|(_, v)| decoded_to_string(v))
+    let message = field(fields, "message")
+        .and_then(decoded_to_string)
         .unwrap_or_default();
     Some(spvirit_types::NtAlarm {
         severity,
@@ -361,20 +391,14 @@ pub fn decode_nt_timestamp(val: &DecodedValue) -> Option<spvirit_types::NtTimeSt
     let DecodedValue::Structure(fields) = val else {
         return None;
     };
-    let seconds = fields
-        .iter()
-        .find(|(n, _)| n == "secondsPastEpoch")
-        .and_then(|(_, v)| decoded_to_i64(v))
+    let seconds = field(fields, "secondsPastEpoch")
+        .and_then(decoded_to_i64)
         .unwrap_or(0);
-    let nanos = fields
-        .iter()
-        .find(|(n, _)| n == "nanoseconds")
-        .and_then(|(_, v)| decoded_to_i32(v))
+    let nanos = field(fields, "nanoseconds")
+        .and_then(decoded_to_i32)
         .unwrap_or(0);
-    let user_tag = fields
-        .iter()
-        .find(|(n, _)| n == "userTag")
-        .and_then(|(_, v)| decoded_to_i32(v))
+    let user_tag = field(fields, "userTag")
+        .and_then(decoded_to_i32)
         .unwrap_or(0);
     Some(spvirit_types::NtTimeStamp {
         seconds_past_epoch: seconds,
@@ -388,30 +412,20 @@ pub fn decode_nt_display(val: &DecodedValue) -> Option<spvirit_types::NtDisplay>
     let DecodedValue::Structure(fields) = val else {
         return None;
     };
-    let limit_low = fields
-        .iter()
-        .find(|(n, _)| n == "limitLow")
-        .and_then(|(_, v)| decoded_to_f64(v))
+    let limit_low = field(fields, "limitLow")
+        .and_then(decoded_to_f64)
         .unwrap_or(0.0);
-    let limit_high = fields
-        .iter()
-        .find(|(n, _)| n == "limitHigh")
-        .and_then(|(_, v)| decoded_to_f64(v))
+    let limit_high = field(fields, "limitHigh")
+        .and_then(decoded_to_f64)
         .unwrap_or(0.0);
-    let description = fields
-        .iter()
-        .find(|(n, _)| n == "description")
-        .and_then(|(_, v)| decoded_to_string(v))
+    let description = field(fields, "description")
+        .and_then(decoded_to_string)
         .unwrap_or_default();
-    let units = fields
-        .iter()
-        .find(|(n, _)| n == "units")
-        .and_then(|(_, v)| decoded_to_string(v))
+    let units = field(fields, "units")
+        .and_then(decoded_to_string)
         .unwrap_or_default();
-    let precision = fields
-        .iter()
-        .find(|(n, _)| n == "precision")
-        .and_then(|(_, v)| decoded_to_i32(v))
+    let precision = field(fields, "precision")
+        .and_then(decoded_to_i32)
         .unwrap_or(0);
     Some(spvirit_types::NtDisplay {
         limit_low,
