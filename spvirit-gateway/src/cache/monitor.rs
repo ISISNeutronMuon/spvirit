@@ -28,6 +28,8 @@ use std::sync::{Arc, Mutex};
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
 
+use crate::lockutil::lock_or_recover;
+
 // NOTE (item 4d): a write-only `latest: Mutex<Option<NtPayload>>` field used to
 // live here to cache the most recent payload for a hypothetical "late-subscriber
 // replay". It was written on every `dispatch` (an extra `payload.clone()` plus a
@@ -79,7 +81,7 @@ impl MonitorEntry {
     /// re-accumulates a full snapshot each tick, so a subscriber that misses
     /// one Full update is not left with a torn/partial view.
     pub fn dispatch(&self, payload: &NtPayload) -> bool {
-        let mut subs = self.subs.lock().unwrap();
+        let mut subs = lock_or_recover(&self.subs);
         subs.retain(|tx| match tx.try_send(payload.clone()) {
             Ok(()) => true,
             // Slow but live: keep the subscriber, drop only this update.
@@ -99,7 +101,7 @@ impl MonitorEntry {
     /// senders here is what makes the server-side pump's `rx.recv()` return
     /// `None`, which is the signal Layer 2 turns into DESTROY_CHANNEL.
     pub fn close_all(&self) {
-        self.subs.lock().unwrap().clear();
+        lock_or_recover(&self.subs).clear();
     }
 }
 
@@ -134,10 +136,10 @@ impl MonitorCache {
         spawn_upstream: impl FnOnce(Arc<MonitorEntry>),
     ) -> mpsc::Receiver<NtPayload> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = lock_or_recover(&self.entries);
         match entries.get(&key) {
             Some(entry) => {
-                let mut subs = entry.subs.lock().unwrap();
+                let mut subs = lock_or_recover(&entry.subs);
                 // Prune before pushing. `dispatch` is the only other pruner
                 // and it runs only on an upstream tick — and the idle-linger
                 // case is precisely a PV that stops ticking, so without this a
@@ -153,7 +155,7 @@ impl MonitorCache {
             }
             None => {
                 let entry = Arc::new(MonitorEntry::new());
-                entry.subs.lock().unwrap().push(tx);
+                lock_or_recover(&entry.subs).push(tx);
                 entries.insert(key, entry.clone());
                 // Release the map lock before spawning: `spawn_upstream` is
                 // expected to `tokio::spawn` a task that will eventually
@@ -208,8 +210,8 @@ impl MonitorCache {
         // re-check under it before deciding to retire, so a concurrent
         // `subscribe()` that attaches a sender while we're mid-decision is
         // never lost.
-        let mut entries = self.entries.lock().unwrap();
-        if !entry.subs.lock().unwrap().is_empty() {
+        let mut entries = lock_or_recover(&self.entries);
+        if !lock_or_recover(&entry.subs).is_empty() {
             // A new subscriber attached between our fan-out and taking the
             // map lock: keep the entry (and the upstream loop) alive.
             return true;
@@ -236,7 +238,7 @@ impl MonitorCache {
     /// a replacement entry created for the same key while this teardown was in
     /// flight must never be removed by the dead upstream's cleanup.
     pub fn retire(&self, key: &MonitorKey, entry: &Arc<MonitorEntry>) {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = lock_or_recover(&self.entries);
         if let Some(current) = entries.get(key)
             && Arc::ptr_eq(current, entry)
         {
@@ -248,7 +250,7 @@ impl MonitorCache {
     /// entries, i.e. keys with at least one past-or-present subscriber that
     /// have not yet been torn down). Used by tests to prove dedup.
     pub fn upstream_count(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        lock_or_recover(&self.entries).len()
     }
 
     /// PV names of all live upstream monitor entries — the "channel cache"
@@ -257,9 +259,7 @@ impl MonitorCache {
     /// possible when the same real name is reached through more than one
     /// client, matching p4p's per-channel listing.
     pub fn names(&self) -> Vec<String> {
-        self.entries
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.entries)
             .keys()
             .map(|(_client, real_name)| real_name.clone())
             .collect()

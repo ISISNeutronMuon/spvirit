@@ -26,6 +26,7 @@ use crate::bridge::{
 use crate::cache::monitor::{MonitorCache, MonitorKey};
 use crate::convert::decoded_to_json;
 use crate::cache::negative::NegativeCache;
+use crate::lockutil::{lock_or_recover, try_lock_or_recover};
 use crate::loopguard::LoopGuard;
 use crate::upstream::UpstreamPool;
 
@@ -102,7 +103,7 @@ pub struct Binding {
 /// [`GatewaySource::retire_binding`] go through here, so the teardown rule
 /// documented on `retire_binding` has exactly one implementation.
 fn retire_binding_in(bindings: &Mutex<HashMap<String, Binding>>, name: &str) {
-    bindings.lock().unwrap().remove(name);
+    lock_or_recover(bindings).remove(name);
 }
 
 /// A [`Source`] that resolves and forwards PVs to upstream PVA servers.
@@ -229,11 +230,9 @@ impl GatewaySource {
     /// tests proving the getholdoff cache is filled when the feature is on and
     /// left completely alone when `getholdoff = 0`.
     pub fn getholdoff_cache_len(&self) -> usize {
-        self.bindings
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.bindings)
             .values()
-            .filter(|b| b.last_get.lock().unwrap().is_some())
+            .filter(|b| lock_or_recover(&b.last_get).is_some())
             .count()
     }
 }
@@ -249,7 +248,7 @@ impl Source for GatewaySource {
         if let Decision::Deny = self.access.decide(Op::Get, name, &current_identity()) {
             return TryClaim::No;
         }
-        let Ok(bindings) = self.bindings.try_lock() else {
+        let Some(bindings) = try_lock_or_recover(&self.bindings) else {
             return TryClaim::Unknown;
         };
         if bindings.contains_key(name) {
@@ -322,7 +321,7 @@ impl Source for GatewaySource {
             // GUID (then re-check it cheaply here), or client-side
             // connection caching that makes the data path stop re-searching.
             {
-                let bindings = self.bindings.lock().unwrap();
+                let bindings = lock_or_recover(&self.bindings);
                 if let Some(binding) = bindings.get(&name)
                     && binding.real_name == target
                     && now.duration_since(binding.bound_at) < self.binding_ttl
@@ -364,7 +363,7 @@ impl Source for GatewaySource {
                     continue;
                 }
                 {
-                    let mut bindings = self.bindings.lock().unwrap();
+                    let mut bindings = lock_or_recover(&self.bindings);
                     // Two statements, not one `match` with an `insert` in
                     // its fallback arm: `get_mut`'s borrow of `bindings`
                     // would still be live in that arm, and the borrow
@@ -398,7 +397,7 @@ impl Source for GatewaySource {
                             // disable getholdoff altogether, which is the
                             // very bug the in-place refresh above fixes.
                             if existing.descriptor != descriptor {
-                                *existing.last_get.lock().unwrap() = None;
+                                *lock_or_recover(&existing.last_get) = None;
                             }
                             existing.descriptor = descriptor.clone();
                             existing.bound_at = Instant::now();
@@ -446,14 +445,14 @@ impl Source for GatewaySource {
             // within this block, before any `.await` — never held across
             // one.
             let (client_name, real_name) = {
-                let bindings = self.bindings.lock().unwrap();
+                let bindings = lock_or_recover(&self.bindings);
                 let binding = bindings.get(&name)?;
 
                 // `getholdoff = 0` (the default) means the feature is off: the
                 // window can never be satisfied, so do not even take the inner
                 // lock to compare against a zero-length window.
                 if self.getholdoff_ms > 0 {
-                    let cache = binding.last_get.lock().unwrap();
+                    let cache = lock_or_recover(&binding.last_get);
                     if let Some((t_last, payload)) = cache.as_ref()
                         && Instant::now()
                             < *t_last + Duration::from_millis(self.getholdoff_ms as u64)
@@ -473,9 +472,9 @@ impl Source for GatewaySource {
                     // default 0 the read above can never hit, so the clone and
                     // the two locks would be pure cost on every read.
                     if self.getholdoff_ms > 0
-                        && let Some(binding) = self.bindings.lock().unwrap().get(&name)
+                        && let Some(binding) = lock_or_recover(&self.bindings).get(&name)
                     {
-                        *binding.last_get.lock().unwrap() = Some((Instant::now(), payload.clone()));
+                        *lock_or_recover(&binding.last_get) = Some((Instant::now(), payload.clone()));
                     }
                     Some(payload)
                 }
@@ -516,7 +515,7 @@ impl Source for GatewaySource {
             // `.await` below — never hold the bindings-map MutexGuard across
             // an await point, matching `get`'s discipline.
             let (client_name, real_name) = {
-                let bindings = self.bindings.lock().unwrap();
+                let bindings = lock_or_recover(&self.bindings);
                 let binding = bindings
                     .get(&name)
                     .ok_or_else(|| format!("no binding for unclaimed PV {name:?}"))?;
@@ -547,7 +546,7 @@ impl Source for GatewaySource {
         let name = name.to_string();
         Box::pin(async move {
             let (client_name, real_name, struct_id) = {
-                let bindings = self.bindings.lock().unwrap();
+                let bindings = lock_or_recover(&self.bindings);
                 let binding = bindings.get(&name)?;
                 (
                     binding.client_name.clone(),
@@ -712,11 +711,10 @@ impl Source for GatewaySource {
     /// §14 / M2).
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
         let mut names: Vec<String> = {
-            let bindings = self.bindings.lock().unwrap();
+            let bindings = lock_or_recover(&self.bindings);
             bindings.keys().cloned().collect()
         };
         names.sort();
-        names.dedup();
         Box::pin(async move { names })
     }
 }
@@ -762,6 +760,40 @@ mod tests {
         // upstream-death path can race a concurrent retirement.
         retire_binding_in(&bindings, "A");
         assert_eq!(bindings.lock().unwrap().len(), 1);
+    }
+
+    /// One panic while holding the bindings map must not take the whole
+    /// gateway offline. Every critical section over this map is a short,
+    /// panic-free `HashMap` operation, so the poison carries no broken
+    /// invariant — recovering is strictly better than refusing every later
+    /// search, get, subscribe and status read for the process's lifetime.
+    #[tokio::test]
+    async fn a_poisoned_bindings_map_does_not_take_the_gateway_down() {
+        let src = test_source(open_neg(), allow_all());
+        src.bindings
+            .lock()
+            .unwrap()
+            .insert("BOUND:PV".to_string(), test_binding("c", "BOUND:REAL"));
+
+        let bindings = src.bindings.clone();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::thread::spawn(move || {
+            let _guard = bindings.lock().unwrap();
+            panic!("poison the bindings map");
+        })
+        .join();
+        std::panic::set_hook(previous);
+        assert!(src.bindings.is_poisoned());
+
+        assert_eq!(
+            src.try_claim("BOUND:PV"),
+            TryClaim::Yes,
+            "a poisoned bindings map must not silence the search path"
+        );
+        assert_eq!(src.names().await, vec!["BOUND:PV".to_string()]);
+        src.retire_binding("BOUND:PV");
+        assert!(src.names().await.is_empty());
     }
 
     fn test_source(neg: Arc<NegativeCache>, access: Arc<AccessControl>) -> GatewaySource {

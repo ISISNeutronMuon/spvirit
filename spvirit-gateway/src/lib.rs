@@ -62,6 +62,7 @@ pub mod bridge;
 pub mod cache;
 pub mod config;
 pub mod convert;
+pub mod lockutil;
 pub mod loopguard;
 pub mod metrics;
 pub mod proxy;
