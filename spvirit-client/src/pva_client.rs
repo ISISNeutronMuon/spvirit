@@ -1921,14 +1921,8 @@ mod tests {
     /// Task 4 review: a pooled connection whose cached sid the server has
     /// destroyed must be treated as a reuse failure. The operation sees an
     /// error reply for the stale sid *before* any commit, so it must reach the
-    /// retry branch and succeed on a fresh connection — for GET and for PUT
-    /// (a PUT INIT error precedes the commit point).
-    ///
-    /// GET_FIELD is deliberately not driven here: the in-process spvirit
-    /// server answers a GET_FIELD naming an unknown sid with its pvlist
-    /// listing rather than an error (`handle_get_field_request` falls through
-    /// when the sid resolves to no PV), so the client never sees a failure to
-    /// retry on. That is a server-side defect, reported separately.
+    /// retry branch and succeed on a fresh connection — for GET, GET_FIELD and
+    /// PUT alike (a PUT INIT error precedes the commit point).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stale_pooled_sid_is_retried_once_on_a_fresh_connection() {
         const PV: &str = "POOL:STALESID";
@@ -1946,11 +1940,24 @@ mod tests {
         assert_eq!(s.conn_misses, 2, "the retry dialled a fresh connection");
 
         client.cache.destroy_pooled_channel_for_test(PV).await;
-        let put = client.pvput(PV, 4.25).await;
-        assert!(put.is_ok(), "PUT whose INIT hits a stale sid must retry: {put:?}");
+        let info = client.pvinfo(PV).await;
+        assert!(info.is_ok(), "GET_FIELD on a stale sid must retry: {info:?}");
+        let desc = info.unwrap();
+        assert_ne!(
+            desc.struct_id.as_deref(),
+            Some("epics:pva/pvlist:1.0"),
+            "the retry must return the PV's introspection, not the server's PV list"
+        );
         let s = client.cache_stats();
         assert_eq!(s.conn_retried_dead, 2);
         assert_eq!(s.conn_misses, 3);
+
+        client.cache.destroy_pooled_channel_for_test(PV).await;
+        let put = client.pvput(PV, 4.25).await;
+        assert!(put.is_ok(), "PUT whose INIT hits a stale sid must retry: {put:?}");
+        let s = client.cache_stats();
+        assert_eq!(s.conn_retried_dead, 3);
+        assert_eq!(s.conn_misses, 4);
         assert_eq!(s.resolve_misses, 1, "no retry re-searched");
 
         let got = client.pvget(PV).await.expect("get after put");
