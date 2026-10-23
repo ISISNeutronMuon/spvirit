@@ -16,8 +16,10 @@ use serde::Serialize;
 use spvirit_client::{client_from_opts, MonitorUpdate};
 use tokio::runtime::Runtime;
 
-// Fixed epoch offset so a millisecond timestamp fits exactly in an f64 mantissa (<2^52).
-const STAMP_EPOCH_MS: u64 = 1_700_000_000_000;
+/// Epoch for `--stamp` values, in microseconds. Offsetting from a fixed recent
+/// epoch keeps the value inside f64's exact-integer range (2^53 us is ~285
+/// years) so a stamp survives the round trip through an f64 PV unchanged.
+const STAMP_EPOCH_US: u64 = 1_700_000_000_000_000;
 
 fn pv_name(prefix: &str, index: usize) -> String {
     format!("{prefix}:PV{index:05}")
@@ -54,11 +56,18 @@ pub(crate) struct WatchSummary {
     latency_ms_p99: Option<f64>,
 }
 
-fn now_ms() -> u64 {
+fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Latency in milliseconds for a stamp `sent_us` (offset from `STAMP_EPOCH_US`)
+/// received at absolute wall-clock `now_abs_us`.
+fn stamp_latency_ms(sent_us: u64, now_abs_us: u64) -> f64 {
+    let recv = now_abs_us.saturating_sub(STAMP_EPOCH_US);
+    recv.saturating_sub(sent_us) as f64 / 1000.0
 }
 
 // Extract the scalar f64 carried in an update's `value` field.
@@ -142,9 +151,8 @@ async fn run_watch(
                         let mut st = state.lock().unwrap();
                         st.received += 1;
                         if stamp {
-                            let sent = v as u64; // ms since STAMP_EPOCH_MS
-                            let recv = now_ms().saturating_sub(STAMP_EPOCH_MS);
-                            st.latencies_ms.push(recv.saturating_sub(sent) as f64);
+                            let sent = v as u64; // us since STAMP_EPOCH_US
+                            st.latencies_ms.push(stamp_latency_ms(sent, now_us()));
                         } else {
                             let c = v as u64;
                             st.min = Some(st.min.map_or(c, |m| m.min(c)));
@@ -204,13 +212,14 @@ async fn run_watch(
     let mut max_counter = 0u64;
     let mut all_lat: Vec<f64> = Vec::new();
     for st in &states {
-        let st = st.lock().unwrap();
+        let mut st = st.lock().unwrap();
         received_total += st.received;
         let (span, coalesced) = coalescing(st.min, st.max, st.received);
         span_total += span;
         coalesced_total += coalesced;
         max_counter = max_counter.max(st.max);
-        all_lat.extend_from_slice(&st.latencies_ms);
+        // `append` moves the samples out, so peak memory is one copy, not two.
+        all_lat.append(&mut st.latencies_ms);
     }
     all_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let summary = WatchSummary {
@@ -281,7 +290,7 @@ async fn run_drive(
         while issued < due {
             let p = target_pv(issued, npvs);
             let value: f64 = if stamp {
-                now_ms().saturating_sub(STAMP_EPOCH_MS) as f64
+                now_us().saturating_sub(STAMP_EPOCH_US) as f64
             } else {
                 // per-PV monotonic counter = issued / npvs (each PV gets a clean 0,1,2,... sequence)
                 (issued / npvs.max(1) as u64) as f64
@@ -291,8 +300,10 @@ async fn run_drive(
         }
         tokio::time::sleep(tick).await;
     }
+    let measured = start.elapsed();
     eprintln!(
-        "spload drive: issued {issued} puts over {:.1}s (target {:.0}/s)",
+        "spload drive: issued {issued} puts over {:.1}s measured (target {:.1}s at {:.0}/s)",
+        measured.as_secs_f64(),
         duration.as_secs_f64(),
         rate_hz
     );
@@ -406,6 +417,20 @@ async fn run_watch_cli(argv: Vec<String>) -> Result<(), Box<dyn std::error::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamp_latency_resolves_sub_millisecond() {
+        let sent = 1_234_567_890u64;
+        let now_abs = STAMP_EPOCH_US + sent + 200;
+        let l = stamp_latency_ms(sent, now_abs);
+        assert!(l > 0.19 && l < 0.21, "200us must read as ~0.2ms, got {l}");
+    }
+
+    #[test]
+    fn stamp_survives_f64_round_trip() {
+        let stamp_us = 365u64 * 24 * 3600 * 1_000_000;
+        assert_eq!((stamp_us as f64) as u64, stamp_us);
+    }
 
     #[test]
     fn coalescing_counts_gaps_as_span_minus_received() {
