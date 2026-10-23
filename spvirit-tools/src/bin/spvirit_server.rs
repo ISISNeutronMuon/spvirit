@@ -3208,6 +3208,179 @@ mod tests {
         assert_eq!(state.db_generation(), 2);
     }
 
+    const SCAN_SRC_DB: &str = r#"
+record(ai, "SRC") {
+    field(VAL, "0")
+}
+"#;
+
+    fn scan_db(p_scan: &str) -> String {
+        format!(
+            r#"{SCAN_SRC_DB}
+record(ai, "P") {{
+    field(SCAN, "{p_scan}")
+    field(INP, "SRC")
+}}
+"#
+        )
+    }
+
+    /// A `ServerState` built from a real .db text, with a live event channel.
+    fn scan_test_state(db: &str) -> (Arc<ServerState>, mpsc::Receiver<PostedEvent>) {
+        let store = spvirit_tools::spvirit_server::db::parse_db(db).expect("test db parses");
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let state = Arc::new(ServerState::new(
+            store,
+            false,
+            event_tx,
+            PvListMode::Off,
+            1024,
+            None,
+            [0u8; 12],
+            5075,
+            None,
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        ));
+        (state, event_rx)
+    }
+
+    async fn scan_value(state: &Arc<ServerState>, name: &str) -> f64 {
+        let store = state.pv_store.read().await;
+        match store.get(name).expect("record exists").to_ntpayload() {
+            NtPayload::Scalar(nt) => scalar_as_f64(&nt.value).expect("numeric value"),
+            _ => panic!("{name} is not a scalar"),
+        }
+    }
+
+    async fn set_src(state: &Arc<ServerState>, v: f64) {
+        let mut store = state.pv_store.write().await;
+        store
+            .get_mut("SRC")
+            .expect("SRC exists")
+            .set_scalar_value(ScalarValue::F64(v), false);
+    }
+
+    /// Poll every 20 ms until `name == want`, failing after 3 s.
+    async fn wait_for_value(state: &Arc<ServerState>, name: &str, want: f64) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let got = scan_value(state, name).await;
+            if got == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name} never reached {want} within 3 s (last seen {got})"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The store swap + generation bump from `run_db_reload` (which itself
+    /// polls a file's mtime, so it is not driven directly here).
+    async fn simulate_reload(state: &Arc<ServerState>, db: &str) {
+        let new_store = spvirit_tools::spvirit_server::db::parse_db(db).expect("reload db parses");
+        let mut store = state.pv_store.write().await;
+        *store = new_store;
+        state.bump_db_generation();
+    }
+
+    // Real-time test (the bin's tests do not use a paused clock): positive
+    // checks poll with a 3 s deadline; negative windows can only false-pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_scheduler_scans_and_follows_db_reload() {
+        let periodic = scan_db("0.1 second");
+        let passive = scan_db("Passive");
+        let (state, _event_rx) = scan_test_state(&periodic);
+        let sched_state = state.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_scan_scheduler(sched_state).await.is_ok();
+        });
+
+        for i in 1..=3 {
+            set_src(&state, i as f64).await;
+            wait_for_value(&state, "P", i as f64).await;
+        }
+
+        // Reload to a DB where P is Passive: it must stop scanning. The
+        // reloaded P starts from its parsed VAL, so read that baseline.
+        simulate_reload(&state, &passive).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = scan_value(&state, "P").await;
+        set_src(&state, 42.0).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            scan_value(&state, "P").await,
+            before,
+            "a record made Passive by a reload must stop scanning"
+        );
+
+        // Reload back to the periodic DB: P must start scanning again.
+        simulate_reload(&state, &periodic).await;
+        set_src(&state, 7.0).await;
+        wait_for_value(&state, "P", 7.0).await;
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_worker_keeps_soft_and_io_events_apart() {
+        let db = format!(
+            r#"{SCAN_SRC_DB}
+record(ai, "E") {{
+    field(SCAN, "Event")
+    field(EVNT, "T")
+    field(INP, "SRC")
+}}
+record(ai, "I") {{
+    field(SCAN, "I/O Intr")
+    field(IOSCAN, "T")
+    field(INP, "SRC")
+}}
+"#
+        );
+        let (state, event_rx) = scan_test_state(&db);
+        set_src(&state, 5.0).await;
+        state
+            .event_tx
+            .send(PostedEvent::Event("T".to_string()))
+            .await
+            .unwrap();
+        state
+            .event_tx
+            .send(PostedEvent::Event("nope".to_string()))
+            .await
+            .unwrap();
+        let worker_state = state.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_event_worker(worker_state, event_rx).await.is_ok();
+        });
+
+        wait_for_value(&state, "E", 5.0).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            scan_value(&state, "I").await,
+            0.0,
+            "a soft event must not fire an I/O Intr record sharing its tag"
+        );
+
+        set_src(&state, 9.0).await;
+        state
+            .event_tx
+            .send(PostedEvent::IoEvent("T".to_string()))
+            .await
+            .unwrap();
+        wait_for_value(&state, "I", 9.0).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            scan_value(&state, "E").await,
+            5.0,
+            "an I/O event must not fire a soft-event record sharing its tag"
+        );
+
+        handle.abort();
+    }
+
     // Regression test for finding tools-T1 (cross-client head-of-line
     // blocking): a slow client whose bounded 128-deep queue is full must NOT
     // stall monitor fan-out to other, healthy clients. The fan-out loop sends
