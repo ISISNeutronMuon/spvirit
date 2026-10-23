@@ -119,7 +119,7 @@ Cross-referenced from the per-crate chapters.
   record.
 - `.db` parser: one-statement-per-line only; cannot load
   longin/longout/mbbi/mbbo/table/ndarray/generic (the repo's only two
-  `TODO(follow-up)` markers: `types.rs:45`, `db.rs:546`).
+  `TODO(follow-up)` markers: `types.rs:45`, `db.rs:562`).
 - `Pv::alarm_limits()` sets only the wire metadata fields, not the fields the
   alarm engine reads — `.alarm_limits()` + `compute_alarms(true)` does not
   auto-alarm. `compute_alarms` defaults to false.

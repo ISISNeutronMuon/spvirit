@@ -44,14 +44,13 @@ The client reads five environment variables:
 ## The server is found but the PV is not
 
 A server answers a search only for names it serves, so a timeout on one PV
-while another works means the name is wrong — a typo, or a record that
-failed to load. Start the server in the foreground and read the startup
-line: it reports how many PVs came out of the `.db` file.
+while another works means the name is wrong. Start the server in the
+foreground and read the startup line: it reports how many PVs came out of
+the `.db` file.
 
-If the record is `mbbi` or `mbbo` and you loaded it from a `.db` file, it was
-dropped and a message went to stderr. If it is `longin` or `longout`, it was
-dropped with **no message at all** — the PV count in the startup line is your
-only clue. See [Known gaps](known-gaps.md).
+A `.db` file containing an `mbbi`, `mbbo`, `longin` or `longout` record does
+not load at all: `spserver` exits with an error naming the first such record.
+See [Known gaps](known-gaps.md).
 
 ## `Write access denied`
 
