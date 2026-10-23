@@ -474,6 +474,14 @@ impl PooledConn {
         self.reused
     }
 
+    /// Forget the cached channel for `pv_name`, so the next operation on this
+    /// connection creates it afresh. Used when the server refused an
+    /// operation on it: the sid may be stale in a way the client cannot
+    /// recognise from the server's wording.
+    pub(crate) fn forget_channel(&mut self, pv_name: &str) {
+        self.channels.remove(pv_name);
+    }
+
     /// The server-side sid for `pv_name` on this connection, creating the
     /// channel if this connection does not have one yet.
     pub(crate) async fn channel_sid(

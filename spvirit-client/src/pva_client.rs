@@ -521,7 +521,16 @@ impl PvaClient {
                     return Err(e);
                 }
                 Err(e) => {
-                    if ctx.is_reusable() || is_server_refusal(&e) {
+                    let mut conn = conn;
+                    if is_server_refusal(&e) {
+                        // The connection is healthy, but the refusal may be a
+                        // stale sid worded in a way `is_reuse_failure` does
+                        // not recognise. Forget the channel so the next op
+                        // re-creates it; a genuine refusal (access denied)
+                        // then costs one extra CREATE_CHANNEL.
+                        conn.forget_channel(pv_name);
+                        self.cache.release(conn);
+                    } else if ctx.is_reusable() {
                         self.cache.release(conn);
                     }
                     return Err(e);
@@ -1619,6 +1628,10 @@ mod tests {
     const RELAY_KILL_AFTER_PUT_DATA: u8 = 1;
     /// Swallow everything the server sends: the client's reads stall.
     const RELAY_BLACKHOLE: u8 = 2;
+    /// Rewrite the server's "Unknown SID" status text to "Bad chan ID" (same
+    /// length, so the length-prefixed string and the frame stay valid): a
+    /// real stale-sid refusal, worded the way a non-spvirit server might.
+    const RELAY_REWORD_STALE_SID: u8 = 3;
 
     /// A frame-aware TCP relay in front of a real server, so a test can break
     /// a connection at an exact protocol point. Point a client at it with
@@ -1657,8 +1670,22 @@ mod tests {
                                 r = s_rd.read(&mut buf) => match r {
                                     Ok(0) | Err(_) => break,
                                     Ok(n) => {
-                                        if m2.load(Ordering::SeqCst) == RELAY_BLACKHOLE {
+                                        let mode = m2.load(Ordering::SeqCst);
+                                        if mode == RELAY_BLACKHOLE {
                                             continue;
+                                        }
+                                        if mode == RELAY_REWORD_STALE_SID {
+                                            const FROM: &[u8] = b"Unknown SID";
+                                            const TO: &[u8] = b"Bad chan ID";
+                                            let mut i = 0;
+                                            while i + FROM.len() <= n {
+                                                if &buf[i..i + FROM.len()] == FROM {
+                                                    buf[i..i + FROM.len()].copy_from_slice(TO);
+                                                    i += FROM.len();
+                                                } else {
+                                                    i += 1;
+                                                }
+                                            }
                                         }
                                         if c_wr.write_all(&buf[..n]).await.is_err() {
                                             break;
@@ -1916,6 +1943,56 @@ mod tests {
         let s = client.cache_stats();
         assert_eq!(s.conn_misses, 2, "the abandoned connection was not pooled");
         assert_eq!(s.conn_retried_dead, 0);
+    }
+
+    /// Task 5 re-review: an op-level server refusal is kept on a healthy
+    /// connection, but the refused channel must be forgotten. Otherwise a
+    /// stale sid refused in words other than "Unknown SID" (not classified as
+    /// a reuse failure) stays cached, the LIFO pool hands the connection
+    /// straight back, and every later op on that PV fails the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_pooled_channel_is_forgotten_and_recreated() {
+        const PV: &str = "POOL:REFUSED";
+        let (_server, _registry, tcp_port, _udp) =
+            start_test_server_with_registry(&[PV], &[]).await;
+        let upstream: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+        let relay = Relay::start(upstream).await;
+        let client = relay_client(&relay);
+
+        client.pvget(PV).await.expect("warm the pool");
+        let old_sid = client.cache.pooled_channels_for_test(PV)[0].0[PV];
+
+        // The server forgets the channel; its "Unknown SID" reply reaches the
+        // client as "Bad chan ID", which is not a recognised stale-sid text.
+        client.cache.destroy_pooled_channel_for_test(PV).await;
+        relay.set(RELAY_REWORD_STALE_SID);
+
+        let err = tokio::time::timeout(Duration::from_secs(10), client.pvget(PV))
+            .await
+            .expect("must not hang")
+            .expect_err("the stale sid is refused");
+        assert!(format!("{err:?}").contains("Bad chan ID"), "{err:?}");
+        let s = client.cache_stats();
+        assert_eq!(s.conn_retried_dead, 0, "not recognised as a reuse failure");
+        assert_eq!(s.conn_misses, 1, "the healthy connection was kept");
+        let pooled = client.cache.pooled_channels_for_test(PV);
+        assert_eq!(pooled.len(), 1);
+        assert!(
+            !pooled[0].0.contains_key(PV),
+            "the refused channel must be forgotten before the connection is pooled"
+        );
+
+        // The next op re-creates the channel on the same connection.
+        let got = tokio::time::timeout(Duration::from_secs(10), client.pvget(PV))
+            .await
+            .expect("must not hang");
+        assert!(got.is_ok(), "the next op must not reuse the dead sid: {got:?}");
+        let s = client.cache_stats();
+        assert_eq!(s.conn_misses, 1, "same connection");
+        let pooled = client.cache.pooled_channels_for_test(PV);
+        let (channels, next_cid) = &pooled[0];
+        assert_ne!(channels[PV], old_sid, "a fresh CreateChannel gave a new sid");
+        assert_eq!(*next_cid, 3, "exactly one more CreateChannel (cid 2)");
     }
 
     /// Task 4 review: a pooled connection whose cached sid the server has
