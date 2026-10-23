@@ -25,7 +25,9 @@ They need the optional `scry` feature, which is **not** on by default and is
 not part of the `pip install spvirit-tools` wheel, because packet capture
 links against a system library:
 
-- **Linux**: `libpcap-dev` (or your distribution's equivalent).
+- **Linux**: `libpcap-dev`, `libssl-dev` and `pkg-config` (or your
+  distribution's equivalents); the InfluxDB collector's HTTP client links
+  OpenSSL.
 - **Windows**: the [Npcap](https://npcap.com/) runtime and the
   [Npcap SDK](https://npcap.com/#download). The build script finds the SDK
   automatically (see below), or set `NPCAP_SDK` to the extracted SDK root.
@@ -58,7 +60,7 @@ administrator rights on Windows.
 ## Requirements
 
 - **Rust** toolchain (edition 2024).
-- **Linux**: `libpcap-dev` installed and available.
+- **Linux**: `libpcap-dev`, `libssl-dev` and `pkg-config` installed and available.
 - **Windows**: [Npcap](https://npcap.com/) runtime and the [Npcap SDK](https://npcap.com/#download). The build script auto-detects the SDK, or set `NPCAP_SDK` to the extracted SDK root.
 - **Linux**: Packet capture requires either `sudo` or `CAP_NET_RAW` capability (see below).
 

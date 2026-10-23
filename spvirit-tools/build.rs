@@ -135,7 +135,7 @@ fn scry_main() -> Result<(), Box<dyn std::error::Error>> {
     let git_ok = (|| -> Result<(), Box<dyn std::error::Error>> {
         let git2 = Git2Builder::default()
             .commit_timestamp(true)
-            .describe(true, false, None)
+            .describe(true, false, Some("spvirit-tools-v*"))
             .sha(true)
             .branch(true)
             .build()?;
