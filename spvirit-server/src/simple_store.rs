@@ -531,6 +531,13 @@ impl Source for SimplePvStore {
         Box::pin(async move {
             let mut pvs = self.pvs.write().await;
             let entry = pvs.get_mut(&name)?;
+            // The write guard is already held, so pruning here is free. A
+            // client that subscribes, drops and re-subscribes would otherwise
+            // leave a dead sender behind on every cycle, and every one of
+            // them gets walked on every post. `is_closed()` is the same
+            // "closed" test as `deliver_or_keep`'s `Closed` arm; a full but
+            // live sender is kept.
+            entry.subscribers.retain(|tx| !tx.is_closed());
             let (tx, rx) = mpsc::channel(64);
             entry.subscribers.push(tx);
             Some(rx)
@@ -1668,5 +1675,32 @@ record(ao, "DB:AO") {
             Some(FieldKind::Str)
         );
         assert!(store.field_value("A:absent", "RTYP").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn subscribing_prunes_senders_whose_receivers_are_gone() {
+        let mut records = std::collections::HashMap::new();
+        records.insert("A:sub".to_string(), make_ai("A:sub", 1.0));
+        let store = SimplePvStore::new(
+            records,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            false,
+        );
+
+        // Subscribe and immediately drop the receiver, three times over.
+        for _ in 0..3 {
+            let rx = Source::subscribe(&store, "A:sub").await.expect("subscribed");
+            drop(rx);
+        }
+        // A fourth subscribe must not leave the three dead senders behind.
+        let _live = Source::subscribe(&store, "A:sub").await.expect("subscribed");
+
+        let pvs = store.pvs.read().await;
+        assert_eq!(
+            pvs.get("A:sub").unwrap().subscribers.len(),
+            1,
+            "closed senders were not pruned"
+        );
     }
 }
