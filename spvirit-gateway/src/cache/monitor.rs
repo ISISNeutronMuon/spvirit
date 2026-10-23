@@ -137,7 +137,19 @@ impl MonitorCache {
         let mut entries = self.entries.lock().unwrap();
         match entries.get(&key) {
             Some(entry) => {
-                entry.subs.lock().unwrap().push(tx);
+                let mut subs = entry.subs.lock().unwrap();
+                // Prune before pushing. `dispatch` is the only other pruner
+                // and it runs only on an upstream tick — and the idle-linger
+                // case is precisely a PV that stops ticking, so without this a
+                // quiet PV with subscribe/drop churn accumulates dead senders
+                // forever. (`spvirit-server`'s monitor registry drops the
+                // receiver outright whenever a live pump for the PV already
+                // exists, so a dead sender per re-subscribe is the normal case.)
+                //
+                // Lock ordering is unchanged: map lock, then `subs` — the same
+                // order `dispatch_or_retire` uses.
+                subs.retain(|tx| !tx.is_closed());
+                subs.push(tx);
             }
             None => {
                 let entry = Arc::new(MonitorEntry::new());
@@ -264,6 +276,31 @@ mod tests {
             struct_id: String::new(),
             fields: vec![("value".to_string(), PvValue::Scalar(ScalarValue::F64(v)))],
         }
+    }
+
+    /// A subscriber whose receiver is dropped leaves a dead `Sender` behind,
+    /// and only `dispatch` prunes it — which requires an upstream tick. On a
+    /// quiet PV (the documented idle-linger case) that tick may never come, so
+    /// subscribe/drop churn would grow this vector without bound.
+    #[test]
+    fn subscribing_prunes_senders_whose_receiver_is_already_gone() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let mut captured_entry = None;
+        let rx1 = cache.subscribe(key.clone(), |entry| captured_entry = Some(entry));
+        let entry = captured_entry.expect("spawn_upstream captured the entry");
+
+        drop(rx1);
+        for _ in 0..10 {
+            drop(cache.subscribe(key.clone(), |_| unreachable!("entry already exists")));
+        }
+        let _rx_live = cache.subscribe(key.clone(), |_| unreachable!("entry already exists"));
+
+        assert_eq!(
+            entry.subs.lock().unwrap().len(),
+            1,
+            "dead senders must be pruned when a new subscriber attaches, not left to              accumulate until an upstream tick that may never come"
+        );
     }
 
     #[test]
