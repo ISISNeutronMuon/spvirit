@@ -646,7 +646,7 @@ pub fn descriptor_for_payload(payload: &NtPayload) -> StructureDesc {
 /// get it — a claim on a large waveform used to clone every sample purely to
 /// read the array's element type. Every arm delegates to the codec for the
 /// same reason `descriptor_for_payload` does: one builder, no drift.
-pub fn descriptor_for_record(payload: NtPayloadRef<'_>) -> StructureDesc {
+pub(crate) fn descriptor_for_record(payload: NtPayloadRef<'_>) -> StructureDesc {
     use spvirit_codec::spvd_encode as enc;
     match payload {
         NtPayloadRef::Scalar(nt) => enc::nt_scalar_desc(&nt.value),
