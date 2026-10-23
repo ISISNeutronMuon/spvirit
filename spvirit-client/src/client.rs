@@ -290,6 +290,7 @@ pub async fn run_get_on(
     let version = conn.version;
 
     let pv_request = if fields.is_empty() {
+        // Empty pvRequest — request all fields
         vec![0xfd, 0x02, 0x00, 0x80, 0x00, 0x00]
     } else {
         encode_pv_request(fields, is_be)
@@ -312,9 +313,24 @@ pub async fn run_get_on(
         "get init response decode failed".to_string(),
     ))?;
     let desc = match cmd {
-        PvaPacketCommand::Op(op) => op
-            .introspection
-            .ok_or_else(|| PvGetError::Decode("missing introspection".to_string()))?,
+        PvaPacketCommand::Op(op) => {
+            // Name a server refusal at INIT ("PV not found", "Unknown SID",
+            // ...) instead of the bare "missing introspection" it used to fall
+            // through to; the pooled path classifies retries on this message.
+            // Still `Decode`, the variant this path has always returned, so
+            // spvirit-py's exception class for it is unchanged.
+            if let Some(st) = op.status.as_ref().filter(|st| st.is_error()) {
+                let msg = st
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| format!("code={}", st.code));
+                return Err(PvGetError::Decode(format!(
+                    "missing introspection: GET init error: {msg}"
+                )));
+            }
+            op.introspection
+                .ok_or_else(|| PvGetError::Decode("missing introspection".to_string()))?
+        }
         _ => {
             return Err(PvGetError::Protocol(
                 "unexpected get init response".to_string(),
@@ -342,6 +358,7 @@ pub async fn run_get_on(
 
     match cmd {
         PvaPacketCommand::Op(mut op) => {
+            // A decode failure leaves decoded_value None, handled below.
             let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
             if let Some(value) = op.decoded_value {
                 return Ok(PvGetResult {

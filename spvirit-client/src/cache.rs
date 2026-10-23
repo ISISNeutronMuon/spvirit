@@ -399,8 +399,13 @@ impl ClientCache {
                     8,
                     8,
                 );
-                // DESTROY_CHANNEL payload: sid, then cid. The cid is not
-                // needed by the server's purge beyond the stale-row guard.
+                // DESTROY_CHANNEL payload: sid, then cid. cid 0 is NOT the
+                // channel's real cid: the server's
+                // `remove_channel_if_current(0, sid)` drops every sid-keyed
+                // row (which is all an op lookup reads, so the next op gets
+                // "Unknown SID") but leaves `cid_to_sid[real cid]` pointing
+                // at the dead sid. Not byte-for-byte what a real destroy
+                // leaves behind, but the state this test needs.
                 let cid = 0u32;
                 if is_be {
                     frame.extend_from_slice(&sid.to_be_bytes());

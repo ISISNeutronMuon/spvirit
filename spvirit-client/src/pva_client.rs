@@ -27,7 +27,8 @@ use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::{PvdDecoder, StructureDesc};
 use spvirit_codec::spvd_encode::{encode_pv_request, encode_pv_request_with_options};
 use spvirit_codec::spvirit_encode::{
-    encode_control_message, encode_get_field_request, encode_monitor_request, encode_put_request,
+    encode_control_message, encode_destroy_request, encode_get_field_request,
+    encode_monitor_request, encode_put_request,
 };
 
 use crate::byte_sink::ByteSink;
@@ -46,15 +47,22 @@ fn alloc_ioid() -> u32 {
     NEXT_IOID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Marks the point at which an operation stops being safe to re-run.
+/// Marks the point at which an operation stops being safe to re-run, and
+/// whether its connection may go back into the pool.
 ///
 /// GET and GET_FIELD never call [`OpCtx::commit`]: they have no server-side
 /// effect, so they are retryable for their whole duration. PUT calls it
 /// immediately before writing the value, because after that write the server
 /// may have applied the value even if it never replies.
+///
+/// An operation calls [`OpCtx::reusable`] only once the connection is at a
+/// frame boundary *and* the server holds no per-request state for it (it sent
+/// DESTROY_REQUEST, or the request never created any). Without that mark the
+/// connection is closed rather than pooled.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OpCtx {
     committed: Arc<std::sync::atomic::AtomicBool>,
+    reusable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl OpCtx {
@@ -63,6 +71,56 @@ impl OpCtx {
     }
     fn is_committed(&self) -> bool {
         self.committed.load(Ordering::Relaxed)
+    }
+    pub(crate) fn reusable(&self) {
+        self.reusable.store(true, Ordering::Relaxed);
+    }
+    fn is_reusable(&self) -> bool {
+        self.reusable.load(Ordering::Relaxed)
+    }
+}
+
+/// Errors worth one retry on a fresh connection when they hit a *reused*
+/// one: the socket is dead or stalled (`Io`, `Timeout` — EOF is an `Io`), or
+/// the server no longer knows the channel's sid. Every server answers an
+/// operation on an unknown sid with an error; spvirit's text is
+/// "Unknown SID".
+fn is_reuse_failure(e: &PvGetError) -> bool {
+    match e {
+        PvGetError::Io(_) | PvGetError::Timeout(_) => true,
+        PvGetError::Protocol(m) | PvGetError::Decode(m) => m.contains("Unknown SID"),
+        _ => false,
+    }
+}
+
+/// A server status reply refusing a channel create or an operation's INIT
+/// ("PV not found", "Write access denied", ...). The reply was read whole, so
+/// the connection is at a frame boundary, and a refused INIT leaves no
+/// per-request state on the server: the connection is healthy and is kept.
+/// The markers are the ones `create_channel_on`, `run_get_on`,
+/// `decode_init_introspection` and `pvinfo_full` build from the status.
+fn is_server_refusal(e: &PvGetError) -> bool {
+    match e {
+        PvGetError::Protocol(m) | PvGetError::Decode(m) => [
+            "create_channel error:",
+            "GET init error:",
+            "PUT init error:",
+            "GET_FIELD error:",
+        ]
+        .iter()
+        .any(|p| m.contains(p)),
+        _ => false,
+    }
+}
+
+/// Free the server's per-request state for `ioid` (the spvirit server keeps a
+/// descriptor and a binding row per GET/PUT until told otherwise) and, if the
+/// write went through, mark the connection reusable. A failed write leaves it
+/// unmarked, so it is closed instead of pooled.
+async fn destroy_request(conn: &mut crate::cache::PooledConn, sid: u32, ioid: u32, ctx: &OpCtx) {
+    let msg = encode_destroy_request(sid, ioid, conn.conn.version, conn.conn.is_be);
+    if conn.conn.stream.write_all(&msg).await.is_ok() {
+        ctx.reusable();
     }
 }
 
@@ -386,9 +444,15 @@ impl PvaClient {
     /// A reused connection can fail because its socket is dead (the server
     /// closed an idle connection) *or* because the sid it has cached for
     /// `pv_name` is stale (the server destroyed that channel). Both surface as
-    /// an `Err` from `op` before any commit, and both take the same branch:
-    /// the connection is discarded, never checked back in, and the operation
-    /// re-runs on a freshly dialled connection that creates its own channel.
+    /// an `Err` from `op` before any commit ([`is_reuse_failure`]), and both
+    /// take the same branch: the connection is discarded, never checked back
+    /// in, and the operation re-runs on a freshly dialled connection that
+    /// creates its own channel.
+    ///
+    /// Any other error is deterministic — a server refusal, a local encode
+    /// failure — and would fail identically on a fresh connection, so it is
+    /// returned at once. The connection is kept when it is known healthy
+    /// ([`is_server_refusal`] or [`OpCtx::reusable`]) and closed otherwise.
     async fn with_pooled_channel<T, F, Fut>(&self, pv_name: &str, op: F) -> Result<T, PvGetError>
     where
         F: Fn(crate::cache::PooledConn, u32, OpCtx) -> Fut,
@@ -419,14 +483,22 @@ impl PvaClient {
             let sid = match conn.channel_sid(pv_name, self.timeout).await {
                 Ok(sid) => sid,
                 Err(e) => {
-                    // Do not check the connection back in: it is either dead
-                    // or it refused the channel.
-                    drop(conn);
-                    if reused && attempt == 0 {
+                    let retryable = is_reuse_failure(&e);
+                    if !retryable && is_server_refusal(&e) {
+                        // The server answered and refused the channel: the
+                        // connection itself is fine.
+                        self.cache.release(conn);
+                    } else {
+                        drop(conn);
+                    }
+                    if retryable && reused && attempt == 0 {
                         crate::cache::bump_retried_dead(self.cache.counters());
                         continue;
                     }
-                    self.cache.invalidate_at(pv_name, resolved.addr);
+                    // The address accepted a connection and a handshake, so
+                    // only this PV's resolution is suspect; the other
+                    // connections pooled for that server stay.
+                    self.cache.invalidate(pv_name);
                     return Err(e);
                 }
             };
@@ -435,14 +507,22 @@ impl PvaClient {
             let (conn, ctx, result) = op(conn, sid, ctx).await;
             match result {
                 Ok(v) => {
-                    self.cache.release(conn);
+                    if ctx.is_reusable() {
+                        self.cache.release(conn);
+                    }
                     return Ok(v);
                 }
-                Err(e) => {
+                Err(e) if is_reuse_failure(&e) => {
                     drop(conn);
                     if reused && attempt == 0 && !ctx.is_committed() {
                         crate::cache::bump_retried_dead(self.cache.counters());
                         continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => {
+                    if ctx.is_reusable() || is_server_refusal(&e) {
+                        self.cache.release(conn);
                     }
                     return Err(e);
                 }
@@ -484,6 +564,9 @@ impl PvaClient {
                         timeout_dur,
                     )
                     .await;
+                    if r.is_ok() {
+                        destroy_request(&mut conn, sid, ioid, &ctx).await;
+                    }
                     (conn, ctx, r)
                 }
             })
@@ -554,8 +637,15 @@ impl PvaClient {
                     .await?;
                     let desc = decode_init_introspection(&init_bytes, "PUT")?;
 
-                    let payload = encode_put_payload(&desc, &json_val, is_be)
-                        .map_err(|e| PvGetError::Protocol(format!("put encode: {e}")))?;
+                    let payload = match encode_put_payload(&desc, &json_val, is_be) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            // A local failure: nothing was written past the
+                            // INIT, whose server state is freed here.
+                            destroy_request(&mut conn, sid, ioid, &ctx2).await;
+                            return Err(PvGetError::Protocol(format!("put encode: {e}")));
+                        }
+                    };
                     let req = encode_put_request(sid, ioid, 0x00, &payload, PVA_VERSION, is_be);
 
                     // POINT OF NO RETURN: after this write the server may have
@@ -579,8 +669,11 @@ impl PvaClient {
                         |cmd| matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.ioid == ioid && op.subcmd == 0x00),
                     )
                     .await?;
-                    ensure_status_ok(&resp_bytes, is_be, "PUT")?;
-                    Ok(())
+                    // The reply was read whole either way, so free the
+                    // request before reporting its status.
+                    let status = ensure_status_ok(&resp_bytes, is_be, "PUT");
+                    destroy_request(&mut conn, sid, ioid, &ctx2).await;
+                    status
                 }
                 .await;
                 (conn, ctx, r)
@@ -939,6 +1032,9 @@ impl PvaClient {
                         let desc = payload.introspection.ok_or_else(|| {
                             PvGetError::Decode("missing GET_FIELD introspection".to_string())
                         })?;
+                        // GET_FIELD is one request, one reply: the server
+                        // keeps nothing for it, so there is nothing to free.
+                        ctx.reusable();
                         Ok((desc, conn.conn.server_addr, conn.conn.guid))
                     }
                     _ => Err(PvGetError::Protocol(
@@ -1363,6 +1459,7 @@ mod tests {
 
         let stats = client.cache_stats();
         assert_eq!(stats.conn_retried_dead, 1, "exactly one retry");
+        assert_eq!(stats.conn_misses, 2, "the retry dialled a fresh connection");
         assert_eq!(stats.resolve_misses, 1, "the retry must not re-search");
     }
 
@@ -1453,6 +1550,374 @@ mod tests {
         assert_eq!(*next_cid, 3, "B was created with a fresh cid (2), not cid 1 again");
     }
 
+    /// Start a server serving writable `ao` PVs (and read-only `ai` PVs) and
+    /// return its `MonitorRegistry` too, whose `channel_tables(conn_id)` is the
+    /// live per-connection state the server mutates — the observable for
+    /// "per-request rows are freed".
+    async fn start_test_server_with_registry(
+        ao: &[&str],
+        ai: &[&str],
+    ) -> (
+        spvirit_server::pva_server::RunningServer,
+        std::sync::Arc<spvirit_server::monitor::MonitorRegistry>,
+        u16,
+        u16,
+    ) {
+        use spvirit_server::pva_server::PvaServer;
+        use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket as StdUdpSocket};
+
+        let tcp_port = TcpListener::bind("127.0.0.1:0")
+            .expect("bind tcp")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let udp_port = StdUdpSocket::bind("127.0.0.1:0")
+            .expect("bind udp")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+
+        let mut b = PvaServer::builder();
+        for pv in ao {
+            b = b.ao(*pv, 1.0);
+        }
+        for pv in ai {
+            b = b.ai(*pv, 1.0);
+        }
+        let mut server = b
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .build();
+        let registry = server.monitor_registry();
+        let running = server.start().await.expect("server start");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        (running, registry, tcp_port, udp_port)
+    }
+
+    /// Total per-request binding rows (`ioid_to_sid`) across every live
+    /// server connection. Connection ids start at 1 and the tests here open
+    /// only a handful, so scanning 1..=16 covers them all.
+    async fn server_request_rows(
+        registry: &spvirit_server::monitor::MonitorRegistry,
+    ) -> usize {
+        let mut total = 0;
+        for conn_id in 1..=16u64 {
+            if let Some(t) = registry.channel_tables(conn_id).await {
+                total += t.lock().unwrap().ioid_to_sid.len();
+            }
+        }
+        total
+    }
+
+    /// What a [`Relay`] does to the traffic it carries.
+    const RELAY_PASS: u8 = 0;
+    /// Forward the next client PUT data frame (cmd 11, subcmd 0x00), then
+    /// close the client's connection: the server gets the value, the client
+    /// never gets the reply. One-shot: the relay drops to `RELAY_BLACKHOLE`,
+    /// so a test sets `RELAY_PASS` again afterwards.
+    const RELAY_KILL_AFTER_PUT_DATA: u8 = 1;
+    /// Swallow everything the server sends: the client's reads stall.
+    const RELAY_BLACKHOLE: u8 = 2;
+
+    /// A frame-aware TCP relay in front of a real server, so a test can break
+    /// a connection at an exact protocol point. Point a client at it with
+    /// `.server_addr(relay_addr)`.
+    struct Relay {
+        mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+        addr: SocketAddr,
+    }
+
+    impl Relay {
+        async fn start(upstream: SocketAddr) -> Self {
+            use std::sync::atomic::AtomicU8;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind relay");
+            let addr = listener.local_addr().expect("relay addr");
+            let mode = Arc::new(AtomicU8::new(RELAY_PASS));
+            let m = mode.clone();
+            tokio::spawn(async move {
+                while let Ok((client, _)) = listener.accept().await {
+                    let server = tokio::net::TcpStream::connect(upstream)
+                        .await
+                        .expect("relay connect upstream");
+                    let (mut c_rd, mut c_wr) = client.into_split();
+                    let (mut s_rd, mut s_wr) = server.into_split();
+                    let kill = Arc::new(tokio::sync::Notify::new());
+
+                    // server -> client: raw copy, unless black-holed or killed.
+                    let (m2, k2) = (m.clone(), kill.clone());
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        loop {
+                            tokio::select! {
+                                r = s_rd.read(&mut buf) => match r {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        if m2.load(Ordering::SeqCst) == RELAY_BLACKHOLE {
+                                            continue;
+                                        }
+                                        if c_wr.write_all(&buf[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                },
+                                _ = k2.notified() => break,
+                            }
+                        }
+                        // Dropping `c_wr` shuts down the client's read side.
+                    });
+
+                    // client -> server: frame by frame, so a PUT data frame
+                    // can be recognised.
+                    let m3 = m.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let mut hdr = [0u8; 8];
+                            if c_rd.read_exact(&mut hdr).await.is_err() {
+                                break;
+                            }
+                            let h = spvirit_codec::epics_decode::PvaHeader::new(&hdr);
+                            let len = if h.flags.is_control {
+                                0
+                            } else {
+                                h.payload_length as usize
+                            };
+                            let mut payload = vec![0u8; len];
+                            if c_rd.read_exact(&mut payload).await.is_err() {
+                                break;
+                            }
+                            let is_put_data = !h.flags.is_control
+                                && h.command == 11
+                                && payload.len() > 8
+                                && payload[8] == 0x00;
+                            // Black-hole the reply path BEFORE the value
+                            // reaches the server, so its reply cannot slip
+                            // through ahead of the kill.
+                            let kill_now = is_put_data
+                                && m3
+                                    .compare_exchange(
+                                        RELAY_KILL_AFTER_PUT_DATA,
+                                        RELAY_BLACKHOLE,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    )
+                                    .is_ok();
+                            let mut frame = hdr.to_vec();
+                            frame.extend_from_slice(&payload);
+                            if s_wr.write_all(&frame).await.is_err() {
+                                break;
+                            }
+                            if kill_now {
+                                kill.notify_one();
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            Relay { mode, addr }
+        }
+
+        fn set(&self, mode: u8) {
+            self.mode.store(mode, Ordering::SeqCst);
+        }
+    }
+
+    fn relay_client(relay: &Relay) -> PvaClient {
+        PvaClient::builder()
+            .timeout(Duration::from_secs(2))
+            .server_addr(relay.addr)
+            .build()
+    }
+
+    /// Task 5 review, Important 1: every pooled GET and PUT frees its
+    /// server-side request state (DESTROY_REQUEST) before the connection is
+    /// pooled, so a busy pooled connection does not grow the server's
+    /// per-request maps without bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_operations_do_not_grow_server_request_state() {
+        const PV: &str = "POOL:ROWS";
+        let (_server, registry, tcp_port, udp_port) =
+            start_test_server_with_registry(&[PV], &[]).await;
+        let client = ns_client(tcp_port, udp_port, Duration::from_secs(5));
+
+        for i in 0..20 {
+            client.pvget(PV).await.expect("pvget");
+            client.pvput(PV, i as f64).await.expect("pvput");
+        }
+        let s = client.cache_stats();
+        assert_eq!(s.conn_misses, 1, "all 40 operations shared one connection");
+
+        // DESTROY_REQUEST has no reply; give the server a moment to drain it.
+        let mut rows = usize::MAX;
+        for _ in 0..100 {
+            rows = server_request_rows(&registry).await;
+            if rows == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            rows, 0,
+            "40 pooled operations must leave no per-request rows on the server"
+        );
+    }
+
+    /// Task 5 review, Minor 2: a local encode failure is not a dead
+    /// connection. It returns at once, is not retried, and keeps the healthy
+    /// pooled connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_encode_error_is_not_retried_and_keeps_the_connection() {
+        const PV: &str = "POOL:ENCODE";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let client = ns_client(tcp_port, udp_port, Duration::from_secs(5));
+
+        client.pvget(PV).await.expect("warm the pool");
+        let err = client
+            .pvput(PV, "not a number")
+            .await
+            .expect_err("a string cannot be put to a float field");
+        assert!(
+            matches!(&err, PvGetError::Protocol(m) if m.contains("put encode")),
+            "{err:?}"
+        );
+        let s = client.cache_stats();
+        assert_eq!(s.conn_retried_dead, 0, "a deterministic error is not a retry");
+        assert_eq!(s.conn_misses, 1, "no fresh dial");
+
+        client.pvget(PV).await.expect("the connection is still pooled");
+        let s = client.cache_stats();
+        assert_eq!(s.conn_misses, 1, "the same connection served the next get");
+        assert_eq!(s.conn_hits, 2);
+    }
+
+    /// Task 5 review, Minor 2: a server refusal at INIT ("Write access
+    /// denied" on a read-only record) is returned at once, not retried, and
+    /// the connection it came over stays pooled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_refusal_at_init_is_not_retried_and_keeps_the_connection() {
+        const RO: &str = "POOL:READONLY";
+        let (_server, _registry, tcp_port, udp_port) =
+            start_test_server_with_registry(&[], &[RO]).await;
+        let client = ns_client(tcp_port, udp_port, Duration::from_secs(5));
+
+        client.pvget(RO).await.expect("warm the pool");
+        let err = client.pvput(RO, 2.0).await.expect_err("ai is read-only");
+        assert!(
+            matches!(&err, PvGetError::Protocol(m) if m.contains("Write access denied")),
+            "{err:?}"
+        );
+        let s = client.cache_stats();
+        assert_eq!(s.conn_retried_dead, 0, "a refusal is not a dead connection");
+        assert_eq!(s.conn_misses, 1);
+
+        client.pvget(RO).await.expect("the connection is still pooled");
+        assert_eq!(client.cache_stats().conn_misses, 1);
+    }
+
+    /// Task 5 review, Minor 3: a channel create the server refuses, over a
+    /// connection that dialled and validated fine, invalidates only that PV's
+    /// resolution. It is not a dead-connection retry, and it neither closes
+    /// that connection nor purges the other connections to the server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_channel_create_invalidates_only_that_pv() {
+        const KEEP: &str = "POOL:KEEP";
+        const GONE: &str = "POOL:GONE";
+        let (server, _registry, tcp_port, udp_port) =
+            start_test_server_with_registry(&[KEEP, GONE], &[]).await;
+        let client = ns_client(tcp_port, udp_port, Duration::from_secs(5));
+
+        // A pooled connection carrying KEEP's channel only...
+        client.pvget(KEEP).await.expect("pool KEEP");
+        // ...and a cached resolution for GONE, via a path that does not pool.
+        drop(client.open_put_channel(GONE).await.expect("resolve GONE"));
+        assert_eq!(client.cache_stats().resolve_misses, 2);
+
+        // GONE disappears; its search no longer answers, its create is refused.
+        assert!(server.store().remove(GONE).await);
+
+        let err = client.pvget(GONE).await.expect_err("GONE was removed");
+        assert!(
+            matches!(&err, PvGetError::Protocol(m) if m.contains("create_channel error")),
+            "{err:?}"
+        );
+        let s = client.cache_stats();
+        assert_eq!(s.conn_retried_dead, 0, "a refusal is not a dead connection");
+        assert_eq!(s.conn_misses, 1, "no fresh dial for the refusal");
+
+        client.pvget(KEEP).await.expect("KEEP still works");
+        let s = client.cache_stats();
+        assert_eq!(s.conn_misses, 1, "KEEP's pooled connection survived");
+
+        // GONE's resolution was invalidated: the next call searches again.
+        let before = client.cache_stats().resolve_misses;
+        assert!(client.pvget(GONE).await.is_err());
+        assert_eq!(client.cache_stats().resolve_misses, before + 1);
+    }
+
+    /// Task 5 review, Minor 1a: a PUT that fails AFTER its value was written
+    /// must not be re-sent, even on a reused connection whose failure looks
+    /// exactly like a dead socket. The relay delivers the PUT data to the
+    /// server and then closes the client's connection before the reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_failing_after_commit_is_never_retried() {
+        const PV: &str = "POOL:COMMIT";
+        let (_server, _registry, tcp_port, _udp) =
+            start_test_server_with_registry(&[PV], &[]).await;
+        let upstream: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+        let relay = Relay::start(upstream).await;
+        let client = relay_client(&relay);
+
+        client.pvget(PV).await.expect("warm the pool");
+        relay.set(RELAY_KILL_AFTER_PUT_DATA);
+
+        let r = tokio::time::timeout(Duration::from_secs(10), client.pvput(PV, 9.5))
+            .await
+            .expect("the put must not hang");
+        assert!(r.is_err(), "the reply never arrived: {r:?}");
+        let s = client.cache_stats();
+        assert_eq!(s.conn_retried_dead, 0, "a committed PUT is never re-sent");
+        assert_eq!(s.conn_misses, 1, "no second connection was dialled for it");
+
+        // The server did apply the one write.
+        relay.set(RELAY_PASS);
+        let got = client.pvget(PV).await.expect("get after");
+        assert_eq!(field_f64(&got.value, "value"), Some(9.5));
+    }
+
+    /// Task 5 review, Minor 1b: a pvget whose future is dropped mid-operation
+    /// does not return its connection to the pool: the next operation dials.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_get_future_does_not_pool_its_connection() {
+        const PV: &str = "POOL:CANCEL";
+        let (_server, _registry, tcp_port, _udp) =
+            start_test_server_with_registry(&[PV], &[]).await;
+        let upstream: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+        let relay = Relay::start(upstream).await;
+        let client = relay_client(&relay);
+
+        client.pvget(PV).await.expect("warm the pool");
+        assert_eq!(client.cache_stats().conn_misses, 1);
+
+        relay.set(RELAY_BLACKHOLE);
+        let dropped = tokio::time::timeout(Duration::from_millis(300), client.pvget(PV)).await;
+        assert!(dropped.is_err(), "the get must still be in flight when dropped");
+        assert_eq!(client.cache_stats().conn_hits, 1, "it had checked out the pooled conn");
+        relay.set(RELAY_PASS);
+
+        tokio::time::timeout(Duration::from_secs(10), client.pvget(PV))
+            .await
+            .expect("must not hang")
+            .expect("next get");
+        let s = client.cache_stats();
+        assert_eq!(s.conn_misses, 2, "the abandoned connection was not pooled");
+        assert_eq!(s.conn_retried_dead, 0);
+    }
+
     /// Task 4 review: a pooled connection whose cached sid the server has
     /// destroyed must be treated as a reuse failure. The operation sees an
     /// error reply for the stale sid *before* any commit, so it must reach the
@@ -1489,7 +1954,14 @@ mod tests {
         assert_eq!(s.resolve_misses, 1, "no retry re-searched");
 
         let got = client.pvget(PV).await.expect("get after put");
-        assert_eq!(field_f64(&got.value, "value"), Some(4.25), "the put landed once");
+        // The read-back proves the value landed; it cannot tell one write from
+        // two. That the PUT was not re-sent is carried by the counters above
+        // (each retry was pre-commit, at INIT).
+        assert_eq!(
+            field_f64(&got.value, "value"),
+            Some(4.25),
+            "the retried put's value must have landed"
+        );
     }
 
     /// Task 2 review gap, `open_channel` path: a cached resolution whose

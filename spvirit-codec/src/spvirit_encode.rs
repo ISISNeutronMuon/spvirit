@@ -1054,6 +1054,23 @@ pub fn encode_destroy_channel_response(sid: u32, cid: u32, version: u8, is_be: b
     out
 }
 
+/// Client DESTROY_REQUEST (0x0F): `serverChannelID` then `requestID`, the
+/// spec form `PvaDestroyRequestPayload::new` decodes. The server sends no
+/// reply; it frees the per-request state it holds for `ioid`.
+pub fn encode_destroy_request(sid: u32, ioid: u32, version: u8, is_be: bool) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8);
+    if is_be {
+        payload.extend_from_slice(&sid.to_be_bytes());
+        payload.extend_from_slice(&ioid.to_be_bytes());
+    } else {
+        payload.extend_from_slice(&sid.to_le_bytes());
+        payload.extend_from_slice(&ioid.to_le_bytes());
+    }
+    let mut out = encode_header(false, is_be, false, version, 15, payload.len() as u32);
+    out.extend_from_slice(&payload);
+    out
+}
+
 pub fn encode_op_error(
     command: u8,
     subcmd: u8,
@@ -1513,6 +1530,22 @@ mod tests {
                 assert_eq!(payload.field_name.as_deref(), Some("*"));
             }
             other => panic!("unexpected decode: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn encode_decode_destroy_request_roundtrip() {
+        for is_be in [false, true] {
+            let msg = encode_destroy_request(7, 42, 2, is_be);
+            let mut pkt = PvaPacket::new(&msg);
+            assert!(!pkt.header.flags.is_server);
+            assert_eq!(pkt.header.command, 15);
+            match pkt.decode_payload().expect("decoded") {
+                PvaPacketCommand::DestroyRequest(p) => {
+                    assert_eq!((p.sid, p.request_id), (7, 42), "is_be={is_be}");
+                }
+                other => panic!("unexpected decode: {:?}", other),
+            }
         }
     }
 
