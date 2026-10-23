@@ -6,9 +6,9 @@ use std::time::Duration;
 use protocol::frame_harness::TestServer;
 use spvirit_client::pvlist::pvlist_with_fallback;
 use spvirit_codec::spvd_decode::DecodedValue;
-use spvirit_tools::spvirit_client::explore::fetch_snapshot_from_server;
+use spvirit_tools::spvirit_client::explore::{fetch_snapshot_from_server, monitor_pv_from_server};
 use spvirit_tools::spvirit_client::search::{SearchTarget, discover_servers};
-use spvirit_tools::spvirit_client::types::PvGetOptions;
+use spvirit_tools::spvirit_client::types::{PvGetOptions, PvGetResult};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discover_servers_finds_test_server() {
@@ -86,4 +86,48 @@ async fn fetch_snapshot_from_server_returns_value_and_structure() {
         matches!(snapshot.value, DecodedValue::Structure(_)),
         "expected structured NT payload"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monitor_pv_from_server_delivers_a_decoded_first_update() {
+    let server = match TestServer::spawn() {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("Skipping test, cannot spawn server: {}", msg);
+            return;
+        }
+    };
+    let addr: SocketAddr = format!("127.0.0.1:{}", server.tcp_port)
+        .parse()
+        .expect("addr");
+
+    let mut opts = PvGetOptions::new("SIM:AI".to_string());
+    opts.server_addr = Some(addr);
+    opts.timeout = Duration::from_secs(5);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PvGetResult>(16);
+    let handle = tokio::spawn(async move {
+        let _ = monitor_pv_from_server(
+            &opts,
+            addr,
+            "SIM:AI",
+            |update| {
+                let _ = tx.try_send(update);
+            },
+            |_| {},
+        )
+        .await;
+    });
+
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("an event within 5s")
+        .expect("a monitor event");
+    assert_eq!(first.pv_name, "SIM:AI");
+    assert!(
+        matches!(first.value, DecodedValue::Structure(_)),
+        "the first monitor event must carry a decoded structure, got {:?}",
+        first.value
+    );
+    handle.abort();
 }

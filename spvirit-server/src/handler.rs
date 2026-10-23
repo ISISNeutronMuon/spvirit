@@ -256,14 +256,37 @@ pub fn collect_visible_pv_names(
     allow_pattern: Option<&Regex>,
     max_items: usize,
 ) -> Vec<String> {
+    collect_visible_pv_names_iter(
+        all_names.iter().map(String::as_str),
+        mode,
+        allow_pattern,
+        max_items,
+    )
+}
+
+/// As [`collect_visible_pv_names`], but over any iterator of names.
+///
+/// Callers that hold a `HashMap` keyed by PV name (the `spserver` binary is
+/// one) would otherwise have to materialise a `Vec<String>` just to call the
+/// slice version, reintroducing the clone-everything cost this function
+/// exists to avoid.
+pub fn collect_visible_pv_names_iter<'a, I>(
+    all_names: I,
+    mode: PvListMode,
+    allow_pattern: Option<&Regex>,
+    max_items: usize,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     // Sort and truncate *references*, and clone only what survives. The
     // caller's `max_items` is typically a few hundred while `all_names` is
     // whatever every registered source put together — on a large gateway,
     // tens of thousands of strings — so cloning first and discarding after
     // meant a heap allocation per name for names that were then thrown away.
     // Reference-sized elements also make the sort itself cheaper to move.
-    let mut refs: Vec<&String> = all_names
-        .iter()
+    let mut refs: Vec<&str> = all_names
+        .into_iter()
         .filter(|name| {
             allow_pattern
                 .as_ref()
@@ -275,7 +298,7 @@ pub fn collect_visible_pv_names(
     if refs.len() > max_items {
         refs.truncate(max_items);
     }
-    let mut names: Vec<String> = refs.into_iter().cloned().collect();
+    let mut names: Vec<String> = refs.into_iter().map(str::to_string).collect();
     if mode == PvListMode::List && names.len() < max_items {
         names.push("__pvlist".to_string());
     }
@@ -501,7 +524,9 @@ where
     PatternDispatch::Deferred
 }
 
-fn build_pvlist_structure(names: &[String]) -> StructureDesc {
+/// Build the `epics:pva/pvlist:1.0` introspection structure that answers a
+/// pvlist GET_FIELD: one boolean field per visible PV name.
+pub fn build_pvlist_structure(names: &[String]) -> StructureDesc {
     use spvirit_codec::spvd_decode::{FieldDesc, FieldType, TypeCode};
     StructureDesc {
         struct_id: Some("epics:pva/pvlist:1.0".to_string()),
@@ -515,7 +540,10 @@ fn build_pvlist_structure(names: &[String]) -> StructureDesc {
     }
 }
 
-fn requested_pvlist_pattern(field_name: Option<&str>) -> Option<&str> {
+/// Interpret a pvlist GET_FIELD's requested field name as a wildcard pattern.
+/// Empty, `*`, `__pvlist` and `pvlist` all mean "everything"; anything else is
+/// returned only if it is actually a pattern.
+pub fn requested_pvlist_pattern(field_name: Option<&str>) -> Option<&str> {
     let raw = field_name.map(str::trim).unwrap_or("");
     if raw.is_empty() || raw == "*" || raw == "__pvlist" || raw.eq_ignore_ascii_case("pvlist") {
         return Some("*");
@@ -615,7 +643,10 @@ pub fn validate_encoded_packet(conn_id: u64, label: &str, bytes: &[u8]) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
-    let mut pkt = PvaPacket::new(bytes);
+    let Some(mut pkt) = PvaPacket::try_new(bytes) else {
+        debug!("Conn {}: {} failed to decode", conn_id, label);
+        return;
+    };
     let decoded = pkt.decode_payload();
     match decoded {
         Some(PvaPacketCommand::ConnectionValidation(payload)) => {
@@ -2623,6 +2654,23 @@ fn purge_channel_requests(conn_state: &mut ConnState, cid: u32, sid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both diagnostics must be total. With a DEBUG subscriber installed the
+    /// decode path actually runs, so a short frame must not reach a panicking
+    /// header constructor.
+    #[test]
+    fn packet_diagnostics_never_panic_on_short_frames() {
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            for bytes in [&[][..], &[0xca, 0x02, 0x00][..], &[0xca, 0x02, 0, 1, 0, 0, 0][..]] {
+                validate_encoded_packet(1, "short", bytes);
+                dump_hex_packet(1, "->", "short", 2, false, bytes);
+            }
+        });
+    }
     use crate::monitor::MonitorRegistry;
     use crate::pvstore::PvInfo;
     use crate::request_ctx::RequestContext;
@@ -2770,6 +2818,46 @@ mod tests {
         // The documented value, so a deliberate retune is a visible edit here
         // and not a silent one.
         assert_eq!(PATTERN_ENUM_TIMEOUT, StdDuration::from_secs(30));
+    }
+
+    #[test]
+    fn collect_visible_pv_names_iter_matches_the_slice_version() {
+        let names = vec!["C:PV".to_string(), "A:PV".to_string(), "B:PV".to_string()];
+        let from_slice = collect_visible_pv_names(&names, PvListMode::List, None, 10);
+        let from_iter = collect_visible_pv_names_iter(
+            names.iter().map(String::as_str),
+            PvListMode::List,
+            None,
+            10,
+        );
+        assert_eq!(from_slice, from_iter);
+        assert_eq!(from_iter, vec!["A:PV", "B:PV", "C:PV", "__pvlist"]);
+    }
+
+    #[test]
+    fn collect_visible_pv_names_iter_truncates_before_appending_pvlist() {
+        let names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let got = collect_visible_pv_names_iter(
+            names.iter().map(String::as_str),
+            PvListMode::List,
+            None,
+            2,
+        );
+        assert_eq!(got, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn pvlist_helpers_are_public_and_stable() {
+        let desc = build_pvlist_structure(&["A:PV".to_string(), "B:PV".to_string()]);
+        assert_eq!(desc.struct_id.as_deref(), Some("epics:pva/pvlist:1.0"));
+        assert_eq!(desc.fields.len(), 2);
+        assert_eq!(desc.fields[0].name, "A:PV");
+
+        assert_eq!(requested_pvlist_pattern(None), Some("*"));
+        assert_eq!(requested_pvlist_pattern(Some("  ")), Some("*"));
+        assert_eq!(requested_pvlist_pattern(Some("pvlist")), Some("*"));
+        assert_eq!(requested_pvlist_pattern(Some("A:*")), Some("A:*"));
+        assert_eq!(requested_pvlist_pattern(Some("A:PV")), None);
     }
 
     /// V6 MEDIUM-2. `collect_visible_pv_names` sorts and *then* truncates, so

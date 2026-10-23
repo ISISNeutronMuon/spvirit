@@ -1,7 +1,7 @@
 use argparse::{ArgumentParser, Store, StoreTrue};
 use tokio::runtime::Runtime;
 
-use spvirit_tools::spvirit_client::cli::CommonClientArgs;
+use spvirit_tools::spvirit_client::cli::{CommonClientArgs, require_pv_name};
 use spvirit_tools::spvirit_client::client::{pvget, pvget_fields};
 use spvirit_tools::spvirit_client::format::{OutputFormat, RenderOptions, format_output};
 
@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ap.parse_args_or_exit();
     }
 
+    require_pv_name(&pv_name)?;
     common.init_tracing();
     let fields = common.fields_list();
     let opts = common.into_pv_get_options(pv_name.clone())?;

@@ -2,11 +2,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tokio::time::{interval, timeout};
+use tokio::time::interval;
 
 use crate::spvirit_client::client::{
-    build_client_validation, encode_create_channel_request, encode_monitor_request, pvget,
+    ChannelConn, encode_monitor_request, establish_channel, pvget,
 };
 use crate::spvirit_client::transport::{read_packet, read_until};
 use crate::spvirit_client::types::{PvGetError, PvGetOptions, PvGetResult};
@@ -82,76 +81,26 @@ where
     P: FnMut(&str),
 {
     on_progress(&format!("Connecting monitor to {}...", server_addr));
-    let mut stream = timeout(opts.timeout, TcpStream::connect(server_addr))
-        .await
-        .map_err(|_| PvGetError::Timeout("connect"))??;
+    // `establish_channel` is what `spmonitor` and `spput` already use: TCP
+    // connect, SET_BYTE_ORDER + server CONNECTION_VALIDATION, client
+    // CONNECTION_VALIDATION, CONNECTION_VALIDATED, CREATE_CHANNEL. Hand-rolling
+    // it here meant every protocol fix had to land twice.
+    //
+    // `PvGetOptions` has no `Default`; clone the caller's options and override
+    // the PV name, so timeout / authnz / port settings are all preserved.
+    let mut chan_opts = opts.clone();
+    chan_opts.pv_name = pv_name.to_string();
 
-    // One reassembler for this connection, shared by every read below.
-    let mut reassembler = spvirit_client::SegmentReassembler::new();
-
-    let mut version = 2u8;
-    let mut is_be = false;
-
-    // Read initial server messages: SET_BYTE_ORDER and server validation.
-    for _ in 0..2 {
-        if let Ok(bytes) = read_packet(&mut stream, opts.timeout, &mut reassembler).await {
-            let mut pkt = spvirit_codec::epics_decode::PvaPacket::new(&bytes);
-            if let Some(cmd) = pkt.decode_payload() {
-                match cmd {
-                    PvaPacketCommand::Control(payload) => {
-                        if payload.command == 2 {
-                            is_be = pkt.header.flags.is_msb;
-                        }
-                    }
-                    PvaPacketCommand::ConnectionValidation(_) => {
-                        version = pkt.header.version;
-                        is_be = pkt.header.flags.is_msb;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    let validation = build_client_validation(opts, version, is_be);
-    stream.write_all(&validation).await?;
-    let _ = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
-        matches!(cmd, PvaPacketCommand::ConnectionValidated(_))
-    })
-    .await?;
-
-    let cid = 1u32;
-    let create = encode_create_channel_request(cid, pv_name, version, is_be);
-    stream.write_all(&create).await?;
-    let create_cmd = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
-        matches!(cmd, PvaPacketCommand::CreateChannel(_))
-    })
-    .await?;
-    let mut pkt = spvirit_codec::epics_decode::PvaPacket::new(&create_cmd);
-    let decoded = pkt.decode_payload().ok_or(PvGetError::Protocol(
-        "monitor create decode failed".to_string(),
-    ))?;
-    let sid = match decoded {
-        PvaPacketCommand::CreateChannel(payload) => {
-            if payload.status.as_ref().is_some_and(|s| s.is_error()) {
-                let detail = payload
-                    .status
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default();
-                return Err(PvGetError::Protocol(format!(
-                    "create_channel error: {}",
-                    detail
-                )));
-            }
-            payload.sid
-        }
-        _ => {
-            return Err(PvGetError::Protocol(
-                "unexpected create_channel response".to_string(),
-            ));
-        }
-    };
+    // `guid` is `[u8; 12]`, not an Option. All-zero is the documented value for
+    // "resolved without a search response", which is this call's situation.
+    let ChannelConn {
+        mut stream,
+        sid,
+        version,
+        is_be,
+        mut reassembler,
+        ..
+    } = establish_channel(server_addr, [0u8; 12], &chan_opts).await?;
 
     let ioid = 1u32;
     let mon_init = encode_monitor_request(sid, ioid, 0x08, &PV_REQUEST_EMPTY, version, is_be);
@@ -235,8 +184,16 @@ where
                     on_update(PvGetResult {
                         pv_name: pv_name.to_string(),
                         value,
-                        raw_pva: bytes.clone(),
-                        raw_pvd: op.body,
+                        // The explore TUI reads only `introspection` and
+                        // `value` (spvirit_explore.rs:1128,1132); it never
+                        // touches the raw frames. Cloning the whole wire frame
+                        // and the body per update, then moving both across a
+                        // channel to be dropped unread, is pure cost. The
+                        // fields stay on `PvGetResult` - spvirit-client's
+                        // bandwidth metering, spget --raw and the Python
+                        // bindings all use them on *their* paths.
+                        raw_pva: Vec::new(),
+                        raw_pvd: Vec::new(),
                         introspection: desc.clone(),
                         server_host: server_addr.to_string(),
                     });

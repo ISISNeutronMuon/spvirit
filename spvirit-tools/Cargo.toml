@@ -23,14 +23,21 @@ spvirit-client.workspace = true
 spvirit-server.workspace = true
 spvirit-gateway.workspace = true
 
-tokio = { version = "1.47.1", features = ["full"] }
+tokio = { version = "1.47.1", features = [
+    "net",
+    "io-util",
+    "time",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "macros",
+] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.145"
 regex = "1.11.2"
-dns-lookup = "3.0.0"
 get_if_addrs = "0.5.3"
 hex = "0.4.3"
 socket2 = { version = "0.5", features = ["all"] }

@@ -167,6 +167,26 @@ impl CommonClientArgs {
     }
 }
 
+/// Reject an empty PV name at the CLI boundary.
+///
+/// Deliberately NOT folded into `into_pv_get_options`: `spexplore` and
+/// `spmonitor` pass an empty name on purpose, because they discover PVs rather
+/// than being given one. Only the PV-taking bins call this.
+pub fn require_pv_name(pv: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if pv.trim().is_empty() {
+        return Err("a PV name is required (got an empty argument)".into());
+    }
+    Ok(())
+}
+
+/// Build a JSON number, rejecting NaN and the infinities.
+///
+/// `serde_json::Number::from_f64` returns `None` for those, and the call sites
+/// used to `.unwrap()` it, so `spput MY:PV 1e999` aborted with a backtrace.
+pub fn finite_number(v: f64) -> Result<serde_json::Number, Box<dyn std::error::Error>> {
+    serde_json::Number::from_f64(v).ok_or_else(|| format!("value must be finite, got {v}").into())
+}
+
 /// Parse the comma-separated `--fields` value into a list of dotted paths.
 /// Whitespace around each entry is trimmed; empty entries are dropped.
 pub fn parse_fields_arg(raw: &str) -> Vec<String> {
