@@ -308,6 +308,18 @@ fn decode_search_response_addr(addr: [u8; 16], port: u16, src: SocketAddr) -> So
         .unwrap_or_else(|| SocketAddr::new(src.ip(), port))
 }
 
+/// Receive scratch size. PVA search traffic is far smaller than this; a
+/// datagram longer than this is truncated, exactly as before.
+const UDP_DATAGRAM_SCRATCH: usize = 2048;
+
+/// Copy the received bytes onto the heap at their actual length.
+///
+/// Kept separate so the "no 2 KiB allocation per datagram" property is
+/// directly testable.
+fn datagram_to_owned(received: &[u8]) -> Vec<u8> {
+    received.to_vec()
+}
+
 fn normalize_discovered_servers(items: Vec<DiscoveredServer>) -> Vec<DiscoveredServer> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -316,7 +328,10 @@ fn normalize_discovered_servers(items: Vec<DiscoveredServer>) -> Vec<DiscoveredS
             out.push(item);
         }
     }
-    out.sort_by(|a, b| a.tcp_addr.to_string().cmp(&b.tcp_addr.to_string()));
+    // `SocketAddr` is `Ord` — compare the value, not its text, so that
+    // 10.0.0.2 sorts before 10.0.0.10 and IPv6 addresses are not ordered by
+    // their formatting.
+    out.sort_by(|a, b| a.tcp_addr.cmp(&b.tcp_addr));
     out
 }
 
@@ -517,16 +532,16 @@ where
         let sock = Arc::clone(sock);
         let tx = tx.clone();
         recv_tasks.spawn(async move {
-            loop {
-                let mut buf = vec![0u8; 2048];
-                match sock.recv_from(&mut buf).await {
-                    Ok((len, src)) => {
-                        buf.truncate(len);
-                        if tx.send((buf, src)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+            // One scratch buffer for the life of the task. Only the bytes a
+            // datagram actually occupies are copied onto the heap.
+            let mut scratch = [0u8; UDP_DATAGRAM_SCRATCH];
+            while let Ok((len, src)) = sock.recv_from(&mut scratch).await {
+                if tx
+                    .send((datagram_to_owned(&scratch[..len]), src))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
         });
@@ -1490,5 +1505,34 @@ mod tests {
             .expect("oneshot dropped");
         assert_eq!(user.as_deref(), Some("search-user"));
         assert_eq!(host.as_deref(), Some("search-host"));
+    }
+
+    #[test]
+    fn discovered_servers_sort_numerically_not_by_formatted_string() {
+        let mk = |ip: &str, port: u16, guid: u8| DiscoveredServer {
+            guid: [guid; 12],
+            tcp_addr: format!("{ip}:{port}").parse().unwrap(),
+        };
+        // "10.0.0.10" < "10.0.0.2" as text, but 2 < 10 numerically.
+        let out = normalize_discovered_servers(vec![
+            mk("10.0.0.10", 5075, 1),
+            mk("10.0.0.2", 5075, 2),
+            mk("10.0.0.2", 5076, 3),
+        ]);
+        let got: Vec<String> = out.iter().map(|d| d.tcp_addr.to_string()).collect();
+        assert_eq!(got, vec!["10.0.0.2:5075", "10.0.0.2:5076", "10.0.0.10:5075"]);
+    }
+
+    #[test]
+    fn a_received_datagram_is_copied_at_its_actual_length() {
+        let scratch = [7u8; 2048];
+        let owned = datagram_to_owned(&scratch[..48]);
+        assert_eq!(owned.len(), 48);
+        assert_eq!(
+            owned.capacity(),
+            48,
+            "the receive scratch must not be handed on as a 2 KiB allocation"
+        );
+        assert!(owned.iter().all(|b| *b == 7));
     }
 }

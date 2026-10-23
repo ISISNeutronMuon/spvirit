@@ -14,7 +14,7 @@ Library-only crate (~5,300 LOC). Deps: `spvirit-types`, `spvirit-codec`,
 | `put_encode.rs` | 633 | JSON→PVD PUT payload encoder (bitset partial encoding, scalars/arrays/unions/variants) |
 | `client.rs` | 358 | Low-level channel lifecycle: `establish_channel`, `pvget`/`pvget_fields` |
 | `format.rs` | 521 | Output rendering (text/JSON), NT metadata extraction, NTTable formatting |
-| `types.rs` | 97 | `PvOptions`, `PvGetResult`, `PvMonitorEvent`, `PvGetError` |
+| `types.rs` | 97 | `PvOptions`, `PvGetResult`, `PvGetError` |
 | `transport.rs` | 532 | Framed-packet readers: `read_frame` (blocks through mid-frame stalls), `read_frame_resumable` (persistent `FrameBuf`, deadline-bounded, resumes after a dropped read), `read_until`, `read_packet` |
 | `auth.rs` | 25 | AuthNZ user/host resolution (options → env → "unknown") |
 

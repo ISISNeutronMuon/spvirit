@@ -904,7 +904,7 @@ impl PvaClient {
                     {
                         if st.code != 0 {
                             let msg = st.message.unwrap_or_else(|| format!("code={}", st.code));
-                            eprintln!("PvaChannel put error: {msg}");
+                            tracing::warn!(pv_error = %msg, "pva channel put returned an error status");
                         }
                     }
                 }
@@ -920,7 +920,7 @@ impl PvaClient {
             put_desc: desc,
             echo_token: 1,
             last_echo: Instant::now(),
-            _reader_handle: reader_handle,
+            reader_handle,
         })
     }
 
@@ -1358,7 +1358,10 @@ pub struct PvaChannel {
     put_desc: StructureDesc,
     echo_token: u32,
     last_echo: Instant,
-    _reader_handle: JoinHandle<()>,
+    /// Reader task for this channel. Load-bearing: `impl Drop for PvaChannel`
+    /// aborts it, which is what releases the socket and stops the task. Not
+    /// underscore-prefixed — it is read, not merely held.
+    reader_handle: JoinHandle<()>,
 }
 
 impl PvaChannel {
@@ -1398,7 +1401,7 @@ impl PvaChannel {
 
 impl Drop for PvaChannel {
     fn drop(&mut self) {
-        self._reader_handle.abort();
+        self.reader_handle.abort();
     }
 }
 

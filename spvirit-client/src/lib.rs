@@ -69,4 +69,4 @@ pub use spvirit_codec::{DecodeError, SegmentOutcome, SegmentReassembler};
 
 // --- Re-exports: monitor updates (callbacks take a &MonitorUpdate) ---
 pub use spvirit_codec::MonitorUpdate;
-pub use types::{PvGetError, PvGetOptions, PvGetResult, PvMonitorEvent, PvOptions};
+pub use types::{PvGetError, PvGetOptions, PvGetResult, PvOptions};
