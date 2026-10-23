@@ -37,6 +37,7 @@
 
 pub mod auth;
 pub mod byte_sink;
+pub mod cache;
 pub mod client;
 pub mod format;
 pub mod put_encode;
@@ -57,6 +58,7 @@ pub use pva_client::{
 pub use pvlist::PvListSource;
 
 // --- Re-exports: client core ---
+pub use cache::{CacheConfig, CacheStats};
 pub use client::{ChannelConn, build_client_validation, establish_channel, pvget, pvget_fields};
 pub use format::{OutputFormat, RenderOptions, format_output};
 pub use search::{SearchTarget, build_auto_broadcast_targets, resolve_pv_server, search_pv};

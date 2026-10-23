@@ -23,5 +23,5 @@ socket2 = { version = "0.5", features = ["all"] }
 chrono = "0.4"
 
 [dev-dependencies]
-tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "test-util"] }
 spvirit-server.workspace = true
