@@ -138,6 +138,22 @@ impl SimplePvStore {
         pvs.get(name).map(|e| e.record.clone())
     }
 
+    /// Run `f` against the named record while the read guard is held, and
+    /// return whatever it produces.
+    ///
+    /// This is the borrowing alternative to [`get_record`](Self::get_record),
+    /// which clones the whole `RecordInstance`. `f` is synchronous by
+    /// construction, so no borrow can escape the guard and none can be held
+    /// across an await.
+    pub async fn with_record<R>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&RecordInstance) -> R,
+    ) -> Option<R> {
+        let pvs = self.pvs.read().await;
+        pvs.get(name).map(|e| f(&e.record))
+    }
+
     /// Read the full [`NtPayload`] of a PV.
     pub async fn get_nt(&self, name: &str) -> Option<NtPayload> {
         let pvs = self.pvs.read().await;
@@ -1608,5 +1624,49 @@ record(ao, "DB:AO") {
 
         let info = Source::claim(&store, "W:big").await.expect("claimed");
         assert_eq!(info.descriptor, expected);
+    }
+
+    #[tokio::test]
+    async fn with_record_runs_against_the_live_record_and_misses_cleanly() {
+        let mut records = HashMap::new();
+        records.insert("A:test".to_string(), make_ai("A:test", 4.5));
+        let store = SimplePvStore::new(records, HashMap::new(), Vec::new(), false);
+
+        let value = store
+            .with_record("A:test", |rec| rec.current_value())
+            .await
+            .expect("record present");
+        assert_eq!(value, store.get_value("A:test").await.unwrap());
+
+        assert!(
+            store.with_record("A:absent", |_| ()).await.is_none(),
+            "a missing record must yield None, not a default"
+        );
+    }
+
+    /// The `<rec>.<FIELD>` path itself, through the trait, so the migration
+    /// is pinned by behaviour and not just by the accessor's contract.
+    #[tokio::test]
+    async fn field_provider_serves_fields_from_the_borrowed_record() {
+        use crate::field_provider::RecordFieldProvider;
+        use crate::record_fields::FieldKind;
+
+        let mut records = HashMap::new();
+        records.insert("A:test".to_string(), make_ai("A:test", 4.5));
+        let store = SimplePvStore::new(records, HashMap::new(), Vec::new(), false);
+
+        assert_eq!(
+            store.field_value("A:test", "RTYP").await,
+            Some(ScalarValue::Str("ai".to_string()))
+        );
+        assert_eq!(
+            store.field_value("A:test", "NAME").await,
+            Some(ScalarValue::Str("A:test".to_string()))
+        );
+        assert_eq!(
+            store.field_descriptor("A:test", "RTYP").await.map(|d| d.kind),
+            Some(FieldKind::Str)
+        );
+        assert!(store.field_value("A:absent", "RTYP").await.is_none());
     }
 }
