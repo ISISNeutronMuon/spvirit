@@ -845,9 +845,10 @@ fn typed_from_raw(raw: &[DbRecord]) -> Result<HashMap<String, RecordInstance>, S
     for rec in raw {
         let Some(parsed) = to_record(rec) else {
             return Err(format!(
-                "record '{}' of type '{}' is not yet supported by the .db loader; \r
-                 create it through the host API instead",
-                rec.name, rec.record_type
+                "record '{}' of type '{}' is not yet supported by the .db loader; {}",
+                rec.name,
+                rec.record_type,
+                "create it through the host API instead"
             ));
         };
         map.insert(parsed.name.clone(), parsed);
@@ -1168,9 +1169,11 @@ mod tests {
         let err = parse_db(src).expect_err("the typed load must abort");
         assert!(err.contains("M:one"), "the error must name the record: {err}");
         assert!(err.contains("mbbi"), "the error must name the type: {err}");
-        assert!(
-            err.contains("not yet supported by the .db loader"),
-            "the corrected diagnostic is missing: {err}"
+        // Exact text, so a regression to a `\`-continued literal (which in a
+        // CRLF checkout keeps the CR and the next line's indent) fails here.
+        assert_eq!(
+            err,
+            "record 'M:one' of type 'mbbi' is not yet supported by the .db loader; create it through the host API instead",
         );
         assert!(
             !err.contains("standard"),
