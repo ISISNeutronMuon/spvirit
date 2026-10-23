@@ -282,18 +282,6 @@ impl<'a> NtPayloadRef<'a> {
 }
 
 impl RecordData {
-    pub fn nt(&self) -> &NtScalar {
-        match self {
-            Self::Ai { nt, .. } => nt,
-            Self::Ao { nt, .. } => nt,
-            Self::Bi { nt, .. } => nt,
-            Self::Bo { nt, .. } => nt,
-            Self::StringIn { nt, .. } => nt,
-            Self::StringOut { nt, .. } => nt,
-            _ => panic!("record variant does not expose NtScalar"),
-        }
-    }
-
     pub fn nt_mut(&mut self) -> &mut NtScalar {
         match self {
             Self::Ai { nt, .. } => nt,
