@@ -645,6 +645,15 @@ impl PvdDecoder {
         let mut fields =
             Vec::with_capacity(field_count.min(data.len().saturating_sub(offset) / 2));
 
+        // Lenient by design. A descriptor that announces more fields than the
+        // buffer holds returns `Ok` with the fields that did parse rather than
+        // an error: spvirit is a passive observer and a gateway, and one
+        // malformed descriptor from a third-party IOC must not drop a
+        // connection carrying other channels. Callers therefore cannot tell
+        // "2 fields" from "6 announced, 2 salvaged" - if you need that
+        // distinction, add a returned count rather than making this strict.
+        // Pinned by `truncated_descriptor_parses_leniently_by_design`.
+        // Same choice, same reason, in `decode_structure` below.
         for _ in 0..field_count {
             if offset >= data.len() {
                 break;
@@ -1063,6 +1072,7 @@ impl PvdDecoder {
         let mut offset = 0;
         let mut fields: Vec<(String, DecodedValue)> = Vec::new();
 
+        // Lenient by design - see the note in `parse_structure_desc`.
         for field in &desc.fields {
             if offset >= data.len() {
                 break;
@@ -1553,6 +1563,39 @@ fn format_scalar_value(val: &DecodedValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lenient contract: a descriptor that announces more fields than the
+    /// buffer holds yields `Ok` with the fields that did parse. Deliberate - see
+    /// the comment at the `break`. Change this test only with a protocol decision.
+    #[test]
+    fn truncated_descriptor_parses_leniently_by_design() {
+        let decoder = PvdDecoder::new(false);
+        // Build a well-formed 3-field structure descriptor, then cut it short so
+        // only the first field survives.
+        let mut desc = StructureDesc::new();
+        for name in ["a", "b", "c"] {
+            desc.fields.push(FieldDesc {
+                name: name.to_string(),
+                field_type: FieldType::Scalar(TypeCode::Int32),
+            });
+        }
+        // `encode_structure_desc` emits 11 bytes here: 1 (empty struct id) +
+        // 1 (field count 3) + 3 fields x 3 bytes (1-byte length + 1 name byte +
+        // 1 type tag). Dropping the last 6 leaves exactly the header plus field
+        // "a", so the loop parses one field and then breaks on `offset >= len`.
+        let full = crate::spvd_encode::encode_structure_desc(&desc, false);
+        assert_eq!(full.len(), 11, "descriptor layout changed; recompute the cut");
+        let cut = &full[..full.len() - 6];
+
+        let (parsed, _consumed) = decoder
+            .parse_structure_desc(cut)
+            .expect("lenient parse returns Ok, not Err");
+        assert!(
+            parsed.fields.len() < 3,
+            "the test buffer must actually be short"
+        );
+        assert_eq!(parsed.fields[0].name, "a");
+    }
 
     /// `counts[n]` must equal what `count_structure_fields` returns for the field
     /// addressed by bit `n + 1`. Walk the descriptor independently and compare.
