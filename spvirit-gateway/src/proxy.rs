@@ -1035,20 +1035,33 @@ mod tests {
     /// indistinguishable from "no such PV", so without a log an upstream that
     /// is up but erroring cannot be told apart from one that is absent.
     ///
-    /// Current-thread runtime on purpose: `tracing::subscriber::set_default`
-    /// is thread-local, so a multi-thread runtime could run the gateway's log
-    /// calls on a worker that does not see this subscriber.
+    /// The capture is a process-wide default subscriber installed once, not a
+    /// thread-scoped `set_default`. With scoped dispatch, `tracing` evaluates
+    /// each callsite's interest across every live dispatcher and caches it
+    /// globally, and other tests in this binary running in parallel made the
+    /// claim-path `debug!` intermittently invisible to the scoped capture
+    /// (about half of full `--lib` runs, even with `rebuild_interest_cache`).
+    /// A single global subscriber has no such race. Every other test in the
+    /// binary then also logs into this buffer, which nobody else reads; the
+    /// assertions below look only for this test's own unique names.
     #[tokio::test]
     async fn a_failing_upstream_is_logged_by_both_claim_and_get() {
-        let buffer = CaptureWriter::default();
-        let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_ansi(false)
-            .without_time()
-            .with_writer(move || writer.clone())
-            .finish();
-        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        static CAPTURE: std::sync::OnceLock<CaptureWriter> = std::sync::OnceLock::new();
+        let buffer = CAPTURE
+            .get_or_init(|| {
+                let buffer = CaptureWriter::default();
+                let writer = buffer.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(move || writer.clone())
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("no other test in this binary installs a global subscriber");
+                buffer
+            })
+            .clone();
 
         let Some(src) = dead_upstream_source(open_neg()) else {
             eprintln!("Skipping test: cannot bind a UDP port in this environment");
