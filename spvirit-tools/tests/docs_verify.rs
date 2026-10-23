@@ -440,3 +440,28 @@ fn python_examples_compile() {
         Err(e) => panic!("failed to run python: {e}"),
     }
 }
+
+#[test]
+fn the_tools_crate_does_not_depend_on_all_of_tokio() {
+    let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml"))
+        .expect("Cargo.toml parses");
+    let tokio = manifest
+        .get("dependencies")
+        .and_then(|d| d.get("tokio"))
+        .expect("a tokio dependency");
+    let features = tokio
+        .get("features")
+        .and_then(|f| f.as_array())
+        .expect("tokio features are listed explicitly");
+    assert!(
+        !features.iter().any(|f| f.as_str() == Some("full")),
+        "spvirit-tools is the only crate pulling all of tokio; list what it uses"
+    );
+    assert!(
+        manifest
+            .get("dependencies")
+            .and_then(|d| d.get("dns-lookup"))
+            .is_none(),
+        "dns-lookup has no uses in this crate"
+    );
+}
