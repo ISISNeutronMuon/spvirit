@@ -816,6 +816,51 @@ impl WeakReplier {
 }
 
 // ---------------------------------------------------------------------------
+// Operation-arm helpers shared by the GET/PUT/PUT_GET/MONITOR arms
+// ---------------------------------------------------------------------------
+
+/// The error reply that a dozen operation arms had copy-pasted.
+async fn reply_op_error(
+    replier: &Replier,
+    command: u8,
+    subcmd: u8,
+    ioid: u32,
+    msg: &str,
+    version: u8,
+    is_be: bool,
+) {
+    replier
+        .send(encode_op_error(command, subcmd, ioid, msg, version, is_be))
+        .await;
+}
+
+/// Resolve the descriptor to advertise for `pv_name`: the source registry's if
+/// it has one, else derived from a live snapshot. `None` means "PV not found",
+/// and the caller replies with [`reply_op_error`].
+///
+/// This preamble was duplicated in the GET, PUT, PUT_GET and MONITOR init arms.
+async fn init_full_desc(state: &ServerState, pv_name: &str) -> Option<StructureDesc> {
+    if let Some(desc) = state.sources.get_descriptor(pv_name).await {
+        return Some(desc);
+    }
+    get_nt_snapshot(state, pv_name).await.map(|nt| nt_payload_desc(&nt))
+}
+
+/// Project `full` onto the fields the client's pvRequest selects.
+///
+/// Returns the descriptor to advertise and whether a field filter was
+/// *actually* requested. That flag is what decides whether a monitor
+/// subscriber needs a `filtered_desc` at all: an empty pvRequest selects
+/// everything, and storing a projection for it forces the expensive
+/// double-encode path in `build_monitor_frame`.
+fn apply_pv_request_filter(full: StructureDesc, body: &[u8], is_be: bool) -> (StructureDesc, bool) {
+    match decode_pv_request_fields(body, is_be) {
+        Some(fields) => (filter_structure_desc(&full, &fields), true),
+        None => (full, false),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET_FIELD handler
 // ---------------------------------------------------------------------------
 
@@ -1652,18 +1697,16 @@ pub async fn handle_connection(
                     .get(&sid)
                     .cloned();
                 let Some(pv_name) = pv_lookup else {
-                    replier
-                        .send(
-                            encode_op_error(
-                                payload.command,
-                                payload.subcmd,
-                                ioid,
-                                "Unknown SID",
-                                version,
-                                is_be,
-                            ),
-                        )
-                        .await;
+                    reply_op_error(
+                        &replier,
+                        payload.command,
+                        payload.subcmd,
+                        ioid,
+                        "Unknown SID",
+                        version,
+                        is_be,
+                    )
+                    .await;
                     continue;
                 };
 
@@ -1688,31 +1731,21 @@ pub async fn handle_connection(
                         if is_init {
                             // Init only needs the type descriptor, not the data.
                             // Use get_descriptor first; fall back to snapshot.
-                            let full_desc =
-                                if let Some(desc) = state.sources.get_descriptor(&pv_name).await {
-                                    desc
-                                } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
-                                    nt_payload_desc(&nt)
-                                } else {
-                                    replier
-                                        .send(
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
-                                    continue;
-                                };
-                            let pv_req_fields = decode_pv_request_fields(&payload.body, is_be);
-                            let desc = match &pv_req_fields {
-                                Some(fields) => filter_structure_desc(&full_desc, fields),
-                                None => full_desc,
+                            let Some(full_desc) = init_full_desc(&state, &pv_name).await else {
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
+                                continue;
                             };
+                            let (desc, _) =
+                                apply_pv_request_filter(full_desc, &payload.body, is_be);
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
                             // Bind the request to its channel so DESTROY_CHANNEL
@@ -1731,18 +1764,16 @@ pub async fn handle_connection(
                             info!("Conn {}: get init pv='{}' ioid={}", conn_id, pv_name, ioid);
                         } else {
                             let Some(nt) = get_nt_snapshot(&state, &pv_name).await else {
-                                replier
-                                    .send(
-                                        encode_op_error(
-                                            payload.command,
-                                            payload.subcmd,
-                                            ioid,
-                                            "PV has no data yet",
-                                            version,
-                                            is_be,
-                                        ),
-                                    )
-                                    .await;
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV has no data yet",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
                                 continue;
                             };
                             let resp = if let Some(desc) = conn_state.ioid_to_desc.get(&ioid) {
@@ -1762,26 +1793,20 @@ pub async fn handle_connection(
                             // Init only needs the type descriptor, not current data.
                             // Use get_descriptor first; fall back to snapshot so PUT
                             // can target PVs that do not yet have any data.
-                            let desc =
-                                if let Some(desc) = state.sources.get_descriptor(&pv_name).await {
-                                    desc
-                                } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
-                                    nt_payload_desc(&nt)
-                                } else {
-                                    replier
-                                        .send(
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
-                                    continue;
-                                };
+                            let Some(full_desc) = init_full_desc(&state, &pv_name).await else {
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
+                                continue;
+                            };
+                            let desc = full_desc;
                             if !is_virtual_event_pv(&pv_name)
                                 && !is_writable_pv(&state, &pv_name).await
                             {
@@ -1836,36 +1861,32 @@ pub async fn handle_connection(
                                         conn_id, pv_name, ioid
                                     );
                                 } else {
-                                    replier
-                                        .send(
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
+                                    reply_op_error(
+                                        &replier,
+                                        payload.command,
+                                        payload.subcmd,
+                                        ioid,
+                                        "PV not found",
+                                        version,
+                                        is_be,
+                                    )
+                                    .await;
                                 }
                                 continue;
                             }
                             let desc = match conn_state.ioid_to_desc.get(&ioid) {
                                 Some(d) => d.clone(),
                                 None => {
-                                    replier
-                                        .send(
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PUT without init",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
+                                    reply_op_error(
+                                        &replier,
+                                        payload.command,
+                                        payload.subcmd,
+                                        ioid,
+                                        "PUT without init",
+                                        version,
+                                        is_be,
+                                    )
+                                    .await;
                                     continue;
                                 }
                             };
@@ -1915,26 +1936,20 @@ pub async fn handle_connection(
                             // Init only needs the type descriptor, not current data.
                             // Use get_descriptor first; fall back to snapshot so that
                             // clients can initiate PUT_GET before any data exists.
-                            let desc =
-                                if let Some(desc) = state.sources.get_descriptor(&pv_name).await {
-                                    desc
-                                } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
-                                    nt_payload_desc(&nt)
-                                } else {
-                                    replier
-                                        .send(
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
-                                    continue;
-                                };
+                            let Some(full_desc) = init_full_desc(&state, &pv_name).await else {
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
+                                continue;
+                            };
+                            let desc = full_desc;
                             if !is_virtual_event_pv(&pv_name)
                                 && !is_writable_pv(&state, &pv_name).await
                             {
@@ -1964,18 +1979,16 @@ pub async fn handle_connection(
                             let desc = match conn_state.ioid_to_desc.get(&ioid) {
                                 Some(d) => d.clone(),
                                 None => {
-                                    replier
-                                        .send(
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PUT_GET without init",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
+                                    reply_op_error(
+                                        &replier,
+                                        payload.command,
+                                        payload.subcmd,
+                                        ioid,
+                                        "PUT_GET without init",
+                                        version,
+                                        is_be,
+                                    )
+                                    .await;
                                     continue;
                                 }
                             };
@@ -2015,18 +2028,16 @@ pub async fn handle_connection(
                                 );
                                 replier.send(resp).await;
                             } else {
-                                replier
-                                    .send(
-                                        encode_op_error(
-                                            payload.command,
-                                            payload.subcmd,
-                                            ioid,
-                                            "PV not found",
-                                            version,
-                                            is_be,
-                                        ),
-                                    )
-                                    .await;
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
                             }
                             debug!(
                                 "Conn {}: put_get data pv='{}' ioid={}",
@@ -2044,31 +2055,21 @@ pub async fn handle_connection(
                             // updates are pushed once data arrives. Strict clients
                             // like p4p treat a MONITOR init error as fatal, so we
                             // must not error out when only the descriptor is known.
-                            let full_desc =
-                                if let Some(desc) = state.sources.get_descriptor(&pv_name).await {
-                                    desc
-                                } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
-                                    nt_payload_desc(&nt)
-                                } else {
-                                    replier
-                                        .send(
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
-                                    continue;
-                                };
-                            let pv_req_fields = decode_pv_request_fields(&payload.body, is_be);
-                            let desc = match &pv_req_fields {
-                                Some(fields) => filter_structure_desc(&full_desc, fields),
-                                None => full_desc,
+                            let Some(full_desc) = init_full_desc(&state, &pv_name).await else {
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
+                                continue;
                             };
+                            let (desc, has_filter) =
+                                apply_pv_request_filter(full_desc, &payload.body, is_be);
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
                             let pipeline_enabled = (payload.subcmd & 0x80) != 0;
@@ -2146,9 +2147,7 @@ pub async fn handle_connection(
                                         // short-circuits to
                                         // `encode_nt_payload_full` when the
                                         // desc equals the payload's own.
-                                        filtered_desc: pv_req_fields
-                                            .is_some()
-                                            .then(|| desc.clone()),
+                                        filtered_desc: has_filter.then(|| desc.clone()),
                                         last_snapshot: None,
                                     });
                             }
@@ -2343,32 +2342,28 @@ pub async fn handle_connection(
                         }
                     }
                     14 | 16 => {
-                        replier
-                            .send(
-                                encode_op_error(
-                                    payload.command,
-                                    payload.subcmd,
-                                    ioid,
-                                    "Operation not supported",
-                                    version,
-                                    is_be,
-                                ),
-                            )
-                            .await;
+                        reply_op_error(
+                            &replier,
+                            payload.command,
+                            payload.subcmd,
+                            ioid,
+                            "Operation not supported",
+                            version,
+                            is_be,
+                        )
+                        .await;
                     }
                     _ => {
-                        replier
-                            .send(
-                                encode_op_error(
-                                    payload.command,
-                                    payload.subcmd,
-                                    ioid,
-                                    "Operation not supported",
-                                    version,
-                                    is_be,
-                                ),
-                            )
-                            .await;
+                        reply_op_error(
+                            &replier,
+                            payload.command,
+                            payload.subcmd,
+                            ioid,
+                            "Operation not supported",
+                            version,
+                            is_be,
+                        )
+                        .await;
                     }
                 }
             }
@@ -4243,5 +4238,59 @@ mod tests {
             "the writer must already be freed once every strong owner is gone, \
              proving the search-reply closure was not holding it alive"
         );
+    }
+
+    #[test]
+    fn apply_pv_request_filter_reports_whether_a_filter_was_requested() {
+        use spvirit_codec::spvd_encode::{encode_pv_request, nt_payload_desc};
+
+        use spvirit_types::{NtPayload, NtScalar, ScalarValue};
+
+        let full = nt_payload_desc(&NtPayload::Scalar(NtScalar::from_value(
+            ScalarValue::F64(1.0),
+        )));
+
+        // A pvRequest with an empty `field(...)` selector: no filter.
+        // `decode_pv_request_fields` returns None for it
+        // (`spvirit-codec/src/spvd_encode.rs:1403-1405`).
+        let empty = encode_pv_request(&[], false);
+        let (desc, filtered) = apply_pv_request_filter(full.clone(), &empty, false);
+        assert!(!filtered, "an empty pvRequest is not a field filter");
+        assert_eq!(
+            desc.fields.len(),
+            full.fields.len(),
+            "with no filter the full descriptor is advertised unchanged"
+        );
+
+        // field(value): a real filter.
+        let req = encode_pv_request(&["value"], false);
+        let (desc, filtered) = apply_pv_request_filter(full.clone(), &req, false);
+        assert!(filtered, "field(value) IS a field filter");
+        let names: Vec<&str> = desc.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["value"]);
+    }
+
+    #[tokio::test]
+    async fn reply_op_error_sends_the_encoded_error_frame() {
+        use crate::diag::ClientRegistry;
+        use spvirit_codec::spvirit_encode::encode_op_error;
+
+        let (mut client, server_side) = tokio::io::duplex(4096);
+        let cr = Arc::new(ClientRegistry::new());
+        cr.connect(1, "127.0.0.1:9999".parse().unwrap());
+        let replier = Replier::new(ConnWriter::new(server_side), 1, Some(cr));
+
+        reply_op_error(&replier, 13, 0x08, 42, "PV not found", 2, false).await;
+
+        let want = encode_op_error(13, 0x08, 42, "PV not found", 2, false);
+        let mut got = vec![0u8; want.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut got),
+        )
+        .await
+        .expect("frame must arrive")
+        .expect("read");
+        assert_eq!(got, want, "the extracted helper must emit the same bytes");
     }
 }
