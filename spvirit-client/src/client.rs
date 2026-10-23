@@ -263,40 +263,54 @@ pub async fn pvget(opts: &PvGetOptions) -> Result<PvGetResult, PvGetError> {
 /// Otherwise, encodes a pvRequest like `field(value,alarm,timeStamp)`.
 pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetResult, PvGetError> {
     let (target, guid) = resolve_pv_server(opts).await?;
+    let mut conn = connect_and_validate(target, guid, opts).await?;
+    let sid = create_channel_on(&mut conn, &opts.pv_name, 1, opts.timeout).await?;
+    run_get_on(&mut conn, sid, &opts.pv_name, fields, 1, opts.timeout).await
+}
 
-    let conn = establish_channel(target, guid, opts).await?;
-    let ChannelConn {
-        mut stream,
-        sid,
-        version,
-        is_be,
-        mut reassembler,
-        server_addr,
-        ..
-    } = conn;
+/// Run one GET (INIT then data) for `pv_name` on an already-created channel.
+///
+/// Split out of [`pvget_fields`] so `PvaClient` can run a GET over a pooled
+/// connection. `ioid` must be unique among the operations that have run on
+/// `conn` — a pooled connection is checked out exclusively, but a *stale*
+/// response from a previous operation on the same socket must not be mistaken
+/// for this one's, so callers pass a fresh `alloc_ioid()` rather than a
+/// constant **and** both predicates below pin `op.command` and `op.ioid`.
+/// Matching on `subcmd` alone (as the pre-pool code did) would accept a late
+/// PUT reply here.
+pub async fn run_get_on(
+    conn: &mut ValidatedConn,
+    sid: u32,
+    pv_name: &str,
+    fields: &[&str],
+    ioid: u32,
+    timeout_dur: Duration,
+) -> Result<PvGetResult, PvGetError> {
+    let is_be = conn.is_be;
+    let version = conn.version;
 
-    let ioid = 1u32;
     let pv_request = if fields.is_empty() {
-        // Empty pvRequest — request all fields
         vec![0xfd, 0x02, 0x00, 0x80, 0x00, 0x00]
     } else {
         encode_pv_request(fields, is_be)
     };
     let get_init_req = encode_get_request(sid, ioid, 0x08, &pv_request, version, is_be);
-    stream.write_all(&get_init_req).await?;
+    conn.stream.write_all(&get_init_req).await?;
 
     let init_resp = read_until(
-        &mut stream,
-        opts.timeout,
-        &mut reassembler,
-        |cmd| matches!(cmd, PvaPacketCommand::Op(op) if (op.subcmd & 0x08) != 0),
+        &mut conn.stream,
+        timeout_dur,
+        &mut conn.reassembler,
+        |cmd| {
+            matches!(cmd, PvaPacketCommand::Op(op)
+            if op.command == 10 && op.ioid == ioid && (op.subcmd & 0x08) != 0)
+        },
     )
     .await?;
     let mut pkt = PvaPacket::new(&init_resp);
     let cmd = pkt.decode_payload().ok_or(PvGetError::Protocol(
         "get init response decode failed".to_string(),
     ))?;
-
     let desc = match cmd {
         PvaPacketCommand::Op(op) => op
             .introspection
@@ -309,13 +323,16 @@ pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetR
     };
 
     let get_data_req = encode_get_request(sid, ioid, 0x00, &[], version, is_be);
-    stream.write_all(&get_data_req).await?;
+    conn.stream.write_all(&get_data_req).await?;
 
     let data_resp = read_until(
-        &mut stream,
-        opts.timeout,
-        &mut reassembler,
-        |cmd| matches!(cmd, PvaPacketCommand::Op(op) if op.subcmd == 0x00),
+        &mut conn.stream,
+        timeout_dur,
+        &mut conn.reassembler,
+        |cmd| {
+            matches!(cmd, PvaPacketCommand::Op(op)
+            if op.command == 10 && op.ioid == ioid && op.subcmd == 0x00)
+        },
     )
     .await?;
     let mut pkt = PvaPacket::new(&data_resp);
@@ -325,16 +342,15 @@ pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetR
 
     match cmd {
         PvaPacketCommand::Op(mut op) => {
-            // A decode failure leaves decoded_value None, handled below.
             let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
             if let Some(value) = op.decoded_value {
                 return Ok(PvGetResult {
-                    pv_name: opts.pv_name.clone(),
+                    pv_name: pv_name.to_string(),
                     value,
                     raw_pva: data_resp,
                     raw_pvd: op.body,
                     introspection: desc,
-                    server_host: server_addr.to_string(),
+                    server_host: conn.server_addr.to_string(),
                 });
             }
             Err(PvGetError::Decode("no decoded value".to_string()))

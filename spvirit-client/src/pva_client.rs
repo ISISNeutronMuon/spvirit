@@ -31,7 +31,7 @@ use spvirit_codec::spvirit_encode::{
 };
 
 use crate::byte_sink::ByteSink;
-use crate::client::{ChannelConn, ensure_status_ok, establish_channel, pvget as low_level_pvget};
+use crate::client::{ChannelConn, ensure_status_ok, establish_channel};
 use crate::put_encode::encode_put_payload;
 use crate::transport::{FrameBuf, read_frame, read_frame_resumable, read_until};
 use crate::types::{PvGetError, PvGetResult, PvOptions};
@@ -44,6 +44,26 @@ const QOS_INIT: u8 = 0x08;
 static NEXT_IOID: AtomicU32 = AtomicU32::new(1);
 fn alloc_ioid() -> u32 {
     NEXT_IOID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Marks the point at which an operation stops being safe to re-run.
+///
+/// GET and GET_FIELD never call [`OpCtx::commit`]: they have no server-side
+/// effect, so they are retryable for their whole duration. PUT calls it
+/// immediately before writing the value, because after that write the server
+/// may have applied the value even if it never replies.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct OpCtx {
+    committed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OpCtx {
+    pub(crate) fn commit(&self) {
+        self.committed.store(true, Ordering::Relaxed);
+    }
+    fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::Relaxed)
+    }
 }
 
 /// Build the pvRequest body for a GET / PUT / MONITOR INIT.
@@ -310,6 +330,14 @@ impl PvaClient {
         self.cache.invalidate(pv_name);
     }
 
+    /// Test hook: drop every idle pooled connection to the address `pv_name`
+    /// currently resolves to, *without* clearing the resolution. Used to
+    /// simulate a server that closed an idle connection.
+    #[cfg(test)]
+    pub(crate) fn close_pooled_for_test(&self, pv_name: &str) {
+        self.cache.close_pooled_for_test(pv_name);
+    }
+
     /// Build [`PvOptions`] for a given PV name, inheriting client-level settings.
     fn opts(&self, pv_name: &str) -> PvOptions {
         let mut o = PvOptions::new(pv_name.to_string());
@@ -347,16 +375,88 @@ impl PvaClient {
         }
     }
 
+    /// Run one short operation over a pooled connection to `pv_name`'s
+    /// server, retrying exactly once on a fresh connection when a *reused*
+    /// connection fails before the operation committed.
+    ///
+    /// `op` receives the connection, the server-side sid for `pv_name`, and
+    /// an [`OpCtx`]; it returns the connection back (so it can be pooled) plus
+    /// its result.
+    ///
+    /// A reused connection can fail because its socket is dead (the server
+    /// closed an idle connection) *or* because the sid it has cached for
+    /// `pv_name` is stale (the server destroyed that channel). Both surface as
+    /// an `Err` from `op` before any commit, and both take the same branch:
+    /// the connection is discarded, never checked back in, and the operation
+    /// re-runs on a freshly dialled connection that creates its own channel.
+    async fn with_pooled_channel<T, F, Fut>(&self, pv_name: &str, op: F) -> Result<T, PvGetError>
+    where
+        F: Fn(crate::cache::PooledConn, u32, OpCtx) -> Fut,
+        Fut: std::future::Future<Output = (crate::cache::PooledConn, OpCtx, Result<T, PvGetError>)>,
+    {
+        let opts = self.opts(pv_name);
+        let resolved = self.cache.resolve(&opts).await?;
+
+        for attempt in 0..2 {
+            // The retry dials rather than drawing from the pool again: the
+            // other idle connections to this server may be just as dead.
+            let acquired = if attempt == 0 {
+                self.cache.acquire(&opts, resolved).await
+            } else {
+                self.cache.acquire_fresh(&opts, resolved).await
+            };
+            let mut conn = match acquired {
+                Ok(c) => c,
+                Err(e) => {
+                    // The cached address will not accept a connection: the
+                    // server is gone, so the resolution is stale too.
+                    self.cache.invalidate_at(pv_name, resolved.addr);
+                    return Err(e);
+                }
+            };
+            let reused = conn.was_reused();
+
+            let sid = match conn.channel_sid(pv_name, self.timeout).await {
+                Ok(sid) => sid,
+                Err(e) => {
+                    // Do not check the connection back in: it is either dead
+                    // or it refused the channel.
+                    drop(conn);
+                    if reused && attempt == 0 {
+                        crate::cache::bump_retried_dead(self.cache.counters());
+                        continue;
+                    }
+                    self.cache.invalidate_at(pv_name, resolved.addr);
+                    return Err(e);
+                }
+            };
+
+            let ctx = OpCtx::default();
+            let (conn, ctx, result) = op(conn, sid, ctx).await;
+            match result {
+                Ok(v) => {
+                    self.cache.release(conn);
+                    return Ok(v);
+                }
+                Err(e) => {
+                    drop(conn);
+                    if reused && attempt == 0 && !ctx.is_committed() {
+                        crate::cache::bump_retried_dead(self.cache.counters());
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        unreachable!("the loop returns on both attempts")
+    }
+
     // ─── pvget ───────────────────────────────────────────────────────────
 
     /// Fetch the current value of a PV.
     pub async fn pvget(&self, pv_name: &str) -> Result<PvGetResult, PvGetError> {
-        let opts = self.opts(pv_name);
-        let result = low_level_pvget(&opts).await?;
-        if let Some(sink) = &self.byte_sink {
-            sink.on_rx(pv_name, &result.server_host, result.raw_pva.len() as u64);
-        }
-        Ok(result)
+        self.pvget_fields(pv_name, &[]).await
     }
 
     /// Fetch a PV with field filtering (equivalent to `pvget -r "field(value,alarm)"`).
@@ -365,8 +465,29 @@ impl PvaClient {
         pv_name: &str,
         fields: &[&str],
     ) -> Result<PvGetResult, PvGetError> {
-        let opts = self.opts(pv_name);
-        let result = crate::client::pvget_fields(&opts, fields).await?;
+        let timeout_dur = self.timeout;
+        let owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        let result = self
+            .with_pooled_channel(pv_name, move |mut conn, sid, ctx| {
+                let owned = owned.clone();
+                let pv_name = pv_name.to_string();
+                async move {
+                    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+                    let ioid = alloc_ioid();
+                    // GET has no server-side effect: never `ctx.commit()`.
+                    let r = crate::client::run_get_on(
+                        &mut conn.conn,
+                        sid,
+                        &pv_name,
+                        &refs,
+                        ioid,
+                        timeout_dur,
+                    )
+                    .await;
+                    (conn, ctx, r)
+                }
+            })
+            .await?;
         if let Some(sink) = &self.byte_sink {
             sink.on_rx(pv_name, &result.server_host, result.raw_pva.len() as u64);
         }
@@ -400,51 +521,72 @@ impl PvaClient {
         fields: &[&str],
     ) -> Result<(), PvGetError> {
         let json_val = value.into();
-        let ChannelConn {
-            mut stream,
-            sid,
-            version: _,
-            is_be,
-            mut reassembler,
-            server_addr,
-            ..
-        } = self.open_channel(pv_name).await?;
+        let timeout_dur = self.timeout;
+        let owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        let sink = self.byte_sink.clone();
+        let pv_owned = pv_name.to_string();
 
-        let ioid = alloc_ioid();
+        self.with_pooled_channel(pv_name, move |mut conn, sid, ctx| {
+            let json_val = json_val.clone();
+            let owned = owned.clone();
+            let sink = sink.clone();
+            let pv_owned = pv_owned.clone();
+            let ctx2 = ctx.clone();
+            async move {
+                let r = async {
+                    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+                    let ioid = alloc_ioid();
+                    let is_be = conn.conn.is_be;
 
-        // PUT INIT — pvRequest from caller-supplied field paths.
-        let pv_request = build_pv_request(fields, is_be);
-        let init = encode_put_request(sid, ioid, QOS_INIT, &pv_request, PVA_VERSION, is_be);
-        stream.write_all(&init).await?;
+                    let pv_request = build_pv_request(&refs, is_be);
+                    let init =
+                        encode_put_request(sid, ioid, QOS_INIT, &pv_request, PVA_VERSION, is_be);
+                    conn.conn.stream.write_all(&init).await?;
 
-        // Read INIT response — extract introspection
-        let init_bytes = read_until(&mut stream, self.timeout, &mut reassembler, |cmd| {
-            matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && (op.subcmd & 0x08) != 0)
+                    // `op.ioid == ioid` added for the pool: this socket may
+                    // carry replies from a previous operation.
+                    let init_bytes = read_until(
+                        &mut conn.conn.stream,
+                        timeout_dur,
+                        &mut conn.conn.reassembler,
+                        |cmd| matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.ioid == ioid && (op.subcmd & 0x08) != 0),
+                    )
+                    .await?;
+                    let desc = decode_init_introspection(&init_bytes, "PUT")?;
+
+                    let payload = encode_put_payload(&desc, &json_val, is_be)
+                        .map_err(|e| PvGetError::Protocol(format!("put encode: {e}")))?;
+                    let req = encode_put_request(sid, ioid, 0x00, &payload, PVA_VERSION, is_be);
+
+                    // POINT OF NO RETURN: after this write the server may have
+                    // applied the value even if it never replies, so the
+                    // operation must never be re-run on a fresh connection.
+                    ctx2.commit();
+                    conn.conn.stream.write_all(&req).await?;
+
+                    if let Some(sink) = &sink {
+                        sink.on_tx(
+                            &pv_owned,
+                            &conn.conn.server_addr.to_string(),
+                            req.len() as u64,
+                        );
+                    }
+
+                    let resp_bytes = read_until(
+                        &mut conn.conn.stream,
+                        timeout_dur,
+                        &mut conn.conn.reassembler,
+                        |cmd| matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.ioid == ioid && op.subcmd == 0x00),
+                    )
+                    .await?;
+                    ensure_status_ok(&resp_bytes, is_be, "PUT")?;
+                    Ok(())
+                }
+                .await;
+                (conn, ctx, r)
+            }
         })
-        .await?;
-
-        let desc = decode_init_introspection(&init_bytes, "PUT")?;
-
-        // Encode and send the value
-        let payload = encode_put_payload(&desc, &json_val, is_be)
-            .map_err(|e| PvGetError::Protocol(format!("put encode: {e}")))?;
-        let req = encode_put_request(sid, ioid, 0x00, &payload, PVA_VERSION, is_be);
-        stream.write_all(&req).await?;
-        if let Some(sink) = &self.byte_sink {
-            sink.on_tx(pv_name, &server_addr.to_string(), req.len() as u64);
-        }
-
-        // Read PUT response — verify status
-        let resp_bytes = read_until(
-            &mut stream,
-            self.timeout,
-            &mut reassembler,
-            |cmd| matches!(cmd, PvaPacketCommand::Op(op) if op.command == 11 && op.subcmd == 0x00),
-        )
-        .await?;
-        ensure_status_ok(&resp_bytes, is_be, "PUT")?;
-
-        Ok(())
+        .await
     }
 
     // ─── open_put_channel ────────────────────────────────────────────────
@@ -752,49 +894,62 @@ impl PvaClient {
         &self,
         pv_name: &str,
     ) -> Result<(StructureDesc, SocketAddr, [u8; 12]), PvGetError> {
-        let ChannelConn {
-            mut stream,
-            sid,
-            version: _,
-            is_be,
-            server_addr,
-            guid,
-            mut reassembler,
-        } = self.open_channel(pv_name).await?;
+        let timeout_dur = self.timeout;
+        self.with_pooled_channel(pv_name, move |mut conn, sid, ctx| async move {
+            let r = async {
+                let ioid = alloc_ioid();
+                let is_be = conn.conn.is_be;
+                let msg = encode_get_field_request(sid, ioid, None, PVA_VERSION, is_be);
+                conn.conn.stream.write_all(&msg).await?;
 
-        let ioid = alloc_ioid();
-        let msg = encode_get_field_request(sid, ioid, None, PVA_VERSION, is_be);
-        stream.write_all(&msg).await?;
+                // Pin the request id: on a pooled connection a GET_FIELD reply
+                // from an earlier operation could otherwise be picked up here.
+                // Note the decoder puts the *server* response's echoed
+                // request_id in `cid`, not in `ioid` — `ioid` is always `None`
+                // on the server direction
+                // (`spvirit-codec/src/epics_decode.rs:763-788`), and
+                // `encode_get_field_response`/`_error` both write
+                // `request_id` first. So match on `cid`.
+                let resp_bytes = read_until(
+                    &mut conn.conn.stream,
+                    timeout_dur,
+                    &mut conn.conn.reassembler,
+                    |cmd| matches!(cmd, PvaPacketCommand::GetField(p)
+                        if p.is_server && p.cid == ioid),
+                )
+                .await?;
 
-        let resp_bytes = read_until(&mut stream, self.timeout, &mut reassembler, |cmd| {
-            matches!(cmd, PvaPacketCommand::GetField(_))
-        })
-        .await?;
-
-        let mut pkt = PvaPacket::new(&resp_bytes);
-        let cmd = pkt
-            .decode_payload()
-            .ok_or_else(|| PvGetError::Decode("GET_FIELD response decode failed".to_string()))?;
-        match cmd {
-            PvaPacketCommand::GetField(payload) => {
-                if let Some(ref st) = payload.status {
-                    if st.is_error() {
-                        let msg = st
-                            .message
-                            .clone()
-                            .unwrap_or_else(|| format!("code={}", st.code));
-                        return Err(PvGetError::Protocol(format!("GET_FIELD error: {msg}")));
-                    }
-                }
-                let desc = payload.introspection.ok_or_else(|| {
-                    PvGetError::Decode("missing GET_FIELD introspection".to_string())
+                let mut pkt = PvaPacket::new(&resp_bytes);
+                let cmd = pkt.decode_payload().ok_or_else(|| {
+                    PvGetError::Decode("GET_FIELD response decode failed".to_string())
                 })?;
-                Ok((desc, server_addr, guid))
+                match cmd {
+                    PvaPacketCommand::GetField(payload) => {
+                        if let Some(ref st) = payload.status {
+                            if st.is_error() {
+                                let msg = st
+                                    .message
+                                    .clone()
+                                    .unwrap_or_else(|| format!("code={}", st.code));
+                                return Err(PvGetError::Protocol(format!(
+                                    "GET_FIELD error: {msg}"
+                                )));
+                            }
+                        }
+                        let desc = payload.introspection.ok_or_else(|| {
+                            PvGetError::Decode("missing GET_FIELD introspection".to_string())
+                        })?;
+                        Ok((desc, conn.conn.server_addr, conn.conn.guid))
+                    }
+                    _ => Err(PvGetError::Protocol(
+                        "unexpected GET_FIELD response".to_string(),
+                    )),
+                }
             }
-            _ => Err(PvGetError::Protocol(
-                "unexpected GET_FIELD response".to_string(),
-            )),
-        }
+            .await;
+            (conn, ctx, r)
+        })
+        .await
     }
 
     // ─── pvlist ──────────────────────────────────────────────────────────
@@ -1088,6 +1243,334 @@ mod tests {
         (tcp_port, udp_port)
     }
 
+    /// Read one top-level `Float64`/`Float32` field out of a decoded structure.
+    fn field_f64(v: &spvirit_codec::spvd_decode::DecodedValue, name: &str) -> Option<f64> {
+        use spvirit_codec::spvd_decode::DecodedValue as D;
+        let D::Structure(fields) = v else { return None };
+        fields.iter().find(|(k, _)| k == name).and_then(|(_, val)| match val {
+            D::Float64(f) => Some(*f),
+            D::Float32(f) => Some(*f as f64),
+            _ => None,
+        })
+    }
+
+    /// Like [`spawn_test_server`], but serving several `ao` PVs and returning
+    /// the [`RunningServer`] so a test can stop the listener mid-test.
+    ///
+    /// `RunningServer::abort` closes the TCP listener (and the UDP responder)
+    /// but, by design, leaves already-accepted per-connection handlers
+    /// running; tests that need an existing connection dead too close it
+    /// client-side with `close_pooled_for_test`.
+    async fn start_test_server(
+        pvs: &[&str],
+    ) -> (spvirit_server::pva_server::RunningServer, u16, u16) {
+        use spvirit_server::pva_server::PvaServer;
+        use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket as StdUdpSocket};
+
+        let tcp_port = TcpListener::bind("127.0.0.1:0")
+            .expect("bind tcp")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let udp_port = StdUdpSocket::bind("127.0.0.1:0")
+            .expect("bind udp")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+
+        let mut b = PvaServer::builder();
+        for pv in pvs {
+            b = b.ao(*pv, 1.0);
+        }
+        let running = b
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .build()
+            .start()
+            .await
+            .expect("server start");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        (running, tcp_port, udp_port)
+    }
+
+    fn ns_client(tcp_port: u16, udp_port: u16, timeout: Duration) -> PvaClient {
+        let ns: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+        PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(timeout)
+            .name_server(ns)
+            .no_broadcast()
+            .build()
+    }
+
+    /// A second get to the same PV performs zero additional UDP searches AND
+    /// zero additional TCP handshakes: it reuses the pooled connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_get_reuses_the_pooled_connection() {
+        const PV: &str = "POOL:REUSE";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let ns: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .name_server(ns)
+            .no_broadcast()
+            .build();
+
+        client.pvget(PV).await.expect("first pvget");
+        let first = client.cache_stats();
+        assert_eq!(first.conn_misses, 1);
+        assert_eq!(first.conn_hits, 0);
+
+        client.pvget(PV).await.expect("second pvget");
+        let second = client.cache_stats();
+        assert_eq!(second.conn_misses, 1, "no second handshake");
+        assert_eq!(second.conn_hits, 1);
+        assert_eq!(second.resolve_misses, 1, "no second search");
+    }
+
+    /// A pooled connection to a server that has gone away is discarded and the
+    /// operation retried once on a fresh connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_pooled_connection_is_retried_once_on_a_fresh_one() {
+        const PV: &str = "POOL:DEAD";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let ns: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .name_server(ns)
+            .no_broadcast()
+            .build();
+
+        // Warm the pool.
+        client.pvget(PV).await.expect("first pvget");
+        assert_eq!(client.cache_stats().conn_misses, 1);
+
+        // Reach into the pool and half-close the idle connection's socket from
+        // the client side, which makes the server drop its end. The next
+        // checkout therefore hands out a connection whose peer is gone.
+        client.close_pooled_for_test(PV);
+
+        let result = client.pvget(PV).await;
+        assert!(result.is_ok(), "the retry must succeed: {result:?}");
+
+        let stats = client.cache_stats();
+        assert_eq!(stats.conn_retried_dead, 1, "exactly one retry");
+        assert_eq!(stats.resolve_misses, 1, "the retry must not re-search");
+    }
+
+    /// A get on a PV the server does not host fails without wedging the cache or
+    /// the pool: the next get of a PV it does host still works. (With
+    /// `.no_broadcast()` + a name server the failure lands in `resolve` — the
+    /// server never answers a search for an unknown PV — so this pins "a failed
+    /// resolve is not cached and does not disturb the pool". The channel-create
+    /// failure path is covered by `a_dead_pooled_connection_is_retried_once_on_a_fresh_one`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_lookup_does_not_poison_the_cache_or_the_pool() {
+        const PV: &str = "POOL:OK";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let ns: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(2))
+            .name_server(ns)
+            .no_broadcast()
+            .build();
+
+        assert!(client.pvget("POOL:NOSUCHPV").await.is_err());
+        assert!(client.pvget(PV).await.is_ok());
+    }
+
+    /// A put still works over the pool, and the value lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_then_get_over_a_pooled_connection_round_trips() {
+        const PV: &str = "POOL:PUTGET";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let ns: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .name_server(ns)
+            .no_broadcast()
+            .build();
+
+        client.pvput(PV, 17.5).await.expect("pvput");
+        let got = client.pvget(PV).await.expect("pvget");
+        assert_eq!(field_f64(&got.value, "value"), Some(17.5));
+
+        // Three operations (put INIT+data, get, and the put's own channel) over
+        // one pooled connection: at most one handshake.
+        assert_eq!(client.cache_stats().conn_misses, 1);
+    }
+
+    /// Task 4 review: `channel_sid` must reuse a pooled connection's sid for
+    /// the same PV (one CREATE_CHANNEL, not one per operation), and hand two
+    /// different PVs on one connection distinct cids and sids. Driven with
+    /// real PVA traffic, inspected through the pooled connection's state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_channels_are_reused_per_pv_and_distinct_across_pvs() {
+        const A: &str = "POOL:CHAN:A";
+        const B: &str = "POOL:CHAN:B";
+        let (_server, tcp_port, udp_port) = start_test_server(&[A, B]).await;
+        let client = ns_client(tcp_port, udp_port, Duration::from_secs(5));
+
+        client.pvget(A).await.expect("first get A");
+        client.pvinfo(A).await.expect("pvinfo A");
+        client.pvget(A).await.expect("second get A");
+
+        let pooled = client.cache.pooled_channels_for_test(A);
+        assert_eq!(pooled.len(), 1, "one pooled connection");
+        let (channels, next_cid) = &pooled[0];
+        assert_eq!(channels.len(), 1, "one channel for one PV");
+        assert_eq!(
+            *next_cid, 2,
+            "three operations on one PV issued exactly one CREATE_CHANNEL (cid 1)"
+        );
+        let sid_a = channels[A];
+
+        client.pvget(B).await.expect("get B");
+        let stats = client.cache_stats();
+        assert_eq!(stats.conn_misses, 1, "B rode the same connection as A");
+        assert_eq!(stats.conn_hits, 3);
+
+        let pooled = client.cache.pooled_channels_for_test(B);
+        assert_eq!(pooled.len(), 1);
+        let (channels, next_cid) = &pooled[0];
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[A], sid_a, "A's sid survives B's channel create");
+        assert_ne!(channels[B], sid_a, "distinct PVs get distinct sids");
+        assert_eq!(*next_cid, 3, "B was created with a fresh cid (2), not cid 1 again");
+    }
+
+    /// Task 4 review: a pooled connection whose cached sid the server has
+    /// destroyed must be treated as a reuse failure. The operation sees an
+    /// error reply for the stale sid *before* any commit, so it must reach the
+    /// retry branch and succeed on a fresh connection — for GET and for PUT
+    /// (a PUT INIT error precedes the commit point).
+    ///
+    /// GET_FIELD is deliberately not driven here: the in-process spvirit
+    /// server answers a GET_FIELD naming an unknown sid with its pvlist
+    /// listing rather than an error (`handle_get_field_request` falls through
+    /// when the sid resolves to no PV), so the client never sees a failure to
+    /// retry on. That is a server-side defect, reported separately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_pooled_sid_is_retried_once_on_a_fresh_connection() {
+        const PV: &str = "POOL:STALESID";
+        let (_server, tcp_port, udp_port) = start_test_server(&[PV]).await;
+        let client = ns_client(tcp_port, udp_port, Duration::from_secs(5));
+
+        client.pvget(PV).await.expect("warm the pool");
+        assert_eq!(client.cache_stats().conn_misses, 1);
+
+        client.cache.destroy_pooled_channel_for_test(PV).await;
+        let got = client.pvget(PV).await;
+        assert!(got.is_ok(), "GET on a stale sid must retry: {got:?}");
+        let s = client.cache_stats();
+        assert_eq!(s.conn_retried_dead, 1);
+        assert_eq!(s.conn_misses, 2, "the retry dialled a fresh connection");
+
+        client.cache.destroy_pooled_channel_for_test(PV).await;
+        let put = client.pvput(PV, 4.25).await;
+        assert!(put.is_ok(), "PUT whose INIT hits a stale sid must retry: {put:?}");
+        let s = client.cache_stats();
+        assert_eq!(s.conn_retried_dead, 2);
+        assert_eq!(s.conn_misses, 3);
+        assert_eq!(s.resolve_misses, 1, "no retry re-searched");
+
+        let got = client.pvget(PV).await.expect("get after put");
+        assert_eq!(field_f64(&got.value, "value"), Some(4.25), "the put landed once");
+    }
+
+    /// Task 2 review gap, `open_channel` path: a cached resolution whose
+    /// address no longer accepts connections is invalidated by the failed
+    /// establish, so the NEXT operation searches again instead of hitting the
+    /// stale entry. `open_put_channel` is driven because it reaches the wire
+    /// through `open_channel` (not the pool).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_establish_in_open_channel_forces_a_fresh_search() {
+        const PV: &str = "CACHE:STALE:OPEN";
+        let (server, tcp_port, udp_port) = start_test_server(&[PV]).await;
+        let client = ns_client(tcp_port, udp_port, Duration::from_secs(5));
+
+        drop(client.open_put_channel(PV).await.expect("warm the resolution"));
+        assert_eq!(client.cache_stats().resolve_misses, 1);
+
+        // Stop the listener: the cached address now refuses connections.
+        server.abort();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(client.open_put_channel(PV).await.is_err());
+        let s = client.cache_stats();
+        assert_eq!(s.resolve_hits, 1, "the failing call used the cached entry");
+        assert_eq!(s.resolve_misses, 1);
+
+        // The failure invalidated the entry, so this call searches again
+        // (and fails: the name server is the stopped server).
+        assert!(client.open_put_channel(PV).await.is_err());
+        let s = client.cache_stats();
+        assert_eq!(s.resolve_misses, 2, "the stale entry must not be served again");
+        assert_eq!(s.resolve_hits, 1);
+    }
+
+    /// Task 2 review gap, pooled path: same property through
+    /// `with_pooled_channel`. The pooled connection is closed too, so the
+    /// call retries once, the fresh dial is refused, and that refusal
+    /// invalidates the resolution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_dial_in_the_pooled_path_forces_a_fresh_search() {
+        const PV: &str = "CACHE:STALE:POOL";
+        let (server, tcp_port, udp_port) = start_test_server(&[PV]).await;
+        let client = ns_client(tcp_port, udp_port, Duration::from_secs(5));
+
+        client.pvget(PV).await.expect("warm resolution and pool");
+        server.abort();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.close_pooled_for_test(PV);
+
+        assert!(client.pvget(PV).await.is_err());
+        let s = client.cache_stats();
+        assert_eq!(s.resolve_hits, 1);
+        assert_eq!(s.resolve_misses, 1);
+        assert_eq!(s.conn_retried_dead, 1, "the dead pooled conn was retried once");
+
+        assert!(client.pvget(PV).await.is_err());
+        let s = client.cache_stats();
+        assert_eq!(s.resolve_misses, 2, "the stale entry must not be served again");
+        assert_eq!(s.resolve_hits, 1);
+    }
+
+    /// Task 2 review gap: `invalidate_pv` turns the next lookup from a hit
+    /// into a miss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalidate_pv_forces_the_next_operation_to_search() {
+        const PV: &str = "CACHE:INVALIDATE";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let client = ns_client(tcp_port, udp_port, Duration::from_secs(5));
+
+        client.pvget(PV).await.expect("miss");
+        client.pvget(PV).await.expect("hit");
+        let s = client.cache_stats();
+        assert_eq!((s.resolve_misses, s.resolve_hits), (1, 1));
+
+        client.invalidate_pv(PV);
+
+        client.pvget(PV).await.expect("miss again");
+        let s = client.cache_stats();
+        assert_eq!(s.resolve_misses, 2, "invalidate_pv must force a search");
+        assert_eq!(s.resolve_hits, 1);
+    }
+
     /// Two operations on the same PV through the same client must perform
     /// exactly ONE resolution. Asserted on the cache counters, not on timing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1106,13 +1589,12 @@ mod tests {
             .no_broadcast()
             .build();
 
-        // pvget is routed through the cache in Task 5; pvinfo uses open_channel today.
-        client.pvinfo(PV).await.expect("first pvinfo");
+        client.pvget(PV).await.expect("first pvget");
         let after_first = client.cache_stats();
         assert_eq!(after_first.resolve_misses, 1);
         assert_eq!(after_first.resolve_hits, 0);
 
-        client.pvinfo(PV).await.expect("second pvinfo");
+        client.pvget(PV).await.expect("second pvget");
         let after_second = client.cache_stats();
         assert_eq!(
             after_second.resolve_misses, 1,
@@ -1138,9 +1620,8 @@ mod tests {
             .build()
             .with_cache_config(crate::cache::CacheConfig::disabled());
 
-        // pvget is routed through the cache in Task 5; pvinfo uses open_channel today.
-        client.pvinfo(PV).await.expect("first pvinfo");
-        client.pvinfo(PV).await.expect("second pvinfo");
+        client.pvget(PV).await.expect("first pvget");
+        client.pvget(PV).await.expect("second pvget");
 
         let stats = client.cache_stats();
         assert_eq!(stats.resolve_misses, 2);
@@ -1164,9 +1645,8 @@ mod tests {
             .build();
         let twin = client.clone();
 
-        // pvget is routed through the cache in Task 5; pvinfo uses open_channel today.
-        client.pvinfo(PV).await.expect("first pvinfo");
-        twin.pvinfo(PV).await.expect("second pvinfo via clone");
+        client.pvget(PV).await.expect("first pvget");
+        twin.pvget(PV).await.expect("second pvget via clone");
 
         assert_eq!(client.cache_stats().resolve_misses, 1);
         assert_eq!(twin.cache_stats().resolve_hits, 1);

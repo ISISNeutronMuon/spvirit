@@ -91,6 +91,12 @@ fn bump(c: &AtomicU64) {
     });
 }
 
+/// Record that an operation was retried on a fresh connection after a pooled
+/// one turned out to be dead.
+pub(crate) fn bump_retried_dead(counters: &CacheCounters) {
+    bump(&counters.conn_retried_dead);
+}
+
 /// A resolved PV location: where the server is and which server it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resolved {
@@ -151,6 +157,17 @@ impl ResolutionCache {
         }
     }
 
+    /// Test hook: the cached address for `pv_name`, without touching the TTL
+    /// or the counters.
+    #[cfg(test)]
+    pub(crate) fn peek_addr(&self, pv_name: &str) -> Option<SocketAddr> {
+        let slots = self.slots.lock().expect("resolution cache mutex poisoned");
+        let slot = slots.get(pv_name)?.clone();
+        drop(slots);
+        let guard = slot.entry.try_lock().ok()?;
+        guard.map(|e| e.resolved.addr)
+    }
+
     /// Return the cached resolution for `pv_name`, or run `resolve` and cache
     /// its result. Concurrent callers for the same name are serialised, so
     /// only the first runs `resolve`.
@@ -209,9 +226,6 @@ pub(crate) struct ClientCache {
     cfg: CacheConfig,
     counters: CacheCounters,
     resolution: ResolutionCache,
-    // Read only by `acquire`/`release`/`invalidate_at`, which Task 5 calls;
-    // remove this allow there.
-    #[allow(dead_code)]
     pool: ConnPool,
 }
 
@@ -255,9 +269,6 @@ impl ClientCache {
 
     /// Take a connection to `resolved.addr` — from the pool if one is idle
     /// and fresh enough, otherwise newly dialled and validated.
-    // Consumed by Task 5 (`with_pooled_channel`) of plan
-    // 2026-09-02-client-connection-cache; remove this allow there.
-    #[allow(dead_code)]
     pub(crate) async fn acquire(
         &self,
         opts: &PvOptions,
@@ -270,29 +281,144 @@ impl ClientCache {
         Ok(PooledConn::fresh(conn))
     }
 
+    /// Dial a new connection to `resolved.addr`, bypassing the pool.
+    ///
+    /// Used for the retry after a *reused* connection failed: another idle
+    /// connection to the same server may be just as dead (a server restart
+    /// kills them all), so the retry must not draw from the pool again.
+    /// Counted as a `conn_misses`, like any other dial.
+    pub(crate) async fn acquire_fresh(
+        &self,
+        opts: &PvOptions,
+        resolved: Resolved,
+    ) -> Result<PooledConn, PvGetError> {
+        bump(&self.counters.conn_misses);
+        let conn = connect_and_validate(resolved.addr, resolved.guid, opts).await?;
+        Ok(PooledConn::fresh(conn))
+    }
+
     /// Return a connection that completed its operation successfully.
-    // Consumed by Task 5 (`with_pooled_channel`) of plan
-    // 2026-09-02-client-connection-cache; remove this allow there.
-    #[allow(dead_code)]
     pub(crate) fn release(&self, conn: PooledConn) {
         self.pool.checkin(conn);
     }
 
-    // Consumed by Task 5 (`with_pooled_channel`) of plan
-    // 2026-09-02-client-connection-cache; remove this allow there.
-    #[allow(dead_code)]
     pub(crate) fn counters(&self) -> &CacheCounters {
         &self.counters
     }
 
     /// Forget the resolution for `pv_name` *and* close every idle connection
     /// to the address it resolved to, if that address is known.
-    // Consumed by Task 5 (`with_pooled_channel`) of plan
-    // 2026-09-02-client-connection-cache; remove this allow there.
-    #[allow(dead_code)]
     pub(crate) fn invalidate_at(&self, pv_name: &str, addr: SocketAddr) {
         self.resolution.invalidate(pv_name);
         self.pool.purge_addr(addr);
+    }
+
+    /// Test hook: see `PvaClient::close_pooled_for_test`.
+    ///
+    /// `tokio::net::TcpStream` has no synchronous `shutdown(Shutdown)`, so this
+    /// borrows the raw socket, shuts it down through a temporary
+    /// `std::net::TcpStream`, and `mem::forget`s that temporary so the fd is
+    /// not closed twice — the pool still owns it. The server sees EOF and drops
+    /// its side, but the `PooledConn` stays in the pool and is handed out again,
+    /// which is exactly the "reused a dead connection" case under test.
+    #[cfg(test)]
+    pub(crate) fn close_pooled_for_test(&self, pv_name: &str) {
+        let Some(addr) = self.resolution.peek_addr(pv_name) else {
+            return;
+        };
+        let idle = self.pool.idle.lock().expect("conn pool mutex poisoned");
+        if let Some(stack) = idle.get(&addr) {
+            for c in stack {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::{AsRawFd, FromRawFd};
+                    let s = unsafe { std::net::TcpStream::from_raw_fd(c.conn.stream.as_raw_fd()) };
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                    std::mem::forget(s); // do not close the fd; the pool owns it
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::io::{AsRawSocket, FromRawSocket};
+                    let s = unsafe {
+                        std::net::TcpStream::from_raw_socket(c.conn.stream.as_raw_socket())
+                    };
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                    std::mem::forget(s); // do not close the socket; the pool owns it
+                }
+            }
+        }
+    }
+
+    /// Test hook: `(channels, next_cid)` for every idle pooled connection to
+    /// the address `pv_name` currently resolves to.
+    #[cfg(test)]
+    pub(crate) fn pooled_channels_for_test(
+        &self,
+        pv_name: &str,
+    ) -> Vec<(HashMap<String, u32>, u32)> {
+        let Some(addr) = self.resolution.peek_addr(pv_name) else {
+            return Vec::new();
+        };
+        let idle = self.pool.idle.lock().expect("conn pool mutex poisoned");
+        idle.get(&addr)
+            .map(|stack| {
+                stack
+                    .iter()
+                    .map(|c| (c.channels.clone(), c.next_cid))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Test hook: on every idle pooled connection that carries a channel for
+    /// `pv_name`, send the server a client DESTROY_CHANNEL for it while
+    /// keeping the sid cached client-side. The next operation on that
+    /// connection therefore uses a sid the server no longer knows — the
+    /// "server destroyed a pooled channel" case.
+    #[cfg(test)]
+    pub(crate) async fn destroy_pooled_channel_for_test(&self, pv_name: &str) {
+        use tokio::io::AsyncWriteExt;
+        let Some(addr) = self.resolution.peek_addr(pv_name) else {
+            return;
+        };
+        // Take the connections out so the std mutex is not held across the
+        // writes, then put them back unchanged (same `idle_since`).
+        let taken = {
+            let mut idle = self.pool.idle.lock().expect("conn pool mutex poisoned");
+            idle.remove(&addr).unwrap_or_default()
+        };
+        let mut back = Vec::with_capacity(taken.len());
+        for mut c in taken {
+            if let Some(&sid) = c.channels.get(pv_name) {
+                let is_be = c.conn.is_be;
+                let mut frame = spvirit_codec::spvirit_encode::encode_header(
+                    false,
+                    is_be,
+                    false,
+                    c.conn.version,
+                    8,
+                    8,
+                );
+                // DESTROY_CHANNEL payload: sid, then cid. The cid is not
+                // needed by the server's purge beyond the stale-row guard.
+                let cid = 0u32;
+                if is_be {
+                    frame.extend_from_slice(&sid.to_be_bytes());
+                    frame.extend_from_slice(&cid.to_be_bytes());
+                } else {
+                    frame.extend_from_slice(&sid.to_le_bytes());
+                    frame.extend_from_slice(&cid.to_le_bytes());
+                }
+                c.conn
+                    .stream
+                    .write_all(&frame)
+                    .await
+                    .expect("write DESTROY_CHANNEL");
+            }
+            back.push(c);
+        }
+        let mut idle = self.pool.idle.lock().expect("conn pool mutex poisoned");
+        idle.insert(addr, back);
     }
 }
 
@@ -309,9 +435,6 @@ impl ClientCache {
 /// `ClientCache`, which Task 2 already left underived. Nothing formats any of
 /// them: `PvaClient`'s hand-written `Debug` prints `self.cache.stats()` (a
 /// plain `CacheStats`), not the cache itself.
-// Consumed by Task 5 (`with_pooled_channel`) of plan
-// 2026-09-02-client-connection-cache; remove this allow there.
-#[allow(dead_code)]
 pub(crate) struct PooledConn {
     pub(crate) conn: ValidatedConn,
     /// PV name -> server-side sid, for channels already created here. The
@@ -330,9 +453,6 @@ pub(crate) struct PooledConn {
     reused: bool,
 }
 
-// Consumed by Task 5 (`with_pooled_channel`) of plan
-// 2026-09-02-client-connection-cache; remove this allow there.
-#[cfg_attr(not(test), allow(dead_code))]
 impl PooledConn {
     /// Wrap a just-dialled connection. Never eligible for a retry.
     pub(crate) fn fresh(conn: ValidatedConn) -> Self {
@@ -351,7 +471,6 @@ impl PooledConn {
 
     /// The server-side sid for `pv_name` on this connection, creating the
     /// channel if this connection does not have one yet.
-    #[allow(dead_code)]
     pub(crate) async fn channel_sid(
         &mut self,
         pv_name: &str,
@@ -371,18 +490,12 @@ impl PooledConn {
 /// Server address -> a small LIFO stack of idle validated connections.
 ///
 /// The mutex guards only the map and is never held across an `.await`.
-// Consumed by Task 5 (`with_pooled_channel`) of plan
-// 2026-09-02-client-connection-cache; remove this allow there.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ConnPool {
     idle_ttl: Option<Duration>,
     max_per_addr: usize,
     idle: std::sync::Mutex<HashMap<SocketAddr, Vec<PooledConn>>>,
 }
 
-// Consumed by Task 5 (`with_pooled_channel`) of plan
-// 2026-09-02-client-connection-cache; remove this allow there.
-#[cfg_attr(not(test), allow(dead_code))]
 impl ConnPool {
     pub(crate) fn new(idle_ttl: Option<Duration>, max_per_addr: usize) -> Self {
         Self {
