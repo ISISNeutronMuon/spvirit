@@ -1332,6 +1332,10 @@ mod tests {
 
     #[test]
     fn payload_ref_materialises_exactly_what_payload_returns() {
+        // Since `payload()` is `payload_ref().to_owned_payload()`, this is a
+        // consistency check only; the real guard is the frozen
+        // `reference_payload` oracle in
+        // `payload_matches_the_frozen_reference_for_every_variant`.
         for rec in one_record_per_shape() {
             assert_eq!(
                 rec.data.payload_ref().to_owned_payload(),
@@ -1340,6 +1344,336 @@ mod tests {
                 rec.record_type
             );
         }
+    }
+
+    /// Frozen copy of `RecordData::payload()` as it was before it was
+    /// re-expressed over `NtPayloadRef` (body verbatim from commit 22181ad,
+    /// with `Self::` spelled `RecordData::`). Do not "simplify" this into a
+    /// call to `payload()`/`payload_ref()`: its independence is what makes it
+    /// an oracle.
+    fn reference_payload(data: &RecordData) -> NtPayload {
+        match data {
+            RecordData::Ai { nt, .. }
+            | RecordData::Ao { nt, .. }
+            | RecordData::Bi { nt, .. }
+            | RecordData::Bo { nt, .. }
+            | RecordData::StringIn { nt, .. }
+            | RecordData::StringOut { nt, .. } => NtPayload::Scalar(nt.clone()),
+            RecordData::Waveform { nt, .. }
+            | RecordData::Aai { nt, .. }
+            | RecordData::Aao { nt, .. }
+            | RecordData::SubArray { nt, .. } => NtPayload::ScalarArray(nt.clone()),
+            RecordData::NtTable { nt, .. } => NtPayload::Table(nt.clone()),
+            RecordData::NtNdArray { nt, .. } => NtPayload::NdArray(nt.clone()),
+            RecordData::NtEnum { nt, .. } => NtPayload::Enum(nt.clone()),
+            RecordData::Generic {
+                struct_id, fields, ..
+            } => NtPayload::Generic {
+                struct_id: struct_id.clone(),
+                fields: fields.clone(),
+            },
+        }
+    }
+
+    /// One record for each of the 14 `RecordData` variants, each with a
+    /// distinct value so a wrong arm mapping cannot pass by coincidence.
+    /// Sibling of `one_record_per_shape()`, which other tests depend on.
+    fn one_record_per_variant() -> Vec<RecordInstance> {
+        fn wrap(data: RecordData, record_type: RecordType) -> RecordInstance {
+            RecordInstance {
+                name: "T".to_string(),
+                record_type,
+                common: DbCommonState::default(),
+                data,
+                raw_fields: std::collections::HashMap::new(),
+            }
+        }
+        // Each scalar-carrying record gets a distinct NON-ZERO severity so an
+        // accessor reading the wrong arm cannot pass on 0 == 0.
+        fn scalar(v: ScalarValue, severity: i32) -> NtScalar {
+            let mut nt = NtScalar::from_value(v);
+            nt.alarm_severity = severity;
+            nt
+        }
+        fn array(v: ScalarArrayValue) -> NtScalarArray {
+            NtScalarArray::from_value(v)
+        }
+
+        vec![
+            wrap(
+                RecordData::Ai {
+                    nt: scalar(ScalarValue::F64(1.25), 1),
+                    inp: None,
+                    siml: None,
+                    siol: None,
+                    simm: false,
+                },
+                RecordType::Ai,
+            ),
+            wrap(
+                RecordData::Ao {
+                    nt: scalar(ScalarValue::F64(2.5), 2),
+                    out: None,
+                    dol: None,
+                    omsl: OutputMode::Supervisory,
+                    drvl: None,
+                    drvh: None,
+                    oroc: None,
+                    siml: None,
+                    siol: None,
+                    simm: false,
+                },
+                RecordType::Ao,
+            ),
+            wrap(
+                RecordData::Bi {
+                    nt: scalar(ScalarValue::Bool(true), 3),
+                    inp: None,
+                    znam: "Low".to_string(),
+                    onam: "High".to_string(),
+                    siml: None,
+                    siol: None,
+                    simm: false,
+                },
+                RecordType::Bi,
+            ),
+            wrap(
+                RecordData::Bo {
+                    nt: scalar(ScalarValue::Bool(false), 4),
+                    out: None,
+                    dol: None,
+                    omsl: OutputMode::Supervisory,
+                    znam: "Off".to_string(),
+                    onam: "On".to_string(),
+                    siml: None,
+                    siol: None,
+                    simm: false,
+                },
+                RecordType::Bo,
+            ),
+            wrap(
+                RecordData::StringIn {
+                    nt: scalar(ScalarValue::Str("in".to_string()), 5),
+                    inp: None,
+                    siml: None,
+                    siol: None,
+                    simm: false,
+                },
+                RecordType::StringIn,
+            ),
+            wrap(
+                RecordData::StringOut {
+                    nt: scalar(ScalarValue::Str("out".to_string()), 6),
+                    out: None,
+                    dol: None,
+                    omsl: OutputMode::Supervisory,
+                    siml: None,
+                    siol: None,
+                    simm: false,
+                },
+                RecordType::StringOut,
+            ),
+            wrap(
+                RecordData::Waveform {
+                    nt: array(ScalarArrayValue::F64(vec![1.0, 2.0, 3.0])),
+                    inp: None,
+                    ftvl: "DOUBLE".to_string(),
+                    nelm: 3,
+                    nord: 3,
+                },
+                RecordType::Waveform,
+            ),
+            wrap(
+                RecordData::Aai {
+                    nt: array(ScalarArrayValue::I32(vec![4, 5])),
+                    inp: None,
+                    ftvl: "LONG".to_string(),
+                    nelm: 2,
+                    nord: 2,
+                },
+                RecordType::Aai,
+            ),
+            wrap(
+                RecordData::Aao {
+                    nt: array(ScalarArrayValue::Str(vec!["a".to_string()])),
+                    out: None,
+                    dol: None,
+                    omsl: OutputMode::Supervisory,
+                    ftvl: "STRING".to_string(),
+                    nelm: 1,
+                    nord: 1,
+                },
+                RecordType::Aao,
+            ),
+            wrap(
+                RecordData::SubArray {
+                    nt: array(ScalarArrayValue::F64(vec![7.0, 8.0])),
+                    inp: None,
+                    ftvl: "DOUBLE".to_string(),
+                    malm: 4,
+                    nelm: 2,
+                    nord: 2,
+                    indx: 1,
+                },
+                RecordType::SubArray,
+            ),
+            wrap(
+                RecordData::NtTable {
+                    nt: NtTable {
+                        labels: vec!["X".to_string()],
+                        columns: vec![NtTableColumn {
+                            name: "x".to_string(),
+                            values: ScalarArrayValue::F64(vec![1.0, 2.0]),
+                        }],
+                        descriptor: Some("table".to_string()),
+                        alarm: None,
+                        time_stamp: None,
+                    },
+                    inp: None,
+                    out: None,
+                    omsl: OutputMode::Supervisory,
+                },
+                RecordType::NtTable,
+            ),
+            wrap(
+                RecordData::NtNdArray {
+                    nt: NtNdArray::empty(),
+                    inp: None,
+                    out: None,
+                    omsl: OutputMode::Supervisory,
+                },
+                RecordType::NtNdArray,
+            ),
+            wrap(
+                RecordData::NtEnum {
+                    nt: NtEnum::new(1, vec!["OFF".to_string(), "ON".to_string()]),
+                    inp: None,
+                    out: None,
+                    omsl: OutputMode::Supervisory,
+                },
+                // `RecordType` has no `NtEnum` variant; ntenum is `Mbbi`.
+                RecordType::Mbbi,
+            ),
+            wrap(
+                RecordData::Generic {
+                    struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                    fields: vec![("value".to_string(), PvValue::Scalar(ScalarValue::I32(3)))],
+                    inp: None,
+                    out: None,
+                    omsl: OutputMode::Supervisory,
+                },
+                RecordType::Generic,
+            ),
+        ]
+    }
+
+    #[test]
+    fn payload_matches_the_frozen_reference_for_every_variant() {
+        let mut records = one_record_per_variant();
+        assert_eq!(records.len(), 14, "one record per RecordData variant");
+        records.extend(one_record_per_shape());
+        for rec in &records {
+            assert_eq!(
+                rec.data.payload(),
+                reference_payload(&rec.data),
+                "payload() drifted from the frozen reference for {:?}",
+                rec.record_type
+            );
+        }
+    }
+
+    /// Frozen copy of `RecordInstance::to_ntscalar()` before Task 7 moved it
+    /// onto the borrowed view (body verbatim from commit f7380f7, with
+    /// `self.to_ntpayload()` spelled `reference_payload(&rec.data)`).
+    fn reference_to_ntscalar(rec: &RecordInstance) -> NtScalar {
+        match reference_payload(&rec.data) {
+            NtPayload::Scalar(nt) => nt,
+            NtPayload::ScalarArray(nt) => {
+                let mut scalar = NtScalar::from_value(ScalarValue::I32(nt.value.len() as i32));
+                scalar.display_description = "Array length".to_string();
+                scalar
+            }
+            NtPayload::Table(nt) => {
+                let mut scalar = NtScalar::from_value(ScalarValue::I32(nt.columns.len() as i32));
+                scalar.display_description = "Table columns".to_string();
+                scalar
+            }
+            NtPayload::NdArray(nt) => {
+                let mut scalar = NtScalar::from_value(ScalarValue::I32(nt.dimension.len() as i32));
+                scalar.display_description = "NDArray dimensions".to_string();
+                scalar
+            }
+            NtPayload::Enum(nt) => {
+                let mut scalar = NtScalar::from_value(ScalarValue::I32(nt.index));
+                scalar.display_description = nt.selected().unwrap_or("").to_string();
+                scalar
+            }
+            NtPayload::Generic { fields, .. } => {
+                let mut scalar = NtScalar::from_value(ScalarValue::I32(fields.len() as i32));
+                scalar.display_description = "Generic structure".to_string();
+                scalar
+            }
+        }
+    }
+
+    /// Frozen copy of `RecordInstance::current_value()` before Task 7 (body
+    /// verbatim from commit f7380f7, same substitution as above).
+    fn reference_current_value(rec: &RecordInstance) -> ScalarValue {
+        match reference_payload(&rec.data) {
+            NtPayload::Scalar(nt) => nt.value,
+            NtPayload::ScalarArray(nt) => ScalarValue::I32(nt.value.len() as i32),
+            NtPayload::Table(nt) => ScalarValue::I32(nt.columns.len() as i32),
+            NtPayload::NdArray(nt) => ScalarValue::I32(nt.dimension.len() as i32),
+            NtPayload::Enum(nt) => ScalarValue::I32(nt.index),
+            NtPayload::Generic { fields, .. } => ScalarValue::I32(fields.len() as i32),
+        }
+    }
+
+    #[test]
+    fn task7_accessors_match_the_frozen_references_for_every_variant() {
+        for rec in one_record_per_variant() {
+            let reference = reference_payload(&rec.data);
+            let reference_scalar = match &reference {
+                NtPayload::Scalar(nt) => Some(nt),
+                _ => None,
+            };
+            assert_eq!(
+                rec.data.nt_scalar(),
+                reference_scalar,
+                "nt_scalar disagrees with the frozen reference for {:?}",
+                rec.record_type
+            );
+            assert_eq!(
+                rec.alarm_severity(),
+                reference_scalar.map_or(0, |nt| nt.alarm_severity),
+                "alarm_severity disagrees with the frozen reference for {:?}",
+                rec.record_type
+            );
+            assert_eq!(
+                rec.to_ntscalar(),
+                reference_to_ntscalar(&rec),
+                "to_ntscalar disagrees with the frozen reference for {:?}",
+                rec.record_type
+            );
+            assert_eq!(
+                rec.current_value(),
+                reference_current_value(&rec),
+                "current_value disagrees with the frozen reference for {:?}",
+                rec.record_type
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_fixtures_carry_distinct_non_zero_severities() {
+        let severities: Vec<i32> = one_record_per_variant()
+            .iter()
+            .filter_map(|rec| match reference_payload(&rec.data) {
+                NtPayload::Scalar(nt) => Some(nt.alarm_severity),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(severities, vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
