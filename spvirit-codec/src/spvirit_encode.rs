@@ -7,8 +7,8 @@ use crate::spvd_decode::StructureDesc;
 use crate::spvd_encode::encode_nt_payload_bitset_parts;
 use crate::spvd_encode::{
     encode_nt_payload_bitset, encode_nt_payload_delta, encode_nt_payload_filtered,
-    encode_nt_payload_full, encode_nt_scalar_bitset, encode_nt_scalar_full,
-    encode_structure_desc, nt_payload_desc, push_nt_payload_bitset,
+    encode_nt_payload_full, encode_nt_scalar_bitset, encode_nt_scalar_full, encode_structure_desc,
+    nt_payload_desc, push_nt_payload_bitset,
 };
 use spvirit_types::{NtPayload, NtScalar};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -135,6 +135,19 @@ fn finish_frame(out: &mut Vec<u8>, header_at: usize, is_be: bool) {
         len.to_le_bytes()
     };
     out[header_at + 4..header_at + 8].copy_from_slice(&bytes);
+}
+
+/// Exact byte length of a monitor-data frame whose bitset and values together
+/// take `parts` bytes, so the builders reserve it once and never reallocate.
+/// The terms mirror the body: header, ioid, subcmd, the status block present
+/// only when `subcmd & 0x10`, the parts, and the empty overrun bitset.
+fn monitor_frame_capacity(subcmd: u8, parts: usize) -> usize {
+    let status = if (subcmd & 0x10) != 0 {
+        encode_status_ok().len()
+    } else {
+        0
+    };
+    8 + 4 + 1 + status + parts + encode_size_pva(0, false).len()
 }
 
 pub fn encode_search_response(
@@ -974,7 +987,7 @@ pub fn encode_monitor_data_response_filtered(
     is_be: bool,
 ) -> Vec<u8> {
     let (bitset, values) = encode_nt_payload_filtered(payload_value, filtered_desc, is_be);
-    let mut out = Vec::with_capacity(8 + 6 + bitset.len() + values.len());
+    let mut out = Vec::with_capacity(monitor_frame_capacity(subcmd, bitset.len() + values.len()));
     let header_at = begin_frame(&mut out, is_be, version, 13);
     out.extend_from_slice(&if is_be {
         ioid.to_be_bytes()
@@ -1006,7 +1019,7 @@ pub fn encode_monitor_data_response_delta(
     is_be: bool,
 ) -> Option<Vec<u8>> {
     let (bitset, values) = encode_nt_payload_delta(prev_value, next_value, filtered_desc, is_be)?;
-    let mut out = Vec::with_capacity(8 + 6 + bitset.len() + values.len());
+    let mut out = Vec::with_capacity(monitor_frame_capacity(subcmd, bitset.len() + values.len()));
     let header_at = begin_frame(&mut out, is_be, version, 13);
     out.extend_from_slice(&if is_be {
         ioid.to_be_bytes()
@@ -1617,6 +1630,18 @@ mod tests {
 
     #[test]
     fn single_buffer_frames_are_byte_identical() {
+        fn variant_index(p: &NtPayload) -> usize {
+            match p {
+                NtPayload::Scalar(_) => 0,
+                NtPayload::ScalarArray(_) => 1,
+                NtPayload::Table(_) => 2,
+                NtPayload::NdArray(_) => 3,
+                NtPayload::Enum(_) => 4,
+                NtPayload::Generic { .. } => 5,
+            }
+        }
+        // Frames the wide-descriptor delta actually assembled, per variant.
+        let mut wide_delta_frames = [0usize; 6];
         for (i, payload) in crate::spvd_encode::tests::pinned_time_samples()
             .into_iter()
             .enumerate()
@@ -1624,6 +1649,18 @@ mod tests {
             let desc = crate::spvd_encode::nt_payload_desc(&payload);
             let mut narrowed = desc.clone();
             narrowed.fields.truncate(1);
+            // `narrowed` keeps only `value`, which `mutate_payload` changes for
+            // Enum and Generic alone. `wide` also keeps the fields it changes for
+            // the other variants (alarm and timeStamp for Scalar/ScalarArray,
+            // descriptor for Table, uniqueId for NdArray), so the changed-delta
+            // path assembles a real frame for those variants too.
+            let mut wide = desc.clone();
+            wide.fields.retain(|f| {
+                matches!(
+                    f.name.as_str(),
+                    "value" | "alarm" | "timeStamp" | "descriptor" | "uniqueId"
+                )
+            });
             let mutated = crate::spvd_encode::tests::pin_timestamps(
                 crate::spvd_encode::tests::mutate_payload(&payload),
             );
@@ -1654,6 +1691,19 @@ mod tests {
                         ),
                         "sample {i} monitor delta, subcmd={subcmd:#x}, is_be={is_be}"
                     );
+                    let wide_delta = encode_monitor_data_response_delta(
+                        7, subcmd, &payload, &mutated, &wide, 2, is_be,
+                    );
+                    assert_eq!(
+                        wide_delta,
+                        reference_monitor_data_response_delta(
+                            7, subcmd, &payload, &mutated, &wide, 2, is_be
+                        ),
+                        "sample {i} monitor wide delta, subcmd={subcmd:#x}, is_be={is_be}"
+                    );
+                    if wide_delta.is_some() {
+                        wide_delta_frames[variant_index(&payload)] += 1;
+                    }
                 }
                 assert_eq!(
                     encode_op_data_response_payload(10, 7, &payload, 2, is_be),
@@ -1666,6 +1716,90 @@ mod tests {
                     "sample {i} op filtered, is_be={is_be}"
                 );
             }
+        }
+        for (variant, name) in ["Scalar", "ScalarArray", "Table", "NdArray"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                wide_delta_frames[variant] > 0,
+                "the wide delta never assembled a {name} frame: {wide_delta_frames:?}"
+            );
+        }
+    }
+
+    /// The monitor builders reserve `monitor_frame_capacity` up front. It must be
+    /// the exact frame length on both the no-status and the status path:
+    /// reserving that much and ending at that length means no reallocation.
+    #[test]
+    fn monitor_frame_capacity_is_the_exact_frame_length() {
+        let mut delta_checked = 0usize;
+        for payload in crate::spvd_encode::tests::pinned_time_samples() {
+            let desc = crate::spvd_encode::nt_payload_desc(&payload);
+            let mutated = crate::spvd_encode::tests::pin_timestamps(
+                crate::spvd_encode::tests::mutate_payload(&payload),
+            );
+            for is_be in [false, true] {
+                for subcmd in [0x00u8, 0x10] {
+                    let (bitset, values) = encode_nt_payload_filtered(&payload, &desc, is_be);
+                    let frame =
+                        encode_monitor_data_response_filtered(7, subcmd, &payload, &desc, 2, is_be);
+                    assert_eq!(
+                        frame.len(),
+                        monitor_frame_capacity(subcmd, bitset.len() + values.len()),
+                        "filtered, subcmd={subcmd:#x}, is_be={is_be}"
+                    );
+                    if let Some((bitset, values)) =
+                        encode_nt_payload_delta(&payload, &mutated, &desc, is_be)
+                    {
+                        let frame = encode_monitor_data_response_delta(
+                            7, subcmd, &payload, &mutated, &desc, 2, is_be,
+                        )
+                        .expect("delta frame");
+                        assert_eq!(
+                            frame.len(),
+                            monitor_frame_capacity(subcmd, bitset.len() + values.len()),
+                            "delta, subcmd={subcmd:#x}, is_be={is_be}"
+                        );
+                        delta_checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(delta_checked > 0, "no delta frame was sized");
+    }
+
+    /// `finish_frame` must backfill the header `begin_frame` reserved at a
+    /// non-zero offset, counting only the bytes after that header.
+    #[test]
+    fn finish_frame_backfills_a_header_that_is_not_at_offset_zero() {
+        for is_be in [false, true] {
+            let mut out = vec![0xAAu8; 13];
+            let header_at = begin_frame(&mut out, is_be, 2, 13);
+            assert_eq!(header_at, 13);
+            out.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
+            finish_frame(&mut out, header_at, is_be);
+            let field: [u8; 4] = out[header_at + 4..header_at + 8].try_into().unwrap();
+            let declared = if is_be {
+                u32::from_be_bytes(field)
+            } else {
+                u32::from_le_bytes(field)
+            };
+            assert_eq!(
+                declared as usize,
+                out.len() - header_at - 8,
+                "is_be={is_be}"
+            );
+            assert_eq!(declared, 7, "is_be={is_be}");
+            assert_eq!(&out[..13], &[0xAAu8; 13], "the prefix must be untouched");
+            assert_eq!(
+                out[header_at..],
+                encode_header(true, is_be, false, 2, 13, 7)[..]
+                    .iter()
+                    .chain(&[1, 2, 3, 4, 5, 6, 7])
+                    .copied()
+                    .collect::<Vec<u8>>()[..]
+            );
         }
     }
 
