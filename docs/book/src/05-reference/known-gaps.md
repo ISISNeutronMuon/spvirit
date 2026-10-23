@@ -35,29 +35,35 @@ it worked. `mbbi`/`mbbo` records are read-only in practice over the wire.
 **What happens.** Given this file:
 
 ```
-record(ai, "GAP:OK")        { field(VAL, "1.0") }
-record(longin, "GAP:LONGIN"){ field(VAL, "7") }
-record(mbbo, "GAP:MBBO")    { field(ZRST, "Off") field(ONST, "On") }
+record(ai, "GAP:OK") {
+  field(VAL, "1.0")
+}
+record(longin, "GAP:LONGIN") {
+  field(VAL, "7")
+}
+record(mbbo, "GAP:MBBO") {
+  field(ZRST, "Off")
+  field(ONST, "On")
+}
 ```
 
 ```console
 $ spserver --db-file gap_test.db
-INFO spserver: Loaded DB file 'gap_test.db' with 1 PVs
-Record 'GAP:MBBO': type 'mbbo' is not a standard EPICS Base record type and cannot be loaded from .db files
+Error: "DB load error: record 'GAP:LONGIN' of type 'longin' is not yet supported by the .db loader; create it through the host API instead"
 ```
 
-One of three records loaded.
+The whole load aborts at the first unsupported record; none of the three
+records is served.
 
-**Why.** Two separate holes. `mbbi`/`mbbo` are recognised by
-`RecordType::from_db_name` and then rejected by an arm in
-`spvirit-server/src/db.rs:550` whose message claims they are not standard
-EPICS Base record types — which they are. `longin`/`longout` are not in
-`from_db_name` at all, so they fall out through a `?`
-(`spvirit-server/src/db.rs:315`) and vanish **with no message whatsoever**.
+**Why.** `to_record` in `spvirit-server/src/db.rs` has no construction for
+`mbbi`/`mbbo` (which `RecordType::from_db_name` recognises) or for
+`longin`/`longout` (which it does not), and the typed loader turns either
+case into an error naming the record and its type.
 
-**Consequence.** A `.db` file written for a real IOC loses records, and the
-diagnostic is either misleading or absent. The silent case is the dangerous
-one: the count in the startup line is the only clue.
+**Consequence.** A `.db` file written for a real IOC that contains any of
+these four types does not load at all. The error names the first offending
+record, so the failure is loud rather than silent, but the remaining
+records are not served either.
 
 **Workaround.** Create those four types through the handle API
 (`Pv::longin`, `Pv::mbbo`, …). See [Record types](record-types.md).
