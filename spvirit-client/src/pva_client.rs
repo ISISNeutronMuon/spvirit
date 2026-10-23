@@ -47,6 +47,51 @@ fn alloc_ioid() -> u32 {
     NEXT_IOID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Borrow the decodable body of a MONITOR data message addressed to
+/// `expect_ioid`, or `None` for anything else.
+///
+/// The monitor loop previously built a `PvaPacket` (which copies the whole
+/// frame) and then a `PvaOpPayload` (which copies the body again), read three
+/// scalars out of them, threw both away, and decoded from the original
+/// slice. All three scalars live at fixed offsets, so this reads them in
+/// place: zero allocations per update.
+///
+/// PVA header layout (`PvaHeader::try_new`,
+/// spvirit-codec/src/epics_decode.rs:142-160): magic, version, flags, command,
+/// payload_length(4). Flags bit 0 set means a control frame (see
+/// `SegmentReassembler::push`, spvirit-codec/src/segment.rs:66-68).
+/// A server MONITOR body is ioid(4) then subcmd(1) then the update.
+fn monitor_data_body(bytes: &[u8], expect_ioid: u32, is_be: bool) -> Option<&[u8]> {
+    const HDR: usize = 8;
+    const IOID_LEN: usize = 4;
+    const SUBCMD_LEN: usize = 1;
+
+    if bytes.len() < HDR + IOID_LEN + SUBCMD_LEN {
+        return None;
+    }
+    if bytes[2] & 0x01 != 0 {
+        return None; // control frame
+    }
+    if bytes[3] != 13 {
+        return None; // not MONITOR
+    }
+
+    let body = &bytes[HDR..];
+    let raw_ioid: [u8; 4] = body[..IOID_LEN].try_into().ok()?;
+    let ioid = if is_be {
+        u32::from_be_bytes(raw_ioid)
+    } else {
+        u32::from_le_bytes(raw_ioid)
+    };
+    if ioid != expect_ioid {
+        return None;
+    }
+    if body[IOID_LEN] != 0x00 {
+        return None; // not a data update (INIT replies set 0x08, etc.)
+    }
+    Some(&body[IOID_LEN + SUBCMD_LEN..])
+}
+
 /// Marks the point at which an operation stops being safe to re-run, and
 /// whether its connection may go back into the pool.
 ///
@@ -926,56 +971,50 @@ impl PvaClient {
                     if let Some(sink) = &self.byte_sink {
                         sink.on_rx(pv_name, &server_addr.to_string(), bytes.len() as u64);
                     }
-                    let mut pkt = PvaPacket::new(&bytes);
-                    if let Some(PvaPacketCommand::Op(op)) = pkt.decode_payload() {
-                        if op.command == 13 && op.ioid == ioid && op.subcmd == 0x00 {
-                            let payload = &bytes[8..]; // skip header
-                            let pos = 5; // skip ioid(4) + subcmd(1)
-                            // Decode the update, but do NOT gate credit
-                            // accounting on a successful decode. Under
-                            // pipelining the server charges exactly one credit
-                            // for this MONITOR data message whether or not the
-                            // client can decode it, so the ACK (credit return)
-                            // must run on *every* consume path — decode success
-                            // and decode failure alike. Gating the ACK on a
-                            // successful decode (as this once did) leaks one
-                            // credit per decode failure; once the queue window
-                            // drains the server stops sending and the monitor
-                            // stalls forever. Only the callback / break
-                            // handling is gated on a successful decode.
-                            let decoded =
-                                decoder.decode_monitor_update(&payload[pos..], &field_desc);
+                    let Some(update_body) = monitor_data_body(&bytes, ioid, is_be) else {
+                        continue;
+                    };
+                    // Decode the update, but do NOT gate credit accounting on
+                    // a successful decode. Under pipelining the server charges
+                    // exactly one credit for this MONITOR data message whether
+                    // or not the client can decode it, so the ACK (credit
+                    // return) must run on *every* consume path — decode
+                    // success and decode failure alike. Gating the ACK on a
+                    // successful decode (as this once did) leaks one credit
+                    // per decode failure; once the queue window drains the
+                    // server stops sending and the monitor stalls forever.
+                    // Only the callback / break handling is gated on a
+                    // successful decode.
+                    let decoded = decoder.decode_monitor_update(update_body, &field_desc);
 
-                            if pipeline_queue.is_some() {
-                                if let Some(ack) = pipeline_ack_on_consume(
-                                    &mut consumed_since_ack,
-                                    ack_threshold,
-                                    sid,
-                                    ioid,
-                                    is_be,
-                                ) {
-                                    if stream.write_all(&ack).await.is_err() {
-                                        return Ok(());
-                                    }
-                                }
+                    if pipeline_queue.is_some() {
+                        if let Some(ack) = pipeline_ack_on_consume(
+                            &mut consumed_since_ack,
+                            ack_threshold,
+                            sid,
+                            ioid,
+                            is_be,
+                        ) {
+                            if stream.write_all(&ack).await.is_err() {
+                                return Ok(());
                             }
+                        }
+                    }
 
-                            if let Ok(update) = decoded {
-                                if callback(&update).is_break() {
-                                    // Best-effort DESTROY so the server releases
-                                    // its per-subscription state promptly.
-                                    let destroy = encode_monitor_request(
-                                        sid,
-                                        ioid,
-                                        0x10,
-                                        &[],
-                                        PVA_VERSION,
-                                        is_be,
-                                    );
-                                    let _ = stream.write_all(&destroy).await;
-                                    return Ok(());
-                                }
-                            }
+                    if let Ok(update) = decoded {
+                        if callback(&update).is_break() {
+                            // Best-effort DESTROY so the server releases
+                            // its per-subscription state promptly.
+                            let destroy = encode_monitor_request(
+                                sid,
+                                ioid,
+                                0x10,
+                                &[],
+                                PVA_VERSION,
+                                is_be,
+                            );
+                            let _ = stream.write_all(&destroy).await;
+                            return Ok(());
                         }
                     }
                 }
@@ -2517,5 +2556,84 @@ mod tests {
             .await
             .expect("monitor timed out")
             .expect("monitor error");
+    }
+
+    // ─── monitor_data_body ─────────────────────────────────────────────
+
+    /// Build a PVA application frame: magic, version, flags, command, len(LE),
+    /// then the body.
+    fn app_frame(command: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![0xCA, 2, 0x40 /* server, LSB, unsegmented */, command];
+        v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// A MONITOR data body: ioid(4, LE) + subcmd(1) + payload.
+    fn monitor_body(ioid: u32, subcmd: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = ioid.to_le_bytes().to_vec();
+        v.push(subcmd);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn monitor_data_body_returns_the_payload_for_our_ioid() {
+        let frame = app_frame(13, &monitor_body(0xDEAD_BEEF, 0x00, &[1, 2, 3, 4]));
+        assert_eq!(
+            monitor_data_body(&frame, 0xDEAD_BEEF, false),
+            Some(&[1u8, 2, 3, 4][..])
+        );
+    }
+
+    #[test]
+    fn monitor_data_body_ignores_other_ioids_commands_and_subcommands() {
+        let ours = 0xDEAD_BEEF;
+
+        // Someone else's ioid.
+        let other = app_frame(13, &monitor_body(0x1234_5678, 0x00, &[9]));
+        assert_eq!(monitor_data_body(&other, ours, false), None);
+
+        // MONITOR INIT reply (subcmd has the 0x08 bit), not a data update.
+        let init = app_frame(13, &monitor_body(ours, 0x08, &[9]));
+        assert_eq!(monitor_data_body(&init, ours, false), None);
+
+        // A GET reply (command 10), not a MONITOR.
+        let get = app_frame(10, &monitor_body(ours, 0x00, &[9]));
+        assert_eq!(monitor_data_body(&get, ours, false), None);
+
+        // A control frame (flags bit 0 set) that happens to look like one.
+        let mut ctrl = app_frame(13, &monitor_body(ours, 0x00, &[9]));
+        ctrl[2] |= 0x01;
+        assert_eq!(monitor_data_body(&ctrl, ours, false), None);
+    }
+
+    #[test]
+    fn monitor_data_body_reads_the_ioid_in_the_connections_byte_order() {
+        let ours = 0x0000_0102u32;
+        let mut frame = vec![0xCA, 2, 0xC0 /* server + MSB */, 13];
+        let mut body = ours.to_be_bytes().to_vec();
+        body.push(0x00);
+        body.extend_from_slice(&[7, 7]);
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+
+        assert_eq!(monitor_data_body(&frame, ours, true), Some(&[7u8, 7][..]));
+        // The same bytes read little-endian address a different ioid.
+        assert_eq!(monitor_data_body(&frame, ours, false), None);
+    }
+
+    #[test]
+    fn monitor_data_body_rejects_a_frame_too_short_to_hold_ioid_and_subcmd() {
+        // Header + 4 bytes: an ioid but no subcmd byte.
+        let frame = app_frame(13, &0xDEAD_BEEFu32.to_le_bytes());
+        assert_eq!(monitor_data_body(&frame, 0xDEAD_BEEF, false), None);
+
+        // Nothing but a header.
+        let frame = app_frame(13, &[]);
+        assert_eq!(monitor_data_body(&frame, 0xDEAD_BEEF, false), None);
+
+        // Not even a header.
+        assert_eq!(monitor_data_body(&[0xCA, 2], 0xDEAD_BEEF, false), None);
     }
 }
