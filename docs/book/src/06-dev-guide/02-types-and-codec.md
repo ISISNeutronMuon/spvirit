@@ -86,11 +86,11 @@ single source of truth. Both `epics_decode::decode_size`/`decode_string`
 (spvd_decode.rs:389/398) are thin wrappers over them — the split that remains
 is the deliberate `Utf8Policy` one: framing decodes `Lossy` (passive observer),
 structured pvData values decode `Strict` (a non-UTF-8 value is a real error).
-**Encode still has three near-identical size helpers**
-(`encode_common::encode_size` at encode_common.rs:5,
-`spvd_encode::encode_size_pvd` at spvd_encode.rs:15,
-`spvirit_encode::encode_size_pva` at spvirit_encode.rs:12) — if you change
-one, check the others.
+**Encode has one public size encoder**
+(`spvirit_encode::encode_size_pva` at spvirit_encode.rs:12, which delegates to
+`encode_common::encode_size` at encode_common.rs:5). `spvd_encode` keeps
+private `encode_size_pvd` / `encode_string_pvd` aliases of the `encode_common`
+functions, so a change to `encode_common` covers all three names.
 
 **Introspection / type descriptors.** PVD structures are described by
 `FieldDesc`/`StructureDesc` trees. Parse path: `PvdDecoder::parse_field_desc`
