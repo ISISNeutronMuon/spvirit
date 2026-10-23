@@ -3282,6 +3282,97 @@ mod tests {
         assert!(matches!(record_plan(&generic), RecordPlan::Inert));
     }
 
+    /// Every link slot gets a DISTINCT constant, so a constructor in
+    /// `record_plan` that swapped two same-typed fields (`out`/`dol`,
+    /// `inp`/`siol`, ...) fails here; the existing test used `None` for
+    /// every link and could not see a swap.
+    #[test]
+    fn record_plan_routes_each_link_to_its_own_slot() {
+        use spvirit_tools::spvirit_server::types::{LinkExpr, NtScalarArray};
+        let k = |n: i32| Some(LinkExpr::Constant(ScalarValue::I32(n)));
+        let sc = || NtScalar::from_value(ScalarValue::F64(0.0));
+        let arr = || NtScalarArray::from_value(ScalarArrayValue::F64(vec![0.0]));
+
+        match record_plan(&RecordData::Ai { nt: sc(), inp: k(1), siml: k(2), siol: k(3), simm: false }) {
+            RecordPlan::Ai { inp, siml, siol, .. } => {
+                assert_eq!((inp, siml, siol), (k(1), k(2), k(3)));
+            }
+            other => panic!("Ai -> {other:?}"),
+        }
+        match record_plan(&RecordData::Ao {
+            nt: sc(), out: k(1), dol: k(2), omsl: OutputMode::Supervisory,
+            drvl: None, drvh: None, oroc: None, siml: k(4), siol: k(3), simm: false,
+        }) {
+            RecordPlan::Ao { out, dol, siol, .. } => {
+                assert_eq!((out, dol, siol), (k(1), k(2), k(3)));
+            }
+            other => panic!("Ao -> {other:?}"),
+        }
+        match record_plan(&RecordData::Bi {
+            nt: sc(), inp: k(1), znam: String::new(), onam: String::new(),
+            siml: k(4), siol: k(3), simm: true,
+        }) {
+            RecordPlan::Bi { inp, siol, simm } => {
+                assert_eq!((inp, siol, simm), (k(1), k(3), true));
+            }
+            other => panic!("Bi -> {other:?}"),
+        }
+        match record_plan(&RecordData::Bo {
+            nt: sc(), out: k(1), dol: k(2), omsl: OutputMode::ClosedLoop,
+            znam: String::new(), onam: String::new(), siml: k(4), siol: k(3), simm: true,
+        }) {
+            RecordPlan::Bo { out, dol, omsl, siol, simm } => {
+                assert_eq!((out, dol, siol, simm), (k(1), k(2), k(3), true));
+                assert_eq!(omsl, OutputMode::ClosedLoop);
+            }
+            other => panic!("Bo -> {other:?}"),
+        }
+        match record_plan(&RecordData::StringIn { nt: sc(), inp: k(1), siml: k(4), siol: k(3), simm: true }) {
+            RecordPlan::StringIn { inp, siol, simm } => {
+                assert_eq!((inp, siol, simm), (k(1), k(3), true));
+            }
+            other => panic!("StringIn -> {other:?}"),
+        }
+        match record_plan(&RecordData::StringOut {
+            nt: sc(), out: k(1), dol: k(2), omsl: OutputMode::ClosedLoop,
+            siml: k(4), siol: k(3), simm: true,
+        }) {
+            RecordPlan::StringOut { out, dol, omsl, siol, simm } => {
+                assert_eq!((out, dol, siol, simm), (k(1), k(2), k(3), true));
+                assert_eq!(omsl, OutputMode::ClosedLoop);
+            }
+            other => panic!("StringOut -> {other:?}"),
+        }
+        for data in [
+            RecordData::Waveform { nt: arr(), inp: k(1), ftvl: String::new(), nelm: 1, nord: 1 },
+            RecordData::Aai { nt: arr(), inp: k(1), ftvl: String::new(), nelm: 1, nord: 1 },
+        ] {
+            match record_plan(&data) {
+                RecordPlan::Waveform { inp } => assert_eq!(inp, k(1)),
+                other => panic!("Waveform/Aai -> {other:?}"),
+            }
+        }
+        match record_plan(&RecordData::Aao {
+            nt: arr(), out: k(1), dol: k(2), omsl: OutputMode::ClosedLoop,
+            ftvl: String::new(), nelm: 1, nord: 1,
+        }) {
+            RecordPlan::Aao { out, dol, omsl } => {
+                assert_eq!((out, dol), (k(1), k(2)));
+                assert_eq!(omsl, OutputMode::ClosedLoop);
+            }
+            other => panic!("Aao -> {other:?}"),
+        }
+        match record_plan(&RecordData::SubArray {
+            nt: arr(), inp: k(1), ftvl: String::new(), malm: 9, nelm: 5, nord: 1, indx: 2,
+        }) {
+            RecordPlan::SubArray { inp, indx, nelm, malm } => {
+                assert_eq!(inp, k(1));
+                assert_eq!((indx, nelm, malm), (2, 5, 9));
+            }
+            other => panic!("SubArray -> {other:?}"),
+        }
+    }
+
     #[test]
     fn packet_validation_and_hex_dump_are_total_functions() {
         // Both are pure diagnostics: they return `()` and only emit `debug!`
