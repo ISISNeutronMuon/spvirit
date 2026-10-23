@@ -241,6 +241,71 @@ impl MonitorOptions {
 
 // ─── PvaClientBuilder ────────────────────────────────────────────────────────
 
+/// Why a subscription stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorEnd {
+    /// The owner cancelled it (explicitly, or by dropping the handle).
+    Cancelled,
+    /// The callback returned `ControlFlow::Break`.
+    CallbackBreak,
+    /// The upstream stopped accepting the flow-control ACKs this
+    /// subscription owes it, so it is no longer delivering. A hard read
+    /// failure surfaces as `Err` rather than as this variant.
+    UpstreamClosed,
+}
+
+/// Owner's handle to a spawned subscription.
+///
+/// Dropping the handle cancels the subscription — that is the property that
+/// lets a caller (the gateway, in particular) release an upstream monitor as
+/// soon as its last downstream subscriber goes away, instead of waiting for
+/// the upstream to end it.
+#[derive(Debug)]
+pub struct MonitorHandle {
+    cancel_tx: tokio::sync::watch::Sender<bool>,
+    join: Option<tokio::task::JoinHandle<Result<MonitorEnd, PvGetError>>>,
+}
+
+impl MonitorHandle {
+    /// Ask the subscription to stop. Idempotent and non-blocking; safe from a
+    /// `Drop` impl. The subscription sends a best-effort MONITOR DESTROY
+    /// before it returns.
+    pub fn cancel(&self) {
+        let _ = self.cancel_tx.send(true);
+    }
+
+    /// Whether the subscription task has already finished.
+    pub fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    /// Wait for the subscription to end on its own terms.
+    pub async fn join(mut self) -> Result<MonitorEnd, PvGetError> {
+        match self.join.take() {
+            Some(h) => h
+                .await
+                .unwrap_or_else(|e| Err(PvGetError::Protocol(format!("monitor task: {e}")))),
+            None => Ok(MonitorEnd::Cancelled),
+        }
+    }
+
+    /// Cancel, then wait for the subscription to acknowledge it.
+    pub async fn cancel_and_join(self) -> Result<MonitorEnd, PvGetError> {
+        self.cancel();
+        self.join().await
+    }
+}
+
+impl Drop for MonitorHandle {
+    fn drop(&mut self) {
+        // Do not abort the task: it needs to run far enough to send DESTROY
+        // and close the socket. Cancelling makes it do that promptly.
+        let _ = self.cancel_tx.send(true);
+    }
+}
+
 /// Builder for [`PvaClient`].
 ///
 /// ```rust,ignore
@@ -903,8 +968,72 @@ impl PvaClient {
         pv_name: &str,
         fields: &[&str],
         options: MonitorOptions,
-        mut callback: F,
+        callback: F,
     ) -> Result<(), PvGetError>
+    where
+        F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
+    {
+        self.pvmonitor_inner(pv_name, fields, options, callback, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Start a subscription on a background task and return a handle that
+    /// cancels it — including on drop.
+    ///
+    /// Prefer this to `pvmonitor` whenever the subscription's lifetime is
+    /// owned by something other than the awaiting call site.
+    ///
+    /// # Panics
+    ///
+    /// Calls `tokio::spawn`, so it panics if called outside a tokio runtime.
+    pub fn pvmonitor_spawn<F>(&self, pv_name: &str, callback: F) -> MonitorHandle
+    where
+        F: FnMut(&MonitorUpdate) -> ControlFlow<()> + Send + 'static,
+    {
+        self.pvmonitor_spawn_with_options(pv_name, &[], MonitorOptions::default(), callback)
+    }
+
+    /// [`pvmonitor_spawn`](Self::pvmonitor_spawn) with field selection and
+    /// monitor options.
+    pub fn pvmonitor_spawn_with_options<F>(
+        &self,
+        pv_name: &str,
+        fields: &[&str],
+        options: MonitorOptions,
+        callback: F,
+    ) -> MonitorHandle
+    where
+        F: FnMut(&MonitorUpdate) -> ControlFlow<()> + Send + 'static,
+    {
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let client = self.clone();
+        let pv = pv_name.to_string();
+        let owned: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+
+        let join = tokio::spawn(async move {
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            client
+                .pvmonitor_inner(&pv, &refs, options, callback, Some(cancel_rx))
+                .await
+        });
+
+        MonitorHandle {
+            cancel_tx,
+            join: Some(join),
+        }
+    }
+
+    /// Shared body of the awaited and spawned monitor APIs. `cancel` is
+    /// `None` for the awaited API, which has no handle to cancel from.
+    async fn pvmonitor_inner<F>(
+        &self,
+        pv_name: &str,
+        fields: &[&str],
+        options: MonitorOptions,
+        mut callback: F,
+        mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<MonitorEnd, PvGetError>
     where
         F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
     {
@@ -992,6 +1121,27 @@ impl PvaClient {
 
         loop {
             tokio::select! {
+                // `cancel` is None for the awaited API, which has no handle to
+                // cancel from; `std::future::pending()` makes that branch never
+                // fire without duplicating the whole select!. Branch order
+                // gives no priority (this select! is deliberately not
+                // `biased;`); a pending cancel still lands within a few frames.
+                _ = async {
+                    match cancel.as_mut() {
+                        Some(rx) => {
+                            // `changed()` is cancel-safe: dropping it loses
+                            // nothing, which matters because the read branch
+                            // may win instead.
+                            while rx.changed().await.is_ok() && !*rx.borrow() {}
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let destroy =
+                        encode_monitor_request(sid, ioid, 0x10, &[], PVA_VERSION, is_be);
+                    let _ = stream.write_all(&destroy).await;
+                    return Ok(MonitorEnd::Cancelled);
+                }
                 _ = echo_interval.tick() => {
                     write_echo(&mut stream, &mut echo_token, is_be).await?;
                 }
@@ -1029,7 +1179,7 @@ impl PvaClient {
                             is_be,
                         ) {
                             if stream.write_all(&ack).await.is_err() {
-                                return Ok(());
+                                return Ok(MonitorEnd::UpstreamClosed);
                             }
                         }
                     }
@@ -1047,7 +1197,7 @@ impl PvaClient {
                                 is_be,
                             );
                             let _ = stream.write_all(&destroy).await;
-                            return Ok(());
+                            return Ok(MonitorEnd::CallbackBreak);
                         }
                     }
                 }
@@ -2792,5 +2942,142 @@ mod tests {
 
         // Not even a header.
         assert_eq!(monitor_data_body(&[0xCA, 2], 0xDEAD_BEEF, false), None);
+    }
+
+    /// Cancelling a live subscription ends it promptly and reports why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_monitor_ends_it_with_monitor_end_cancelled() {
+        const PV: &str = "CANCEL:PV";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let server_addr: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .server_addr(server_addr)
+            .build();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let handle = client.pvmonitor_spawn(PV, move |_u| {
+            let _ = tx.send(());
+            ControlFlow::Continue(())
+        });
+
+        // Wait for the subscription to actually be delivering before cancelling,
+        // so this is not a race against connection setup.
+        tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("no update within 10s")
+            .expect("callback channel closed");
+
+        let end = tokio::time::timeout(Duration::from_secs(10), handle.cancel_and_join())
+            .await
+            .expect("cancel did not take effect within 10s")
+            .expect("monitor returned an error");
+        assert_eq!(end, MonitorEnd::Cancelled);
+    }
+
+    /// Dropping the handle cancels the subscription — this is what stops the
+    /// gateway leaking when a binding is retired.
+    ///
+    /// Asserting "the callback stops firing" would prove nothing here: the test
+    /// server's `ao` PV emits one update on subscribe and then goes silent, so a
+    /// *leaked* subscription is also silent. Instead the callback owns a
+    /// `DropSignal` whose `Drop` fires a oneshot: the callback is moved into the
+    /// subscription task and is dropped only when that task returns, so receiving
+    /// the signal is direct evidence that the task ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_handle_cancels_the_subscription() {
+        const PV: &str = "DROPCANCEL:PV";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let server_addr: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .server_addr(server_addr)
+            .build();
+
+        /// Fires its oneshot when dropped, i.e. when the subscription task ends.
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut signal = DropSignal(Some(done_tx));
+
+        {
+            let handle = client.pvmonitor_spawn(PV, move |_u| {
+                // Keep `signal` owned by the callback so it dies with the task.
+                let _ = &mut signal;
+                let _ = tx.send(());
+                ControlFlow::Continue(())
+            });
+            // Wait until the subscription is actually delivering, so this is not
+            // a race against connection setup.
+            tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("no update within 10s")
+                .expect("callback channel closed");
+            drop(handle);
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), done_rx)
+            .await
+            .expect("subscription task still running 10s after the handle was dropped")
+            .expect("drop signal sender vanished");
+    }
+
+    /// A callback that breaks reports CallbackBreak, not Cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_breaking_callback_reports_callback_break() {
+        const PV: &str = "BREAK:PV";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let server_addr: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .server_addr(server_addr)
+            .build();
+
+        let handle = client.pvmonitor_spawn(PV, |_u| ControlFlow::Break(()));
+        let end = tokio::time::timeout(Duration::from_secs(10), handle.join())
+            .await
+            .expect("monitor did not finish within 10s")
+            .expect("monitor returned an error");
+        assert_eq!(end, MonitorEnd::CallbackBreak);
+    }
+
+    /// The pre-existing awaited API is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_awaited_pvmonitor_api_still_returns_unit() {
+        const PV: &str = "AWAITED:PV";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let server_addr: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .server_addr(server_addr)
+            .build();
+
+        let r: Result<(), PvGetError> = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.pvmonitor(PV, |_u| ControlFlow::Break(())),
+        )
+        .await
+        .expect("monitor timed out");
+        assert!(r.is_ok());
     }
 }

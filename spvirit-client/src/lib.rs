@@ -52,8 +52,8 @@ pub use byte_sink::ByteSink;
 
 // --- Re-exports: high-level API ---
 pub use pva_client::{
-    MonitorOptions, PvaChannel, PvaClient, PvaClientBuilder, client_from_opts, pvinfo, pvmonitor,
-    pvmonitor_fields, pvput, pvput_fields,
+    MonitorEnd, MonitorHandle, MonitorOptions, PvaChannel, PvaClient, PvaClientBuilder,
+    client_from_opts, pvinfo, pvmonitor, pvmonitor_fields, pvput, pvput_fields,
 };
 pub use pvlist::PvListSource;
 
