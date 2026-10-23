@@ -1,3 +1,4 @@
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -126,34 +127,98 @@ pub async fn pva_handshake(
     Ok((version, is_be))
 }
 
-pub async fn establish_channel(
+/// A TCP connection that has completed the PVA connection-validation
+/// handshake but carries no channel yet.
+///
+/// This is the unit the connection pool stores: everything here is
+/// per-connection, nothing is per-operation.
+pub struct ValidatedConn {
+    pub stream: TcpStream,
+    pub version: u8,
+    pub is_be: bool,
+    pub server_addr: std::net::SocketAddr,
+    /// The responder's GUID, as reported by the search response that
+    /// resolved `server_addr` (all-zero when resolved via the unicast
+    /// shortcut).
+    pub guid: [u8; 12],
+    /// Segment reassembly state for this connection. It lives here because a
+    /// message's segments may be separated by control frames and by the
+    /// boundary between one operation and the next on the same socket.
+    pub reassembler: SegmentReassembler,
+}
+
+impl ValidatedConn {
+    /// Pair this connection with a server-side channel id, producing the
+    /// single-channel [`ChannelConn`] the existing API hands out.
+    pub fn into_channel(self, sid: u32) -> ChannelConn {
+        ChannelConn {
+            stream: self.stream,
+            sid,
+            version: self.version,
+            is_be: self.is_be,
+            server_addr: self.server_addr,
+            guid: self.guid,
+            reassembler: self.reassembler,
+        }
+    }
+}
+
+/// Connect to `target` and complete the PVA connection-validation handshake.
+pub async fn connect_and_validate(
     target: std::net::SocketAddr,
     guid: [u8; 12],
     opts: &PvGetOptions,
-) -> Result<ChannelConn, PvGetError> {
+) -> Result<ValidatedConn, PvGetError> {
     let mut stream = timeout(opts.timeout, TcpStream::connect(target))
         .await
         .map_err(|_| PvGetError::Timeout("connect"))??;
 
-    // One reassembler for the lifetime of this connection; it is handed to
-    // the caller in `ChannelConn` so pending segments survive the handshake.
     let mut reassembler = SegmentReassembler::new();
-
     let (version, is_be) = pva_handshake(&mut stream, opts, &mut reassembler).await?;
 
-    let cid = 1u32;
-    let create = encode_create_channel_request(cid, &opts.pv_name, version, is_be);
-    stream.write_all(&create).await?;
-
-    let create_resp = read_until(&mut stream, opts.timeout, &mut reassembler, |cmd| {
-        matches!(cmd, PvaPacketCommand::CreateChannel(_))
+    Ok(ValidatedConn {
+        stream,
+        version,
+        is_be,
+        server_addr: target,
+        guid,
+        reassembler,
     })
+}
+
+/// Create one channel for `pv_name` on an already-validated connection and
+/// return the server-side sid.
+///
+/// `cid` must be unique for the lifetime of `conn`; the caller owns that
+/// allocation (see `cache::PooledConn::next_cid`).
+///
+/// The response predicate pins `cid` because a pooled connection may already
+/// carry other channels: both the success and the error CREATE_CHANNEL server
+/// responses echo the cid (`spvirit-codec/src/epics_decode.rs:1174-1229`,
+/// `spvirit_encode::encode_create_channel_error`), so this cannot mistake a
+/// neighbouring channel's reply for its own.
+pub async fn create_channel_on(
+    conn: &mut ValidatedConn,
+    pv_name: &str,
+    cid: u32,
+    timeout_dur: Duration,
+) -> Result<u32, PvGetError> {
+    let create = encode_create_channel_request(cid, pv_name, conn.version, conn.is_be);
+    conn.stream.write_all(&create).await?;
+
+    let create_resp = read_until(
+        &mut conn.stream,
+        timeout_dur,
+        &mut conn.reassembler,
+        |cmd| matches!(cmd, PvaPacketCommand::CreateChannel(p) if p.is_server && p.cid == cid),
+    )
     .await?;
+
     let mut pkt = PvaPacket::new(&create_resp);
     let cmd = pkt.decode_payload().ok_or(PvGetError::Protocol(
         "create_channel decode failed".to_string(),
     ))?;
-    let sid = match cmd {
+    match cmd {
         PvaPacketCommand::CreateChannel(payload) => {
             if payload.status.as_ref().is_some_and(|s| s.is_error()) {
                 let detail = payload
@@ -166,24 +231,25 @@ pub async fn establish_channel(
                     detail
                 )));
             }
-            payload.sid
+            Ok(payload.sid)
         }
-        _ => {
-            return Err(PvGetError::Protocol(
-                "unexpected create_channel response".to_string(),
-            ));
-        }
-    };
+        _ => Err(PvGetError::Protocol(
+            "unexpected create_channel response".to_string(),
+        )),
+    }
+}
 
-    Ok(ChannelConn {
-        stream,
-        sid,
-        version,
-        is_be,
-        server_addr: target,
-        guid,
-        reassembler,
-    })
+/// Connect, validate, and create a single channel for `opts.pv_name`.
+///
+/// Signature-compatible with the pre-split version; spvirit-py imports this.
+pub async fn establish_channel(
+    target: std::net::SocketAddr,
+    guid: [u8; 12],
+    opts: &PvGetOptions,
+) -> Result<ChannelConn, PvGetError> {
+    let mut conn = connect_and_validate(target, guid, opts).await?;
+    let sid = create_channel_on(&mut conn, &opts.pv_name, 1, opts.timeout).await?;
+    Ok(conn.into_channel(sid))
 }
 
 /// Convenience wrapper: GET with no field filtering.
@@ -283,6 +349,99 @@ pub async fn pvget_fields(opts: &PvGetOptions, fields: &[&str]) -> Result<PvGetR
 mod tests {
     use super::*;
     use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand, PvaStatus};
+
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket as StdUdpSocket};
+    use std::time::Duration;
+
+    /// Two different PVs created on ONE validated connection get two
+    /// different server-side sids. This is the property the connection pool
+    /// depends on: a pooled connection keyed only by server address must be
+    /// able to serve any PV that server hosts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_connection_can_host_two_channels_with_distinct_sids() {
+        use spvirit_server::pva_server::PvaServer;
+
+        let tcp_port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let udp_port = StdUdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let server = PvaServer::builder()
+            .ao("MULTI:A", 1.0)
+            .ao("MULTI:B", 2.0)
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .build();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let target: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+        let mut opts = PvGetOptions::new("MULTI:A".to_string());
+        opts.timeout = Duration::from_secs(5);
+        opts.server_addr = Some(target);
+
+        let mut conn = connect_and_validate(target, [0u8; 12], &opts)
+            .await
+            .expect("connect_and_validate");
+
+        let sid_a = create_channel_on(&mut conn, "MULTI:A", 1, opts.timeout)
+            .await
+            .expect("create MULTI:A");
+        let sid_b = create_channel_on(&mut conn, "MULTI:B", 2, opts.timeout)
+            .await
+            .expect("create MULTI:B");
+
+        assert_ne!(sid_a, sid_b, "each channel must get its own sid");
+    }
+
+    /// `establish_channel` keeps working exactly as before the split — this
+    /// is the signature spvirit-py imports.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn establish_channel_still_returns_a_usable_channel_conn() {
+        use spvirit_server::pva_server::PvaServer;
+
+        let tcp_port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let udp_port = StdUdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let server = PvaServer::builder()
+            .ao("SPLIT:PV", 1.0)
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .build();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let target: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+        let mut opts = PvGetOptions::new("SPLIT:PV".to_string());
+        opts.timeout = Duration::from_secs(5);
+        opts.server_addr = Some(target);
+
+        let conn = establish_channel(target, [0u8; 12], &opts)
+            .await
+            .expect("establish_channel");
+        assert_eq!(conn.server_addr, target);
+        assert_eq!(conn.version, 2);
+    }
 
     #[test]
     fn encode_decode_monitor_request_roundtrip() {
