@@ -94,6 +94,17 @@ pub struct Binding {
     last_get: Mutex<Option<(Instant, NtPayload)>>,
 }
 
+/// Forget the binding for downstream `name`.
+///
+/// A free function over the map rather than a `GatewaySource` method because
+/// `subscribe`'s spawned upstream task is `'static` and holds only the
+/// `Arc<Mutex<..>>`, not `&self`. Both that task and
+/// [`GatewaySource::retire_binding`] go through here, so the teardown rule
+/// documented on `retire_binding` has exactly one implementation.
+fn retire_binding_in(bindings: &Mutex<HashMap<String, Binding>>, name: &str) {
+    bindings.lock().unwrap().remove(name);
+}
+
 /// A [`Source`] that resolves and forwards PVs to upstream PVA servers.
 pub struct GatewaySource {
     pool: Arc<UpstreamPool>,
@@ -205,7 +216,7 @@ impl GatewaySource {
     /// falls back to normal PVA search backoff and recovers on its own when
     /// the IOC returns.
     pub fn retire_binding(&self, name: &str) {
-        self.bindings.lock().unwrap().remove(name);
+        retire_binding_in(&self.bindings, name);
     }
 
     /// Number of upstream monitors torn down because their upstream ended.
@@ -592,7 +603,7 @@ impl Source for GatewaySource {
                     // Without this, `try_claim` keeps answering `Yes` from the
                     // bindings map and a destroyed client hot-loops straight
                     // back into the dead upstream (design spec §4).
-                    bindings.lock().unwrap().remove(&down_name);
+                    retire_binding_in(&bindings, &down_name);
                     deaths.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         "upstream monitor ended for real='{}' downstream='{}' via client='{}' \
@@ -684,6 +695,43 @@ mod tests {
     use super::*;
     use crate::config::GatewayConfig;
     use std::time::Duration;
+
+    fn test_binding(client: &str, real: &str) -> Binding {
+        Binding {
+            client_name: client.to_string(),
+            real_name: real.to_string(),
+            descriptor: StructureDesc::default(),
+            bound_at: Instant::now(),
+            last_get: Mutex::new(None),
+        }
+    }
+
+    /// The teardown rule documented on `retire_binding` (design spec §4) must
+    /// have exactly one implementation, shared by the `&self` entry point and
+    /// by `subscribe`'s `'static` spawned task. This exercises that shared
+    /// helper directly, including the "already gone" case the spawned task can
+    /// race into.
+    #[test]
+    fn retire_binding_in_removes_only_the_named_binding() {
+        let bindings: Mutex<HashMap<String, Binding>> = Mutex::new(HashMap::new());
+        bindings
+            .lock()
+            .unwrap()
+            .insert("A".to_string(), test_binding("c", "A:REAL"));
+        bindings
+            .lock()
+            .unwrap()
+            .insert("B".to_string(), test_binding("c", "B:REAL"));
+
+        retire_binding_in(&bindings, "A");
+        assert!(!bindings.lock().unwrap().contains_key("A"));
+        assert!(bindings.lock().unwrap().contains_key("B"));
+
+        // Retiring a name that is already gone is a no-op, not a panic: the
+        // upstream-death path can race a concurrent retirement.
+        retire_binding_in(&bindings, "A");
+        assert_eq!(bindings.lock().unwrap().len(), 1);
+    }
 
     fn test_source(neg: Arc<NegativeCache>, access: Arc<AccessControl>) -> GatewaySource {
         let cfg = GatewayConfig::from_json_str(r#"{"version":2,"clients":[],"servers":[]}"#)
