@@ -71,6 +71,10 @@ struct ServerState {
     monitors: Mutex<HashMap<String, Vec<MonitorSub>>>,
     conns: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
     sid_counter: AtomicU32,
+    /// Bumped whenever the whole store is replaced (DB reload). Long-lived
+    /// derived indexes — the scan scheduler's periodic-record list — cache
+    /// against this instead of rebuilding themselves every tick.
+    db_generation: AtomicU64,
     beacon_change: AtomicU16,
     compute_alarms: bool,
     event_tx: mpsc::Sender<PostedEvent>,
@@ -119,6 +123,7 @@ impl ServerState {
             monitors: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
             sid_counter: AtomicU32::new(1),
+            db_generation: AtomicU64::new(0),
             beacon_change: AtomicU16::new(0),
             compute_alarms,
             event_tx,
@@ -130,6 +135,14 @@ impl ServerState {
             advertise_ip,
             listen_ip,
         }
+    }
+
+    fn db_generation(&self) -> u64 {
+        self.db_generation.load(Ordering::Relaxed)
+    }
+
+    fn bump_db_generation(&self) {
+        self.db_generation.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1533,6 +1546,7 @@ async fn run_db_reload(
                 }
             }
             *store = new_store;
+            state.bump_db_generation();
         }
 
         for (name, payload) in changed {
@@ -2095,33 +2109,58 @@ async fn process_pini_records(state: &Arc<ServerState>) {
     }
 }
 
+/// True when a cached periodic-record index must be rebuilt.
+fn periodic_index_is_stale(
+    cache: Option<&(u64, Vec<(String, Duration)>)>,
+    generation: u64,
+) -> bool {
+    match cache {
+        Some((cached_generation, _)) => *cached_generation != generation,
+        None => true,
+    }
+}
+
 async fn run_scan_scheduler(state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     let mut next_due: HashMap<String, Instant> = HashMap::new();
+    // (db_generation, periodic records) — rebuilt only when the store is
+    // replaced, not on every 100 ms tick. `record.common.scan` is immutable at
+    // runtime; a whole-store swap in `run_db_reload` is the only thing that can
+    // change this set, and it bumps the generation.
+    let mut periodic_cache: Option<(u64, Vec<(String, Duration)>)> = None;
     loop {
         interval.tick().await;
         let now = Instant::now();
-        let periodic: Vec<(String, Duration)> = {
+        let generation = state.db_generation();
+        if periodic_index_is_stale(periodic_cache.as_ref(), generation) {
             let store = state.pv_store.read().await;
-            store
+            let records: Vec<(String, Duration)> = store
                 .iter()
                 .filter_map(|(name, record)| match &record.common.scan {
                     ScanMode::Periodic(period) => Some((name.clone(), *period)),
                     _ => None,
                 })
-                .collect()
-        };
+                .collect();
+            drop(store);
+            next_due.retain(|name, _| records.iter().any(|(n, _)| n == name));
+            periodic_cache = Some((generation, records));
+        }
+        let periodic = &periodic_cache
+            .as_ref()
+            .expect("periodic_cache populated above")
+            .1;
+
         let mut due: Vec<String> = Vec::new();
-        let periodic_names: HashSet<String> =
-            periodic.iter().map(|(name, _)| name.clone()).collect();
         for (name, period) in periodic {
-            let entry = next_due.entry(name.clone()).or_insert_with(|| now + period);
+            let entry = next_due
+                .entry(name.clone())
+                .or_insert_with(|| now + *period);
             if now >= *entry {
-                due.push(name);
-                *entry = now + period;
+                due.push(name.clone());
+                *entry = now + *period;
             }
         }
-        next_due.retain(|name, _| periodic_names.contains(name));
+
         for name in due {
             let changed = process_single_record(&state, &name).await;
             notify_changed_records(&state, changed).await;
@@ -2133,22 +2172,41 @@ async fn run_event_worker(
     state: Arc<ServerState>,
     mut event_rx: mpsc::Receiver<PostedEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // (db_generation, event-tag index, io-event-tag index). Rebuilt only when
+    // the store is replaced, not on every posted event. `record.common.scan` is
+    // immutable at runtime (its only two readers in the whole workspace are
+    // this function and `run_scan_scheduler`), and a whole-store swap in
+    // `run_db_reload` is the only thing that can change these sets — it bumps
+    // the generation. `Event` and `IoEvent` get separate maps because the
+    // original `filter_map` matched the (scan, event) pair: a soft event must
+    // never fire an `I/O Intr` record that happens to share its tag.
+    type EventIndex = (u64, HashMap<String, Vec<String>>, HashMap<String, Vec<String>>);
+    let mut event_cache: Option<EventIndex> = None;
     while let Some(event) = event_rx.recv().await {
-        let targets: Vec<String> = {
+        let generation = state.db_generation();
+        if event_cache.as_ref().map(|(g, _, _)| *g) != Some(generation) {
             let store = state.pv_store.read().await;
-            store
-                .iter()
-                .filter_map(|(name, record)| match (&record.common.scan, &event) {
-                    (ScanMode::Event(ev), PostedEvent::Event(trigger)) if ev == trigger => {
-                        Some(name.clone())
-                    }
-                    (ScanMode::IoEvent(ev), PostedEvent::IoEvent(trigger)) if ev == trigger => {
-                        Some(name.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
+            let mut soft: HashMap<String, Vec<String>> = HashMap::new();
+            let mut io: HashMap<String, Vec<String>> = HashMap::new();
+            for (name, record) in store.iter() {
+                match &record.common.scan {
+                    ScanMode::Event(tag) => soft.entry(tag.clone()).or_default().push(name.clone()),
+                    ScanMode::IoEvent(tag) => io.entry(tag.clone()).or_default().push(name.clone()),
+                    _ => {}
+                }
+            }
+            drop(store);
+            event_cache = Some((generation, soft, io));
+        }
+        let (_, soft, io) = event_cache.as_ref().expect("event_cache populated above");
+        let targets: &[String] = match &event {
+            PostedEvent::Event(trigger) => soft.get(trigger).map(Vec::as_slice).unwrap_or(&[]),
+            PostedEvent::IoEvent(trigger) => io.get(trigger).map(Vec::as_slice).unwrap_or(&[]),
         };
+        // `process_single_record` takes `&Arc<ServerState>` and awaits, which
+        // would hold the `event_cache` borrow across the await points. Copy the
+        // (small) target list out first so the borrow ends here.
+        let targets: Vec<String> = targets.to_vec();
         for target in targets {
             let changed = process_single_record(&state, &target).await;
             notify_changed_records(&state, changed).await;
@@ -3130,6 +3188,24 @@ mod tests {
             },
             raw_fields,
         }
+    }
+
+    #[test]
+    fn periodic_index_is_stale_only_when_the_generation_moves() {
+        let cached: (u64, Vec<(String, Duration)>) =
+            (7, vec![("A:PV".to_string(), Duration::from_secs(1))]);
+        assert!(periodic_index_is_stale(None, 7), "an empty cache is always stale");
+        assert!(!periodic_index_is_stale(Some(&cached), 7));
+        assert!(periodic_index_is_stale(Some(&cached), 8));
+    }
+
+    #[tokio::test]
+    async fn db_generation_starts_at_zero_and_bumps() {
+        let state = test_state(mdel_ai_record("test_pv", 1.0, "0"));
+        assert_eq!(state.db_generation(), 0);
+        state.bump_db_generation();
+        state.bump_db_generation();
+        assert_eq!(state.db_generation(), 2);
     }
 
     // Regression test for finding tools-T1 (cross-client head-of-line
