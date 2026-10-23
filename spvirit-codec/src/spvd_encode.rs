@@ -2724,7 +2724,7 @@ fn path_tree_to_field_descs(node: &PathNode) -> Vec<FieldDesc> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::spvd_decode::PvdDecoder;
 
@@ -3954,7 +3954,7 @@ mod tests {
 
     /// Produce a modified copy of `payload` that differs in at least one leaf,
     /// so the delta path emits a non-empty frame.
-    fn mutate_payload(payload: &NtPayload) -> NtPayload {
+    pub(crate) fn mutate_payload(payload: &NtPayload) -> NtPayload {
         match payload {
             NtPayload::Scalar(nt) => {
                 let mut n = nt.clone();
@@ -4035,7 +4035,7 @@ mod tests {
     /// `encode_timestamp` and `dv_scalar_timestamp` fall back to `SystemTime::now()`
     /// when the payload carries no timestamp, so two encodes of the *same* payload
     /// differ. Any test that compares two encodes must pin the timestamps first.
-    fn pin_timestamps(p: NtPayload) -> NtPayload {
+    pub(crate) fn pin_timestamps(p: NtPayload) -> NtPayload {
         fn ts() -> NtTimeStamp {
             NtTimeStamp {
                 seconds_past_epoch: 1_700_000_000,
@@ -4061,7 +4061,7 @@ mod tests {
         }
     }
 
-    fn pinned_time_samples() -> Vec<NtPayload> {
+    pub(crate) fn pinned_time_samples() -> Vec<NtPayload> {
         all_payload_samples().into_iter().map(pin_timestamps).collect()
     }
 

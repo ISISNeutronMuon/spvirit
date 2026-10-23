@@ -1108,6 +1108,144 @@ pub fn format_pva_address(addr: &[u8; 16]) -> String {
     }
 }
 
+/// The pre-refactor frame assembly, frozen. Any divergence between this and
+/// the single-buffer version is a wire-format regression.
+#[cfg(test)]
+fn reference_monitor_data_response_payload(
+    ioid: u32,
+    subcmd: u8,
+    payload_value: &NtPayload,
+    version: u8,
+    is_be: bool,
+) -> Vec<u8> {
+    let (changed_bitset, values) = encode_nt_payload_bitset_parts(payload_value, is_be);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&if is_be {
+        ioid.to_be_bytes()
+    } else {
+        ioid.to_le_bytes()
+    });
+    payload.push(subcmd);
+    if (subcmd & 0x10) != 0 {
+        payload.extend_from_slice(&encode_status_ok());
+    }
+    payload.extend_from_slice(&changed_bitset);
+    payload.extend_from_slice(&values);
+    // overrun bitset: empty (after data per spec)
+    payload.extend_from_slice(&encode_size_pva(0, is_be));
+    let mut out = encode_header(true, is_be, false, version, 13, payload.len() as u32);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Frozen pre-refactor copy of [`encode_monitor_data_response_filtered`]; see [`reference_monitor_data_response_payload`].
+#[cfg(test)]
+fn reference_monitor_data_response_filtered(
+    ioid: u32,
+    subcmd: u8,
+    payload_value: &NtPayload,
+    filtered_desc: &StructureDesc,
+    version: u8,
+    is_be: bool,
+) -> Vec<u8> {
+    let (bitset, values) = encode_nt_payload_filtered(payload_value, filtered_desc, is_be);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&if is_be {
+        ioid.to_be_bytes()
+    } else {
+        ioid.to_le_bytes()
+    });
+    payload.push(subcmd);
+    if (subcmd & 0x10) != 0 {
+        payload.extend_from_slice(&encode_status_ok());
+    }
+    payload.extend_from_slice(&bitset);
+    payload.extend_from_slice(&values);
+    payload.extend_from_slice(&encode_size_pva(0, is_be));
+    let mut out = encode_header(true, is_be, false, version, 13, payload.len() as u32);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Frozen pre-refactor copy of [`encode_monitor_data_response_delta`]; see [`reference_monitor_data_response_payload`].
+#[cfg(test)]
+fn reference_monitor_data_response_delta(
+    ioid: u32,
+    subcmd: u8,
+    prev_value: &NtPayload,
+    next_value: &NtPayload,
+    filtered_desc: &StructureDesc,
+    version: u8,
+    is_be: bool,
+) -> Option<Vec<u8>> {
+    let (bitset, values) = encode_nt_payload_delta(prev_value, next_value, filtered_desc, is_be)?;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&if is_be {
+        ioid.to_be_bytes()
+    } else {
+        ioid.to_le_bytes()
+    });
+    payload.push(subcmd);
+    if (subcmd & 0x10) != 0 {
+        payload.extend_from_slice(&encode_status_ok());
+    }
+    payload.extend_from_slice(&bitset);
+    payload.extend_from_slice(&values);
+    payload.extend_from_slice(&encode_size_pva(0, is_be));
+    let mut out = encode_header(true, is_be, false, version, 13, payload.len() as u32);
+    out.extend_from_slice(&payload);
+    Some(out)
+}
+
+/// Frozen pre-refactor copy of [`encode_op_data_response_payload`]; see [`reference_monitor_data_response_payload`].
+#[cfg(test)]
+fn reference_op_data_response_payload(
+    command: u8,
+    ioid: u32,
+    payload_value: &NtPayload,
+    version: u8,
+    is_be: bool,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&if is_be {
+        ioid.to_be_bytes()
+    } else {
+        ioid.to_le_bytes()
+    });
+    payload.push(0x00);
+    payload.extend_from_slice(&encode_status_ok());
+    payload.extend_from_slice(&encode_nt_payload_bitset(payload_value, is_be));
+    let mut out = encode_header(true, is_be, false, version, command, payload.len() as u32);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Frozen pre-refactor copy of [`encode_op_data_response_filtered`]; see [`reference_monitor_data_response_payload`].
+#[cfg(test)]
+fn reference_op_data_response_filtered(
+    command: u8,
+    ioid: u32,
+    payload_value: &NtPayload,
+    filtered_desc: &StructureDesc,
+    version: u8,
+    is_be: bool,
+) -> Vec<u8> {
+    let (bitset, values) = encode_nt_payload_filtered(payload_value, filtered_desc, is_be);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&if is_be {
+        ioid.to_be_bytes()
+    } else {
+        ioid.to_le_bytes()
+    });
+    payload.push(0x00);
+    payload.extend_from_slice(&encode_status_ok());
+    payload.extend_from_slice(&bitset);
+    payload.extend_from_slice(&values);
+    let mut out = encode_header(true, is_be, false, version, command, payload.len() as u32);
+    out.extend_from_slice(&payload);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1432,5 +1570,84 @@ mod tests {
     #[test]
     fn socket_addr_from_pva_bytes_returns_none_for_unspecified() {
         assert_eq!(socket_addr_from_pva_bytes([0u8; 16], 5075), None);
+    }
+
+    #[test]
+    fn single_buffer_frames_are_byte_identical() {
+        for (i, payload) in crate::spvd_encode::tests::pinned_time_samples()
+            .into_iter()
+            .enumerate()
+        {
+            let desc = crate::spvd_encode::nt_payload_desc(&payload);
+            let mut narrowed = desc.clone();
+            narrowed.fields.truncate(1);
+            let mutated = crate::spvd_encode::tests::pin_timestamps(
+                crate::spvd_encode::tests::mutate_payload(&payload),
+            );
+            for is_be in [false, true] {
+                // subcmd 0x00 (no status) and 0x10 (status present) exercise both
+                // branches of the status block.
+                for subcmd in [0x00u8, 0x10] {
+                    assert_eq!(
+                        encode_monitor_data_response_payload(7, subcmd, &payload, 2, is_be),
+                        reference_monitor_data_response_payload(7, subcmd, &payload, 2, is_be),
+                        "sample {i} monitor payload, subcmd={subcmd:#x}, is_be={is_be}"
+                    );
+                    assert_eq!(
+                        encode_monitor_data_response_filtered(
+                            7, subcmd, &payload, &narrowed, 2, is_be
+                        ),
+                        reference_monitor_data_response_filtered(
+                            7, subcmd, &payload, &narrowed, 2, is_be
+                        ),
+                        "sample {i} monitor filtered, subcmd={subcmd:#x}, is_be={is_be}"
+                    );
+                    assert_eq!(
+                        encode_monitor_data_response_delta(
+                            7, subcmd, &payload, &mutated, &narrowed, 2, is_be
+                        ),
+                        reference_monitor_data_response_delta(
+                            7, subcmd, &payload, &mutated, &narrowed, 2, is_be
+                        ),
+                        "sample {i} monitor delta, subcmd={subcmd:#x}, is_be={is_be}"
+                    );
+                }
+                assert_eq!(
+                    encode_op_data_response_payload(10, 7, &payload, 2, is_be),
+                    reference_op_data_response_payload(10, 7, &payload, 2, is_be),
+                    "sample {i} op payload, is_be={is_be}"
+                );
+                assert_eq!(
+                    encode_op_data_response_filtered(10, 7, &payload, &narrowed, 2, is_be),
+                    reference_op_data_response_filtered(10, 7, &payload, &narrowed, 2, is_be),
+                    "sample {i} op filtered, is_be={is_be}"
+                );
+            }
+        }
+    }
+
+    /// The header length field must be the byte count that follows it, for a
+    /// payload big enough to exercise the `0xFE` size prefix and a multi-KB body.
+    #[test]
+    fn single_buffer_frames_have_a_correct_payload_length() {
+        // `NtScalarArray` has no `empty()`; `from_value` (spvirit-types:347) is
+        // the constructor, and it defaults alarm/timeStamp/display/control.
+        let nt = spvirit_types::NtScalarArray::from_value(spvirit_types::ScalarArrayValue::I32(
+            (0..4096).collect(),
+        ));
+        let payload = NtPayload::ScalarArray(nt);
+        for is_be in [false, true] {
+            let frame = encode_monitor_data_response_payload(7, 0x00, &payload, 2, is_be);
+            let declared = if is_be {
+                u32::from_be_bytes(frame[4..8].try_into().unwrap())
+            } else {
+                u32::from_le_bytes(frame[4..8].try_into().unwrap())
+            } as usize;
+            assert_eq!(declared, frame.len() - 8, "is_be={is_be}");
+            assert!(
+                frame.len() > 4096,
+                "the body must be large enough to matter"
+            );
+        }
     }
 }
