@@ -696,8 +696,9 @@ impl Source for GatewaySource {
         })
     }
 
-    /// Returns the sorted, deduplicated set of PV names this gateway has
-    /// already successfully `claim`ed (the keys of `bindings`), *not* a full
+    /// Returns the sorted set of PV names this gateway has already
+    /// successfully `claim`ed (the keys of `bindings`, so unique by
+    /// construction), *not* a full
     /// enumeration of every name available upstream.
     ///
     /// The plan's original design called for the union of `pvlist` results
