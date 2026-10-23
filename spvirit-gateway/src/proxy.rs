@@ -432,10 +432,6 @@ impl Source for GatewaySource {
             // just spent a full `PvaClient` operation timeout per configured
             // client, and charging that against this entry would make any TTL
             // shorter than the search expire the moment it is written.
-            // Stamped now, not with the `now` taken at entry: the loop above
-            // just spent a full `PvaClient` operation timeout per configured
-            // client, and charging that against this entry would make any TTL
-            // shorter than the search expire the moment it is written.
             self.neg.record_miss(&name, Instant::now());
             None
         })
