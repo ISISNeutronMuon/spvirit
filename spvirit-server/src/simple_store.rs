@@ -17,7 +17,7 @@ use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::{PvInfo, Source, TryClaim};
-use crate::types::{RecordData, RecordInstance};
+use crate::types::{NtPayloadRef, RecordData, RecordInstance};
 
 /// Callback invoked after a PUT value is applied to a record.
 pub type OnPutCallback = Arc<dyn Fn(&str, &DecodedValue) + Send + Sync>;
@@ -571,8 +571,8 @@ fn scalar_as_f64(v: &ScalarValue) -> Option<f64> {
 /// initialises MLST from the initial VAL, so the first small change is
 /// already subject to the deadband).
 fn initial_posted(record: &RecordInstance) -> Option<f64> {
-    match record.to_ntpayload() {
-        NtPayload::Scalar(nt) => scalar_as_f64(&nt.value),
+    match record.payload_ref() {
+        NtPayloadRef::Scalar(nt) => scalar_as_f64(&nt.value),
         _ => None,
     }
 }
@@ -585,15 +585,15 @@ fn initial_posted(record: &RecordInstance) -> Option<f64> {
 /// alarm severity did not change, and the value moved less than MDEL from
 /// the last *posted* value — EPICS monitor-deadband semantics.
 fn should_post_update(entry: &mut PvEntry, prev_severity: i32) -> bool {
-    let new_f = match entry.record.to_ntpayload() {
-        NtPayload::Scalar(nt) => match scalar_as_f64(&nt.value) {
+    let new_f = match entry.record.payload_ref() {
+        NtPayloadRef::Scalar(nt) => match scalar_as_f64(&nt.value) {
             Some(f) => f,
             None => return true,
         },
         _ => return true,
     };
     let mdel = crate::record_fields::mdel_of(&entry.record);
-    let severity_changed = entry.record.to_ntscalar().alarm_severity != prev_severity;
+    let severity_changed = entry.record.alarm_severity() != prev_severity;
     let within_deadband = mdel > 0.0
         && !severity_changed
         && entry
@@ -1477,5 +1477,37 @@ record(ao, "DB:AO") {
         assert!(Source::claim(&store, "PRESENT").await.is_some());
         assert_eq!(store.try_claim("ABSENT"), TryClaim::No);
         assert!(Source::claim(&store, "ABSENT").await.is_none());
+    }
+
+    #[test]
+    fn deadband_gate_sees_a_severity_change_even_within_the_deadband() {
+        // MDEL suppression must be defeated by an alarm-severity change. This
+        // pins the behaviour that `should_post_update` gets its severity from
+        // the record, whichever accessor it uses to do so.
+        let mut record = make_ai("A:severity", 1.0);
+        record.raw_fields.insert("MDEL".to_string(), "10.0".to_string());
+        // `PvEntry` is a private struct in this module with no constructor
+        // (simple_store.rs:41-48); `mod tests` is a child module, so build it
+        // literally, exactly as `SimplePvStore::new` does at :66-79.
+        let mut entry = PvEntry {
+            record,
+            subscribers: Vec::new(),
+            last_posted: Some(1.0),
+        };
+
+        // A tiny move with no severity change is inside the deadband.
+        assert!(
+            !should_post_update(&mut entry, 0),
+            "a sub-MDEL move with no severity change must be suppressed"
+        );
+
+        // The same tiny move with a severity change must be posted.
+        if let Some(nt) = entry.record.nt_scalar_mut() {
+            nt.alarm_severity = 2;
+        }
+        assert!(
+            should_post_update(&mut entry, 0),
+            "a severity change must defeat the deadband"
+        );
     }
 }
