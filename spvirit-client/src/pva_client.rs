@@ -248,9 +248,9 @@ pub enum MonitorEnd {
     Cancelled,
     /// The callback returned `ControlFlow::Break`.
     CallbackBreak,
-    /// The upstream stopped accepting the flow-control ACKs this
-    /// subscription owes it, so it is no longer delivering. A hard read
-    /// failure surfaces as `Err` rather than as this variant.
+    /// The upstream ended the subscription cleanly. Not currently produced:
+    /// a failed write (flow-control ACK or echo) or a hard read failure
+    /// surfaces as `Err(PvGetError::Io)` rather than as this variant.
     UpstreamClosed,
 }
 
@@ -1178,9 +1178,10 @@ impl PvaClient {
                             ioid,
                             is_be,
                         ) {
-                            if stream.write_all(&ack).await.is_err() {
-                                return Ok(MonitorEnd::UpstreamClosed);
-                            }
+                            // A failed ACK write ends the monitor with an
+                            // error, the same as a failed echo write: the
+                            // connection is gone, not cleanly finished.
+                            stream.write_all(&ack).await?;
                         }
                     }
 
