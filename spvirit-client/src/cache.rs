@@ -532,6 +532,7 @@ impl ConnPool {
 
         // LIFO: the most recently checked-in connection is the most likely
         // to still be alive, so pop from the back.
+        let mut hit = None;
         while let Some(mut c) = stack.pop() {
             if c.idle_since.elapsed() >= ttl {
                 // Dropping `c` closes its socket.
@@ -539,12 +540,24 @@ impl ConnPool {
                 continue;
             }
             c.reused = true;
-            bump(&counters.conn_hits);
-            return Some(c);
+            hit = Some(c);
+            break;
+        }
+        // Do not keep an empty entry per address ever seen.
+        if stack.is_empty() {
+            idle.remove(&addr);
         }
 
-        bump(&counters.conn_misses);
-        None
+        match hit {
+            Some(c) => {
+                bump(&counters.conn_hits);
+                Some(c)
+            }
+            None => {
+                bump(&counters.conn_misses);
+                None
+            }
+        }
     }
 
     /// Return a healthy connection to the pool. A connection that failed
@@ -558,6 +571,14 @@ impl ConnPool {
         conn.reused = false;
         let mut idle = self.idle.lock().expect("conn pool mutex poisoned");
         let stack = idle.entry(addr).or_default();
+        // Sweep expired connections first, so a stack full of stale ones
+        // does not make the cap turn away this fresh one. Dropping them
+        // closes their sockets. `checkin` has no counters to hand, so these
+        // sweeps are not counted in `conn_evicted_idle` (only the evictions
+        // met at checkout are).
+        if let Some(ttl) = self.idle_ttl {
+            stack.retain(|c| c.idle_since.elapsed() < ttl);
+        }
         if stack.len() < self.max_per_addr {
             stack.push(conn);
         }
@@ -1042,6 +1063,71 @@ mod tests {
 
         pool.checkin(PooledConn::fresh(fake_conn(addr).await));
         assert!(pool.checkout(addr, &counters).is_none());
+    }
+
+    /// Task 4 review Minor 2: a fresh connection checked in while the stack
+    /// is full of expired-but-unswept ones must be kept (the expired ones are
+    /// swept first), not dropped in their favour.
+    #[tokio::test(start_paused = true)]
+    async fn checkin_sweeps_expired_connections_before_the_cap_test() {
+        let (_l, addr) = loopback_listener().await;
+        let pool = ConnPool::new(Some(Duration::from_secs(30)), 2);
+        let counters = CacheCounters::default();
+
+        pool.checkin(PooledConn::fresh(fake_conn(addr).await));
+        pool.checkin(PooledConn::fresh(fake_conn(addr).await));
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        // Both pooled connections are now expired; the stack is at the cap.
+        pool.checkin(PooledConn::fresh(fake_conn(addr).await));
+
+        let got = pool.checkout(addr, &counters);
+        assert!(got.is_some(), "the fresh connection must have been kept");
+        let s = counters.snapshot();
+        assert_eq!(s.conn_hits, 1);
+        assert_eq!(
+            s.conn_evicted_idle, 0,
+            "the expired ones were swept at checkin, not met at checkout"
+        );
+        assert!(
+            pool.checkout(addr, &counters).is_none(),
+            "nothing else is left"
+        );
+    }
+
+    /// Task 4 review Minor 3: the map must not keep one empty entry per
+    /// address ever seen. Emptying a stack by checkout (or by expiry) removes
+    /// its key, and so does `purge_addr`.
+    #[tokio::test(start_paused = true)]
+    async fn emptied_stacks_do_not_leave_map_entries_behind() {
+        let (_l1, a1) = loopback_listener().await;
+        let (_l2, a2) = loopback_listener().await;
+        let (_l3, a3) = loopback_listener().await;
+        let pool = ConnPool::new(Some(Duration::from_secs(30)), 4);
+        let counters = CacheCounters::default();
+        let keys = |pool: &ConnPool| pool.idle.lock().unwrap().len();
+
+        pool.checkin(PooledConn::fresh(fake_conn(a1).await));
+        pool.checkin(PooledConn::fresh(fake_conn(a2).await));
+        pool.checkin(PooledConn::fresh(fake_conn(a3).await));
+        assert_eq!(keys(&pool), 3);
+
+        // Emptied by a hit.
+        assert!(pool.checkout(a1, &counters).is_some());
+        assert_eq!(keys(&pool), 2, "a1's emptied stack must be removed");
+
+        // Emptied by purge.
+        pool.purge_addr(a2);
+        assert_eq!(keys(&pool), 1);
+
+        // Emptied by expiry at checkout.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(pool.checkout(a3, &counters).is_none());
+        assert_eq!(
+            keys(&pool),
+            0,
+            "a3's stack emptied by eviction must be removed"
+        );
     }
 
     #[tokio::test]
