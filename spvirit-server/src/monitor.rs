@@ -118,6 +118,12 @@ pub struct PendingFrame {
     pub prebuilt: Option<Vec<u8>>,
 }
 
+impl Default for MonitorRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MonitorRegistry {
     pub fn new() -> Self {
         Self {
@@ -695,8 +701,8 @@ impl MonitorRegistry {
         let mut to_send: Option<(u64, Vec<u8>, bool)> = None;
         {
             let mut monitors = self.monitors.lock().await;
-            if let Some(list) = monitors.get_mut(pv_name) {
-                if let Some(sub) = list
+            if let Some(list) = monitors.get_mut(pv_name)
+                && let Some(sub) = list
                     .iter_mut()
                     .find(|s| s.conn_id == conn_id && s.ioid == ioid)
                 {
@@ -725,14 +731,12 @@ impl MonitorRegistry {
                     sub.last_snapshot = Some(payload.clone());
                     to_send = Some((sub.conn_id, msg, sub.pipeline_enabled));
                 }
-            }
         }
 
-        if let Some((conn_id, msg, pipelined)) = to_send {
-            if let Some(cw) = self.conn_writer(conn_id).await {
+        if let Some((conn_id, msg, pipelined)) = to_send
+            && let Some(cw) = self.conn_writer(conn_id).await {
                 self.route_monitor_frame(&cw, ioid, msg, pipelined).await;
             }
-        }
     }
 
     /// Update a monitor subscription's running/pipeline state.
@@ -746,8 +750,8 @@ impl MonitorRegistry {
         pipeline_enabled: Option<bool>,
     ) -> bool {
         let mut monitors = self.monitors.lock().await;
-        if let Some(list) = monitors.get_mut(pv_name) {
-            if let Some(sub) = list
+        if let Some(list) = monitors.get_mut(pv_name)
+            && let Some(sub) = list
                 .iter_mut()
                 .find(|s| s.conn_id == conn_id && s.ioid == ioid)
             {
@@ -759,14 +763,12 @@ impl MonitorRegistry {
                     // unbounded (R1-H1).
                     sub.nfree = v.min(crate::handler::MAX_PIPELINE_WINDOW);
                 }
-                if let Some(enabled) = pipeline_enabled {
-                    if enabled {
+                if let Some(enabled) = pipeline_enabled
+                    && enabled {
                         sub.pipeline_enabled = true;
                     }
-                }
                 return true;
             }
-        }
         false
     }
 

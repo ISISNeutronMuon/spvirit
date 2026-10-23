@@ -201,9 +201,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Background: simulate readback tracking the setpoint
     tokio::spawn(async move {
         loop {
-            if let Some(sp) = store.get_value("CTRL:SETPOINT").await {
-                if let ScalarValue::F64(target) = sp {
-                    if let Some(ScalarValue::F64(current)) = store.get_value("CTRL:READBACK").await
+            if let Some(sp) = store.get_value("CTRL:SETPOINT").await
+                && let ScalarValue::F64(target) = sp
+                    && let Some(ScalarValue::F64(current)) = store.get_value("CTRL:READBACK").await
                     {
                         // First-order exponential approach
                         let next = current + 0.1 * (target - current);
@@ -211,8 +211,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .set_value("CTRL:READBACK", ScalarValue::F64(next))
                             .await;
                     }
-                }
-            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     });

@@ -8,11 +8,10 @@ use crate::types::{now_nt_timestamp, RecordData, RecordInstance};
 
 /// Apply a scalar value update from a decoded PUT body to an `NtScalar`.
 pub fn apply_value_update(nt: &mut NtScalar, val: &DecodedValue, compute_alarms: bool) -> bool {
-    if let DecodedValue::Structure(fields) = val {
-        if let Some((_, inner)) = fields.iter().find(|(name, _)| name == "value") {
+    if let DecodedValue::Structure(fields) = val
+        && let Some((_, inner)) = fields.iter().find(|(name, _)| name == "value") {
             return apply_value_update(nt, inner, compute_alarms);
         }
-    }
     match &mut nt.value {
         ScalarValue::Bool(current) => {
             if let Some(v) = decoded_to_bool(val) {
@@ -267,14 +266,12 @@ pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
             "value" => {
                 if let DecodedValue::Structure(cols) = field_value {
                     for (col_name, col_value) in cols {
-                        if let Some(col) = nt.columns.iter_mut().find(|c| c.name == *col_name) {
-                            if let Some(next) = decoded_to_scalar_array(col_value, &col.values) {
-                                if col.values != next {
+                        if let Some(col) = nt.columns.iter_mut().find(|c| c.name == *col_name)
+                            && let Some(next) = decoded_to_scalar_array(col_value, &col.values)
+                                && col.values != next {
                                     col.values = next;
                                     changed = true;
                                 }
-                            }
-                        }
                     }
                 }
             }
@@ -288,12 +285,11 @@ pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
                 }
             }
             "alarm" => {
-                if let Some(alarm) = decode_nt_alarm(field_value) {
-                    if nt.alarm.as_ref() != Some(&alarm) {
+                if let Some(alarm) = decode_nt_alarm(field_value)
+                    && nt.alarm.as_ref() != Some(&alarm) {
                         nt.alarm = Some(alarm);
                         changed = true;
                     }
-                }
             }
             // `timeStamp` is not a data field: `RecordInstance::apply_put`
             // owns stamping (it always restamps on an accepted PUT) and
@@ -321,48 +317,42 @@ pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> bool {
     for (name, field_value) in fields {
         match name.as_str() {
             "value" => {
-                if let Some(next) = decoded_to_scalar_array(field_value, &nt.value) {
-                    if nt.value != next {
+                if let Some(next) = decoded_to_scalar_array(field_value, &nt.value)
+                    && nt.value != next {
                         nt.value = next;
                         changed = true;
                     }
-                }
             }
             "compressedSize" => {
-                if let Some(v) = decoded_to_i64(field_value) {
-                    if nt.compressed_size != v {
+                if let Some(v) = decoded_to_i64(field_value)
+                    && nt.compressed_size != v {
                         nt.compressed_size = v;
                         changed = true;
                     }
-                }
             }
             "uncompressedSize" => {
-                if let Some(v) = decoded_to_i64(field_value) {
-                    if nt.uncompressed_size != v {
+                if let Some(v) = decoded_to_i64(field_value)
+                    && nt.uncompressed_size != v {
                         nt.uncompressed_size = v;
                         changed = true;
                     }
-                }
             }
             "uniqueId" => {
-                if let Some(v) = decoded_to_i32(field_value) {
-                    if nt.unique_id != v {
+                if let Some(v) = decoded_to_i32(field_value)
+                    && nt.unique_id != v {
                         nt.unique_id = v;
                         changed = true;
                     }
-                }
             }
             "codec" => {
                 if let DecodedValue::Structure(codec_fields) = field_value {
                     for (cname, cval) in codec_fields {
-                        if cname == "name" {
-                            if let Some(s) = decoded_to_string(cval) {
-                                if nt.codec.name != s {
+                        if cname == "name"
+                            && let Some(s) = decoded_to_string(cval)
+                                && nt.codec.name != s {
                                     nt.codec.name = s;
                                     changed = true;
                                 }
-                            }
-                        }
                     }
                 }
             }
@@ -420,12 +410,11 @@ pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> bool {
                 }
             }
             "alarm" => {
-                if let Some(alarm) = decode_nt_alarm(field_value) {
-                    if nt.alarm.as_ref() != Some(&alarm) {
+                if let Some(alarm) = decode_nt_alarm(field_value)
+                    && nt.alarm.as_ref() != Some(&alarm) {
                         nt.alarm = Some(alarm);
                         changed = true;
                     }
-                }
             }
             // `timeStamp`/`dataTimeStamp` are not data fields here — see the
             // comment on the matching arm removed from `apply_table_put`.
@@ -434,12 +423,11 @@ pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> bool {
             // relay `timeStamp` distinct from the acquisition
             // `dataTimeStamp` and both must survive independently.
             "display" => {
-                if let Some(display) = decode_nt_display(field_value) {
-                    if nt.display.as_ref() != Some(&display) {
+                if let Some(display) = decode_nt_display(field_value)
+                    && nt.display.as_ref() != Some(&display) {
                         nt.display = Some(display);
                         changed = true;
                     }
-                }
             }
             "attribute" => {
                 if let DecodedValue::Array(items) = field_value {
@@ -561,11 +549,10 @@ impl RecordInstance {
         // T_acquire}. `set_time_stamp` just set both fields from the chosen
         // `timeStamp`; override `data_time_stamp` here if the client sent its
         // own.
-        if let RecordData::NtNdArray { nt, .. } = &mut self.data {
-            if let Some(data_ts) = client_data_timestamp(value) {
+        if let RecordData::NtNdArray { nt, .. } = &mut self.data
+            && let Some(data_ts) = client_data_timestamp(value) {
                 nt.data_time_stamp = data_ts;
             }
-        }
 
         PutOutcome {
             value_changed,

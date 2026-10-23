@@ -241,6 +241,87 @@ pub fn decoded_to_scalar_array(
     }
 }
 
+/// Look up one field of a decoded structure by name.
+///
+/// Every `decode_nt_*` below used to spell this out inline, once per field.
+pub(crate) fn field<'a>(
+    fields: &'a [(String, DecodedValue)],
+    name: &str,
+) -> Option<&'a DecodedValue> {
+    fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+}
+
+/// Decode an `NtAlarm` from a decoded PVA alarm structure.
+pub fn decode_nt_alarm(val: &DecodedValue) -> Option<spvirit_types::NtAlarm> {
+    let DecodedValue::Structure(fields) = val else {
+        return None;
+    };
+    let severity = field(fields, "severity")
+        .and_then(decoded_to_i32)
+        .unwrap_or(0);
+    let status = field(fields, "status")
+        .and_then(decoded_to_i32)
+        .unwrap_or(0);
+    let message = field(fields, "message")
+        .and_then(decoded_to_string)
+        .unwrap_or_default();
+    Some(spvirit_types::NtAlarm {
+        severity,
+        status,
+        message,
+    })
+}
+
+/// Decode an `NtTimeStamp` from a decoded PVA timestamp structure.
+pub fn decode_nt_timestamp(val: &DecodedValue) -> Option<spvirit_types::NtTimeStamp> {
+    let DecodedValue::Structure(fields) = val else {
+        return None;
+    };
+    let seconds = field(fields, "secondsPastEpoch")
+        .and_then(decoded_to_i64)
+        .unwrap_or(0);
+    let nanos = field(fields, "nanoseconds")
+        .and_then(decoded_to_i32)
+        .unwrap_or(0);
+    let user_tag = field(fields, "userTag")
+        .and_then(decoded_to_i32)
+        .unwrap_or(0);
+    Some(spvirit_types::NtTimeStamp {
+        seconds_past_epoch: seconds,
+        nanoseconds: nanos,
+        user_tag,
+    })
+}
+
+/// Decode an `NtDisplay` from a decoded PVA display structure.
+pub fn decode_nt_display(val: &DecodedValue) -> Option<spvirit_types::NtDisplay> {
+    let DecodedValue::Structure(fields) = val else {
+        return None;
+    };
+    let limit_low = field(fields, "limitLow")
+        .and_then(decoded_to_f64)
+        .unwrap_or(0.0);
+    let limit_high = field(fields, "limitHigh")
+        .and_then(decoded_to_f64)
+        .unwrap_or(0.0);
+    let description = field(fields, "description")
+        .and_then(decoded_to_string)
+        .unwrap_or_default();
+    let units = field(fields, "units")
+        .and_then(decoded_to_string)
+        .unwrap_or_default();
+    let precision = field(fields, "precision")
+        .and_then(decoded_to_i32)
+        .unwrap_or(0);
+    Some(spvirit_types::NtDisplay {
+        limit_low,
+        limit_high,
+        description,
+        units,
+        precision,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,85 +434,4 @@ mod tests {
         assert!(matches!(field(&fields, "b"), Some(DecodedValue::Int32(2))));
         assert!(field(&fields, "c").is_none());
     }
-}
-
-/// Look up one field of a decoded structure by name.
-///
-/// Every `decode_nt_*` below used to spell this out inline, once per field.
-pub(crate) fn field<'a>(
-    fields: &'a [(String, DecodedValue)],
-    name: &str,
-) -> Option<&'a DecodedValue> {
-    fields.iter().find(|(n, _)| n == name).map(|(_, v)| v)
-}
-
-/// Decode an `NtAlarm` from a decoded PVA alarm structure.
-pub fn decode_nt_alarm(val: &DecodedValue) -> Option<spvirit_types::NtAlarm> {
-    let DecodedValue::Structure(fields) = val else {
-        return None;
-    };
-    let severity = field(fields, "severity")
-        .and_then(decoded_to_i32)
-        .unwrap_or(0);
-    let status = field(fields, "status")
-        .and_then(decoded_to_i32)
-        .unwrap_or(0);
-    let message = field(fields, "message")
-        .and_then(decoded_to_string)
-        .unwrap_or_default();
-    Some(spvirit_types::NtAlarm {
-        severity,
-        status,
-        message,
-    })
-}
-
-/// Decode an `NtTimeStamp` from a decoded PVA timestamp structure.
-pub fn decode_nt_timestamp(val: &DecodedValue) -> Option<spvirit_types::NtTimeStamp> {
-    let DecodedValue::Structure(fields) = val else {
-        return None;
-    };
-    let seconds = field(fields, "secondsPastEpoch")
-        .and_then(decoded_to_i64)
-        .unwrap_or(0);
-    let nanos = field(fields, "nanoseconds")
-        .and_then(decoded_to_i32)
-        .unwrap_or(0);
-    let user_tag = field(fields, "userTag")
-        .and_then(decoded_to_i32)
-        .unwrap_or(0);
-    Some(spvirit_types::NtTimeStamp {
-        seconds_past_epoch: seconds,
-        nanoseconds: nanos,
-        user_tag,
-    })
-}
-
-/// Decode an `NtDisplay` from a decoded PVA display structure.
-pub fn decode_nt_display(val: &DecodedValue) -> Option<spvirit_types::NtDisplay> {
-    let DecodedValue::Structure(fields) = val else {
-        return None;
-    };
-    let limit_low = field(fields, "limitLow")
-        .and_then(decoded_to_f64)
-        .unwrap_or(0.0);
-    let limit_high = field(fields, "limitHigh")
-        .and_then(decoded_to_f64)
-        .unwrap_or(0.0);
-    let description = field(fields, "description")
-        .and_then(decoded_to_string)
-        .unwrap_or_default();
-    let units = field(fields, "units")
-        .and_then(decoded_to_string)
-        .unwrap_or_default();
-    let precision = field(fields, "precision")
-        .and_then(decoded_to_i32)
-        .unwrap_or(0);
-    Some(spvirit_types::NtDisplay {
-        limit_low,
-        limit_high,
-        description,
-        units,
-        precision,
-    })
 }

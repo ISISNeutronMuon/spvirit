@@ -984,8 +984,8 @@ async fn handle_get_field_request(
         return;
     }
 
-    if let Some(sid) = sid {
-        if let Some(pv_name) = resolved_pv.as_ref() {
+    if let Some(sid) = sid
+        && let Some(pv_name) = resolved_pv.as_ref() {
             if let Some(nt) = get_nt_snapshot(state, pv_name).await {
                 let full_desc = nt_payload_desc(&nt);
                 let sub = payload.field_name.as_deref().filter(|s| !s.is_empty());
@@ -1025,7 +1025,6 @@ async fn handle_get_field_request(
             replier.send(resp).await;
             return;
         }
-    }
 
     if state.pvlist_mode != PvListMode::List {
         let resp = encode_get_field_error(
@@ -1198,167 +1197,164 @@ pub async fn run_udp_search(
         };
         let version = pkt.header.version;
         let is_be = pkt.header.flags.is_msb;
-        match cmd {
-            PvaPacketCommand::Search(payload) => {
-                debug!(
-                    "UDP search from {}: pv_count={} mask=0x{:02x}",
-                    peer,
-                    payload.pv_requests.len(),
-                    payload.mask
-                );
-                let accepts_tcp = payload.protocols.is_empty()
-                    || payload
-                        .protocols
-                        .iter()
-                        .any(|p| p.eq_ignore_ascii_case("tcp"));
-                if !accepts_tcp {
-                    debug!("UDP search: no compatible protocol (tcp not accepted)");
-                    continue;
-                }
-                let (cids, pattern_requests, req_ctx) = crate::request_ctx::scope(peer, async {
-                    let mut cids = Vec::new();
-                    let mut pattern_requests: Vec<(u32, String)> = Vec::new();
-                    for (cid, name) in &payload.pv_requests {
-                        if is_virtual_event_pv(name)
-                            || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
-                            || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
-                        {
+        if let PvaPacketCommand::Search(payload) = cmd {
+            debug!(
+                "UDP search from {}: pv_count={} mask=0x{:02x}",
+                peer,
+                payload.pv_requests.len(),
+                payload.mask
+            );
+            let accepts_tcp = payload.protocols.is_empty()
+                || payload
+                    .protocols
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case("tcp"));
+            if !accepts_tcp {
+                debug!("UDP search: no compatible protocol (tcp not accepted)");
+                continue;
+            }
+            let (cids, pattern_requests, req_ctx) = crate::request_ctx::scope(peer, async {
+                let mut cids = Vec::new();
+                let mut pattern_requests: Vec<(u32, String)> = Vec::new();
+                for (cid, name) in &payload.pv_requests {
+                    if is_virtual_event_pv(name)
+                        || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
+                        || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
+                    {
+                        cids.push(*cid);
+                        continue;
+                    }
+                    // `try_claim` never blocks. Anything it cannot decide
+                    // is resolved on a background task and answered on the
+                    // client's next search retry — awaiting resolution here
+                    // would stop this task reading datagrams for every
+                    // other client, which is the whole defect.
+                    let outcome = state.sources.try_claim(name);
+                    crate::search_resolve::note_try_claim(outcome);
+                    match outcome {
+                        TryClaim::Yes => {
                             cids.push(*cid);
                             continue;
                         }
-                        // `try_claim` never blocks. Anything it cannot decide
-                        // is resolved on a background task and answered on the
-                        // client's next search retry — awaiting resolution here
-                        // would stop this task reading datagrams for every
-                        // other client, which is the whole defect.
-                        let outcome = state.sources.try_claim(name);
-                        crate::search_resolve::note_try_claim(outcome);
-                        match outcome {
-                            TryClaim::Yes => {
-                                cids.push(*cid);
-                                continue;
+                        TryClaim::Unknown => {
+                            // A wildcard is answered from the visible-name
+                            // list below; resolving it upstream is
+                            // meaningless and would pollute the negative
+                            // cache with a name no server owns.
+                            if !is_pattern_query(name) {
+                                state.search_resolver.enqueue(name);
                             }
-                            TryClaim::Unknown => {
-                                // A wildcard is answered from the visible-name
-                                // list below; resolving it upstream is
-                                // meaningless and would pollute the negative
-                                // cache with a name no server owns.
-                                if !is_pattern_query(name) {
-                                    state.search_resolver.enqueue(name);
-                                }
-                            }
-                            TryClaim::No => {}
                         }
-                        // Answered off this task: matching needs the full
-                        // enumeration, which is unbounded third-party work.
-                        if state.pvlist_mode != PvListMode::Off && is_pattern_query(name) {
-                            pattern_requests.push((*cid, name.clone()));
-                        }
+                        TryClaim::No => {}
                     }
-                    // Captured *inside* the scope, on the task that holds the
-                    // request's task-local: the pattern enumeration is
-                    // spawned below, after this scope has already ended.
-                    //
-                    // Only when there is something to spawn. `current_request`
-                    // takes a mutex and clones up to two `String`s, and the
-                    // overwhelming majority of datagrams carry no pattern
-                    // query at all — for those `spawn_pattern_query_reply`
-                    // returns `PatternDispatch::None` without ever looking at
-                    // the context. This is the search read loop, the very path
-                    // this branch exists to keep clear.
-                    let req_ctx = if pattern_requests.is_empty() {
-                        None
-                    } else {
-                        crate::request_ctx::current_request()
-                    };
-                    (cids, pattern_requests, req_ctx)
-                })
-                .await;
-                let response_required = (payload.mask & 0x01) != 0;
-                let server_discovery_ping = payload.pv_requests.is_empty();
-                let found = server_discovery_ping || !cids.is_empty();
-                // `Some(0.0.0.0)` (all-interface bind, no explicit advertise IP)
-                // is treated as unset so we fall through to the bound socket
-                // address and finally to inferring the local IP toward this
-                // peer — never emitting a zero address a client cannot reach.
-                let resp_ip = effective_advertise_ip(advertise_ip)
-                    .or_else(|| effective_advertise_ip(Some(addr.ip())))
-                    .or_else(|| {
-                        let inferred = infer_udp_response_ip(peer);
-                        if let Some(ip) = inferred {
-                            debug!("UDP search: inferred response address {}", ip);
-                        }
-                        inferred
-                    })
-                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-                let addr_bytes = if resp_ip.is_unspecified() {
-                    debug!("UDP search: responding with zero address (unspecified listen)");
-                    [0u8; 16]
+                    // Answered off this task: matching needs the full
+                    // enumeration, which is unbounded third-party work.
+                    if state.pvlist_mode != PvListMode::Off && is_pattern_query(name) {
+                        pattern_requests.push((*cid, name.clone()));
+                    }
+                }
+                // Captured *inside* the scope, on the task that holds the
+                // request's task-local: the pattern enumeration is
+                // spawned below, after this scope has already ended.
+                //
+                // Only when there is something to spawn. `current_request`
+                // takes a mutex and clones up to two `String`s, and the
+                // overwhelming majority of datagrams carry no pattern
+                // query at all — for those `spawn_pattern_query_reply`
+                // returns `PatternDispatch::None` without ever looking at
+                // the context. This is the search read loop, the very path
+                // this branch exists to keep clear.
+                let req_ctx = if pattern_requests.is_empty() {
+                    None
                 } else {
-                    ip_to_bytes(resp_ip)
+                    crate::request_ctx::current_request()
                 };
-                let response = encode_search_response(
-                    guid,
-                    payload.seq,
-                    addr_bytes,
-                    tcp_port,
-                    "tcp",
-                    found,
-                    &cids,
-                    version,
-                    is_be,
-                );
-                let reply_target = search_reply_target(&payload.addr, payload.port, peer);
-                // Hand the pattern queries to their own task. If it takes
-                // them, it also inherits the duty to answer a
-                // `response_required` datagram this loop found nothing for —
-                // so a wildcard-only search still gets exactly one reply,
-                // carrying exactly the cids it used to carry.
-                let seq = payload.seq;
-                let answer_negative = response_required && !found;
-                let dispatch = {
-                    let socket = socket.clone();
-                    spawn_pattern_query_reply(&state, req_ctx, pattern_requests, move |pattern_cids| async move {
-                        if pattern_cids.is_empty() && !answer_negative {
-                            return;
-                        }
-                        let response = encode_search_response(
-                            guid,
-                            seq,
-                            addr_bytes,
-                            tcp_port,
-                            "tcp",
-                            !pattern_cids.is_empty(),
-                            &pattern_cids,
-                            version,
-                            is_be,
-                        );
-                        if let Err(e) = socket.send_to(&response, reply_target).await {
-                            debug!("UDP search: failed sending pattern reply to {reply_target}: {e}");
-                        }
-                    })
-                };
-                if !found && (dispatch.withholds_negative() || !response_required) {
-                    debug!("UDP search: no immediate matches (pattern dispatch={dispatch:?})");
-                    continue;
-                }
-                if let Err(e) = socket.send_to(&response, reply_target).await {
-                    debug!(
-                        "UDP search: failed sending {} matches to {}: {}",
-                        cids.len(),
-                        reply_target,
-                        e
+                (cids, pattern_requests, req_ctx)
+            })
+            .await;
+            let response_required = (payload.mask & 0x01) != 0;
+            let server_discovery_ping = payload.pv_requests.is_empty();
+            let found = server_discovery_ping || !cids.is_empty();
+            // `Some(0.0.0.0)` (all-interface bind, no explicit advertise IP)
+            // is treated as unset so we fall through to the bound socket
+            // address and finally to inferring the local IP toward this
+            // peer — never emitting a zero address a client cannot reach.
+            let resp_ip = effective_advertise_ip(advertise_ip)
+                .or_else(|| effective_advertise_ip(Some(addr.ip())))
+                .or_else(|| {
+                    let inferred = infer_udp_response_ip(peer);
+                    if let Some(ip) = inferred {
+                        debug!("UDP search: inferred response address {}", ip);
+                    }
+                    inferred
+                })
+                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            let addr_bytes = if resp_ip.is_unspecified() {
+                debug!("UDP search: responding with zero address (unspecified listen)");
+                [0u8; 16]
+            } else {
+                ip_to_bytes(resp_ip)
+            };
+            let response = encode_search_response(
+                guid,
+                payload.seq,
+                addr_bytes,
+                tcp_port,
+                "tcp",
+                found,
+                &cids,
+                version,
+                is_be,
+            );
+            let reply_target = search_reply_target(&payload.addr, payload.port, peer);
+            // Hand the pattern queries to their own task. If it takes
+            // them, it also inherits the duty to answer a
+            // `response_required` datagram this loop found nothing for —
+            // so a wildcard-only search still gets exactly one reply,
+            // carrying exactly the cids it used to carry.
+            let seq = payload.seq;
+            let answer_negative = response_required && !found;
+            let dispatch = {
+                let socket = socket.clone();
+                spawn_pattern_query_reply(&state, req_ctx, pattern_requests, move |pattern_cids| async move {
+                    if pattern_cids.is_empty() && !answer_negative {
+                        return;
+                    }
+                    let response = encode_search_response(
+                        guid,
+                        seq,
+                        addr_bytes,
+                        tcp_port,
+                        "tcp",
+                        !pattern_cids.is_empty(),
+                        &pattern_cids,
+                        version,
+                        is_be,
                     );
-                    continue;
-                }
-                debug!(
-                    "UDP search: responded found={} with {} matches to {}",
-                    found,
-                    cids.len(),
-                    reply_target
-                );
+                    if let Err(e) = socket.send_to(&response, reply_target).await {
+                        debug!("UDP search: failed sending pattern reply to {reply_target}: {e}");
+                    }
+                })
+            };
+            if !found && (dispatch.withholds_negative() || !response_required) {
+                debug!("UDP search: no immediate matches (pattern dispatch={dispatch:?})");
+                continue;
             }
-            _ => {}
+            if let Err(e) = socket.send_to(&response, reply_target).await {
+                debug!(
+                    "UDP search: failed sending {} matches to {}: {}",
+                    cids.len(),
+                    reply_target,
+                    e
+                );
+                continue;
+            }
+            debug!(
+                "UDP search: responded found={} with {} matches to {}",
+                found,
+                cids.len(),
+                reply_target
+            );
         }
     }
 }
@@ -2307,14 +2303,13 @@ pub async fn handle_connection(
                                 pipeline_ack,
                                 nfree
                             );
-                            if start {
-                                if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
+                            if start
+                                && let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     state
                                         .registry
                                         .send_monitor_update_for(&pv_name, conn_id, ioid, &nt)
                                         .await;
                                 }
-                            }
                         }
                     }
                     20 => {
@@ -2851,7 +2846,7 @@ mod tests {
 
     #[test]
     fn collect_visible_pv_names_iter_truncates_before_appending_pvlist() {
-        let names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let names = ["A".to_string(), "B".to_string(), "C".to_string()];
         let got = collect_visible_pv_names_iter(
             names.iter().map(String::as_str),
             PvListMode::List,
