@@ -473,13 +473,17 @@ impl Source for GatewaySource {
         value: &DecodedValue,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>> {
         let name = name.to_string();
+        // Converted eagerly (before `Box::pin`) only because `value` is
+        // borrowed and the future is `'static` in `value`; the RESULT is not
+        // inspected until after the access decision below, so a denied put
+        // never surfaces a conversion error.
         let json = decoded_to_json(value);
         Box::pin(async move {
-            let json = json?;
-
             if let Decision::Deny = self.access.decide(Op::Put, &name, &current_identity()) {
                 return Err("access denied".to_string());
             }
+
+            let json = json?;
 
             // Resolve the binding and clone out what's needed before the
             // `.await` below — never hold the bindings-map MutexGuard across
@@ -769,6 +773,26 @@ mod tests {
 
     fn allow_all() -> Arc<AccessControl> {
         Arc::new(AccessControl::new(false, None, None))
+    }
+
+    /// The access decision must run before the value conversion. A read-only
+    /// gateway asked to put an unrepresentable value must answer "access
+    /// denied" — not a conversion error that reveals the request got past the
+    /// gate, and not the cost of converting a value that will never be sent.
+    #[tokio::test]
+    async fn put_decides_access_before_converting_the_value() {
+        let read_only = Arc::new(AccessControl::new(true, None, None));
+        let src = test_source(open_neg(), read_only);
+
+        let err = src
+            .put("ANY:PV", &DecodedValue::Raw(vec![0xde, 0xad]))
+            .await
+            .expect_err("a read-only gateway must reject every put");
+
+        assert_eq!(
+            err, "access denied",
+            "expected the denial, got the JSON conversion's error instead"
+        );
     }
 
     #[tokio::test]
