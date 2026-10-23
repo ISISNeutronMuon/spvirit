@@ -1,10 +1,14 @@
 //! PVA message encoding helpers.
 
 use crate::spvd_decode::StructureDesc;
+// Only the frozen `reference_*` builders still want the bitset and values as
+// separate halves; the live frame builders append straight into the frame.
+#[cfg(test)]
+use crate::spvd_encode::encode_nt_payload_bitset_parts;
 use crate::spvd_encode::{
-    encode_nt_payload_bitset, encode_nt_payload_bitset_parts, encode_nt_payload_delta,
-    encode_nt_payload_filtered, encode_nt_payload_full, encode_nt_scalar_bitset,
-    encode_nt_scalar_full, encode_structure_desc, nt_payload_desc,
+    encode_nt_payload_bitset, encode_nt_payload_delta, encode_nt_payload_filtered,
+    encode_nt_payload_full, encode_nt_scalar_bitset, encode_nt_scalar_full,
+    encode_structure_desc, nt_payload_desc, push_nt_payload_bitset,
 };
 use spvirit_types::{NtPayload, NtScalar};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -659,8 +663,7 @@ pub fn encode_op_data_response_payload(
     version: u8,
     is_be: bool,
 ) -> Vec<u8> {
-    let body = encode_nt_payload_bitset(payload_value, is_be);
-    let mut out = Vec::with_capacity(8 + 6 + body.len());
+    let mut out = Vec::new();
     let header_at = begin_frame(&mut out, is_be, version, command);
     out.extend_from_slice(&if is_be {
         ioid.to_be_bytes()
@@ -669,7 +672,7 @@ pub fn encode_op_data_response_payload(
     });
     out.push(0x00);
     out.extend_from_slice(&encode_status_ok());
-    out.extend_from_slice(&body);
+    push_nt_payload_bitset(&mut out, payload_value, is_be);
     finish_frame(&mut out, header_at, is_be);
     out
 }
@@ -942,8 +945,7 @@ pub fn encode_monitor_data_response_payload(
     version: u8,
     is_be: bool,
 ) -> Vec<u8> {
-    let (changed_bitset, values) = encode_nt_payload_bitset_parts(payload_value, is_be);
-    let mut out = Vec::with_capacity(8 + 6 + changed_bitset.len() + values.len());
+    let mut out = Vec::new();
     let header_at = begin_frame(&mut out, is_be, version, 13);
     out.extend_from_slice(&if is_be {
         ioid.to_be_bytes()
@@ -954,8 +956,7 @@ pub fn encode_monitor_data_response_payload(
     if (subcmd & 0x10) != 0 {
         out.extend_from_slice(&encode_status_ok());
     }
-    out.extend_from_slice(&changed_bitset);
-    out.extend_from_slice(&values);
+    push_nt_payload_bitset(&mut out, payload_value, is_be);
     // overrun bitset: empty (after data per spec)
     out.extend_from_slice(&encode_size_pva(0, is_be));
     finish_frame(&mut out, header_at, is_be);

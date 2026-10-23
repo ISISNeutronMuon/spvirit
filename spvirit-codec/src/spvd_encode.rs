@@ -319,14 +319,22 @@ pub fn nt_scalar_desc(value: &ScalarValue) -> StructureDesc {
     }
 }
 
-pub fn encode_nt_scalar_full(nt: &NtScalar, is_be: bool) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Append the full `epics:nt/NTScalar:1.0` value block to `out`.
+///
+/// Sink form: the caller's frame buffer is written directly, so a multi-MB
+/// body is not built in a temporary and then copied.
+pub(crate) fn push_nt_scalar_full(out: &mut Vec<u8>, nt: &NtScalar, is_be: bool) {
     out.extend_from_slice(&encode_scalar_value(&nt.value, is_be));
     out.extend_from_slice(&encode_alarm(nt, is_be));
     out.extend_from_slice(&encode_timestamp(nt, is_be));
     out.extend_from_slice(&encode_display(nt, is_be));
     out.extend_from_slice(&encode_control(nt, is_be));
     out.extend_from_slice(&encode_value_alarm(nt, is_be));
+}
+
+pub fn encode_nt_scalar_full(nt: &NtScalar, is_be: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_nt_scalar_full(&mut out, nt, is_be);
     out
 }
 
@@ -410,24 +418,28 @@ fn pv_value_field_count(fields: &[(String, PvValue)]) -> usize {
     count
 }
 
-/// A size-prefixed bitset with `total_bits` bits set, written a byte at a time.
+/// Append an all-ones changed bitset covering `total_bits` bits.
 ///
-/// The old loop set one bit per iteration; whole bytes are `0xFF` by
-/// construction and only the final partial byte needs a mask.
-pub(crate) fn encode_all_ones_bitset(total_bits: usize, is_be: bool) -> Vec<u8> {
+/// `total_bits` includes bit 0 (the whole structure), matching
+/// [`encode_all_ones_bitset`] from Task 1 — callers pass `1 + field_count`.
+/// Whole bytes are `0xFF` by construction; only the final partial byte needs
+/// a mask, because trailing bits beyond `total_bits` must stay clear.
+pub(crate) fn push_all_ones_bitset(out: &mut Vec<u8>, total_bits: usize, is_be: bool) {
     let bitset_size = total_bits.div_ceil(8);
-    let mut bitset = vec![0xFFu8; bitset_size];
-    let remainder = total_bits % 8;
-    if remainder != 0 {
-        // Trailing bits beyond `total_bits` must stay clear: the reference
-        // implementation never set them.
-        if let Some(last) = bitset.last_mut() {
-            *last = (1u8 << remainder) - 1;
-        }
+    out.extend_from_slice(&crate::encode_common::encode_size(bitset_size, is_be));
+    let start = out.len();
+    out.resize(start + bitset_size, 0xFF);
+    let spare = bitset_size * 8 - total_bits;
+    if spare != 0 {
+        let last = out.len() - 1;
+        out[last] = 0xFFu8 >> spare;
     }
-    let mut out = Vec::with_capacity(bitset_size + 5);
-    out.extend_from_slice(&encode_size_pvd(bitset_size, is_be));
-    out.extend_from_slice(&bitset);
+}
+
+/// A size-prefixed bitset with `total_bits` bits set.
+pub(crate) fn encode_all_ones_bitset(total_bits: usize, is_be: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_all_ones_bitset(&mut out, total_bits, is_be);
     out
 }
 
@@ -788,8 +800,8 @@ pub fn nt_scalar_array_desc(value: &ScalarArrayValue) -> StructureDesc {
     }
 }
 
-pub fn encode_nt_scalar_array_full(nt: &NtScalarArray, is_be: bool) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Append the full `epics:nt/NTScalarArray:1.0` value block to `out` (sink form).
+pub(crate) fn push_nt_scalar_array_full(out: &mut Vec<u8>, nt: &NtScalarArray, is_be: bool) {
     out.extend_from_slice(&encode_scalar_array_value_pvd(&nt.value, is_be));
     out.extend_from_slice(&encode_nt_alarm(&nt.alarm, is_be));
     out.extend_from_slice(&encode_nt_timestamp(&nt.time_stamp, is_be));
@@ -797,6 +809,11 @@ pub fn encode_nt_scalar_array_full(nt: &NtScalarArray, is_be: bool) -> Vec<u8> {
     out.extend_from_slice(&encode_f64(nt.control.limit_low, is_be));
     out.extend_from_slice(&encode_f64(nt.control.limit_high, is_be));
     out.extend_from_slice(&encode_f64(nt.control.min_step, is_be));
+}
+
+pub fn encode_nt_scalar_array_full(nt: &NtScalarArray, is_be: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_nt_scalar_array_full(&mut out, nt, is_be);
     out
 }
 
@@ -840,8 +857,8 @@ pub fn nt_table_desc(nt: &NtTable) -> StructureDesc {
     }
 }
 
-pub fn encode_nt_table_full(nt: &NtTable, is_be: bool) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Append the full `epics:nt/NTTable:1.0` value block to `out` (sink form).
+pub(crate) fn push_nt_table_full(out: &mut Vec<u8>, nt: &NtTable, is_be: bool) {
     out.extend_from_slice(&encode_string_array(&nt.labels, is_be));
     for NtTableColumn { values, .. } in &nt.columns {
         out.extend_from_slice(&encode_scalar_array_value_pvd(values, is_be));
@@ -858,6 +875,11 @@ pub fn encode_nt_table_full(nt: &NtTable, is_be: bool) -> Vec<u8> {
         nt.time_stamp.as_ref().unwrap_or(&NtTimeStamp::default()),
         is_be,
     ));
+}
+
+pub fn encode_nt_table_full(nt: &NtTable, is_be: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_nt_table_full(&mut out, nt, is_be);
     out
 }
 
@@ -1175,8 +1197,11 @@ fn encode_attribute_variant(attr: &NtAttribute, is_be: bool) -> Vec<u8> {
     }
 }
 
-pub fn encode_nt_ndarray_full(nt: &NtNdArray, is_be: bool) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Append the full `epics:nt/NTNDArray:1.0` value block to `out` (sink form).
+///
+/// The image payload is the largest body the codec writes; appending it to
+/// the caller's frame buffer avoids a multi-MB temporary and copy.
+pub(crate) fn push_nt_ndarray_full(out: &mut Vec<u8>, nt: &NtNdArray, is_be: bool) {
     out.extend_from_slice(&encode_ndarray_union(&nt.value, is_be));
     out.extend_from_slice(&encode_string_pvd(&nt.codec.name, is_be));
     out.extend_from_slice(&encode_codec_parameters(&nt.codec.parameters, is_be));
@@ -1225,6 +1250,11 @@ pub fn encode_nt_ndarray_full(nt: &NtNdArray, is_be: bool) -> Vec<u8> {
         nt.display.as_ref().unwrap_or(&NtDisplay::default()),
         is_be,
     ));
+}
+
+pub fn encode_nt_ndarray_full(nt: &NtNdArray, is_be: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_nt_ndarray_full(&mut out, nt, is_be);
     out
 }
 
@@ -1264,14 +1294,19 @@ pub fn nt_enum_desc() -> StructureDesc {
     }
 }
 
-pub fn encode_nt_enum_full(nt: &NtEnum, is_be: bool) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Append the full `epics:nt/NTEnum:1.0` value block to `out` (sink form).
+pub(crate) fn push_nt_enum_full(out: &mut Vec<u8>, nt: &NtEnum, is_be: bool) {
     // value — enum_t { index, choices }
     out.extend_from_slice(&encode_enum(nt.index, &nt.choices, is_be));
     // alarm
     out.extend_from_slice(&encode_nt_alarm(&nt.alarm, is_be));
     // timeStamp
     out.extend_from_slice(&encode_nt_timestamp(&nt.time_stamp, is_be));
+}
+
+pub fn encode_nt_enum_full(nt: &NtEnum, is_be: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_nt_enum_full(&mut out, nt, is_be);
     out
 }
 
@@ -1330,18 +1365,23 @@ fn pv_value_field_type(val: &PvValue) -> FieldType {
     }
 }
 
-/// Encode a [`PvValue`] tree to PVA wire bytes (values only, no descriptor).
-pub(crate) fn encode_pv_value(val: &PvValue, is_be: bool) -> Vec<u8> {
+/// Append a [`PvValue`] tree's PVA wire bytes (values only, no descriptor)
+/// to `out` (sink form).
+pub(crate) fn push_pv_value(out: &mut Vec<u8>, val: &PvValue, is_be: bool) {
     match val {
-        PvValue::Scalar(sv) => encode_scalar_value(sv, is_be),
-        PvValue::ScalarArray(sa) => encode_scalar_array_value_pvd(sa, is_be),
-        PvValue::Structure { fields, .. } => {
-            let mut out = Vec::new();
-            for (_, v) in fields {
-                out.extend_from_slice(&encode_pv_value(v, is_be));
-            }
-            out
+        PvValue::Scalar(sv) => out.extend_from_slice(&encode_scalar_value(sv, is_be)),
+        PvValue::ScalarArray(sa) => {
+            out.extend_from_slice(&encode_scalar_array_value_pvd(sa, is_be))
         }
+        PvValue::Structure { fields, .. } => push_pv_value_fields(out, fields, is_be),
+    }
+}
+
+/// Append the values of a [`PvValue`] field list, in order, to `out`
+/// (sink form). Used for `PvValue::Structure` and `NtPayload::Generic`.
+pub(crate) fn push_pv_value_fields(out: &mut Vec<u8>, fields: &[(String, PvValue)], is_be: bool) {
+    for (_, v) in fields {
+        push_pv_value(out, v, is_be);
     }
 }
 
@@ -1356,26 +1396,33 @@ pub fn nt_payload_desc(payload: &NtPayload) -> StructureDesc {
     }
 }
 
-pub fn encode_nt_payload_full(payload: &NtPayload, is_be: bool) -> Vec<u8> {
+/// Append the full value block for any [`NtPayload`] to `out`.
+pub(crate) fn push_nt_payload_full(out: &mut Vec<u8>, payload: &NtPayload, is_be: bool) {
     match payload {
-        NtPayload::Scalar(nt) => encode_nt_scalar_full(nt, is_be),
-        NtPayload::ScalarArray(nt) => encode_nt_scalar_array_full(nt, is_be),
-        NtPayload::Table(nt) => encode_nt_table_full(nt, is_be),
-        NtPayload::NdArray(nt) => encode_nt_ndarray_full(nt, is_be),
-        NtPayload::Enum(nt) => encode_nt_enum_full(nt, is_be),
-        NtPayload::Generic { fields, .. } => {
-            let mut out = Vec::new();
-            for (_, v) in fields {
-                out.extend_from_slice(&encode_pv_value(v, is_be));
-            }
-            out
-        }
+        NtPayload::Scalar(nt) => push_nt_scalar_full(out, nt, is_be),
+        NtPayload::ScalarArray(nt) => push_nt_scalar_array_full(out, nt, is_be),
+        NtPayload::Table(nt) => push_nt_table_full(out, nt, is_be),
+        NtPayload::NdArray(nt) => push_nt_ndarray_full(out, nt, is_be),
+        NtPayload::Enum(nt) => push_nt_enum_full(out, nt, is_be),
+        NtPayload::Generic { fields, .. } => push_pv_value_fields(out, fields, is_be),
     }
 }
 
+pub fn encode_nt_payload_full(payload: &NtPayload, is_be: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_nt_payload_full(&mut out, payload, is_be);
+    out
+}
+
+/// Append an all-ones bitset followed by the full value block.
+pub(crate) fn push_nt_payload_bitset(out: &mut Vec<u8>, payload: &NtPayload, is_be: bool) {
+    push_all_ones_bitset(out, 1 + nt_payload_field_count(payload), is_be);
+    push_nt_payload_full(out, payload, is_be);
+}
+
 pub fn encode_nt_payload_bitset(payload: &NtPayload, is_be: bool) -> Vec<u8> {
-    let mut out = encode_all_ones_bitset(1 + nt_payload_field_count(payload), is_be);
-    out.extend_from_slice(&encode_nt_payload_full(payload, is_be));
+    let mut out = Vec::new();
+    push_nt_payload_bitset(&mut out, payload, is_be);
     out
 }
 
@@ -4063,6 +4110,35 @@ pub(crate) mod tests {
 
     pub(crate) fn pinned_time_samples() -> Vec<NtPayload> {
         all_payload_samples().into_iter().map(pin_timestamps).collect()
+    }
+
+    #[test]
+    fn push_and_encode_forms_agree_byte_for_byte() {
+        for (i, payload) in pinned_time_samples().into_iter().enumerate() {
+            for is_be in [false, true] {
+                let mut sunk = Vec::new();
+                push_nt_payload_full(&mut sunk, &payload, is_be);
+                assert_eq!(
+                    sunk,
+                    encode_nt_payload_full(&payload, is_be),
+                    "sample {i} full, is_be={is_be}"
+                );
+
+                let mut sunk = Vec::new();
+                push_nt_payload_bitset(&mut sunk, &payload, is_be);
+                assert_eq!(
+                    sunk,
+                    encode_nt_payload_bitset(&payload, is_be),
+                    "sample {i} bitset+full, is_be={is_be}"
+                );
+
+                // The sink must append, not overwrite: a non-empty prefix survives.
+                let mut sunk = vec![0xAA, 0xBB];
+                push_nt_payload_full(&mut sunk, &payload, is_be);
+                assert_eq!(&sunk[..2], &[0xAA, 0xBB]);
+                assert_eq!(&sunk[2..], &encode_nt_payload_full(&payload, is_be)[..]);
+            }
+        }
     }
 
     #[test]
