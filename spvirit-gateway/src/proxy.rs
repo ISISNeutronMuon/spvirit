@@ -20,7 +20,9 @@ use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
 
 use crate::access::{AccessControl, Decision, Identity, Op};
-use crate::bridge::{merge_monitor_delta, nt_payload_from_decoded, nt_payload_from_get};
+use crate::bridge::{
+    merge_monitor_delta, nt_payload_from_decoded, nt_payload_from_get, patch_nt_payload,
+};
 use crate::cache::monitor::{MonitorCache, MonitorKey};
 use crate::convert::decoded_to_json;
 use crate::cache::negative::NegativeCache;
@@ -522,6 +524,9 @@ impl Source for GatewaySource {
             let rx = self.monitors.subscribe(key.clone(), move |entry| {
                 tokio::spawn(async move {
                     let mut last_full = DecodedValue::Null;
+                    // The payload handed to subscribers, kept across ticks so a delta can
+                    // be patched into it instead of rebuilding the whole structure.
+                    let mut cached_payload: Option<NtPayload> = None;
                     // Set by the callback IMMEDIATELY BEFORE it returns
                     // `Break`, i.e. ONLY on the "last subscriber left" path.
                     //
@@ -540,7 +545,23 @@ impl Source for GatewaySource {
                     let result = client
                         .pvmonitor(&real_name, move |update| {
                             merge_monitor_delta(&mut last_full, update);
-                            let payload = nt_payload_from_decoded(&last_full, struct_id.clone());
+
+                            // Patch in place when the delta names its changed
+                            // fields; only rebuild (re-converting every field of
+                            // the structure) when it cannot be applied
+                            // incrementally — a whole-structure delta, the first
+                            // tick, or a path the payload does not yet have.
+                            let needs_rebuild = match cached_payload.as_mut() {
+                                Some(cached) => !patch_nt_payload(cached, &last_full, update),
+                                None => true,
+                            };
+                            if needs_rebuild {
+                                cached_payload =
+                                    Some(nt_payload_from_decoded(&last_full, struct_id.clone()));
+                            }
+                            let payload =
+                                cached_payload.as_ref().expect("filled immediately above");
+
                             if callback_monitors.dispatch_or_retire(
                                 &callback_key,
                                 &callback_entry,

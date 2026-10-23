@@ -78,7 +78,7 @@ impl MonitorEntry {
     /// an intermediate update is safe specifically because `subscribe`
     /// re-accumulates a full snapshot each tick, so a subscriber that misses
     /// one Full update is not left with a torn/partial view.
-    pub fn dispatch(&self, payload: NtPayload) -> bool {
+    pub fn dispatch(&self, payload: &NtPayload) -> bool {
         let mut subs = self.subs.lock().unwrap();
         subs.retain(|tx| match tx.try_send(payload.clone()) {
             Ok(()) => true,
@@ -186,7 +186,7 @@ impl MonitorCache {
         &self,
         key: &MonitorKey,
         entry: &Arc<MonitorEntry>,
-        payload: NtPayload,
+        payload: &NtPayload,
     ) -> bool {
         if entry.dispatch(payload) {
             return true;
@@ -296,7 +296,7 @@ mod tests {
         let mut rx2 = cache.subscribe(key.clone(), |_| {});
 
         let entry = captured_entry.expect("spawn_upstream captured the entry");
-        let still_live = entry.dispatch(payload(3.5));
+        let still_live = entry.dispatch(&payload(3.5));
         assert!(still_live);
 
         let NtPayload::Generic { fields, .. } = rx1.try_recv().unwrap() else {
@@ -318,7 +318,7 @@ mod tests {
         drop(rx);
 
         let entry = captured_entry.expect("spawn_upstream captured the entry");
-        let still_live = entry.dispatch(payload(1.0));
+        let still_live = entry.dispatch(&payload(1.0));
         assert!(!still_live, "no live subscribers left after drop");
     }
 
@@ -341,7 +341,7 @@ mod tests {
         // Fill BOTH subscribers' buffers right up to capacity.
         for i in 0..CHANNEL_CAPACITY {
             assert!(
-                entry.dispatch(payload(i as f64)),
+                entry.dispatch(&payload(i as f64)),
                 "filling buffers must keep the entry live"
             );
         }
@@ -349,7 +349,7 @@ mod tests {
         // Every subscriber's buffer is now Full. A further update must be
         // dropped for those subscribers WITHOUT pruning them and WITHOUT
         // retiring the entry.
-        let still_live = entry.dispatch(payload(1000.0));
+        let still_live = entry.dispatch(&payload(1000.0));
         assert!(
             still_live,
             "an all-Full burst must not report the entry empty (no upstream teardown)"
@@ -361,7 +361,7 @@ mod tests {
         );
 
         // And through the full retire path: the upstream must survive.
-        let should_continue = cache.dispatch_or_retire(&key, &entry, payload(1001.0));
+        let should_continue = cache.dispatch_or_retire(&key, &entry, &payload(1001.0));
         assert!(
             should_continue,
             "dispatch_or_retire must not tear down the upstream on an all-Full burst"
@@ -391,11 +391,11 @@ mod tests {
 
         // Fill the slow subscriber's buffer to capacity.
         for i in 0..CHANNEL_CAPACITY {
-            entry.dispatch(payload(i as f64));
+            entry.dispatch(&payload(i as f64));
         }
 
         // Slow sub is now Full (kept), closed sub is Closed (pruned).
-        let still_live = entry.dispatch(payload(1000.0));
+        let still_live = entry.dispatch(&payload(1000.0));
         assert!(
             still_live,
             "the slow-but-live subscriber must keep the upstream alive"
@@ -432,7 +432,7 @@ mod tests {
         // Last (only) subscriber drops.
         drop(rx1);
 
-        let should_continue = cache.dispatch_or_retire(&key, &entry, payload(1.0));
+        let should_continue = cache.dispatch_or_retire(&key, &entry, &payload(1.0));
         assert!(
             !should_continue,
             "upstream loop must break once its last subscriber is gone"
@@ -507,7 +507,7 @@ mod tests {
             "attaching to a still-present entry must not spawn a second upstream"
         );
 
-        let should_continue = cache.dispatch_or_retire(&key, &entry, payload(2.0));
+        let should_continue = cache.dispatch_or_retire(&key, &entry, &payload(2.0));
         assert!(
             should_continue,
             "a subscriber attached in the meantime must save the entry from retirement"

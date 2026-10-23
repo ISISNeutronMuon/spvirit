@@ -285,6 +285,78 @@ pub fn merge_monitor_delta(last_full: &mut DecodedValue, update: &MonitorUpdate)
     }
 }
 
+/// Applies the fields named by `update`'s changed bitset to an already-built
+/// `cached` payload, reading their (already merged) values out of `last_full`.
+///
+/// Returns `true` when the whole delta was applied in place, `false` when the
+/// caller must fall back to a full `nt_payload_from_decoded` rebuild — bit 0
+/// ("<whole structure>") is set, the delta named no field at all, the cached
+/// payload is not a `Generic` structure, or a changed path does not resolve in
+/// either the merged value or the cached payload.
+///
+/// This exists because the rebuild it replaces re-converts every field of the
+/// structure (a fresh `String` key and a fresh `PvValue` per field) on every
+/// upstream tick, no matter how small the delta.
+pub fn patch_nt_payload(
+    cached: &mut NtPayload,
+    last_full: &DecodedValue,
+    update: &MonitorUpdate,
+) -> bool {
+    let NtPayload::Generic { fields, .. } = cached else {
+        return false;
+    };
+    if bit_is_set(&update.changed, 0) {
+        return false;
+    }
+
+    let mut patched_any = false;
+    for (bit, path) in update.paths.iter().enumerate().skip(1) {
+        if !bit_is_set(&update.changed, bit) {
+            continue;
+        }
+        let Some(merged) = get_at_path(last_full, path) else {
+            return false;
+        };
+        if !patch_fields(fields, path, decoded_to_pv_value(merged)) {
+            return false;
+        }
+        patched_any = true;
+    }
+    patched_any
+}
+
+/// Writes `value` at dotted `path` inside an `NtPayload::Generic`'s field
+/// list, descending through `PvValue::Structure` fields by name. Returns
+/// `false` if the path does not already exist — unlike `set_at_path` on the
+/// `DecodedValue` side this never creates intermediates, because a payload
+/// growing a field is exactly the case that needs a full rebuild.
+///
+/// Takes `&mut [_]`, not `&mut Vec<_>`: nothing here grows or shrinks the
+/// list, and clippy's `ptr_arg` (warn-by-default) would flag the `Vec` form —
+/// which this crate's zero-warning bar does not allow. Both call sites pass a
+/// `&mut Vec<..>` and deref-coerce.
+fn patch_fields(fields: &mut [(String, PvValue)], path: &str, value: PvValue) -> bool {
+    let (head, rest) = match path.split_once('.') {
+        Some((h, r)) => (h, Some(r)),
+        None => (path, None),
+    };
+    // `position` + index rather than `iter_mut().find()`: the recursive call
+    // below needs a fresh mutable borrow of the nested vector.
+    let Some(idx) = fields.iter().position(|(n, _)| n == head) else {
+        return false;
+    };
+    match rest {
+        None => {
+            fields[idx].1 = value;
+            true
+        }
+        Some(rest) => match &mut fields[idx].1 {
+            PvValue::Structure { fields: inner, .. } => patch_fields(inner, rest, value),
+            _ => false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +546,75 @@ mod tests {
         assert!(bit_is_set(&[0b0000_0010], 1));
         assert!(!bit_is_set(&[0b0000_0010], 0));
         assert!(!bit_is_set(&[0b0000_0010], 8)); // out of range byte
+    }
+
+    /// The whole point of the incremental patch is that it is
+    /// indistinguishable from the full rebuild it replaces.
+    #[test]
+    fn patching_a_cached_payload_matches_a_full_rebuild() {
+        let struct_id = "epics:nt/NTScalar:1.0".to_string();
+        let update = MonitorUpdate {
+            value: DecodedValue::Structure(vec![(
+                "alarm".to_string(),
+                DecodedValue::Structure(vec![("severity".to_string(), DecodedValue::Int32(2))]),
+            )]),
+            // bit 3 == sample_paths()[3] == "alarm.severity"
+            changed: vec![0b0000_1000],
+            overrun: vec![],
+            consumed: 0,
+            paths: sample_paths(),
+        };
+
+        let mut last_full = sample_last_full();
+        merge_monitor_delta(&mut last_full, &update);
+
+        let mut cached = nt_payload_from_decoded(&sample_last_full(), struct_id.clone());
+        assert!(
+            patch_nt_payload(&mut cached, &last_full, &update),
+            "a single-leaf delta must be applicable in place"
+        );
+
+        assert_eq!(
+            cached,
+            nt_payload_from_decoded(&last_full, struct_id),
+            "the patched payload must be identical to a full rebuild"
+        );
+    }
+
+    /// Bit 0 is "<whole structure>": there is nothing selective to patch, so
+    /// the caller must be told to rebuild rather than silently keeping a stale
+    /// payload.
+    #[test]
+    fn a_whole_structure_delta_refuses_to_patch() {
+        let update = MonitorUpdate {
+            value: sample_last_full(),
+            changed: vec![0b0000_0001],
+            overrun: vec![],
+            consumed: 0,
+            paths: sample_paths(),
+        };
+        let mut cached = nt_payload_from_decoded(&sample_last_full(), String::new());
+        assert!(!patch_nt_payload(&mut cached, &sample_last_full(), &update));
+    }
+
+    /// A path the cached payload does not contain cannot be patched into it;
+    /// refuse rather than drop the update on the floor.
+    #[test]
+    fn an_unknown_path_refuses_to_patch() {
+        let update = MonitorUpdate {
+            value: DecodedValue::Structure(vec![(
+                "nosuch".to_string(),
+                DecodedValue::Int32(1),
+            )]),
+            changed: vec![0b0000_0010],
+            overrun: vec![],
+            consumed: 0,
+            // `.into()` is an identity today (`paths: Vec<String>`) and a
+            // `Vec -> Arc<[String]>` conversion once the codec plan's Task 8
+            // lands, so this literal compiles against either field type.
+            paths: vec!["<whole structure>".to_string(), "nosuch".to_string()].into(),
+        };
+        let mut cached = nt_payload_from_decoded(&sample_last_full(), String::new());
+        assert!(!patch_nt_payload(&mut cached, &sample_last_full(), &update));
     }
 }
