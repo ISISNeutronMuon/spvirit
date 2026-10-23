@@ -563,6 +563,12 @@ fn to_record(record: &DbRecord) -> Option<RecordInstance> {
         // LongOut today, so these arms are unreachable; they're only here to
         // satisfy exhaustiveness. Wiring longin/longout .db loading is
         // tracked as follow-up work.
+        // NtTable/NtNdArray/Generic have no `.db` spelling at all, and
+        // mbbi/mbbo/longin/longout are standard EPICS Base record types this
+        // loader does not construct yet. Either way the caller
+        // (`typed_from_raw`) turns the `None` into an error that names the
+        // record and the type - an `eprintln!` here duplicated it, and it
+        // also bypassed the crate's `tracing` configuration entirely.
         RecordType::NtTable
         | RecordType::NtNdArray
         | RecordType::Mbbi
@@ -570,10 +576,6 @@ fn to_record(record: &DbRecord) -> Option<RecordInstance> {
         | RecordType::Generic
         | RecordType::LongIn
         | RecordType::LongOut => {
-            eprintln!(
-                "Record '{}': type '{}' is not a standard EPICS Base record type and cannot be loaded from .db files",
-                record.name, record.record_type
-            );
             return None;
         }
     };
@@ -843,7 +845,8 @@ fn typed_from_raw(raw: &[DbRecord]) -> Result<HashMap<String, RecordInstance>, S
     for rec in raw {
         let Some(parsed) = to_record(rec) else {
             return Err(format!(
-                "record '{}' of type '{}' is not supported",
+                "record '{}' of type '{}' is not yet supported by the .db loader; \r
+                 create it through the host API instead",
                 rec.name, rec.record_type
             ));
         };
@@ -1139,5 +1142,39 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_mbbi_record_is_reported_as_unsupported_not_as_non_standard() {
+        // mbbi IS a standard EPICS Base record type; `RecordType::from_db_name`
+        // maps it, so the untyped parse succeeds and this diagnostic arm
+        // really is reachable - the operator is not making a typo, the loader
+        // just cannot construct the record yet.
+        let src = "record(mbbi, \"M:one\") {
+    field(DESC, \"m\")
+}
+";
+        let raw = parse_db_records(src, "test.db", &HashMap::new()).expect("raw parse succeeds");
+        assert_eq!(raw.len(), 1);
+        assert!(
+            to_record(&raw[0]).is_none(),
+            "mbbi is not constructible from .db yet"
+        );
+
+        // The operator-facing text is the `Err` from the typed load. Assert on
+        // that returned String, which is a production value - NOT on the file's
+        // own source text, which a test containing the same literal could never
+        // fail against.
+        let err = parse_db(src).expect_err("the typed load must abort");
+        assert!(err.contains("M:one"), "the error must name the record: {err}");
+        assert!(err.contains("mbbi"), "the error must name the type: {err}");
+        assert!(
+            err.contains("not yet supported by the .db loader"),
+            "the corrected diagnostic is missing: {err}"
+        );
+        assert!(
+            !err.contains("standard"),
+            "the diagnostic still calls a standard record type non-standard: {err}"
+        );
     }
 }
