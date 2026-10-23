@@ -240,6 +240,47 @@ pub enum RecordData {
     },
 }
 
+/// A borrowed view of a record's payload.
+///
+/// Mirrors [`NtPayload`] variant-for-variant but holds references, so reading
+/// one field of a record costs nothing. Use this for anything that inspects a
+/// record's shape or one of its fields; use [`RecordData::payload`] only when
+/// the value really has to outlive the store's read guard.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NtPayloadRef<'a> {
+    Scalar(&'a NtScalar),
+    ScalarArray(&'a NtScalarArray),
+    Table(&'a NtTable),
+    NdArray(&'a NtNdArray),
+    Enum(&'a NtEnum),
+    Generic {
+        struct_id: &'a str,
+        fields: &'a [(String, PvValue)],
+    },
+}
+
+impl<'a> NtPayloadRef<'a> {
+    /// Materialise an owned [`NtPayload`].
+    ///
+    /// This is the ONLY place the store clones a payload. Keeping the single
+    /// clone site here is what stops the owned and borrowed views drifting:
+    /// both this and [`RecordData::payload_ref`] are exhaustive matches over
+    /// the same enums, so a new variant cannot be added to one alone.
+    pub fn to_owned_payload(&self) -> NtPayload {
+        match self {
+            Self::Scalar(nt) => NtPayload::Scalar((*nt).clone()),
+            Self::ScalarArray(nt) => NtPayload::ScalarArray((*nt).clone()),
+            Self::Table(nt) => NtPayload::Table((*nt).clone()),
+            Self::NdArray(nt) => NtPayload::NdArray((*nt).clone()),
+            Self::Enum(nt) => NtPayload::Enum((*nt).clone()),
+            Self::Generic { struct_id, fields } => NtPayload::Generic {
+                struct_id: (*struct_id).to_string(),
+                fields: (*fields).to_vec(),
+            },
+        }
+    }
+}
+
 impl RecordData {
     pub fn nt(&self) -> &NtScalar {
         match self {
@@ -265,28 +306,34 @@ impl RecordData {
         }
     }
 
-    pub fn payload(&self) -> NtPayload {
+    /// Borrowing counterpart of [`payload`](Self::payload): the same variant
+    /// mapping with no clones.
+    pub fn payload_ref(&self) -> NtPayloadRef<'_> {
         match self {
             Self::Ai { nt, .. }
             | Self::Ao { nt, .. }
             | Self::Bi { nt, .. }
             | Self::Bo { nt, .. }
             | Self::StringIn { nt, .. }
-            | Self::StringOut { nt, .. } => NtPayload::Scalar(nt.clone()),
+            | Self::StringOut { nt, .. } => NtPayloadRef::Scalar(nt),
             Self::Waveform { nt, .. }
             | Self::Aai { nt, .. }
             | Self::Aao { nt, .. }
-            | Self::SubArray { nt, .. } => NtPayload::ScalarArray(nt.clone()),
-            Self::NtTable { nt, .. } => NtPayload::Table(nt.clone()),
-            Self::NtNdArray { nt, .. } => NtPayload::NdArray(nt.clone()),
-            Self::NtEnum { nt, .. } => NtPayload::Enum(nt.clone()),
+            | Self::SubArray { nt, .. } => NtPayloadRef::ScalarArray(nt),
+            Self::NtTable { nt, .. } => NtPayloadRef::Table(nt),
+            Self::NtNdArray { nt, .. } => NtPayloadRef::NdArray(nt),
+            Self::NtEnum { nt, .. } => NtPayloadRef::Enum(nt),
             Self::Generic {
                 struct_id, fields, ..
-            } => NtPayload::Generic {
-                struct_id: struct_id.clone(),
-                fields: fields.clone(),
+            } => NtPayloadRef::Generic {
+                struct_id,
+                fields,
             },
         }
+    }
+
+    pub fn payload(&self) -> NtPayload {
+        self.payload_ref().to_owned_payload()
     }
 }
 
@@ -1047,6 +1094,102 @@ fn parse_bool_like(input: &str) -> Option<bool> {
 mod tests {
     use super::*;
 
+    /// One record of every `RecordData` payload shape, for exhaustive
+    /// accessor tests.
+    ///
+    /// No `use` statements are needed: `types.rs` does `pub use
+    /// spvirit_types::*` at module level and `mod tests` does `use super::*`,
+    /// so every NT type below is already in scope.
+    fn one_record_per_shape() -> Vec<RecordInstance> {
+        fn wrap(data: RecordData, record_type: RecordType) -> RecordInstance {
+            RecordInstance {
+                name: "T".to_string(),
+                record_type,
+                common: DbCommonState::default(),
+                data,
+                raw_fields: std::collections::HashMap::new(),
+            }
+        }
+
+        vec![
+            wrap(
+                RecordData::Ai {
+                    nt: NtScalar::from_value(ScalarValue::F64(1.25)),
+                    inp: None,
+                    siml: None,
+                    siol: None,
+                    simm: false,
+                },
+                RecordType::Ai,
+            ),
+            wrap(
+                RecordData::Waveform {
+                    nt: NtScalarArray::from_value(ScalarArrayValue::F64(vec![1.0, 2.0, 3.0])),
+                    inp: None,
+                    ftvl: "DOUBLE".to_string(),
+                    nelm: 3,
+                    nord: 3,
+                },
+                RecordType::Waveform,
+            ),
+            wrap(
+                RecordData::NtTable {
+                    // `NtTable` derives no `Default`, so spell it out. Same
+                    // shape `simple_store.rs`'s `make_nt_table` (:847) uses.
+                    nt: NtTable {
+                        labels: vec!["X".to_string()],
+                        columns: vec![NtTableColumn {
+                            name: "x".to_string(),
+                            values: ScalarArrayValue::F64(vec![1.0, 2.0]),
+                        }],
+                        descriptor: Some("table".to_string()),
+                        alarm: None,
+                        time_stamp: None,
+                    },
+                    inp: None,
+                    out: None,
+                    omsl: OutputMode::Supervisory,
+                },
+                RecordType::NtTable,
+            ),
+            wrap(
+                RecordData::NtNdArray {
+                    // `NtNdArray` derives no `Default`; `empty()` is the
+                    // constructor the crate provides.
+                    nt: NtNdArray::empty(),
+                    inp: None,
+                    out: None,
+                    omsl: OutputMode::Supervisory,
+                },
+                RecordType::NtNdArray,
+            ),
+            wrap(
+                RecordData::NtEnum {
+                    // `NtEnum` derives no `Default`; `NtEnum::new(index,
+                    // choices)` is the constructor.
+                    nt: NtEnum::new(1, vec!["OFF".to_string(), "ON".to_string()]),
+                    inp: None,
+                    out: None,
+                    omsl: OutputMode::Supervisory,
+                },
+                // NOTE: `RecordType` has NO `NtEnum` variant. An ntenum record
+                // is typed `Mbbi` (`RecordType::from_db_name` maps
+                // `"mbbi" | "ntenum" => Mbbi`, types.rs:59).
+                RecordType::Mbbi,
+            ),
+            wrap(
+                RecordData::Generic {
+                    struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                    fields: vec![("value".to_string(), PvValue::Scalar(ScalarValue::I32(3)))],
+                    inp: None,
+                    out: None,
+                    omsl: OutputMode::Supervisory,
+                },
+                RecordType::Generic,
+            ),
+        ]
+    }
+
     fn ai_record(val: f64) -> RecordInstance {
         RecordInstance {
             name: "T".to_string(),
@@ -1153,5 +1296,17 @@ mod tests {
             panic!("expected Generic");
         };
         assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn payload_ref_materialises_exactly_what_payload_returns() {
+        for rec in one_record_per_shape() {
+            assert_eq!(
+                rec.data.payload_ref().to_owned_payload(),
+                rec.data.payload(),
+                "borrowed and owned payload views disagree for {:?}",
+                rec.record_type
+            );
+        }
     }
 }
