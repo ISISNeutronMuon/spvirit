@@ -1150,7 +1150,9 @@ impl PvaClient {
                         encode_monitor_request(sid, ioid, 0x10, &[], PVA_VERSION, is_be);
                     // Bounded: against an upstream that stopped reading, a
                     // full send buffer would otherwise hang this write — and
-                    // `cancel_and_join` with it.
+                    // `cancel_and_join` with it. A timeout can leave a partial
+                    // frame on the wire; harmless, as the connection is dropped
+                    // right after.
                     let _ = tokio::time::timeout(self.timeout, stream.write_all(&destroy)).await;
                     return Ok(MonitorEnd::Cancelled);
                 }
