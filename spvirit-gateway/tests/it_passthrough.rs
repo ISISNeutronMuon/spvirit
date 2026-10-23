@@ -1208,3 +1208,77 @@ async fn a_binding_refresh_clears_the_getholdoff_cache_only_when_the_descriptor_
 
     ioc2.kill();
 }
+
+/// The module's documented "idle-linger", closed. Dropping the last downstream
+/// receiver used to leave the upstream subscription and its TCP connection
+/// running until the *upstream* ended them — which for a static `ao` is never,
+/// because the only teardown trigger was an upstream tick. With the
+/// `MonitorHandle` on the entry and the supervisor's idle sweep it goes away on
+/// its own, and it is a cancellation, not a death.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_last_subscriber_cancels_the_upstream_monitor() {
+    let Some((src, _pool)) = spawn_gateway(|b| b.ao("IT:IDLE", 1.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+
+    assert!(src.claim("IT:IDLE").await.is_some());
+    let mut rx = src.subscribe("IT:IDLE").await.expect("subscribe");
+
+    // Consume the initial MONITOR update before dropping, so the drop cannot
+    // race that one dispatch: after it, `IT:IDLE` never changes again, so no
+    // further tick will ever run `dispatch_or_retire`. That is exactly the
+    // case the sweep exists for.
+    rx.recv().await.expect("initial monitor update");
+    assert_eq!(src.upstream_monitor_count(), 1);
+    drop(rx);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(12);
+    while src.upstream_monitor_count() != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(
+        src.upstream_monitor_count(),
+        0,
+        "the idle upstream monitor must be swept away within a few IDLE_SWEEP \
+         ticks of its last subscriber leaving"
+    );
+    assert_eq!(
+        src.upstream_monitor_deaths(),
+        0,
+        "cancelling an unwanted subscription is not an upstream fault"
+    );
+}
+
+/// `build_client` must hand every upstream client an explicit cache config, so
+/// a change to `spvirit-client`'s default cannot silently change how often the
+/// gateway searches. Pins the property; see the task's scoping note for why
+/// this is a pin rather than a red-to-green proof.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_clients_resolve_a_repeated_name_from_their_cache() {
+    let Some((src, pool)) = spawn_gateway(|b| b.ai("IT:CACHED", 3.0), 0).await else {
+        eprintln!("Skipping test: cannot bind a free port in this environment");
+        return;
+    };
+    // A zero binding TTL forces both claims past Task 1's fast path into a real
+    // `pvinfo_full`, so what is measured here is the *client's* resolution
+    // cache and not the gateway's binding map.
+    let src = src.with_binding_ttl(Duration::ZERO);
+
+    assert!(src.claim("IT:CACHED").await.is_some());
+    assert!(src.claim("IT:CACHED").await.is_some());
+
+    let stats = pool
+        .client("it-client")
+        .expect("client in pool")
+        .cache_stats();
+    assert_eq!(
+        stats.resolve_misses, 1,
+        "only the first claim may search upstream; got {stats:?}"
+    );
+    assert_eq!(
+        stats.resolve_hits, 1,
+        "the second claim must be answered from the resolution cache; got {stats:?}"
+    );
+}

@@ -10,10 +10,11 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use spvirit_client::MonitorEnd;
 use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::pvstore::{PvInfo, Source, TryClaim};
 use spvirit_types::NtPayload;
@@ -23,7 +24,7 @@ use crate::access::{AccessControl, Decision, Identity, Op};
 use crate::bridge::{
     merge_monitor_delta, nt_payload_from_decoded, nt_payload_from_get, patch_nt_payload,
 };
-use crate::cache::monitor::{MonitorCache, MonitorKey};
+use crate::cache::monitor::{MonitorCache, MonitorKey, UpstreamState};
 use crate::convert::decoded_to_json;
 use crate::cache::negative::NegativeCache;
 use crate::lockutil::{lock_or_recover, try_lock_or_recover};
@@ -94,6 +95,15 @@ pub struct Binding {
     pub bound_at: Instant,
     last_get: Mutex<Option<(Instant, NtPayload)>>,
 }
+
+/// How often each live upstream monitor's supervisor asks the cache whether
+/// every downstream subscriber has gone.
+///
+/// This is the resolution of the idle-linger fix: a PV that stops ticking is
+/// never noticed by `dispatch_or_retire`, which only runs on a tick. Coarse on
+/// purpose — one timer wakeup per live upstream monitor, and a few seconds of
+/// extra upstream subscription is not worth a tighter loop.
+const IDLE_SWEEP: Duration = Duration::from_secs(2);
 
 /// Forget the binding for downstream `name`.
 ///
@@ -563,78 +573,99 @@ impl Source for GatewaySource {
             let down_name = name.clone();
 
             let rx = self.monitors.subscribe(key.clone(), move |entry| {
+                let mut last_full = DecodedValue::Null;
+                // The payload handed to subscribers, kept across ticks so a
+                // delta can be patched into it instead of rebuilding the whole
+                // structure.
+                let mut cached_payload: Option<NtPayload> = None;
+                let callback_entry = entry.clone();
+                let callback_monitors = monitors.clone();
+                let callback_key = key.clone();
+
+                // `pvmonitor_spawn` runs the subscription on its own task and
+                // hands back a handle immediately. There is no
+                // `stopped_by_callback` flag any more: the entry owning (or not
+                // owning) the handle IS the record of whether the stop was
+                // deliberate, and unlike the flag it cannot go stale, because
+                // it is the same object the cancellation acts on.
+                let handle = client.pvmonitor_spawn(&real_name, move |update| {
+                    merge_monitor_delta(&mut last_full, update);
+
+                    // Patch in place when the delta names its changed fields;
+                    // only rebuild (re-converting every field of the
+                    // structure) when it cannot be applied incrementally — a
+                    // whole-structure delta, the first tick, or a path the
+                    // payload does not yet have.
+                    let needs_rebuild = match cached_payload.as_mut() {
+                        Some(cached) => !patch_nt_payload(cached, &last_full, update),
+                        None => true,
+                    };
+                    if needs_rebuild {
+                        cached_payload =
+                            Some(nt_payload_from_decoded(&last_full, struct_id.clone()));
+                    }
+                    let payload = cached_payload.as_ref().expect("filled immediately above");
+
+                    if callback_monitors.dispatch_or_retire(&callback_key, &callback_entry, payload)
+                    {
+                        ControlFlow::Continue(())
+                    } else {
+                        // Belt and braces: `dispatch_or_retire` has already
+                        // cancelled us on its way out, so this only matters if
+                        // the cancel signal loses a race with the next update.
+                        ControlFlow::Break(())
+                    }
+                });
+                entry.attach_upstream(handle);
+
                 tokio::spawn(async move {
-                    let mut last_full = DecodedValue::Null;
-                    // The payload handed to subscribers, kept across ticks so a delta can
-                    // be patched into it instead of rebuilding the whole structure.
-                    let mut cached_payload: Option<NtPayload> = None;
-                    // Set by the callback IMMEDIATELY BEFORE it returns
-                    // `Break`, i.e. ONLY on the "last subscriber left" path.
-                    //
-                    // This flag is load-bearing and cannot be replaced by
-                    // inspecting `pvmonitor`'s `Result`: a clean upstream EOF
-                    // and a callback-requested stop BOTH surface as `Ok(())`,
-                    // so a Result-based test would either miss real upstream
-                    // deaths or double-retire an entry `dispatch_or_retire`
-                    // has already removed (and possibly clobber a replacement
-                    // entry created for the same key in the meantime).
-                    let stopped_by_callback = Arc::new(AtomicBool::new(false));
-                    let callback_stopped = stopped_by_callback.clone();
-                    let callback_entry = entry.clone();
-                    let callback_monitors = monitors.clone();
-                    let callback_key = key.clone();
-                    let result = client
-                        .pvmonitor(&real_name, move |update| {
-                            merge_monitor_delta(&mut last_full, update);
-
-                            // Patch in place when the delta names its changed
-                            // fields; only rebuild (re-converting every field of
-                            // the structure) when it cannot be applied
-                            // incrementally — a whole-structure delta, the first
-                            // tick, or a path the payload does not yet have.
-                            let needs_rebuild = match cached_payload.as_mut() {
-                                Some(cached) => !patch_nt_payload(cached, &last_full, update),
-                                None => true,
-                            };
-                            if needs_rebuild {
-                                cached_payload =
-                                    Some(nt_payload_from_decoded(&last_full, struct_id.clone()));
-                            }
-                            let payload =
-                                cached_payload.as_ref().expect("filled immediately above");
-
-                            if callback_monitors.dispatch_or_retire(
-                                &callback_key,
-                                &callback_entry,
-                                payload,
-                            ) {
-                                ControlFlow::Continue(())
-                            } else {
-                                callback_stopped.store(true, Ordering::SeqCst);
-                                ControlFlow::Break(())
-                            }
-                        })
-                        .await;
-
-                    if stopped_by_callback.load(Ordering::SeqCst) {
-                        // Last subscriber left. `dispatch_or_retire` already
-                        // removed this key's entry from the map (atomically,
-                        // under the map lock) the moment it decided the
-                        // upstream loop should end. This is the existing,
-                        // correct shutdown path: nothing to clean up, and no
-                        // fault to report.
-                        return;
+                    let mut ticker = tokio::time::interval(IDLE_SWEEP);
+                    // `interval` yields immediately on its first tick; skip it
+                    // so a subscription is never swept before it has run.
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        // Death BEFORE idleness. An upstream that closed (the
+                        // client surfaces that as `Err(Io)` from `join`) must
+                        // always take the "PV dead" path below — retired
+                        // binding, counted death, closed senders — even if the
+                        // last subscriber happened to leave in the same sweep
+                        // window. Sweeping for idleness first would retire a
+                        // dead upstream silently as merely unwanted and leave
+                        // its binding answering `Yes` to the next search
+                        // (design spec §4).
+                        match entry.upstream_state() {
+                            UpstreamState::Running => {}
+                            // A tick that found `subs` empty already retired
+                            // and cancelled this entry.
+                            UpstreamState::Cancelled => return,
+                            UpstreamState::Finished => break,
+                        }
+                        if monitors.retire_if_idle(&key, &entry) {
+                            // Every downstream receiver is gone and no upstream
+                            // tick was ever going to notice. The entry is out
+                            // of the map and the subscription is cancelled.
+                            // Not a fault: no death counted, no binding retired
+                            // (the PV is still perfectly claimable).
+                            return;
+                        }
                     }
 
-                    // Upstream ended — an error, or a clean EOF. Either way
-                    // there will never be another fan-out for this key, so
-                    // nothing else will ever tear the entry down.
+                    // Upstream ended on its own — an error (an upstream close
+                    // surfaces as `Err(Io)`), a clean EOF, or the callback
+                    // breaking. Take the handle BEFORE `retire`, whose own
+                    // cancel would otherwise throw away the reason.
+                    let ended = entry.take_upstream();
                     monitors.retire(&key, &entry);
                     // Without this, `try_claim` keeps answering `Yes` from the
                     // bindings map and a destroyed client hot-loops straight
                     // back into the dead upstream (design spec §4).
                     retire_binding_in(&bindings, &down_name);
                     deaths.fetch_add(1, Ordering::Relaxed);
+                    let end = match ended {
+                        Some(handle) => handle.join().await,
+                        None => Ok(MonitorEnd::Cancelled),
+                    };
                     tracing::warn!(
                         "upstream monitor ended for real='{}' downstream='{}' via client='{}' \
                          ({:?}); retired the cache entry and binding and closed every \
@@ -642,30 +673,18 @@ impl Source for GatewaySource {
                         real_name,
                         down_name,
                         client_name,
-                        result.err(),
+                        end,
                     );
                     // LAST, deliberately: dropping the `Sender`s is the
                     // observable "upstream is gone" edge — it is what wakes
-                    // every downstream receiver with `rx.recv() == None` and,
-                    // once Layer 2 lands, what makes the server-side pump send
-                    // DESTROY_CHANNEL. Everything a woken client might
-                    // immediately observe (the retired cache entry, the retired
-                    // binding, the death count) must already be committed
-                    // before we signal, or a client re-searching the instant it
-                    // is woken can still be answered `Yes` from a binding we
-                    // were about to remove — the §4 hot loop.
-                    //
-                    // Honest note on why this call exists at all: today it is
-                    // *equivalent* to simply returning from this task, because
-                    // the only surviving `Arc<MonitorEntry>` clones are this
-                    // task's `entry` and the one the `pvmonitor` callback held
-                    // (already dropped with the callback), so the senders would
-                    // die microseconds later anyway. The call earns its place
-                    // by making the edge explicit and correctly ordered, and it
-                    // becomes strictly load-bearing the moment anything holds
-                    // an `Arc<MonitorEntry>` clone past this task's return.
-                    // Do not delete it on the grounds that a test still passes
-                    // without it.
+                    // every downstream receiver with `rx.recv() == None` and
+                    // what makes the server-side pump send DESTROY_CHANNEL.
+                    // Everything a woken client might immediately observe (the
+                    // retired cache entry, the retired binding, the death
+                    // count) must already be committed before we signal, or a
+                    // client re-searching the instant it is woken can still be
+                    // answered `Yes` from a binding we were about to remove —
+                    // the §4 hot loop.
                     entry.close_all();
                 });
             });
