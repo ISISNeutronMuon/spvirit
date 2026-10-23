@@ -19,13 +19,12 @@ use spvirit_tools::spvirit_server::types::{
 };
 
 use spvirit_codec::epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand};
-use spvirit_codec::spvd_decode::{DecodedValue, PvdDecoder};
+use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_codec::spvd_decode::{FieldDesc, FieldType, StructureDesc, TypeCode};
 use spvirit_codec::spvd_encode::{
     decode_pv_request_fields, filter_structure_desc, nt_payload_desc,
 };
 use spvirit_codec::spvirit_encode::encode_control_message;
-use spvirit_codec::spvirit_encode::encode_size_pva;
 use spvirit_codec::spvirit_encode::{
     encode_beacon, encode_connection_validation, encode_create_channel_error,
     encode_create_channel_response, encode_get_field_error, encode_get_field_response,
@@ -39,6 +38,7 @@ use spvirit_codec::spvirit_encode::{
 };
 use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
+use spvirit_server::decode::decode_put_body;
 use spvirit_server::handler::{
     PvListMode, dump_hex_packet, infer_udp_response_ip, is_pattern_query, is_pvlist_virtual_pv,
     is_server_rpc_pv, is_virtual_event_pv, rand_guid, search_reply_target, validate_encoded_packet,
@@ -2957,106 +2957,6 @@ fn scalar_to_string(value: &ScalarValue) -> Option<String> {
         ScalarValue::F64(v) => Some(v.to_string()),
         ScalarValue::Str(v) => Some(v.clone()),
     }
-}
-
-fn decode_put_body(
-    body: &[u8],
-    desc: &spvirit_codec::spvd_decode::StructureDesc,
-    is_be: bool,
-) -> Option<DecodedValue> {
-    let decoder = PvdDecoder::new(is_be);
-    if let Ok((value, _)) = decoder.decode_structure_with_bitset(body, desc) {
-        if !decoded_is_empty(&value) {
-            return Some(value);
-        }
-    }
-    if !body.is_empty() && body[0] == 0xFF {
-        if let Ok((value, _)) = decoder.decode_structure_with_bitset(&body[1..], desc) {
-            if !decoded_is_empty(&value) {
-                return Some(value);
-            }
-        }
-    }
-    if let Some(value) = decode_put_body_shifted_bitset(body, desc, is_be) {
-        return Some(value);
-    }
-    if let Some(value) = decode_put_body_value_only(body, desc, is_be) {
-        return Some(value);
-    }
-    None
-}
-
-fn decoded_is_empty(value: &DecodedValue) -> bool {
-    matches!(value, DecodedValue::Structure(fields) if fields.is_empty())
-}
-
-fn decode_put_body_shifted_bitset(
-    body: &[u8],
-    desc: &spvirit_codec::spvd_decode::StructureDesc,
-    is_be: bool,
-) -> Option<DecodedValue> {
-    let decoder = PvdDecoder::new(is_be);
-    let (size, consumed) = decoder.decode_size(body).ok()?;
-    if size == 0 || body.len() < consumed + size {
-        return None;
-    }
-    let bitset = &body[consumed..consumed + size];
-    let data = &body[consumed + size..];
-    let shifted = shift_bitset_left(bitset, 1);
-    let mut shifted_body = Vec::new();
-    shifted_body.extend_from_slice(&encode_size_pva(shifted.len(), is_be));
-    shifted_body.extend_from_slice(&shifted);
-    shifted_body.extend_from_slice(data);
-    decoder
-        .decode_structure_with_bitset(&shifted_body, desc)
-        .ok()
-        .map(|(value, _)| value)
-        .filter(|value| !decoded_is_empty(value))
-}
-
-fn decode_put_body_value_only(
-    body: &[u8],
-    desc: &spvirit_codec::spvd_decode::StructureDesc,
-    is_be: bool,
-) -> Option<DecodedValue> {
-    let decoder = PvdDecoder::new(is_be);
-    if let Ok((size, consumed)) = decoder.decode_size(body) {
-        if consumed + size <= body.len() {
-            let data = &body[consumed + size..];
-            if let Some(value) = decode_value_only_from_data(data, desc, &decoder) {
-                return Some(value);
-            }
-        }
-    }
-    decode_value_only_from_data(body, desc, &decoder)
-}
-
-fn decode_value_only_from_data(
-    data: &[u8],
-    desc: &spvirit_codec::spvd_decode::StructureDesc,
-    decoder: &PvdDecoder,
-) -> Option<DecodedValue> {
-    let value_field = desc.fields.iter().find(|f| f.name == "value")?;
-    decoder
-        .decode_value(data, &value_field.field_type)
-        .ok()
-        .map(|(value, _)| DecodedValue::Structure(vec![("value".to_string(), value)]))
-}
-
-fn shift_bitset_left(bitset: &[u8], shift: usize) -> Vec<u8> {
-    if shift == 0 {
-        return bitset.to_vec();
-    }
-    let total_bits = bitset.len() * 8;
-    let new_bits = total_bits + shift;
-    let mut out = vec![0u8; (new_bits + 7) / 8];
-    for bit in 0..total_bits {
-        if (bitset[bit / 8] & (1 << (bit % 8))) != 0 {
-            let new_bit = bit + shift;
-            out[new_bit / 8] |= 1 << (new_bit % 8);
-        }
-    }
-    out
 }
 
 async fn handle_control_message(state: &Arc<ServerState>, conn_id: u64, header: &PvaHeader) {
