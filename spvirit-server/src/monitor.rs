@@ -8,9 +8,10 @@ use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::debug;
 
+use spvirit_codec::spvd_encode::nt_payload_changed_on_desc;
 use spvirit_codec::spvirit_encode::{
-    encode_destroy_channel_response, encode_monitor_data_response_delta,
-    encode_monitor_data_response_filtered, encode_monitor_data_response_payload,
+    encode_destroy_channel_response, encode_monitor_data_response_filtered,
+    encode_monitor_data_response_payload,
 };
 use spvirit_types::NtPayload;
 
@@ -500,21 +501,16 @@ impl MonitorRegistry {
             // delta would silently corrupt the client's value.
             //
             // Still suppress no-op updates (filtered view unchanged) to preserve
-            // bandwidth and pipeline credit — the delta encoder returning `None`
-            // is the change detector here.
+            // bandwidth and pipeline credit.
             //
-            // PERF follow-up (codec audit): this detects change by building and
-            // discarding a delta frame; a lighter filtered-projection equality
-            // check would avoid the redundant encode.
-            encode_monitor_data_response_delta(
-                sub.ioid,
-                subcmd,
-                prev,
-                payload,
-                desc,
-                sub.version,
-                sub.is_be,
-            )?;
+            // Change detection builds no frame: the predicate is pinned to
+            // `encode_nt_payload_delta(..).is_some()` by the codec's
+            // `changed_on_desc_agrees_with_the_delta_encoder`, so a no-op
+            // update is suppressed exactly as before (and `nfree` is left
+            // alone by the caller, per this function's contract).
+            if !nt_payload_changed_on_desc(prev, payload, desc, sub.is_be) {
+                return None;
+            }
             Some(encode_monitor_data_response_filtered(
                 sub.ioid,
                 subcmd,
@@ -2838,5 +2834,58 @@ mod tests {
             subs[0].nfree, 2,
             "a suppressed update must not burn pipeline credit"
         );
+    }
+
+    /// The filtered branch of `build_monitor_frame` used to encode a whole
+    /// delta frame and throw it away just to learn whether the filtered view
+    /// changed. Change detection now goes through the codec's
+    /// `nt_payload_changed_on_desc`, which builds no frame. Pin that the
+    /// delta encoder is gone from this file — a reintroduction is a
+    /// double-encode-per-update regression, not a style choice.
+    #[test]
+    fn filtered_change_detection_builds_no_delta_frame() {
+        let src = include_str!("monitor.rs");
+        let needle = concat!("encode_monitor_data_", "response_delta");
+        assert!(
+            !src.contains(needle),
+            "monitor.rs still references the delta encoder ({needle});              the filtered branch must use nt_payload_changed_on_desc"
+        );
+        // Positive precondition so the guard is proven to look at live code.
+        assert!(src.contains("nt_payload_changed_on_desc("));
+    }
+
+    /// A MULTI-field narrowed descriptor (value + alarm): a change confined to
+    /// the unselected timeStamp is suppressed; a change to alarm.severity is
+    /// emitted as exactly the full filtered frame.
+    #[test]
+    fn multi_field_filtered_suppresses_unselected_change_and_emits_selected_change() {
+        let stamped = |value: f64, severity: i32, secs: i64| {
+            let mut nt = NtScalar::from_value(ScalarValue::F64(value));
+            nt.alarm_severity = severity;
+            nt.time_stamp = Some(spvirit_types::NtTimeStamp {
+                seconds_past_epoch: secs,
+                nanoseconds: 5,
+                user_tag: 0,
+            });
+            NtPayload::Scalar(nt)
+        };
+        let p1 = stamped(1.0, 0, 1_700_000_000);
+        let full = nt_payload_desc(&p1);
+        let desc = filter_structure_desc(&full, &["value".to_string(), "alarm".to_string()]);
+        let mut sub = make_sub(Some(desc.clone()));
+        sub.version = 2;
+        sub.is_be = true;
+        sub.ioid = 77;
+        sub.last_snapshot = Some(p1.clone());
+
+        // Only timeStamp differs: not part of the view, so suppressed.
+        let p_ts = stamped(1.0, 0, 1_700_000_999);
+        assert!(MonitorRegistry::build_monitor_frame(&sub, &p_ts).is_none());
+
+        // alarm.severity differs: emitted, byte-identical to the filtered encode.
+        let p_alarm = stamped(1.0, 2, 1_700_000_000);
+        let got = MonitorRegistry::build_monitor_frame(&sub, &p_alarm).expect("alarm change");
+        let want = encode_monitor_data_response_filtered(77, 0x00, &p_alarm, &desc, 2, true);
+        assert_eq!(got, want);
     }
 }
