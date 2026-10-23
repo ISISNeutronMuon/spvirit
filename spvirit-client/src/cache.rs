@@ -1,10 +1,5 @@
 //! Resolution and connection caching for [`crate::pva_client::PvaClient`].
 
-// The crate-private cache internals have no in-crate consumer until
-// `PvaClient` is wired to them (plan 2026-09-02-client-connection-cache,
-// Task 2). Remove this allow in that task.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -180,6 +175,61 @@ impl ResolutionCache {
             stored_at: Instant::now(),
         });
         Ok(resolved)
+    }
+}
+
+/// The per-`PvaClient` cache: one resolution cache plus (from Task 4) one
+/// connection pool, sharing one set of counters.
+///
+/// Deliberately no `#[derive(Debug)]`: Task 4 gives this a `ConnPool`, which
+/// transitively holds a `spvirit_codec::SegmentReassembler`, and that type does
+/// not implement `Debug` (`spvirit-codec/src/segment.rs:34`). Nothing formats
+/// `ClientCache` — `PvaClient`'s hand-written `Debug` prints
+/// `self.cache.stats()`, a plain `CacheStats`.
+pub(crate) struct ClientCache {
+    // Read only through `config()`, which nothing calls yet; no later task in
+    // plan 2026-09-02-client-connection-cache names a caller either.
+    #[allow(dead_code)]
+    cfg: CacheConfig,
+    counters: CacheCounters,
+    resolution: ResolutionCache,
+}
+
+impl ClientCache {
+    pub(crate) fn new(cfg: CacheConfig) -> Self {
+        Self {
+            resolution: ResolutionCache::new(cfg.resolve_ttl),
+            counters: CacheCounters::default(),
+            cfg,
+        }
+    }
+
+    // Specified by Task 2 of plan 2026-09-02-client-connection-cache, but no
+    // task in that plan calls it yet.
+    #[allow(dead_code)]
+    pub(crate) fn config(&self) -> CacheConfig {
+        self.cfg
+    }
+
+    pub(crate) fn stats(&self) -> CacheStats {
+        self.counters.snapshot()
+    }
+
+    pub(crate) fn invalidate(&self, pv_name: &str) {
+        self.resolution.invalidate(pv_name);
+    }
+
+    /// Resolve `opts.pv_name` through the cache.
+    pub(crate) async fn resolve(
+        &self,
+        opts: &crate::types::PvOptions,
+    ) -> Result<Resolved, PvGetError> {
+        self.resolution
+            .get_or_resolve(&opts.pv_name, &self.counters, || async {
+                let (addr, guid) = crate::search::resolve_pv_server(opts).await?;
+                Ok(Resolved { addr, guid })
+            })
+            .await
     }
 }
 

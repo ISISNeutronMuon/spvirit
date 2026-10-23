@@ -33,7 +33,6 @@ use spvirit_codec::spvirit_encode::{
 use crate::byte_sink::ByteSink;
 use crate::client::{ChannelConn, ensure_status_ok, establish_channel, pvget as low_level_pvget};
 use crate::put_encode::encode_put_payload;
-use crate::search::resolve_pv_server;
 use crate::transport::{FrameBuf, read_frame, read_frame_resumable, read_until};
 use crate::types::{PvGetError, PvGetResult, PvOptions};
 
@@ -211,6 +210,9 @@ impl PvaClientBuilder {
             bind_addr: self.bind_addr,
             debug: self.debug,
             byte_sink: None,
+            cache: Arc::new(crate::cache::ClientCache::new(
+                crate::cache::CacheConfig::default(),
+            )),
         }
     }
 }
@@ -244,6 +246,10 @@ pub struct PvaClient {
     /// encode-send / recv-decode boundaries with the real PV name, server
     /// host, and wire-byte count.
     byte_sink: Option<Arc<dyn ByteSink>>,
+    /// Shared resolution cache and connection pool. Behind an `Arc` so every
+    /// clone of this client warms and reads one cache — which is what makes
+    /// the gateway's `Arc<PvaClient>` per upstream effective.
+    cache: Arc<crate::cache::ClientCache>,
 }
 
 // `dyn ByteSink` does not implement `Debug`, so this is written by hand
@@ -263,6 +269,7 @@ impl std::fmt::Debug for PvaClient {
             .field("bind_addr", &self.bind_addr)
             .field("debug", &self.debug)
             .field("byte_sink", &self.byte_sink.is_some())
+            .field("cache", &self.cache.stats())
             .finish()
     }
 }
@@ -279,6 +286,28 @@ impl PvaClient {
     /// no trait call happens on the hot path unless a sink is installed.
     pub fn set_byte_sink(&mut self, sink: Arc<dyn ByteSink>) {
         self.byte_sink = Some(sink);
+    }
+
+    /// Replace this client's cache with a freshly configured one.
+    ///
+    /// Consumes and returns `self` so it composes with the builder. Call it
+    /// before the client is cloned or shared: it installs a *new* cache, so
+    /// existing clones keep the old one.
+    pub fn with_cache_config(mut self, cfg: crate::cache::CacheConfig) -> Self {
+        self.cache = Arc::new(crate::cache::ClientCache::new(cfg));
+        self
+    }
+
+    /// A snapshot of this client's cache counters.
+    pub fn cache_stats(&self) -> crate::cache::CacheStats {
+        self.cache.stats()
+    }
+
+    /// Forget the cached resolution for `pv_name`, forcing the next
+    /// operation to search again. Call this when a PV is known to have
+    /// moved (an IOC restart, a retired gateway binding).
+    pub fn invalidate_pv(&self, pv_name: &str) {
+        self.cache.invalidate(pv_name);
     }
 
     /// Build [`PvOptions`] for a given PV name, inheriting client-level settings.
@@ -298,11 +327,24 @@ impl PvaClient {
         o
     }
 
-    /// Resolve a PV server and establish a channel, returning the raw connection.
+    /// Resolve a PV server (through the cache) and establish a channel,
+    /// returning the raw connection.
+    ///
+    /// Long-lived callers (`pvmonitor`, `PvaChannel`) use this: they get the
+    /// cached *resolution* but always dial their own connection, so a
+    /// subscription can never occupy a pooled connection indefinitely.
     async fn open_channel(&self, pv_name: &str) -> Result<ChannelConn, PvGetError> {
         let opts = self.opts(pv_name);
-        let (target, guid) = resolve_pv_server(&opts).await?;
-        establish_channel(target, guid, &opts).await
+        let resolved = self.cache.resolve(&opts).await?;
+        match establish_channel(resolved.addr, resolved.guid, &opts).await {
+            Ok(conn) => Ok(conn),
+            Err(e) => {
+                // The cached address did not yield a channel: either it is
+                // gone or the PV moved. Either way the resolution is stale.
+                self.cache.invalidate(pv_name);
+                Err(e)
+            }
+        }
     }
 
     // ─── pvget ───────────────────────────────────────────────────────────
@@ -1013,6 +1055,122 @@ fn pipeline_ack_on_consume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spawn an in-process `PvaServer` holding one `ao` PV and return
+    /// `(tcp_port, udp_port)`. Callers point a client at it either as a
+    /// name server (`.name_server(addr).no_broadcast()`, which exercises a
+    /// real resolution) or directly (`.server_addr(addr)`, which does not).
+    async fn spawn_test_server(pv: &str) -> (u16, u16) {
+        use spvirit_server::pva_server::PvaServer;
+        use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket as StdUdpSocket};
+
+        let tcp_port = TcpListener::bind("127.0.0.1:0")
+            .expect("bind tcp")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+        let udp_port = StdUdpSocket::bind("127.0.0.1:0")
+            .expect("bind udp")
+            .local_addr()
+            .expect("local_addr")
+            .port();
+
+        let server = PvaServer::builder()
+            .ao(pv, 1.0)
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .build();
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        (tcp_port, udp_port)
+    }
+
+    /// Two operations on the same PV through the same client must perform
+    /// exactly ONE resolution. Asserted on the cache counters, not on timing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_operation_on_the_same_pv_performs_no_additional_search() {
+        const PV: &str = "CACHE:RESOLVE";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let ns: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        // Resolve via the in-process server acting as a TCP name server. No
+        // UDP broadcast, so this is deterministic on every platform.
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .name_server(ns)
+            .no_broadcast()
+            .build();
+
+        // pvget is routed through the cache in Task 5; pvinfo uses open_channel today.
+        client.pvinfo(PV).await.expect("first pvinfo");
+        let after_first = client.cache_stats();
+        assert_eq!(after_first.resolve_misses, 1);
+        assert_eq!(after_first.resolve_hits, 0);
+
+        client.pvinfo(PV).await.expect("second pvinfo");
+        let after_second = client.cache_stats();
+        assert_eq!(
+            after_second.resolve_misses, 1,
+            "the second get must not search again"
+        );
+        assert_eq!(after_second.resolve_hits, 1);
+    }
+
+    /// A client built with `CacheConfig::disabled()` behaves exactly as it did
+    /// before this plan: every operation resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disabled_cache_searches_on_every_operation() {
+        const PV: &str = "CACHE:DISABLED";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let ns: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .name_server(ns)
+            .no_broadcast()
+            .build()
+            .with_cache_config(crate::cache::CacheConfig::disabled());
+
+        // pvget is routed through the cache in Task 5; pvinfo uses open_channel today.
+        client.pvinfo(PV).await.expect("first pvinfo");
+        client.pvinfo(PV).await.expect("second pvinfo");
+
+        let stats = client.cache_stats();
+        assert_eq!(stats.resolve_misses, 2);
+        assert_eq!(stats.resolve_hits, 0);
+    }
+
+    /// Clones of a `PvaClient` share one cache — which is how the gateway's
+    /// `Arc<PvaClient>` per upstream gets a warm cache across requests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clones_of_a_client_share_one_cache() {
+        const PV: &str = "CACHE:SHARED";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let ns: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .name_server(ns)
+            .no_broadcast()
+            .build();
+        let twin = client.clone();
+
+        // pvget is routed through the cache in Task 5; pvinfo uses open_channel today.
+        client.pvinfo(PV).await.expect("first pvinfo");
+        twin.pvinfo(PV).await.expect("second pvinfo via clone");
+
+        assert_eq!(client.cache_stats().resolve_misses, 1);
+        assert_eq!(twin.cache_stats().resolve_hits, 1);
+    }
 
     /// Regression test for the pipelined-monitor ACK-credit leak.
     ///
