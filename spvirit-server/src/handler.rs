@@ -524,7 +524,9 @@ where
     PatternDispatch::Deferred
 }
 
-fn build_pvlist_structure(names: &[String]) -> StructureDesc {
+/// Build the `epics:pva/pvlist:1.0` introspection structure that answers a
+/// pvlist GET_FIELD: one boolean field per visible PV name.
+pub fn build_pvlist_structure(names: &[String]) -> StructureDesc {
     use spvirit_codec::spvd_decode::{FieldDesc, FieldType, TypeCode};
     StructureDesc {
         struct_id: Some("epics:pva/pvlist:1.0".to_string()),
@@ -538,7 +540,10 @@ fn build_pvlist_structure(names: &[String]) -> StructureDesc {
     }
 }
 
-fn requested_pvlist_pattern(field_name: Option<&str>) -> Option<&str> {
+/// Interpret a pvlist GET_FIELD's requested field name as a wildcard pattern.
+/// Empty, `*`, `__pvlist` and `pvlist` all mean "everything"; anything else is
+/// returned only if it is actually a pattern.
+pub fn requested_pvlist_pattern(field_name: Option<&str>) -> Option<&str> {
     let raw = field_name.map(str::trim).unwrap_or("");
     if raw.is_empty() || raw == "*" || raw == "__pvlist" || raw.eq_ignore_ascii_case("pvlist") {
         return Some("*");
@@ -2839,6 +2844,20 @@ mod tests {
             2,
         );
         assert_eq!(got, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn pvlist_helpers_are_public_and_stable() {
+        let desc = build_pvlist_structure(&["A:PV".to_string(), "B:PV".to_string()]);
+        assert_eq!(desc.struct_id.as_deref(), Some("epics:pva/pvlist:1.0"));
+        assert_eq!(desc.fields.len(), 2);
+        assert_eq!(desc.fields[0].name, "A:PV");
+
+        assert_eq!(requested_pvlist_pattern(None), Some("*"));
+        assert_eq!(requested_pvlist_pattern(Some("  ")), Some("*"));
+        assert_eq!(requested_pvlist_pattern(Some("pvlist")), Some("*"));
+        assert_eq!(requested_pvlist_pattern(Some("A:*")), Some("A:*"));
+        assert_eq!(requested_pvlist_pattern(Some("A:PV")), None);
     }
 
     /// V6 MEDIUM-2. `collect_visible_pv_names` sorts and *then* truncates, so

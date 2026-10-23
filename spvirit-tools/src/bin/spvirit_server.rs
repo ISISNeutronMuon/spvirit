@@ -20,7 +20,6 @@ use spvirit_tools::spvirit_server::types::{
 
 use spvirit_codec::epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::DecodedValue;
-use spvirit_codec::spvd_decode::{FieldDesc, FieldType, StructureDesc, TypeCode};
 use spvirit_codec::spvd_encode::{
     decode_pv_request_fields, filter_structure_desc, nt_payload_desc,
 };
@@ -40,9 +39,10 @@ use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
 use spvirit_server::decode::decode_put_body;
 use spvirit_server::handler::{
-    PvListMode, collect_visible_pv_names_iter, dump_hex_packet, infer_udp_response_ip, is_pattern_query, is_pvlist_virtual_pv,
-    is_server_rpc_pv, is_virtual_event_pv, rand_guid, search_reply_target, validate_encoded_packet,
-    virtual_event_nt, virtual_pvlist_nt, wildcard_match,
+    PvListMode, build_pvlist_structure, collect_visible_pv_names_iter, dump_hex_packet,
+    infer_udp_response_ip, is_pattern_query, is_pvlist_virtual_pv, is_server_rpc_pv,
+    is_virtual_event_pv, rand_guid, requested_pvlist_pattern, search_reply_target,
+    validate_encoded_packet, virtual_event_nt, virtual_pvlist_nt, wildcard_match,
 };
 use spvirit_server::monitor::MonitorRegistry;
 
@@ -1791,30 +1791,6 @@ async fn send_msg(state: &Arc<ServerState>, conn_id: u64, msg: Vec<u8>) -> bool 
     } else {
         false
     }
-}
-
-fn build_pvlist_structure(names: &[String]) -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("epics:pva/pvlist:1.0".to_string()),
-        fields: names
-            .iter()
-            .map(|name| FieldDesc {
-                name: name.clone(),
-                field_type: FieldType::Scalar(TypeCode::Boolean),
-            })
-            .collect(),
-    }
-}
-
-fn requested_pvlist_pattern(field_name: Option<&str>) -> Option<&str> {
-    let raw = field_name.map(str::trim).unwrap_or("");
-    if raw.is_empty() || raw == "*" || raw == "__pvlist" || raw.eq_ignore_ascii_case("pvlist") {
-        return Some("*");
-    }
-    if is_pattern_query(raw) {
-        return Some(raw);
-    }
-    None
 }
 
 async fn handle_get_field_request(
