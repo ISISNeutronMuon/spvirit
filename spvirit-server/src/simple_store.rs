@@ -414,7 +414,7 @@ impl Source for SimplePvStore {
         Box::pin(async move {
             let pvs = self.pvs.read().await;
             let entry = pvs.get(&name)?;
-            let descriptor = descriptor_for_payload(&entry.record.to_ntpayload());
+            let descriptor = descriptor_for_record(entry.record.payload_ref());
             Some(PvInfo {
                 descriptor,
                 writable: entry.record.writable(),
@@ -622,6 +622,24 @@ fn should_post_update(entry: &mut PvEntry, prev_severity: i32) -> bool {
 /// that class of drift.
 pub fn descriptor_for_payload(payload: &NtPayload) -> StructureDesc {
     spvirit_codec::spvd_encode::nt_payload_desc(payload)
+}
+
+/// The advertised descriptor, built from a BORROWED payload.
+///
+/// Same result as [`descriptor_for_payload`], without cloning the record to
+/// get it — a claim on a large waveform used to clone every sample purely to
+/// read the array's element type. Every arm delegates to the codec for the
+/// same reason `descriptor_for_payload` does: one builder, no drift.
+pub fn descriptor_for_record(payload: NtPayloadRef<'_>) -> StructureDesc {
+    use spvirit_codec::spvd_encode as enc;
+    match payload {
+        NtPayloadRef::Scalar(nt) => enc::nt_scalar_desc(&nt.value),
+        NtPayloadRef::ScalarArray(nt) => enc::nt_scalar_array_desc(&nt.value),
+        NtPayloadRef::Table(nt) => enc::nt_table_desc(nt),
+        NtPayloadRef::NdArray(_) => enc::nt_ndarray_desc(),
+        NtPayloadRef::Enum(_) => enc::nt_enum_desc(),
+        NtPayloadRef::Generic { struct_id, fields } => enc::pv_value_desc(struct_id, fields),
+    }
 }
 
 #[cfg(test)]
@@ -1509,5 +1527,86 @@ record(ao, "DB:AO") {
             should_post_update(&mut entry, 0),
             "a severity change must defeat the deadband"
         );
+    }
+
+    /// The payload shapes `descriptor_payload_samples()` does not cover:
+    /// Table, NdArray, Enum and Generic. Without these the "every shape"
+    /// claim below would be false.
+    fn extra_descriptor_shapes() -> Vec<(&'static str, NtPayload)> {
+        use spvirit_types::{NtEnum, PvValue};
+        vec![
+            (
+                "NTTable",
+                NtPayload::Table(NtTable {
+                    labels: vec!["X".to_string()],
+                    columns: vec![NtTableColumn {
+                        name: "x".to_string(),
+                        values: ScalarArrayValue::F64(vec![1.0, 2.0]),
+                    }],
+                    descriptor: Some("table".to_string()),
+                    alarm: None,
+                    time_stamp: None,
+                }),
+            ),
+            ("NTNDArray", NtPayload::NdArray(NtNdArray::empty())),
+            (
+                "NTEnum",
+                NtPayload::Enum(NtEnum::new(1, vec!["OFF".to_string(), "ON".to_string()])),
+            ),
+            (
+                "Generic",
+                NtPayload::Generic {
+                    struct_id: "epics:nt/NTScalar:1.0".to_string(),
+                    fields: vec![("value".to_string(), PvValue::Scalar(ScalarValue::I32(3)))],
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_borrowing_descriptor_matches_the_owning_one_for_every_shape() {
+        // `descriptor_for_record` must be byte-identical to
+        // `descriptor_for_payload`: the descriptor is what PUT bodies are
+        // decoded against, so any drift here breaks writes, exactly as the
+        // string-PUT regression did.
+        let all = descriptor_payload_samples()
+            .into_iter()
+            .chain(extra_descriptor_shapes());
+        for (label, payload) in all {
+            let borrowed = match &payload {
+                NtPayload::Scalar(nt) => descriptor_for_record(NtPayloadRef::Scalar(nt)),
+                NtPayload::ScalarArray(nt) => {
+                    descriptor_for_record(NtPayloadRef::ScalarArray(nt))
+                }
+                NtPayload::Table(nt) => descriptor_for_record(NtPayloadRef::Table(nt)),
+                NtPayload::NdArray(nt) => descriptor_for_record(NtPayloadRef::NdArray(nt)),
+                NtPayload::Enum(nt) => descriptor_for_record(NtPayloadRef::Enum(nt)),
+                NtPayload::Generic { struct_id, fields } => {
+                    descriptor_for_record(NtPayloadRef::Generic { struct_id, fields })
+                }
+            };
+            assert_eq!(
+                borrowed,
+                descriptor_for_payload(&payload),
+                "borrowed descriptor drifted from the owned one for {label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_advertises_the_same_descriptor_as_before() {
+        let mut records = std::collections::HashMap::new();
+        let wf = make_waveform("W:big", ScalarArrayValue::F64(vec![0.0; 1024]));
+        let expected = descriptor_for_payload(&wf.to_ntpayload());
+        records.insert("W:big".to_string(), wf);
+        let store = SimplePvStore::new(
+            records,
+            std::collections::HashMap::new(),
+            Vec::new(),
+            false,
+        );
+
+        let info = Source::claim(&store, "W:big").await.expect("claimed");
+        assert_eq!(info.descriptor, expected);
     }
 }
