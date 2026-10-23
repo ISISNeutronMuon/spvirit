@@ -1490,17 +1490,49 @@ async fn cleanup_connection(state: &Arc<ServerState>, conn_id: u64) {
     }
 }
 
+/// Compute which PVs a reloaded store changed.
+///
+/// Pure, so it runs under a *read* lock: the write lock then only has to cover
+/// the pointer swap. Each side's `NtPayload` is materialised exactly once, where
+/// the old code called `to_ntpayload()` twice and cloned the result a third time
+/// per PV, all while holding the write lock.
+fn diff_stores(
+    old: &HashMap<String, RecordInstance>,
+    new: &HashMap<String, RecordInstance>,
+) -> Vec<(String, NtPayload)> {
+    let mut changed = Vec::new();
+    for (name, new_val) in new {
+        let new_payload = new_val.to_ntpayload();
+        let unchanged = old
+            .get(name)
+            .is_some_and(|old_val| old_val.to_ntpayload() == new_payload);
+        if !unchanged {
+            changed.push((name.clone(), new_payload));
+        }
+    }
+    changed
+}
+
 async fn run_db_reload(
     state: Arc<ServerState>,
     db_file: String,
     interval_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut last_mtime = file_mtime(&db_file).unwrap_or(SystemTime::UNIX_EPOCH);
+    let db_path = db_file.clone();
+    let mut last_mtime = tokio::task::spawn_blocking(move || file_mtime(&db_path))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
     loop {
         interval.tick().await;
-        let current_mtime = match file_mtime(&db_file) {
+        let db_path = db_file.clone();
+        let current_mtime = match tokio::task::spawn_blocking(move || file_mtime(&db_path))
+            .await
+            .unwrap_or(None)
+        {
             Some(t) => t,
             None => continue,
         };
@@ -1509,10 +1541,16 @@ async fn run_db_reload(
         }
         last_mtime = current_mtime;
 
-        let mut new_store = match load_db(&db_file) {
-            Ok(v) => v,
-            Err(e) => {
+        let db_path = db_file.clone();
+        let loaded = tokio::task::spawn_blocking(move || load_db(&db_path)).await;
+        let mut new_store = match loaded {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 error!("Failed to reload DB: {}", e);
+                continue;
+            }
+            Err(e) => {
+                error!("DB reload task panicked: {}", e);
                 continue;
             }
         };
@@ -1535,16 +1573,12 @@ async fn run_db_reload(
             new_store.len()
         );
 
-        let mut changed: Vec<(String, NtPayload)> = Vec::new();
+        let changed: Vec<(String, NtPayload)> = {
+            let store = state.pv_store.read().await;
+            diff_stores(&store, &new_store)
+        };
         {
             let mut store = state.pv_store.write().await;
-            for (name, new_val) in &new_store {
-                let old_val = store.get(name);
-                let new_payload = new_val.to_ntpayload();
-                if old_val.map(|v| v.to_ntpayload()) != Some(new_payload.clone()) {
-                    changed.push((name.clone(), new_payload));
-                }
-            }
             *store = new_store;
             state.bump_db_generation();
         }
@@ -3593,6 +3627,29 @@ mod tests {
             None,
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         ))
+    }
+
+    fn ai_record_with_value(name: &str, v: f64) -> RecordInstance {
+        // Built through the constructor, not `set_scalar_value`: the setter stamps
+        // the wall clock, which would make two equal-valued records differ.
+        mdel_ai_record(name, v, "0")
+    }
+
+    #[test]
+    fn diff_stores_reports_only_changed_payloads_and_materialises_each_once() {
+        let mut old = HashMap::new();
+        old.insert("A:PV".to_string(), ai_record_with_value("A:PV", 1.0));
+        old.insert("B:PV".to_string(), ai_record_with_value("B:PV", 2.0));
+
+        let mut new = HashMap::new();
+        new.insert("A:PV".to_string(), ai_record_with_value("A:PV", 1.0)); // unchanged
+        new.insert("B:PV".to_string(), ai_record_with_value("B:PV", 9.0)); // changed
+        new.insert("C:PV".to_string(), ai_record_with_value("C:PV", 3.0)); // added
+
+        let mut changed = diff_stores(&old, &new);
+        changed.sort_by(|a, b| a.0.cmp(&b.0));
+        let names: Vec<&str> = changed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["B:PV", "C:PV"]);
     }
 
     fn mdel_ai_record(name: &str, val: f64, mdel: &str) -> RecordInstance {
