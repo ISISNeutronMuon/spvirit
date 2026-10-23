@@ -5,7 +5,7 @@
 //! decoder tries several strategies in order.
 
 use spvirit_codec::spvd_decode::{DecodedValue, PvdDecoder, StructureDesc};
-use spvirit_codec::spvd_encode::encode_size_pvd;
+use spvirit_codec::spvirit_encode::encode_size_pva;
 
 /// Decode a PUT body payload using the known structure descriptor.
 ///
@@ -53,7 +53,7 @@ fn decode_put_body_shifted_bitset(
     let data = &body[consumed + size..];
     let shifted = shift_bitset_left(bitset, 1);
     let mut shifted_body = Vec::new();
-    shifted_body.extend_from_slice(&encode_size_pvd(shifted.len(), is_be));
+    shifted_body.extend_from_slice(&encode_size_pva(shifted.len(), is_be));
     shifted_body.extend_from_slice(&shifted);
     shifted_body.extend_from_slice(data);
     decoder

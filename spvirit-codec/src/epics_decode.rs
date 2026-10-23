@@ -2061,10 +2061,11 @@ mod tests {
         assert!(PvaDestroyRequestPayload::new(&[0u8; 3], false).is_none());
     }
     use crate::spvd_encode::{
-        encode_nt_payload_bitset_parts, encode_nt_scalar_bitset_parts, encode_size_pvd,
+        encode_nt_payload_bitset_parts, encode_nt_scalar_bitset_parts,
         nt_payload_desc, nt_scalar_desc,
     };
     use crate::spvirit_encode::encode_header;
+    use crate::spvirit_encode::encode_size_pva;
     use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue, ScalarValue};
 
     #[test]
@@ -2126,7 +2127,7 @@ mod tests {
         let mut body_spec = Vec::new();
         body_spec.extend_from_slice(&changed_bitset);
         body_spec.extend_from_slice(&values);
-        body_spec.extend_from_slice(&encode_size_pvd(0, false));
+        body_spec.extend_from_slice(&encode_size_pva(0, false));
 
         let pkt = build_monitor_packet(1, 0x00, &body_spec);
         let mut pva = PvaPacket::new(&pkt);
@@ -2162,7 +2163,7 @@ mod tests {
         // changed bitset, overrun bitset, data.
         let mut body_overrun = Vec::new();
         body_overrun.extend_from_slice(&changed_bitset);
-        body_overrun.extend_from_slice(&encode_size_pvd(0, false));
+        body_overrun.extend_from_slice(&encode_size_pva(0, false));
         body_overrun.extend_from_slice(&values);
 
         let (update, layout) = decoder
@@ -2201,7 +2202,7 @@ mod tests {
         let mut body_spec = Vec::new();
         body_spec.extend_from_slice(&changed_bitset);
         body_spec.extend_from_slice(&values);
-        body_spec.extend_from_slice(&encode_size_pvd(0, false));
+        body_spec.extend_from_slice(&encode_size_pva(0, false));
 
         let pkt = build_monitor_packet(11, 0x00, &body_spec);
         let mut pva = PvaPacket::new(&pkt);

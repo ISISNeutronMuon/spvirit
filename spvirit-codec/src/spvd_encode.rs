@@ -13,13 +13,12 @@ use spvirit_types::{
     STANDARD_FORM_CHOICES,
 };
 
-pub fn encode_size_pvd(size: usize, is_be: bool) -> Vec<u8> {
-    crate::encode_common::encode_size(size, is_be)
-}
-
-pub fn encode_string_pvd(value: &str, is_be: bool) -> Vec<u8> {
-    crate::encode_common::encode_string(value, is_be)
-}
+// The PVD and PVA size/string prefixes are the same wire format. There is one
+// implementation, in `encode_common`; `spvirit_encode` re-exports it publicly
+// as `encode_size_pva` / `encode_string_pva`. These private aliases keep this
+// module's existing call sites reading `_pvd`, which matches the pvData spec
+// language used throughout the file.
+use crate::encode_common::{encode_size as encode_size_pvd, encode_string as encode_string_pvd};
 
 pub fn encode_structure_desc(desc: &StructureDesc, is_be: bool) -> Vec<u8> {
     let mut out = Vec::new();
