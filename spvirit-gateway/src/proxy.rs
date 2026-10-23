@@ -1070,8 +1070,10 @@ mod tests {
     /// claim-path `debug!` intermittently invisible to the scoped capture
     /// (about half of full `--lib` runs, even with `rebuild_interest_cache`).
     /// A single global subscriber has no such race. Every other test in the
-    /// binary then also logs into this buffer, which nobody else reads; the
-    /// assertions below look only for this test's own unique names.
+    /// binary then also logs into this buffer, which nobody else reads. The
+    /// PV names here (`LOGTEST:*`) are used by no other test, and each
+    /// assertion matches a `key="value"` fragment of the log line, so
+    /// another test's output cannot satisfy it.
     #[tokio::test]
     async fn a_failing_upstream_is_logged_by_both_claim_and_get() {
         static CAPTURE: std::sync::OnceLock<CaptureWriter> = std::sync::OnceLock::new();
@@ -1097,29 +1099,33 @@ mod tests {
         };
 
         // claim: every configured client fails to resolve.
-        assert!(src.claim("GONE:PV").await.is_none());
+        assert!(src.claim("LOGTEST:GONE").await.is_none());
 
         // get: insert a binding by hand — the upstream is dead, so no claim
         // can create one — then `get` reaches `pvget` and fails there.
         src.bindings.lock().unwrap().insert(
-            "BOUND:PV".to_string(),
+            "LOGTEST:BOUND".to_string(),
             Binding {
                 client_name: "dead-client".to_string(),
-                real_name: "BOUND:REAL".to_string(),
+                real_name: "LOGTEST:REAL".to_string(),
                 descriptor: StructureDesc::default(),
                 bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
-        assert!(src.get("BOUND:PV").await.is_none());
+        assert!(src.get("LOGTEST:BOUND").await.is_none());
 
         let captured = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         assert!(
-            captured.contains("GONE:PV") && captured.contains("dead-client"),
+            captured.contains(
+                "downstream=\"LOGTEST:GONE\" real=\"LOGTEST:GONE\" via client=\"dead-client\""
+            ),
             "claim's upstream failure must name the PV and the client: {captured:?}"
         );
         assert!(
-            captured.contains("BOUND:PV") && captured.contains("BOUND:REAL"),
+            captured.contains(
+                "downstream=\"LOGTEST:BOUND\" real=\"LOGTEST:REAL\" via client=\"dead-client\""
+            ),
             "get's upstream failure must name the downstream and upstream names: {captured:?}"
         );
     }
