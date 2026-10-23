@@ -566,395 +566,24 @@ impl RecordInstance {
             _ => return false,
         };
 
-        let changed = match (&mut nt.value, value) {
-            // Same-variant fast path: exact compare-and-assign for every
-            // variant, including the 8 non-native numeric ones. This must
-            // come before the native↔native arms below and the f64-based
-            // catch-all so 64-bit integers (and other precision-sensitive
-            // types) never round-trip through f64.
-            (ScalarValue::I8(current), ScalarValue::I8(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::I16(current), ScalarValue::I16(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::I64(current), ScalarValue::I64(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::U8(current), ScalarValue::U8(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::U16(current), ScalarValue::U16(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::U32(current), ScalarValue::U32(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::U64(current), ScalarValue::U64(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::F32(current), ScalarValue::F32(v)) => {
-                // Exact comparison. `f32::EPSILON` is the gap between 1.0 and
-                // the next float, not an absolute tolerance: using it as one
-                // silently discards every write smaller than 1.19e-7.
-                // Deadbanding is monitor policy (MDEL in `simple_store.rs`),
-                // not store policy.
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::Bool(current), ScalarValue::Bool(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::I32(current), ScalarValue::I32(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::F64(current), ScalarValue::F64(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::Str(current), ScalarValue::Str(v)) => {
-                if *current == v {
-                    false
-                } else {
-                    *current = v;
-                    true
-                }
-            }
-            (ScalarValue::Bool(current), ScalarValue::I32(v)) => {
-                let next = v != 0;
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::Bool(current), ScalarValue::F64(v)) => {
-                let next = v != 0.0;
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::I32(current), ScalarValue::Bool(v)) => {
-                let next = if v { 1 } else { 0 };
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::I32(current), ScalarValue::F64(v)) => {
-                let next = v as i32;
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::F64(current), ScalarValue::Bool(v)) => {
-                let next = if v { 1.0 } else { 0.0 };
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::F64(current), ScalarValue::I32(v)) => {
-                let next = v as f64;
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::Str(current), ScalarValue::Bool(v)) => {
-                let next = if v { "1" } else { "0" }.to_string();
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::Str(current), ScalarValue::I32(v)) => {
-                let next = v.to_string();
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::Str(current), ScalarValue::F64(v)) => {
-                let next = v.to_string();
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::Bool(current), ScalarValue::Str(v)) => {
-                let next = parse_bool_like(&v).unwrap_or(*current);
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::I32(current), ScalarValue::Str(v)) => {
-                let next = v.parse::<i32>().unwrap_or(*current);
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            (ScalarValue::F64(current), ScalarValue::Str(v)) => {
-                let next = v.parse::<f64>().unwrap_or(*current);
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }
-            // Handle all remaining numeric ScalarValue variants by coercing to
-            // the target's type via f64.
-            (target, other) => {
-                let as_f64 = match &other {
-                    ScalarValue::I8(v) => *v as f64,
-                    ScalarValue::I16(v) => *v as f64,
-                    ScalarValue::I64(v) => *v as f64,
-                    ScalarValue::U8(v) => *v as f64,
-                    ScalarValue::U16(v) => *v as f64,
-                    ScalarValue::U32(v) => *v as f64,
-                    ScalarValue::U64(v) => *v as f64,
-                    ScalarValue::F32(v) => *v as f64,
-                    // I32/F64/Bool as the *incoming* value only reach this
-                    // catch-all when the *target* is one of the new
-                    // non-native numeric variants (native-target combos of
-                    // these are already consumed by the explicit arms
-                    // above), e.g. a U16 record receiving an I32 or F64 put.
-                    ScalarValue::I32(v) => *v as f64,
-                    ScalarValue::F64(v) => *v,
-                    ScalarValue::Bool(v) => {
-                        if *v {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                    _ => return false,
-                };
-                // Integer-to-integer conversions route through i128 instead
-                // of f64 so 64-bit magnitudes (I64/U64) survive the
-                // coercion intact — an f64 round-trip would round them.
-                // `None` when `other` is a float (F32/F64); those targets
-                // fall back to the `as_f64` path below.
-                let as_i128: Option<i128> = match &other {
-                    ScalarValue::I8(v) => Some(*v as i128),
-                    ScalarValue::I16(v) => Some(*v as i128),
-                    ScalarValue::I32(v) => Some(*v as i128),
-                    ScalarValue::I64(v) => Some(*v as i128),
-                    ScalarValue::U8(v) => Some(*v as i128),
-                    ScalarValue::U16(v) => Some(*v as i128),
-                    ScalarValue::U32(v) => Some(*v as i128),
-                    ScalarValue::U64(v) => Some(*v as i128),
-                    ScalarValue::Bool(v) => Some(if *v { 1 } else { 0 }),
-                    _ => None,
-                };
-                match target {
-                    ScalarValue::Bool(current) => {
-                        let next = as_f64 != 0.0;
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    ScalarValue::I32(current) => {
-                        let next = as_f64 as i32;
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    ScalarValue::F64(current) => {
-                        if *current == as_f64 {
-                            false
-                        } else {
-                            *current = as_f64;
-                            true
-                        }
-                    }
-                    ScalarValue::Str(current) => {
-                        let next = as_f64.to_string();
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    // Non-native numeric targets: prefer the exact i128
-                    // route for integer-to-integer coercions; fall back to
-                    // the f64 path when `other` is a float (F32). Final
-                    // narrowing uses C-like `as` cast semantics, mirroring
-                    // the `as_f64 as i32` arm above.
-                    ScalarValue::I8(current) => {
-                        let next = as_i128.map(|i| i as i8).unwrap_or(as_f64 as i8);
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    ScalarValue::I16(current) => {
-                        let next = as_i128.map(|i| i as i16).unwrap_or(as_f64 as i16);
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    ScalarValue::I64(current) => {
-                        let next = as_i128.map(|i| i as i64).unwrap_or(as_f64 as i64);
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    ScalarValue::U8(current) => {
-                        let next = as_i128.map(|i| i as u8).unwrap_or(as_f64 as u8);
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    ScalarValue::U16(current) => {
-                        let next = as_i128.map(|i| i as u16).unwrap_or(as_f64 as u16);
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    ScalarValue::U32(current) => {
-                        let next = as_i128.map(|i| i as u32).unwrap_or(as_f64 as u32);
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    ScalarValue::U64(current) => {
-                        let next = as_i128.map(|i| i as u64).unwrap_or(as_f64 as u64);
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                    ScalarValue::F32(current) => {
-                        let next = as_f64 as f32;
-                        if *current == next {
-                            false
-                        } else {
-                            *current = next;
-                            true
-                        }
-                    }
-                }
-            }
+        let Some(next) = coerce_into(&nt.value, value) else {
+            return false; // not representable in the target type
         };
-        if changed {
-            // A `None` time_stamp makes the encoder stamp now() at *encode*
-            // time. The monitor delta path re-encodes the previous and next
-            // snapshots microseconds apart, so secondsPastEpoch compares
-            // equal and is never flagged changed — freezing the seconds on
-            // monitoring clients. Store the update time so encodes are
-            // stable (see spvd_encode::encode_timestamp).
-            nt.time_stamp = Some(now_nt_timestamp());
-            if compute_alarms {
-                nt.update_alarm_from_value();
-            }
+        if nt.value == next {
+            return false;
         }
-        changed
+        nt.value = next;
+        // A `None` time_stamp makes the encoder stamp now() at *encode*
+        // time. The monitor delta path re-encodes the previous and next
+        // snapshots microseconds apart, so secondsPastEpoch compares
+        // equal and is never flagged changed — freezing the seconds on
+        // monitoring clients. Store the update time so encodes are
+        // stable (see spvd_encode::encode_timestamp).
+        nt.time_stamp = Some(now_nt_timestamp());
+        if compute_alarms {
+            nt.update_alarm_from_value();
+        }
+        true
     }
 
     pub fn set_array_value(&mut self, value: ScalarArrayValue) -> bool {
@@ -1111,6 +740,128 @@ fn truncate_scalar_array_to_nelm(value: &mut ScalarArrayValue, nelm: usize) {
         ScalarArrayValue::F32(v) => v.truncate(nelm),
         ScalarArrayValue::F64(v) => v.truncate(nelm),
         ScalarArrayValue::Str(v) => v.truncate(nelm),
+    }
+}
+
+/// The incoming value as an exact integer, when it is one.
+fn as_i128(v: &ScalarValue) -> Option<i128> {
+    match v {
+        ScalarValue::Bool(b) => Some(if *b { 1 } else { 0 }),
+        ScalarValue::I8(x) => Some(*x as i128),
+        ScalarValue::I16(x) => Some(*x as i128),
+        ScalarValue::I32(x) => Some(*x as i128),
+        ScalarValue::I64(x) => Some(*x as i128),
+        ScalarValue::U8(x) => Some(*x as i128),
+        ScalarValue::U16(x) => Some(*x as i128),
+        ScalarValue::U32(x) => Some(*x as i128),
+        ScalarValue::U64(x) => Some(*x as i128),
+        ScalarValue::F32(_) | ScalarValue::F64(_) | ScalarValue::Str(_) => None,
+    }
+}
+
+/// The incoming value as an f64, when it is numeric.
+fn as_f64(v: &ScalarValue) -> Option<f64> {
+    match v {
+        ScalarValue::F32(x) => Some(*x as f64),
+        ScalarValue::F64(x) => Some(*x),
+        ScalarValue::Str(_) => None,
+        other => as_i128(other).map(|i| i as f64),
+    }
+}
+
+/// The incoming value rendered as a string, preserving each type's own
+/// precision. Notably an `F32` is formatted AS an f32: widening it to f64
+/// first turns 0.1 into "0.10000000149011612". A `Bool` renders as "1"/"0",
+/// as the explicit `(Str, Bool)` arm always stored it.
+fn scalar_to_string(v: &ScalarValue) -> String {
+    match v {
+        ScalarValue::Bool(x) => if *x { "1" } else { "0" }.to_string(),
+        ScalarValue::I8(x) => x.to_string(),
+        ScalarValue::I16(x) => x.to_string(),
+        ScalarValue::I32(x) => x.to_string(),
+        ScalarValue::I64(x) => x.to_string(),
+        ScalarValue::U8(x) => x.to_string(),
+        ScalarValue::U16(x) => x.to_string(),
+        ScalarValue::U32(x) => x.to_string(),
+        ScalarValue::U64(x) => x.to_string(),
+        ScalarValue::F32(x) => x.to_string(),
+        ScalarValue::F64(x) => x.to_string(),
+        ScalarValue::Str(s) => s.clone(),
+    }
+}
+
+/// Coerce `incoming` into `target`'s variant.
+///
+/// `None` means the value is not representable in the target type and the
+/// write must be refused — the same rule the wire PUT path applies through
+/// `crate::convert`. The two paths must not disagree. Every refusal is
+/// logged once at debug so a refused client write is visible in logs.
+fn coerce_into(target: &ScalarValue, incoming: ScalarValue) -> Option<ScalarValue> {
+    if std::mem::discriminant(target) == std::mem::discriminant(&incoming) {
+        return Some(incoming);
+    }
+    let next = coerce_cross_variant(target, &incoming);
+    if next.is_none() {
+        tracing::debug!(
+            target_value = ?target,
+            incoming_value = ?incoming,
+            "set_scalar_value: write refused, value not representable in the target type"
+        );
+    }
+    next
+}
+
+/// The cross-variant half of [`coerce_into`]; `target` and `incoming` are
+/// known to be different variants.
+fn coerce_cross_variant(target: &ScalarValue, incoming: &ScalarValue) -> Option<ScalarValue> {
+    use ScalarValue as S;
+
+    // A string source is not a number. Exactly three targets parse one
+    // (Bool, I32, F64); every other target refused a string before this
+    // change and still does.
+    if let S::Str(s) = incoming {
+        return match target {
+            S::Bool(_) => parse_bool_like(s).map(S::Bool),
+            S::I32(_) => s.parse::<i32>().ok().map(S::I32),
+            S::F64(_) => s.parse::<f64>().ok().map(S::F64),
+            _ => None,
+        };
+    }
+
+    // Integers convert exactly or not at all; floats are range-checked
+    // BEFORE the cast, because `f as i128` saturates rather than failing.
+    fn int<T: TryFrom<i128>>(v: &ScalarValue) -> Option<T> {
+        match as_i128(v) {
+            Some(i) => T::try_from(i).ok(),
+            None => {
+                // Float source. i128's range comfortably contains every
+                // finite f64 that any integer target could hold, but reject
+                // non-finite values explicitly rather than relying on the
+                // saturating cast.
+                let f = as_f64(v)?;
+                if !f.is_finite() {
+                    return None;
+                }
+                T::try_from(f as i128).ok()
+            }
+        }
+    }
+    match target {
+        S::Str(_) => Some(S::Str(scalar_to_string(incoming))),
+        S::Bool(_) => match as_i128(incoming) {
+            Some(i) => Some(S::Bool(i != 0)),
+            None => as_f64(incoming).map(|f| S::Bool(f != 0.0)),
+        },
+        S::F64(_) => as_f64(incoming).map(S::F64),
+        S::F32(_) => as_f64(incoming).map(|f| S::F32(f as f32)),
+        S::I8(_) => int::<i8>(incoming).map(S::I8),
+        S::I16(_) => int::<i16>(incoming).map(S::I16),
+        S::I32(_) => int::<i32>(incoming).map(S::I32),
+        S::I64(_) => int::<i64>(incoming).map(S::I64),
+        S::U8(_) => int::<u8>(incoming).map(S::U8),
+        S::U16(_) => int::<u16>(incoming).map(S::U16),
+        S::U32(_) => int::<u32>(incoming).map(S::U32),
+        S::U64(_) => int::<u64>(incoming).map(S::U64),
     }
 }
 
@@ -1708,5 +1459,124 @@ mod tests {
                 rec.record_type
             );
         }
+    }
+
+    const ALL_SCALARS: &[fn() -> ScalarValue] = &[
+        || ScalarValue::Bool(true),
+        || ScalarValue::I8(3),
+        || ScalarValue::I16(3),
+        || ScalarValue::I32(3),
+        || ScalarValue::I64(3),
+        || ScalarValue::U8(3),
+        || ScalarValue::U16(3),
+        || ScalarValue::U32(3),
+        || ScalarValue::U64(3),
+        || ScalarValue::F32(3.0),
+        || ScalarValue::F64(3.0),
+        || ScalarValue::Str("3".to_string()),
+    ];
+
+    #[test]
+    fn set_scalar_value_same_variant_round_trips_for_every_type() {
+        for make in ALL_SCALARS {
+            let v = make();
+            let mut rec = ai_record_of(ScalarValue::I32(0));
+            if let RecordData::Ai { nt, .. } = &mut rec.data {
+                nt.value = v.clone();
+            }
+            // Writing the same value back is a no-op...
+            assert!(
+                !rec.set_scalar_value(v.clone(), false),
+                "same-variant identical write must report unchanged for {v:?}"
+            );
+            assert_eq!(rec.current_value(), v, "no-op write must not mutate");
+        }
+    }
+
+    #[test]
+    fn set_scalar_value_always_preserves_the_target_variant() {
+        for target in ALL_SCALARS {
+            for incoming in ALL_SCALARS {
+                let t = target();
+                let i = incoming();
+                let mut rec = ai_record_of(t.clone());
+                rec.set_scalar_value(i.clone(), false);
+                assert_eq!(
+                    std::mem::discriminant(&rec.current_value()),
+                    std::mem::discriminant(&t),
+                    "target {t:?} changed variant after a write of {i:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_scalar_value_integer_to_integer_is_exact() {
+        let mut rec = ai_record_of(ScalarValue::U64(0));
+        let big: u64 = 9_007_199_254_740_993; // 2^53 + 1
+        assert!(rec.set_scalar_value(ScalarValue::U64(big), false));
+        assert_eq!(rec.current_value(), ScalarValue::U64(big));
+    }
+
+    #[test]
+    fn set_scalar_value_still_parses_strings_into_bool_i32_and_f64_targets() {
+        // These three arms exist today (types.rs:667, :676, :685) and must
+        // survive the collapse. Every OTHER target refuses a string source,
+        // and that must survive too.
+        let mut b = ai_record_of(ScalarValue::Bool(false));
+        assert!(b.set_scalar_value(ScalarValue::Str("on".to_string()), false));
+        assert_eq!(b.current_value(), ScalarValue::Bool(true));
+
+        let mut i = ai_record_of(ScalarValue::I32(0));
+        assert!(i.set_scalar_value(ScalarValue::Str("-42".to_string()), false));
+        assert_eq!(i.current_value(), ScalarValue::I32(-42));
+
+        let mut f = ai_record_of(ScalarValue::F64(0.0));
+        assert!(f.set_scalar_value(ScalarValue::Str("1.5".to_string()), false));
+        assert_eq!(f.current_value(), ScalarValue::F64(1.5));
+
+        // Unparsable text is a no-op, not a zeroing write.
+        let mut bad = ai_record_of(ScalarValue::I32(7));
+        assert!(!bad.set_scalar_value(ScalarValue::Str("banana".to_string()), false));
+        assert_eq!(bad.current_value(), ScalarValue::I32(7));
+
+        // A target with no string arm refuses.
+        let mut u = ai_record_of(ScalarValue::U16(3));
+        assert!(!u.set_scalar_value(ScalarValue::Str("5".to_string()), false));
+        assert_eq!(u.current_value(), ScalarValue::U16(3));
+    }
+
+    // --- the two deliberate improvements ---
+
+    #[test]
+    fn a_large_integer_written_to_a_string_record_is_exact() {
+        let mut rec = ai_record_of(ScalarValue::Str(String::new()));
+        let big: u64 = 9_007_199_254_740_993;
+        assert!(rec.set_scalar_value(ScalarValue::U64(big), false));
+        assert_eq!(
+            rec.current_value(),
+            ScalarValue::Str("9007199254740993".to_string()),
+            "a string record must not round a u64 through f64"
+        );
+    }
+
+    #[test]
+    fn an_f32_written_to_a_string_record_formats_as_an_f32() {
+        let mut rec = ai_record_of(ScalarValue::Str(String::new()));
+        assert!(rec.set_scalar_value(ScalarValue::F32(0.1), false));
+        assert_eq!(
+            rec.current_value(),
+            ScalarValue::Str("0.1".to_string()),
+            "widening to f64 before formatting leaks f32 representation error"
+        );
+    }
+
+    #[test]
+    fn a_bool_written_to_a_string_record_stores_one_or_zero() {
+        let mut rec = ai_record_of(ScalarValue::Str(String::new()));
+        assert!(rec.set_scalar_value(ScalarValue::Bool(true), false));
+        assert_eq!(rec.current_value(), ScalarValue::Str("1".to_string()));
+        assert!(rec.set_scalar_value(ScalarValue::Bool(false), false));
+        assert_eq!(rec.current_value(), ScalarValue::Str("0".to_string()));
     }
 }
