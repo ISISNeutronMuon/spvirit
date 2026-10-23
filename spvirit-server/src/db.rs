@@ -9,6 +9,22 @@ use crate::types::{
     RecordType, ScalarArrayValue, ScalarValue, ScanMode,
 };
 
+use std::sync::LazyLock;
+
+// Compiled once per process. `parse_db_inner` recurses once per `include`
+// directive, so building these per call meant recompiling three regexes for
+// every file in a .db include tree.
+static RECORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^record\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([^"]*)"\s*\)\s*\{?$"#)
+        .expect("static record regex")
+});
+static FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^field\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([\s\S]*)"\s*\)$"#)
+        .expect("static field regex")
+});
+static INCLUDE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^include\s+"?([^"]+)"?$"#).expect("static include regex"));
+
 #[derive(Debug, Clone)]
 pub struct DbRecord {
     pub name: String,
@@ -730,11 +746,9 @@ fn parse_db_inner(
     macros: &HashMap<String, String>,
     visiting: &mut Vec<String>,
 ) -> Result<Vec<DbRecord>, DbParseError> {
-    let record_re = Regex::new(r#"^record\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([^"]*)"\s*\)\s*\{?$"#)
-        .expect("static record regex");
-    let field_re = Regex::new(r#"^field\s*\(\s*([A-Za-z0-9_]+)\s*,\s*"([\s\S]*)"\s*\)$"#)
-        .expect("static field regex");
-    let include_re = Regex::new(r#"^include\s+"?([^"]+)"?$"#).expect("static include regex");
+    let record_re = &*RECORD_RE;
+    let field_re = &*FIELD_RE;
+    let include_re = &*INCLUDE_RE;
 
     let mut records: Vec<DbRecord> = Vec::new();
     let mut current: Option<DbRecord> = None;
@@ -1086,5 +1100,44 @@ mod tests {
         );
         load_db(path.to_str().expect("utf8 path"))
             .expect("archiver_demo.db must load as typed records");
+    }
+
+    #[test]
+    fn parsing_an_include_tree_yields_the_same_records_and_fields() {
+        // Characterisation: the regexes move to statics, so the parse result
+        // must be untouched — record names, include ordering AND field
+        // capture, since all three regexes are being moved.
+        //
+        // NOTE the directory name. `include_pulls_in_a_sibling_file`
+        // already uses `spvirit_db_include_test`, and cargo runs
+        // tests in parallel — reusing that name makes both tests flaky.
+        let dir = std::env::temp_dir().join("spvirit_db_lazyregex_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(
+            dir.join("inner.db"),
+            "record(ai, \"INC:one\") {\n    field(DESC, \"from include\")\n}\n",
+        )
+        .expect("write inner");
+        std::fs::write(
+            dir.join("outer.db"),
+            "record(ai, \"TOP:one\") {\n    field(DESC, \"top\")\n}\ninclude \"inner.db\"\n",
+        )
+        .expect("write outer");
+
+        let recs = load_db_records(
+            dir.join("outer.db").to_str().expect("utf8 path"),
+            &HashMap::new(),
+        )
+        .expect("parsed");
+        let names: Vec<&str> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["TOP:one", "INC:one"]);
+        assert_eq!(
+            recs[1].fields.get("DESC").map(String::as_str),
+            Some("from include"),
+            "the field regex must still capture through an include"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
