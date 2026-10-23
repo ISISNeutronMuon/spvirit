@@ -786,3 +786,52 @@ async fn a_real_client_re_searches_and_gets_data_again_after_destroy_channel() {
     // reaching the end of this test IS the proof that the client recovered.
     let _recovered = open_monitor(found, &opts).await;
 }
+
+/// Upstream death must reach downstream promptly, not on the next idle-sweep
+/// tick. The supervisor's ticker exists only to notice a quiet PV nobody wants
+/// any more; an upstream that closes ends the subscription task, and that end
+/// must be acted on the moment it happens.
+///
+/// The kill is timed to land just after a sweep tick (the supervisor's ticker
+/// starts with the subscription and fires every 2 s), so a supervisor that only
+/// polls on its tick would need ~1.9 s to notice — well past the 1 s budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upstream_death_reaches_downstream_without_waiting_for_a_sweep_tick() {
+    let (Some(tcp), Some(udp)) = (free_tcp_port(), free_udp_port()) else {
+        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
+    };
+    let mut backend = spawn_backend("GW:PROMPT", tcp, udp);
+    let (src, _pool) = gateway_source(udp);
+
+    assert!(claim_within(&src, "GW:PROMPT").await, "backend must be up");
+    let mut rx = src.subscribe("GW:PROMPT").await.expect("subscribe");
+    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("initial monitor update arrives")
+        .expect("initial monitor update");
+
+    // Just past the first sweep tick after the subscription started.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    backend.kill();
+    let killed_at = std::time::Instant::now();
+
+    let closed = tokio::time::timeout(Duration::from_secs(1), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    assert!(
+        closed,
+        "the downstream receiver must close within 1 s of the upstream dying; \
+         still open after {:?}",
+        killed_at.elapsed()
+    );
+    assert!(
+        src.upstream_monitor_deaths() >= 1,
+        "the upstream death must be counted"
+    );
+    assert!(
+        matches!(src.try_claim("GW:PROMPT"), TryClaim::Unknown),
+        "the binding must already be retired when the receiver closes"
+    );
+}

@@ -6,25 +6,23 @@
 //! task, every subsequent `subscribe` for the same key just adds another
 //! downstream `mpsc::Sender`/`Receiver` pair fed by that one task's updates.
 //!
-//! Cancellation for M1 is "next-tick": the upstream task notices its
-//! `subs` list is empty only when it goes to deliver the *next* update, at
-//! which point `MonitorCache::dispatch_or_retire` atomically (under the
-//! entries-map lock) removes the `MonitorEntry` from the map and reports
-//! that the upstream loop should end. That atomicity — retiring the entry
-//! and deciding to stop the loop as one map-locked step — is what prevents
-//! a concurrent `subscribe()` from attaching a new subscriber to an entry
-//! whose upstream loop has already (or is about to have) ended; see
-//! `dispatch_or_retire`'s doc comment for the exact race it closes. A PV
-//! that goes silent forever right after its last subscriber leaves does
-//! *not* get its upstream monitor torn down promptly — this "idle-linger"
-//! is a documented M1 simplification (see task-11-report.md), not a
-//! correctness bug: no downstream traffic is leaked, only an idle upstream
-//! monitor task outlives its last subscriber until the PV next changes (or
-//! forever, for a PV that never changes again).
+//! Cancellation happens on whichever comes first: the next upstream tick, or
+//! the next idle sweep. On a tick, `MonitorCache::dispatch_or_retire` notices
+//! an empty `subs` list and atomically (under the entries-map lock) removes
+//! the `MonitorEntry` from the map, then cancels its upstream subscription.
+//! That atomicity — retiring the entry and deciding to stop as one map-locked
+//! step — is what prevents a concurrent `subscribe()` from attaching a new
+//! subscriber to an entry whose upstream has already (or is about to have)
+//! ended; see `dispatch_or_retire`'s doc comment for the exact race it closes.
+//! A PV that goes quiet never ticks, so `proxy.rs`'s per-entry supervisor
+//! calls `MonitorCache::retire_if_idle` every `IDLE_SWEEP` to do the same for
+//! it. Every retirement path takes the entry's `MonitorHandle` and drops it,
+//! which cancels the upstream subscription and closes its connection.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use spvirit_client::MonitorHandle;
 use spvirit_types::NtPayload;
 use tokio::sync::mpsc;
 
@@ -50,15 +48,52 @@ pub type MonitorKey = (String, String);
 /// dropped, `TrySendError::Closed`) is pruned. See `MonitorEntry::dispatch`.
 const CHANNEL_CAPACITY: usize = 16;
 
+/// Where an entry's upstream subscription stands.
+///
+/// The distinction that matters is `Cancelled` vs `Finished`: the first means
+/// *we* stopped it (a retirement path took the handle and dropped it), the
+/// second means it stopped on its own. Only the second is an upstream fault,
+/// so only the second bumps the death count and retires the binding. This is
+/// what the old `stopped_by_callback: Arc<AtomicBool>` was for, except that it
+/// cannot go stale: the handle is the thing being cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamState {
+    /// The handle is attached and its task is still running.
+    Running,
+    /// The handle has been taken and dropped by a retirement path.
+    Cancelled,
+    /// The handle is still attached but its task has ended by itself — the
+    /// upstream closed, errored, or never connected. (A callback `Break` never
+    /// lands here: it is always preceded by `dispatch_or_retire` taking the
+    /// handle, so that path reads `Cancelled`.)
+    Finished,
+}
+
 /// Shared state for one upstream monitor: the live downstream fan-out list.
 pub struct MonitorEntry {
     subs: Mutex<Vec<mpsc::Sender<NtPayload>>>,
+    /// The upstream subscription this entry fans out, once `subscribe`'s
+    /// `spawn_upstream` closure has started it.
+    ///
+    /// Owned *here* rather than by the spawning task because the cache is what
+    /// learns the subscription is no longer wanted — `dispatch_or_retire` on a
+    /// tick, `retire_if_idle` on a quiet PV — and dropping a `MonitorHandle`
+    /// cancels.
+    ///
+    /// The explicit take is MANDATORY on every retirement path. While the
+    /// subscription runs there is an `Arc` cycle: the monitor callback (owned
+    /// by the subscription task) holds an `Arc<MonitorEntry>`, and the entry
+    /// holds the handle that keeps that task alive. The entry therefore never
+    /// falls out of every `Arc` on its own; drop a `cancel_upstream()` call as
+    /// "redundant" and the subscription and its connection run forever.
+    upstream: Mutex<Option<MonitorHandle>>,
 }
 
 impl MonitorEntry {
     fn new() -> Self {
         MonitorEntry {
             subs: Mutex::new(Vec::new()),
+            upstream: Mutex::new(None),
         }
     }
 
@@ -102,6 +137,37 @@ impl MonitorEntry {
     /// `None`, which is the signal Layer 2 turns into DESTROY_CHANNEL.
     pub fn close_all(&self) {
         lock_or_recover(&self.subs).clear();
+    }
+
+    /// Hand this entry the handle for the upstream subscription that feeds it.
+    /// Called exactly once per entry, from `subscribe`'s `spawn_upstream`.
+    pub fn attach_upstream(&self, handle: MonitorHandle) {
+        *lock_or_recover(&self.upstream) = Some(handle);
+    }
+
+    /// Take the handle back out, if it is still here.
+    ///
+    /// Dropping the returned handle cancels the subscription; keeping it lets
+    /// the caller `join()` for the reason it ended. Taking it also moves this
+    /// entry to [`UpstreamState::Cancelled`], which is how a deliberate stop is
+    /// told apart from an upstream death.
+    pub fn take_upstream(&self) -> Option<MonitorHandle> {
+        lock_or_recover(&self.upstream).take()
+    }
+
+    /// Take the handle and drop it, cancelling the upstream subscription.
+    /// Idempotent; a second call is a no-op.
+    pub fn cancel_upstream(&self) {
+        drop(self.take_upstream());
+    }
+
+    /// See [`UpstreamState`].
+    pub fn upstream_state(&self) -> UpstreamState {
+        match lock_or_recover(&self.upstream).as_ref() {
+            None => UpstreamState::Cancelled,
+            Some(handle) if handle.is_finished() => UpstreamState::Finished,
+            Some(_) => UpstreamState::Running,
+        }
     }
 }
 
@@ -221,6 +287,13 @@ impl MonitorCache {
         {
             entries.remove(key);
         }
+        drop(entries);
+        // Stop the upstream now instead of waiting for the `ControlFlow::Break`
+        // below to travel back through the client. Taking the handle here also
+        // marks the entry `Cancelled`, and because this runs synchronously
+        // inside the monitor callback the take always beats the callback's own
+        // return — so the supervisor can never read this as a death.
+        entry.cancel_upstream();
         false
     }
 
@@ -244,6 +317,38 @@ impl MonitorCache {
         {
             entries.remove(key);
         }
+        drop(entries);
+        entry.cancel_upstream();
+    }
+
+    /// Retire `entry` for `key` if every downstream subscriber has gone,
+    /// cancelling its upstream subscription. Returns whether it did.
+    ///
+    /// This is the trigger the module's documented "idle-linger" (see the
+    /// module docs) was missing. `dispatch_or_retire` is the only other place
+    /// that notices an empty subscriber list, and it runs only on an upstream
+    /// tick — while the linger case is precisely a PV that has stopped
+    /// ticking. `proxy.rs::subscribe`'s supervisor task calls this on a timer.
+    ///
+    /// "Idle" means every `Sender` is closed, which covers both an empty list
+    /// and a list of corpses `subscribe`'s prune has not reached yet.
+    ///
+    /// Lock ordering is the module's usual one — map lock, then `subs`, never
+    /// the reverse — and neither is held across the cancel.
+    pub fn retire_if_idle(&self, key: &MonitorKey, entry: &Arc<MonitorEntry>) -> bool {
+        let mut entries = lock_or_recover(&self.entries);
+        if !lock_or_recover(&entry.subs).iter().all(|tx| tx.is_closed()) {
+            return false;
+        }
+        if let Some(current) = entries.get(key)
+            && Arc::ptr_eq(current, entry)
+        {
+            entries.remove(key);
+        }
+        drop(entries);
+        entry.cancel_upstream();
+        entry.close_all();
+        true
     }
 
     /// Number of distinct upstream monitors currently tracked (live
@@ -301,6 +406,44 @@ mod tests {
             1,
             "dead senders must be pruned when a new subscriber attaches, not left to              accumulate until an upstream tick that may never come"
         );
+    }
+
+    /// `retire_if_idle` is the trigger the documented idle-linger was missing:
+    /// `dispatch_or_retire` only ever runs on an upstream tick, and a PV that
+    /// stops ticking is precisely the case where no tick arrives. It must
+    /// remove an entry whose subscribers have all gone, leave one that still
+    /// has a live subscriber alone, and be safe to call repeatedly.
+    #[test]
+    fn retire_if_idle_removes_only_an_entry_whose_subscribers_have_all_gone() {
+        let cache = MonitorCache::new();
+        let key: MonitorKey = ("c".into(), "PV".into());
+        let mut captured_entry = None;
+        let rx = cache.subscribe(key.clone(), |entry| captured_entry = Some(entry));
+        let entry = captured_entry.expect("spawn_upstream captured the entry");
+
+        assert!(
+            !cache.retire_if_idle(&key, &entry),
+            "a live subscriber must keep the entry"
+        );
+        assert_eq!(cache.upstream_count(), 1);
+
+        drop(rx);
+        assert!(
+            cache.retire_if_idle(&key, &entry),
+            "with every receiver gone the entry must be retired"
+        );
+        assert_eq!(cache.upstream_count(), 0);
+        assert_eq!(
+            entry.upstream_state(),
+            UpstreamState::Cancelled,
+            "retiring must mark the entry cancelled, so the supervisor does not \
+             mistake it for an upstream death"
+        );
+
+        // Idempotent: sweeping an already-retired entry is a no-op that still
+        // reports "idle". The supervisor can race a tick-driven retirement.
+        assert!(cache.retire_if_idle(&key, &entry));
+        assert_eq!(cache.upstream_count(), 0);
     }
 
     #[test]
