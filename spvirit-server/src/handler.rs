@@ -256,14 +256,37 @@ pub fn collect_visible_pv_names(
     allow_pattern: Option<&Regex>,
     max_items: usize,
 ) -> Vec<String> {
+    collect_visible_pv_names_iter(
+        all_names.iter().map(String::as_str),
+        mode,
+        allow_pattern,
+        max_items,
+    )
+}
+
+/// As [`collect_visible_pv_names`], but over any iterator of names.
+///
+/// Callers that hold a `HashMap` keyed by PV name (the `spserver` binary is
+/// one) would otherwise have to materialise a `Vec<String>` just to call the
+/// slice version, reintroducing the clone-everything cost this function
+/// exists to avoid.
+pub fn collect_visible_pv_names_iter<'a, I>(
+    all_names: I,
+    mode: PvListMode,
+    allow_pattern: Option<&Regex>,
+    max_items: usize,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     // Sort and truncate *references*, and clone only what survives. The
     // caller's `max_items` is typically a few hundred while `all_names` is
     // whatever every registered source put together — on a large gateway,
     // tens of thousands of strings — so cloning first and discarding after
     // meant a heap allocation per name for names that were then thrown away.
     // Reference-sized elements also make the sort itself cheaper to move.
-    let mut refs: Vec<&String> = all_names
-        .iter()
+    let mut refs: Vec<&str> = all_names
+        .into_iter()
         .filter(|name| {
             allow_pattern
                 .as_ref()
@@ -275,7 +298,7 @@ pub fn collect_visible_pv_names(
     if refs.len() > max_items {
         refs.truncate(max_items);
     }
-    let mut names: Vec<String> = refs.into_iter().cloned().collect();
+    let mut names: Vec<String> = refs.into_iter().map(str::to_string).collect();
     if mode == PvListMode::List && names.len() < max_items {
         names.push("__pvlist".to_string());
     }
@@ -2790,6 +2813,32 @@ mod tests {
         // The documented value, so a deliberate retune is a visible edit here
         // and not a silent one.
         assert_eq!(PATTERN_ENUM_TIMEOUT, StdDuration::from_secs(30));
+    }
+
+    #[test]
+    fn collect_visible_pv_names_iter_matches_the_slice_version() {
+        let names = vec!["C:PV".to_string(), "A:PV".to_string(), "B:PV".to_string()];
+        let from_slice = collect_visible_pv_names(&names, PvListMode::List, None, 10);
+        let from_iter = collect_visible_pv_names_iter(
+            names.iter().map(String::as_str),
+            PvListMode::List,
+            None,
+            10,
+        );
+        assert_eq!(from_slice, from_iter);
+        assert_eq!(from_iter, vec!["A:PV", "B:PV", "C:PV", "__pvlist"]);
+    }
+
+    #[test]
+    fn collect_visible_pv_names_iter_truncates_before_appending_pvlist() {
+        let names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let got = collect_visible_pv_names_iter(
+            names.iter().map(String::as_str),
+            PvListMode::List,
+            None,
+            2,
+        );
+        assert_eq!(got, vec!["A", "B"]);
     }
 
     /// V6 MEDIUM-2. `collect_visible_pv_names` sorts and *then* truncates, so

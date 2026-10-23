@@ -40,7 +40,7 @@ use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
 use spvirit_server::decode::decode_put_body;
 use spvirit_server::handler::{
-    PvListMode, dump_hex_packet, infer_udp_response_ip, is_pattern_query, is_pvlist_virtual_pv,
+    PvListMode, collect_visible_pv_names_iter, dump_hex_packet, infer_udp_response_ip, is_pattern_query, is_pvlist_virtual_pv,
     is_server_rpc_pv, is_virtual_event_pv, rand_guid, search_reply_target, validate_encoded_packet,
     virtual_event_nt, virtual_pvlist_nt, wildcard_match,
 };
@@ -444,8 +444,8 @@ async fn run_udp_search(
                     continue;
                 }
                 let pv_store = state.pv_store.read().await;
-                let visible_names = collect_visible_pv_names_from_store(
-                    &pv_store,
+                let visible_names = collect_visible_pv_names_iter(
+                    pv_store.keys().map(String::as_str),
                     state.pvlist_mode,
                     state.pvlist_allow_pattern.as_ref(),
                     state.pvlist_max,
@@ -1401,8 +1401,8 @@ async fn handle_connection(
                         .any(|p| p.eq_ignore_ascii_case("tcp"));
                 if accepts_tcp {
                     let pv_store = state.pv_store.read().await;
-                    let visible_names = collect_visible_pv_names_from_store(
-                        &pv_store,
+                    let visible_names = collect_visible_pv_names_iter(
+                        pv_store.keys().map(String::as_str),
                         state.pvlist_mode,
                         state.pvlist_allow_pattern.as_ref(),
                         state.pvlist_max,
@@ -1793,32 +1793,6 @@ async fn send_msg(state: &Arc<ServerState>, conn_id: u64, msg: Vec<u8>) -> bool 
     }
 }
 
-fn collect_visible_pv_names_from_store(
-    pv_store: &HashMap<String, RecordInstance>,
-    mode: PvListMode,
-    allow_pattern: Option<&Regex>,
-    max_items: usize,
-) -> Vec<String> {
-    let mut names: Vec<String> = pv_store
-        .keys()
-        .filter(|name| {
-            allow_pattern
-                .as_ref()
-                .map(|re| re.is_match(name))
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
-    names.sort();
-    if names.len() > max_items {
-        names.truncate(max_items);
-    }
-    if mode == PvListMode::List && names.len() < max_items {
-        names.push("__pvlist".to_string());
-    }
-    names
-}
-
 fn build_pvlist_structure(names: &[String]) -> StructureDesc {
     StructureDesc {
         struct_id: Some("epics:pva/pvlist:1.0".to_string()),
@@ -1952,8 +1926,8 @@ async fn handle_get_field_request(
     };
 
     let pv_store = state.pv_store.read().await;
-    let mut names = collect_visible_pv_names_from_store(
-        &pv_store,
+    let mut names = collect_visible_pv_names_iter(
+        pv_store.keys().map(String::as_str),
         state.pvlist_mode,
         state.pvlist_allow_pattern.as_ref(),
         state.pvlist_max,
@@ -2009,8 +1983,8 @@ async fn handle_server_rpc(
 
     let names = {
         let store = state.pv_store.read().await;
-        collect_visible_pv_names_from_store(
-            &store,
+        collect_visible_pv_names_iter(
+            store.keys().map(String::as_str),
             state.pvlist_mode,
             state.pvlist_allow_pattern.as_ref(),
             state.pvlist_max,
@@ -2073,8 +2047,8 @@ async fn get_nt_snapshot(state: &Arc<ServerState>, pv_name: &str) -> Option<NtPa
             return None;
         }
         let store = state.pv_store.read().await;
-        let names = collect_visible_pv_names_from_store(
-            &store,
+        let names = collect_visible_pv_names_iter(
+            store.keys().map(String::as_str),
             state.pvlist_mode,
             state.pvlist_allow_pattern.as_ref(),
             state.pvlist_max,
