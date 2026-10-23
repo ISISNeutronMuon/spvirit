@@ -666,6 +666,19 @@ where
     Ok(None)
 }
 
+/// Whether a search response names the search we sent.
+///
+/// `seq` is already matched by `run_search_recv_loop`, but it is derived from
+/// the wall clock and the pid (see `search_pv`) and so is guessable. The
+/// search-instance ID is the per-request identifier, and the PVA
+/// specification requires a response to echo the IDs it answers. A response
+/// that echoes none is not evidence about our request, so it is rejected —
+/// accepting it would let anything on the network that can guess `seq`
+/// redirect the client to a server of its choosing.
+fn search_response_identifies(cids: &[u32], cid: u32) -> bool {
+    cids.contains(&cid)
+}
+
 pub async fn search_pv(
     pv_name: &str,
     udp_port: u16,
@@ -714,7 +727,7 @@ pub async fn search_pv(
             if !payload.found {
                 return ControlFlow::Continue(());
             }
-            if !payload.cids.is_empty() && !payload.cids.contains(&cid) {
+            if !search_response_identifies(&payload.cids, cid) {
                 return ControlFlow::Continue(());
             }
             let addr = decode_search_response_addr(payload.addr, payload.port, src);
@@ -1534,5 +1547,24 @@ mod tests {
             "the receive scratch must not be handed on as a 2 KiB allocation"
         );
         assert!(owned.iter().all(|b| *b == 7));
+    }
+
+    #[test]
+    fn a_response_echoing_our_cid_is_accepted() {
+        assert!(search_response_identifies(&[0xDEAD_BEEF], 0xDEAD_BEEF));
+        assert!(search_response_identifies(&[1, 0xDEAD_BEEF, 2], 0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn a_response_echoing_someone_elses_cid_is_rejected() {
+        assert!(!search_response_identifies(&[1, 2, 3], 0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn a_response_echoing_no_cid_is_rejected() {
+        // `seq` is derived from the clock and the pid, so it is guessable.
+        // A response that does not name the search it answers must not be
+        // allowed to redirect us to an arbitrary server.
+        assert!(!search_response_identifies(&[], 0xDEAD_BEEF));
     }
 }
