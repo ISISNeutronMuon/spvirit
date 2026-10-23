@@ -1687,11 +1687,13 @@ async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPa
     // one delivered?", so a linear scan per sub would make the commit phase
     // O(delivered x subs).
     let delivered = send_msgs(state, to_send).await;
-    debug!(
-        "Monitor update pv='{}' delivered to {} conn(s)",
-        pv_name,
-        delivered.len()
-    );
+    // Per-connection detail, as the old per-recipient loop logged it; the
+    // enabled! check keeps the walk off the hot path when DEBUG is off.
+    if tracing::enabled!(Level::DEBUG) {
+        for (conn_id, _ioid) in &delivered {
+            debug!("Monitor update pv='{}' conn={} ", pv_name, conn_id);
+        }
+    }
 
     // Phase 3: commit delta baseline + pipeline credit ONLY for delivered frames.
     if !delivered.is_empty() {
