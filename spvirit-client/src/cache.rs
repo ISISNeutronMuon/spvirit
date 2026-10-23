@@ -103,6 +103,20 @@ pub struct Resolved {
 struct Entry {
     resolved: Resolved,
     stored_at: Instant,
+    /// The slot generation this entry was resolved under. An `invalidate`
+    /// bumps the slot's generation, so an older entry reads as a miss.
+    generation: u64,
+}
+
+/// One PV's cache slot. The map key is never removed by `invalidate`: that
+/// would let a caller arriving mid-resolve create a fresh slot and start a
+/// second, concurrent resolve. Instead `invalidate` bumps `generation`
+/// (synchronously, without waiting for an in-flight resolver to release
+/// `entry`), and any entry from an older generation is treated as absent.
+#[derive(Debug, Default)]
+struct Slot {
+    generation: AtomicU64,
+    entry: tokio::sync::Mutex<Option<Entry>>,
 }
 
 /// PV name -> [`Resolved`], with a TTL and single-flight.
@@ -113,7 +127,7 @@ struct Entry {
 #[derive(Debug)]
 pub(crate) struct ResolutionCache {
     ttl: Option<Duration>,
-    slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<Entry>>>>>,
+    slots: std::sync::Mutex<HashMap<String, Arc<Slot>>>,
 }
 
 impl ResolutionCache {
@@ -124,18 +138,16 @@ impl ResolutionCache {
         }
     }
 
-    fn slot(&self, pv_name: &str) -> Arc<tokio::sync::Mutex<Option<Entry>>> {
+    fn slot(&self, pv_name: &str) -> Arc<Slot> {
         let mut slots = self.slots.lock().expect("resolution cache mutex poisoned");
-        Arc::clone(
-            slots
-                .entry(pv_name.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
-        )
+        Arc::clone(slots.entry(pv_name.to_string()).or_default())
     }
 
     pub(crate) fn invalidate(&self, pv_name: &str) {
-        let mut slots = self.slots.lock().expect("resolution cache mutex poisoned");
-        slots.remove(pv_name);
+        let slots = self.slots.lock().expect("resolution cache mutex poisoned");
+        if let Some(slot) = slots.get(pv_name) {
+            slot.generation.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     /// Return the cached resolution for `pv_name`, or run `resolve` and cache
@@ -157,9 +169,11 @@ impl ResolutionCache {
         };
 
         let slot = self.slot(pv_name);
-        let mut guard = slot.lock().await;
+        let mut guard = slot.entry.lock().await;
+        let generation = slot.generation.load(Ordering::SeqCst);
 
         if let Some(entry) = *guard
+            && entry.generation == generation
             && entry.stored_at.elapsed() < ttl
         {
             bump(&counters.resolve_hits);
@@ -173,6 +187,7 @@ impl ResolutionCache {
         *guard = Some(Entry {
             resolved,
             stored_at: Instant::now(),
+            generation,
         });
         Ok(resolved)
     }
@@ -479,6 +494,129 @@ mod tests {
 
         assert_eq!(ok, resolved(5075));
         assert_eq!(fake.calls(), 2, "a failure must not poison the slot");
+    }
+
+    /// Review M2: an `invalidate` while a resolve is in flight must not let
+    /// a later caller start a second, concurrent resolve of the same PV. The
+    /// later caller queues behind the leader and, because the leader's result
+    /// predates the invalidate, resolves again only once the leader is done.
+    #[tokio::test]
+    async fn invalidate_during_an_in_flight_resolve_keeps_single_flight() {
+        let cache = Arc::new(ResolutionCache::new(Some(Duration::from_secs(300))));
+        let counters = Arc::new(CacheCounters::default());
+        let fake = Arc::new(CountingResolver::default());
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        let t1 = {
+            let (cache, counters, fake, gate) =
+                (cache.clone(), counters.clone(), fake.clone(), gate.clone());
+            tokio::spawn(async move {
+                cache
+                    .get_or_resolve("A:PV", &counters, || async {
+                        fake.calls.fetch_add(1, Ordering::SeqCst);
+                        gate.notified().await;
+                        Ok(resolved(5075))
+                    })
+                    .await
+            })
+        };
+        while fake.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        cache.invalidate("A:PV");
+
+        let t2 = {
+            let (cache, counters, fake) = (cache.clone(), counters.clone(), fake.clone());
+            tokio::spawn(async move {
+                cache
+                    .get_or_resolve("A:PV", &counters, || async {
+                        fake.calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(resolved(5099))
+                    })
+                    .await
+            })
+        };
+        // Give t2 every chance to run; it must park on the slot lock rather
+        // than start its own resolve while the leader is still in flight.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.calls(),
+            1,
+            "a caller arriving after invalidate must not resolve concurrently"
+        );
+
+        gate.notify_one();
+        assert_eq!(t1.await.unwrap().unwrap(), resolved(5075));
+        assert_eq!(
+            t2.await.unwrap().unwrap(),
+            resolved(5099),
+            "the leader's pre-invalidate result must not be served as a hit"
+        );
+        assert_eq!(fake.calls(), 2);
+
+        // The post-invalidate result is what is cached now.
+        let got = cache
+            .get_or_resolve("A:PV", &counters, || async {
+                fake.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(resolved(1))
+            })
+            .await
+            .unwrap();
+        assert_eq!(got, resolved(5099));
+        assert_eq!(fake.calls(), 2);
+    }
+
+    /// Review M4: a leader cancelled mid-resolve must not wedge its
+    /// followers. The follower takes over and resolves itself. The timeout
+    /// turns a hang into a failure instead of a stuck test run.
+    #[tokio::test]
+    async fn a_cancelled_leader_does_not_wedge_a_follower() {
+        let cache = Arc::new(ResolutionCache::new(Some(Duration::from_secs(300))));
+        let counters = Arc::new(CacheCounters::default());
+        let fake = Arc::new(CountingResolver::default());
+
+        let leader = {
+            let (cache, counters, fake) = (cache.clone(), counters.clone(), fake.clone());
+            tokio::spawn(async move {
+                cache
+                    .get_or_resolve("A:PV", &counters, || async {
+                        fake.calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                        Ok(resolved(1))
+                    })
+                    .await
+            })
+        };
+        while fake.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let follower = {
+            let (cache, counters, fake) = (cache.clone(), counters.clone(), fake.clone());
+            tokio::spawn(async move {
+                cache
+                    .get_or_resolve("A:PV", &counters, || async {
+                        fake.calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(resolved(5075))
+                    })
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+
+        let got = tokio::time::timeout(Duration::from_secs(5), follower)
+            .await
+            .expect("the follower must not hang after the leader is cancelled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, resolved(5075));
+        assert_eq!(fake.calls(), 2, "the follower resolves for itself");
     }
 
     #[test]
