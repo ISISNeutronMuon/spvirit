@@ -115,8 +115,8 @@ impl FrameBuf {
     /// the cancel-safety invariant (prior audit item C1) — ignored when the
     /// donation is no larger than what is already held, and dropped (freed)
     /// when its capacity exceeds [`RECYCLE_RETAIN_MAX`] or this buffer's own
-    /// `max_payload` (plus the 8-byte header), so one large frame cannot pin its allocation for the
-    /// connection's lifetime.
+    /// `max_payload` (plus the 8-byte header), so one large frame cannot pin
+    /// its allocation for the connection's lifetime.
     pub fn recycle(&mut self, buf: Vec<u8>) {
         if self.header_filled != 0 || self.header_done || self.payload_filled != 0 {
             return;
@@ -561,6 +561,40 @@ mod tests {
             .expect("larger frame");
         assert_eq!(msg_l.len(), larger.len());
         assert_eq!(msg_l, larger);
+    }
+
+    /// The retention ceiling on the real read path: a frame larger than
+    /// `RECYCLE_RETAIN_MAX`, read through `read_frame_resumable` and then
+    /// donated, is freed rather than kept — and the next frame still reads
+    /// byte-exact into a fresh allocation.
+    #[tokio::test]
+    async fn a_large_frame_read_and_donated_is_not_retained() {
+        let large = frame_with_payload(&vec![0x5A; RECYCLE_RETAIN_MAX + 1]);
+        let small = frame_with_payload(b"HELLO");
+        let mut wire = large.clone();
+        wire.extend_from_slice(&small);
+
+        let mut reader = &wire[..];
+        let mut reassembler = SegmentReassembler::new();
+        let mut fb = FrameBuf::new();
+        let t = Duration::from_millis(200);
+
+        let msg_large = read_frame_resumable(&mut reader, t, &mut reassembler, &mut fb)
+            .await
+            .expect("large frame");
+        assert_eq!(msg_large, large);
+        assert!(msg_large.capacity() > RECYCLE_RETAIN_MAX);
+        fb.recycle(msg_large);
+        assert_eq!(
+            fb.payload_capacity(),
+            0,
+            "a frame above the retention ceiling must be freed, not retained"
+        );
+
+        let msg_small = read_frame_resumable(&mut reader, t, &mut reassembler, &mut fb)
+            .await
+            .expect("small frame");
+        assert_eq!(msg_small, small);
     }
 
     /// The partial-state guard also covers a half-read header

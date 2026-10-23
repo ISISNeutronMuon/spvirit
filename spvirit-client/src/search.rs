@@ -801,7 +801,8 @@ fn encode_search_validation(creds: &AuthnzCreds, version: u8, is_be: bool) -> Ve
 /// with the environment-derived defaults.
 ///
 /// Kept at this exact signature because it is public API and `spvirit-py`
-/// calls it with four arguments (`spvirit-py/src/discovery.rs:172`).
+/// calls it with four arguments (`spvirit-py/src/discovery.rs:172`). To
+/// present configured credentials instead, see [`search_pv_tcp_with_creds`].
 pub async fn search_pv_tcp(
     pv_name: &str,
     name_server: SocketAddr,
