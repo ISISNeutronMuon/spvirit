@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
-use spvirit_codec::spvirit_encode::{encode_header, encode_string_pva};
+use spvirit_codec::spvirit_encode::encode_client_connection_validation;
 use spvirit_tools::spvirit_client::client::{encode_create_channel_request, encode_get_request};
 
 #[derive(Debug)]
@@ -119,7 +119,7 @@ fn compare_validation(actual: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("unexpected command for validation".into()),
     };
 
-    let expected = encode_validation_for_compare(
+    let expected = encode_client_connection_validation(
         87_040,
         32_767,
         0,
@@ -180,58 +180,6 @@ fn compare_bytes(label: &str, actual: &[u8], expected: &[u8]) {
             actual[idx], expected[idx]
         );
     }
-}
-
-fn encode_validation_for_compare(
-    buffer_size: u32,
-    introspection_registry_size: u16,
-    qos: u16,
-    authz: &str,
-    user: &str,
-    host: &str,
-    version: u8,
-    is_be: bool,
-) -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&if is_be {
-        buffer_size.to_be_bytes()
-    } else {
-        buffer_size.to_le_bytes()
-    });
-    payload.extend_from_slice(&if is_be {
-        introspection_registry_size.to_be_bytes()
-    } else {
-        introspection_registry_size.to_le_bytes()
-    });
-    payload.extend_from_slice(&if is_be {
-        qos.to_be_bytes()
-    } else {
-        qos.to_le_bytes()
-    });
-    payload.extend_from_slice(&encode_string_pva(authz, is_be));
-    payload.extend_from_slice(&encode_authnz_blob(user, host));
-    let mut out = encode_header(false, is_be, false, version, 1, payload.len() as u32);
-    out.extend_from_slice(&payload);
-    out
-}
-
-fn encode_authnz_blob(user: &str, host: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&[0xFD, 0x01, 0x00, 0x80, 0x00]);
-    out.push(0x02);
-    out.push(0x04);
-    out.extend_from_slice(b"user");
-    out.push(0x60);
-    out.push(0x04);
-    out.extend_from_slice(b"host");
-    out.push(0x60);
-    let user_bytes = user.as_bytes();
-    let host_bytes = host.as_bytes();
-    out.push(user_bytes.len() as u8);
-    out.extend_from_slice(user_bytes);
-    out.push(host_bytes.len() as u8);
-    out.extend_from_slice(host_bytes);
-    out
 }
 
 fn parse_raw_dump(path: &str) -> Result<Vec<Frame>, Box<dyn std::error::Error>> {
