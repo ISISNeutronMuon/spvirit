@@ -890,6 +890,13 @@ impl PvaClient {
             ..
         } = self.open_channel(pv_name).await?;
 
+        // Formatted once per subscription rather than once per update: the
+        // address cannot change for the life of this connection, and the
+        // gateway always installs a ByteSink so this ran on every update.
+        // `None` when no sink is installed, so an unsinked client pays
+        // nothing at all.
+        let sink_host: Option<String> = self.byte_sink.as_ref().map(|_| server_addr.to_string());
+
         let ioid = alloc_ioid();
         let decoder = PvdDecoder::new(is_be);
 
@@ -968,8 +975,8 @@ impl PvaClient {
                         Err(PvGetError::Timeout(_)) => continue,
                         Err(e) => return Err(e),
                     };
-                    if let Some(sink) = &self.byte_sink {
-                        sink.on_rx(pv_name, &server_addr.to_string(), bytes.len() as u64);
+                    if let (Some(sink), Some(host)) = (&self.byte_sink, &sink_host) {
+                        sink.on_rx(pv_name, host, bytes.len() as u64);
                     }
                     let Some(update_body) = monitor_data_body(&bytes, ioid, is_be) else {
                         continue;
@@ -2556,6 +2563,60 @@ mod tests {
             .await
             .expect("monitor timed out")
             .expect("monitor error");
+    }
+
+    /// The monitor loop reports the same host string on every update, and it is
+    /// the server's socket address. Pinning this lets the loop hoist the
+    /// formatting out without changing what a ByteSink observes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_reports_a_stable_host_string_on_every_update() {
+        use std::sync::Arc;
+
+        const PV: &str = "HOSTSTR:TEST";
+        let (tcp_port, udp_port) = spawn_test_server(PV).await;
+        let server_addr: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+
+        let recorder = Arc::new(RecordingSink::default());
+        let mut client = PvaClient::builder()
+            .port(tcp_port)
+            .udp_port(udp_port)
+            .timeout(Duration::from_secs(5))
+            .server_addr(server_addr)
+            .build();
+        client.set_byte_sink(recorder.clone());
+
+        // Take three updates, then stop.
+        let mut seen = 0u32;
+        let monitor = client.pvmonitor(PV, move |_update| {
+            seen += 1;
+            if seen >= 3 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        // The server pushes an initial update immediately; a put drives the rest.
+        let driver = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                for v in [1.0f64, 2.0, 3.0] {
+                    let _ = client.pvput(PV, v).await;
+                }
+            })
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(10), monitor).await;
+        let _ = driver.await;
+
+        let rx = recorder.rx.lock().unwrap();
+        assert!(
+            rx.len() >= 2,
+            "expected several rx events, got {}",
+            rx.len()
+        );
+        for (pv, host, _n) in rx.iter() {
+            assert_eq!(pv, PV);
+            assert_eq!(host, &server_addr.to_string());
+        }
     }
 
     // ─── monitor_data_body ─────────────────────────────────────────────
