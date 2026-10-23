@@ -44,7 +44,7 @@ impl SegmentReassembler {
 
     /// A reassembler with a custom cap on the reassembled message size.
     ///
-    /// The cap is clamped to `u32::MAX`: [`finish`] rewrites the first
+    /// The cap is clamped to `u32::MAX`: `finish` rewrites the first
     /// segment's `payload_length`, which is a `u32` on the wire, so a larger
     /// cap could only produce a silently wrong header.
     pub fn with_max_bytes(max_bytes: usize) -> Self {
