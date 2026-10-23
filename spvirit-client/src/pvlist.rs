@@ -154,11 +154,10 @@ fn extract_ascii_candidates(raw: &[u8], out: &mut Vec<String>) {
                 }
             }
             let len = i - start;
-            if (3..=128).contains(&len) {
-                if let Ok(s) = std::str::from_utf8(&raw[start..start + len]) {
+            if (3..=128).contains(&len)
+                && let Ok(s) = std::str::from_utf8(&raw[start..start + len]) {
                     out.push(s.to_string());
                 }
-            }
         } else {
             i += 1;
         }
@@ -307,8 +306,8 @@ async fn list_pvs_via_server_rpc_channel(
     let init_cmd = pkt
         .decode_payload()
         .ok_or(PvGetError::Protocol("rpc init decode failed".to_string()))?;
-    if let PvaPacketCommand::Op(op) = init_cmd {
-        if op.status.as_ref().is_some_and(|s| s.is_error()) {
+    if let PvaPacketCommand::Op(op) = init_cmd
+        && op.status.as_ref().is_some_and(|s| s.is_error()) {
             let detail = op
                 .status
                 .as_ref()
@@ -316,7 +315,6 @@ async fn list_pvs_via_server_rpc_channel(
                 .unwrap_or_default();
             return Err(PvGetError::Protocol(format!("rpc init failed: {}", detail)));
         }
-    }
 
     let rpc_payload = encode_server_rpc_channels_request(is_be);
     let rpc_req = encode_rpc_request(sid, ioid, 0x00, &rpc_payload, version, is_be);
@@ -755,11 +753,10 @@ mod tests {
                 ("path", DecodedValue::String(v)) => path = Some(v),
                 ("query", DecodedValue::Structure(query_fields)) => {
                     for (qname, qvalue) in query_fields {
-                        if qname == "op" {
-                            if let DecodedValue::String(v) = qvalue {
+                        if qname == "op"
+                            && let DecodedValue::String(v) = qvalue {
                                 op = Some(v);
                             }
-                        }
                     }
                 }
                 _ => {}

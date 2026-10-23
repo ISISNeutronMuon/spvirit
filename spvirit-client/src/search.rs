@@ -34,7 +34,7 @@ pub struct DiscoveredServer {
 }
 
 pub fn parse_addr_list(env: &str) -> Vec<IpAddr> {
-    env.split(|c| c == ',' || c == ' ' || c == '\t')
+    env.split([',', ' ', '\t'])
         .filter(|s| !s.trim().is_empty())
         .filter_map(|s| parse_search_target_ip(s.trim()))
         .collect()
@@ -54,8 +54,8 @@ fn parse_search_target_ip(token: &str) -> Option<IpAddr> {
 
     // Accept host:port where host may be a name or an IP literal.
     // For IPv6 bracket notation [::1]:port, SocketAddr::parse above already handles it.
-    if let Some((host, port_str)) = token.rsplit_once(':') {
-        if !host.is_empty()
+    if let Some((host, port_str)) = token.rsplit_once(':')
+        && !host.is_empty()
             && !port_str.is_empty()
             && port_str.chars().all(|c| c.is_ascii_digit())
             && !host.contains(']')
@@ -76,7 +76,6 @@ fn parse_search_target_ip(token: &str) -> Option<IpAddr> {
                 }
             }
         }
-    }
 
     if let Ok(addrs) = lookup_host(token) {
         // Prefer IPv4, fall back to first IPv6
@@ -753,7 +752,7 @@ pub fn default_bind_ip() -> Option<IpAddr> {
 /// (port defaults to 5075).
 pub fn parse_name_servers(env_val: &str) -> Vec<SocketAddr> {
     let mut out = Vec::new();
-    for token in env_val.split(|c| c == ',' || c == ' ' || c == '\t') {
+    for token in env_val.split([',', ' ', '\t']) {
         let token = token.trim();
         if token.is_empty() {
             continue;
@@ -767,18 +766,16 @@ pub fn parse_name_servers(env_val: &str) -> Vec<SocketAddr> {
             continue;
         }
         use std::net::ToSocketAddrs;
-        if let Ok(mut addrs) = token.to_socket_addrs() {
-            if let Some(addr) = addrs.next() {
+        if let Ok(mut addrs) = token.to_socket_addrs()
+            && let Some(addr) = addrs.next() {
                 out.push(addr);
                 continue;
             }
-        }
         let with_port = format!("{}:5075", token);
-        if let Ok(mut addrs) = with_port.to_socket_addrs() {
-            if let Some(addr) = addrs.next() {
+        if let Ok(mut addrs) = with_port.to_socket_addrs()
+            && let Some(addr) = addrs.next() {
                 out.push(addr);
             }
-        }
     }
     out
 }
@@ -879,11 +876,10 @@ pub async fn search_pv_tcp_with_creds(
         let remaining = deadline - now;
         let bytes = read_packet(&mut stream, remaining, &mut reassembler).await?;
         let mut pkt = PvaPacket::new(&bytes);
-        if let Some(cmd) = pkt.decode_payload() {
-            if matches!(cmd, PvaPacketCommand::ConnectionValidated(_)) {
+        if let Some(cmd) = pkt.decode_payload()
+            && matches!(cmd, PvaPacketCommand::ConnectionValidated(_)) {
                 break;
             }
-        }
     }
 
     // Send search request over TCP.
@@ -912,8 +908,8 @@ pub async fn search_pv_tcp_with_creds(
         let remaining = deadline - now;
         let bytes = read_packet(&mut stream, remaining, &mut reassembler).await?;
         let mut pkt = PvaPacket::new(&bytes);
-        if let Some(cmd) = pkt.decode_payload() {
-            if let PvaPacketCommand::SearchResponse(payload) = cmd {
+        if let Some(cmd) = pkt.decode_payload()
+            && let PvaPacketCommand::SearchResponse(payload) = cmd {
                 if !payload.found {
                     continue;
                 }
@@ -929,7 +925,6 @@ pub async fn search_pv_tcp_with_creds(
                 }
                 return Ok((addr, payload.guid));
             }
-        }
     }
 }
 
