@@ -61,7 +61,6 @@ store-entry time precisely because of this.
 | `spvd_decode.rs` | 1843 | **pvData (PVD) introspection + value decode**: `TypeCode`, `FieldDesc`, `StructureDesc`, `DecodedValue`, `DecodeLimits`, `PvdDecoder` (incl. introspection registry, bitset decode) |
 | `spvd_encode.rs` | 3472 | **pvData encode / NT serialization**: struct-desc encoding, per-NT-type encoders, bitset/delta/monitor encoding, PvRequest encode/decode, projection/filtering |
 | `spvirit_encode.rs` | 1436 | **PVA wire-format encode**: `encode_header`, all request/response builders (search, create-channel, op init/data/status, monitor, beacon) |
-| `spvirit_state.rs` | 1948 | **Connection state tracker**: CID↔SID↔PV-name mapping, operation states, search cache, snapshots/stats (used by the sniffing/diagnostic tools) |
 
 ### How the wire protocol works
 
@@ -87,11 +86,11 @@ single source of truth. Both `epics_decode::decode_size`/`decode_string`
 (spvd_decode.rs:389/398) are thin wrappers over them — the split that remains
 is the deliberate `Utf8Policy` one: framing decodes `Lossy` (passive observer),
 structured pvData values decode `Strict` (a non-UTF-8 value is a real error).
-**Encode still has three near-identical size helpers**
-(`encode_common::encode_size` at encode_common.rs:5,
-`spvd_encode::encode_size_pvd` at spvd_encode.rs:15,
-`spvirit_encode::encode_size_pva` at spvirit_encode.rs:12) — if you change
-one, check the others.
+**Encode has one public size encoder**
+(`spvirit_encode::encode_size_pva` at spvirit_encode.rs:12, which delegates to
+`encode_common::encode_size` at encode_common.rs:5). `spvd_encode` keeps
+private `encode_size_pvd` / `encode_string_pvd` aliases of the `encode_common`
+functions, so a change to `encode_common` covers all three names.
 
 **Introspection / type descriptors.** PVD structures are described by
 `FieldDesc`/`StructureDesc` trees. Parse path: `PvdDecoder::parse_field_desc`
@@ -169,19 +168,6 @@ oversized outgoing message into segments; the server sends one large frame
 regardless of size. Roadmap item 6 in
 [Current State and Roadmap](08-current-state.md).
 
-### Connection state tracker (`spvirit_state.rs`)
-
-`PvaStateTracker` is fed protocol events (`on_search`,
-`on_create_channel_request/response`, `on_op_init_request/response`,
-`on_op_activity`, `on_destroy_channel`, …) and maintains CID↔SID↔PV-name
-maps, per-operation `field_desc`s, a search cache, TTL-based cleanup (5 min /
-40 k channels default) and snapshot/stats reporting. PV-name resolution
-(`resolve_pv_name`, spvirit_state.rs:870) is deliberately best-effort for
-mid-stream packet captures — the single-channel fallback is disabled when
-multiple ops exist to avoid mis-attribution on multiplexed connections
-(Phoebus). Used by the diagnostic TUI tools, not by the server/client
-runtimes.
-
 ### Data-flow asymmetry (important)
 
 NT types flow **into** the encoder (`spvd_encode` takes `spvirit-types`
@@ -212,9 +198,8 @@ mapping in these crates**; each consumer interprets `DecodedValue` itself
 
 ### Tests
 
-All inline `#[cfg(test)]` modules at the bottom of each file: spvd_encode 21,
-spvirit_encode 20, spvirit_state 23, spvd_decode 18, epics_decode 13,
+All inline `#[cfg(test)]` modules at the bottom of each file: spvd_encode 30,
+spvirit_encode 20, spvd_decode 27, epics_decode 17,
 monitor 10, segment 10, error 6, types 5.
-Round-trip oriented (encode → decode → assert equality). The state-tracker
-tests (spvirit_state.rs:1023–1350) double as documentation of the intended
-state-machine semantics. Run with `cargo test -p spvirit-codec -p spvirit-types`.
+Round-trip oriented (encode → decode → assert equality). Run with
+`cargo test -p spvirit-codec -p spvirit-types`.

@@ -26,3 +26,40 @@ pub fn encode_string(value: &str, is_be: bool) -> Vec<u8> {
     out.extend_from_slice(bytes);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spvirit_encode::{encode_size_pva, encode_string_pva};
+
+    /// The `_pva` and `_pvd` names always produced identical bytes; this pins
+    /// that the surviving name is the same function, across every branch of
+    /// the size prefix.
+    #[test]
+    fn the_surviving_encoders_cover_all_three_size_forms() {
+        for (n, expected) in [
+            (0usize, vec![0x00u8]),
+            (1, vec![0x01]),
+            (253, vec![253]),
+            (254, {
+                let mut v = vec![0xFE];
+                v.extend_from_slice(&254u32.to_le_bytes());
+                v
+            }),
+        ] {
+            assert_eq!(encode_size(n, false), expected, "size {n}");
+            assert_eq!(encode_size_pva(n, false), expected, "pva size {n}");
+        }
+        assert_eq!(encode_size(254, true), {
+            let mut v = vec![0xFE];
+            v.extend_from_slice(&254u32.to_be_bytes());
+            v
+        });
+
+        let s = "pva";
+        let mut expected = encode_size(3, false);
+        expected.extend_from_slice(b"pva");
+        assert_eq!(encode_string(s, false), expected);
+        assert_eq!(encode_string_pva(s, false), expected);
+    }
+}

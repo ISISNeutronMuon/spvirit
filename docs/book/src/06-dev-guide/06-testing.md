@@ -17,8 +17,8 @@ round-trip based. Both are worth adding.
 
 Every crate keeps tests at the bottom of each source file. Notable suites:
 
-- `spvirit-codec`: spvd_encode (18), spvirit_encode (20), spvirit_state (15 —
-  these double as the state-machine spec), epics_decode (9), spvd_decode (7).
+- `spvirit-codec`: spvd_encode (18), spvirit_encode (20), epics_decode (9),
+  spvd_decode (7).
 - `spvirit-server`: simple_store (MDEL, timestamps, all 12 array element
   types, put_nt, validator rejection), pv (constructors, attach guards),
   pva_server (builder wiring, links), monitor (delta-frame semantics), db,

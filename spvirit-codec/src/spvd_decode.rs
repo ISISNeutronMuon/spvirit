@@ -157,20 +157,6 @@ impl FieldType {
             FieldType::BoundedString(_) => "string",
         }
     }
-
-    /// Bytes this type owns on the heap, walked recursively.
-    ///
-    /// Only the nesting variants own anything; scalars are pure discriminant.
-    pub fn heap_size(&self) -> usize {
-        match self {
-            FieldType::Structure(s) | FieldType::StructureArray(s) => s.heap_size(),
-            FieldType::Union(f) | FieldType::UnionArray(f) => {
-                f.capacity() * std::mem::size_of::<FieldDesc>()
-                    + f.iter().map(FieldDesc::heap_size).sum::<usize>()
-            }
-            _ => 0,
-        }
-    }
 }
 
 /// Field description (name + type)
@@ -178,13 +164,6 @@ impl FieldType {
 pub struct FieldDesc {
     pub name: String,
     pub field_type: FieldType,
-}
-
-impl FieldDesc {
-    /// Bytes this field owns on the heap, including any nested structure.
-    pub fn heap_size(&self) -> usize {
-        self.name.capacity() + self.field_type.heap_size()
-    }
 }
 
 /// Structure description with optional ID
@@ -205,20 +184,6 @@ impl StructureDesc {
     /// Look up a field by name.
     pub fn field(&self, name: &str) -> Option<&FieldDesc> {
         self.fields.iter().find(|f| f.name == name)
-    }
-
-    /// Bytes this description owns on the heap, walked recursively.
-    ///
-    /// Introspection is the one term in the state tracker's memory estimate
-    /// that is both large and expensive to measure: an NTScalar carries
-    /// thirty-odd nested `FieldDesc` nodes, each with its own name. Callers
-    /// are expected to cache this at assignment rather than re-walk the tree
-    /// on every accounting pass.
-    pub fn heap_size(&self) -> usize {
-        let id = self.struct_id.as_ref().map_or(0, |s| s.capacity());
-        let fields = self.fields.capacity() * std::mem::size_of::<FieldDesc>()
-            + self.fields.iter().map(FieldDesc::heap_size).sum::<usize>();
-        id + fields
     }
 }
 
@@ -680,6 +645,15 @@ impl PvdDecoder {
         let mut fields =
             Vec::with_capacity(field_count.min(data.len().saturating_sub(offset) / 2));
 
+        // Lenient by design. A descriptor that announces more fields than the
+        // buffer holds returns `Ok` with the fields that did parse rather than
+        // an error: spvirit is a passive observer and a gateway, and one
+        // malformed descriptor from a third-party IOC must not drop a
+        // connection carrying other channels. Callers therefore cannot tell
+        // "2 fields" from "6 announced, 2 salvaged" - if you need that
+        // distinction, add a returned count rather than making this strict.
+        // Pinned by `truncated_descriptor_parses_leniently_by_design`.
+        // Same choice, same reason, in `decode_structure` below.
         for _ in 0..field_count {
             if offset >= data.len() {
                 break;
@@ -1098,6 +1072,7 @@ impl PvdDecoder {
         let mut offset = 0;
         let mut fields: Vec<(String, DecodedValue)> = Vec::new();
 
+        // Lenient by design - see the note in `parse_structure_desc`.
         for field in &desc.fields {
             if offset >= data.len() {
                 break;
@@ -1187,6 +1162,8 @@ impl PvdDecoder {
         let mut fields: Vec<(String, DecodedValue)> = Vec::new();
         let mut offset = 0usize;
 
+        // Recursive decoder threads its whole state explicitly; a context struct would widen this byte-critical path.
+        #[allow(clippy::too_many_arguments)]
         fn decode_with_bitset_recursive(
             decoder: &PvdDecoder,
             data: &[u8],
@@ -1194,6 +1171,7 @@ impl PvdDecoder {
             desc: &StructureDesc,
             bitset: &[u8],
             bit_offset: &mut usize,
+            counts: &[usize],
             fields: &mut Vec<(String, DecodedValue)>,
         ) -> bool {
             for field in &desc.fields {
@@ -1215,7 +1193,7 @@ impl PvdDecoder {
 
                 if let FieldType::Structure(nested_desc) = &field.field_type {
                     let child_start_bit = *bit_offset;
-                    let child_field_count = count_structure_fields(nested_desc);
+                    let child_field_count = counts[current_bit - 1];
 
                     let mut any_child_bits_set = false;
                     for i in 0..child_field_count {
@@ -1263,6 +1241,7 @@ impl PvdDecoder {
                             nested_desc,
                             bitset,
                             bit_offset,
+                            counts,
                             &mut nested_fields,
                         ) {
                             return false;
@@ -1300,6 +1279,7 @@ impl PvdDecoder {
             true
         }
 
+        let counts = subtree_field_counts(desc);
         let mut bit_offset = 1;
         decode_with_bitset_recursive(
             self,
@@ -1308,6 +1288,7 @@ impl PvdDecoder {
             desc,
             bitset,
             &mut bit_offset,
+            &counts,
             &mut fields,
         );
         Ok((DecodedValue::Structure(fields), offset))
@@ -1327,6 +1308,29 @@ pub(crate) fn count_structure_fields(desc: &StructureDesc) -> usize {
         }
     }
     count
+}
+
+/// Descendant field-bit counts in bitset-bit order.
+///
+/// `counts[n]` is the number of bits owned by the *subtree* of the field
+/// addressed by bit `n + 1` (bit 0 is the whole structure and has no entry).
+/// Built once per decode so the bitset walk stops re-running
+/// `count_structure_fields` for every nested field of every frame.
+pub(crate) fn subtree_field_counts(desc: &StructureDesc) -> Vec<usize> {
+    let mut out = Vec::with_capacity(count_structure_fields(desc));
+    push_subtree_counts(desc, &mut out);
+    out
+}
+
+fn push_subtree_counts(desc: &StructureDesc, out: &mut Vec<usize>) {
+    for field in &desc.fields {
+        let slot = out.len();
+        out.push(0);
+        if let FieldType::Structure(nested) = &field.field_type {
+            push_subtree_counts(nested, out);
+        }
+        out[slot] = out.len() - slot - 1;
+    }
 }
 
 /// Extract a sub-field from a StructureDesc by dot-separated path.
@@ -1559,6 +1563,89 @@ fn format_scalar_value(val: &DecodedValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lenient contract: a descriptor that announces more fields than the
+    /// buffer holds yields `Ok` with the fields that did parse. Deliberate - see
+    /// the comment at the `break`. Change this test only with a protocol decision.
+    #[test]
+    fn truncated_descriptor_parses_leniently_by_design() {
+        let decoder = PvdDecoder::new(false);
+        // Build a well-formed 3-field structure descriptor, then cut it short so
+        // only the first field survives.
+        let mut desc = StructureDesc::new();
+        for name in ["a", "b", "c"] {
+            desc.fields.push(FieldDesc {
+                name: name.to_string(),
+                field_type: FieldType::Scalar(TypeCode::Int32),
+            });
+        }
+        // `encode_structure_desc` emits 11 bytes here: 1 (empty struct id) +
+        // 1 (field count 3) + 3 fields x 3 bytes (1-byte length + 1 name byte +
+        // 1 type tag). Dropping the last 6 leaves exactly the header plus field
+        // "a", so the loop parses one field and then breaks on `offset >= len`.
+        let full = crate::spvd_encode::encode_structure_desc(&desc, false);
+        assert_eq!(full.len(), 11, "descriptor layout changed; recompute the cut");
+        let cut = &full[..full.len() - 6];
+
+        let (parsed, _consumed) = decoder
+            .parse_structure_desc(cut)
+            .expect("lenient parse returns Ok, not Err");
+        // 11 bytes = 1 (0x80) + 1 (field count 3) + 3 x 3-byte fields; cutting
+        // 6 leaves exactly one complete field, so the lenient loop must stop
+        // after it. Pinned exactly: salvaging a second field would be a change.
+        assert_eq!(
+            parsed.fields.len(),
+            1,
+            "the test buffer must actually be short"
+        );
+        assert_eq!(parsed.fields[0].name, "a");
+    }
+
+    /// `counts[n]` must equal what `count_structure_fields` returns for the field
+    /// addressed by bit `n + 1`. Walk the descriptor independently and compare.
+    #[test]
+    fn subtree_field_counts_match_count_structure_fields() {
+        fn walk(desc: &StructureDesc, out: &mut Vec<usize>) {
+            for field in &desc.fields {
+                match &field.field_type {
+                    FieldType::Structure(nested) => {
+                        out.push(count_structure_fields(nested));
+                        walk(nested, out);
+                    }
+                    _ => out.push(0),
+                }
+            }
+        }
+
+        let mut leaf = StructureDesc::new();
+        leaf.fields.push(FieldDesc {
+            name: "deep".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+        let mut mid = StructureDesc::new();
+        mid.fields.push(FieldDesc {
+            name: "a".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+        mid.fields.push(FieldDesc {
+            name: "leaf".to_string(),
+            field_type: FieldType::Structure(leaf),
+        });
+        let mut top = StructureDesc::new();
+        top.fields.push(FieldDesc {
+            name: "mid".to_string(),
+            field_type: FieldType::Structure(mid),
+        });
+        top.fields.push(FieldDesc {
+            name: "z".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+
+        let mut expected = Vec::new();
+        walk(&top, &mut expected);
+        assert_eq!(subtree_field_counts(&top), expected);
+        assert_eq!(subtree_field_counts(&top).len(), count_structure_fields(&top));
+    }
 
     #[test]
     fn test_decode_size() {

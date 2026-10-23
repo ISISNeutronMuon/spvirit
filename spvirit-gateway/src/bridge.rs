@@ -359,7 +359,7 @@ mod tests {
 
     /// Mirrors `bit_paths`' layout for the sample structure: bit 0 is the
     /// whole structure, then depth-first self-then-nested field order.
-    fn sample_paths() -> Vec<String> {
+    fn sample_paths() -> std::sync::Arc<[String]> {
         vec![
             "<whole structure>".to_string(),
             "value".to_string(),
@@ -367,6 +367,7 @@ mod tests {
             "alarm.severity".to_string(),
             "alarm.message".to_string(),
         ]
+        .into()
     }
 
     #[test]

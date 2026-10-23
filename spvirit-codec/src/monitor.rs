@@ -13,6 +13,7 @@
 
 use crate::error::{DecodeError, DecodeResult};
 use crate::spvd_decode::{DecodedValue, FieldType, PvdDecoder, StructureDesc};
+use std::sync::Arc;
 
 /// A decoded MONITOR update: the delta value plus both bitsets.
 #[derive(Debug, Clone)]
@@ -29,8 +30,11 @@ pub struct MonitorUpdate {
     /// `"<whole structure>"`, index *n* is the field addressed by bit *n*.
     ///
     /// Captured at decode time so a callback can name the set bits without
-    /// also being handed the [`StructureDesc`].
-    pub paths: Vec<String>,
+    /// also being handed the [`StructureDesc`]. Shared rather than owned: the
+    /// table depends only on the descriptor, so one subscription's updates all
+    /// point at the same allocation. See
+    /// [`PvdDecoder::decode_monitor_update_with_paths`].
+    pub paths: Arc<[String]>,
 }
 
 /// Which wire layout a lenient decode matched.
@@ -75,10 +79,10 @@ impl MonitorUpdate {
 
 /// Bit-indexed paths for a descriptor: bit 0 is the whole structure, field
 /// bits follow in `flatten_field_paths` order.
-pub(crate) fn bit_paths(desc: &StructureDesc) -> Vec<String> {
+pub fn bit_paths(desc: &StructureDesc) -> Arc<[String]> {
     let mut paths = vec!["<whole structure>".to_string()];
     flatten_field_paths(desc, "", &mut paths);
-    paths
+    paths.into()
 }
 
 /// The subset of `paths` whose bit is set in `bits`.
@@ -96,6 +100,9 @@ fn select_paths(paths: &[String], bits: &[u8]) -> Vec<String> {
 
 /// Depth-first, self-then-nested. Must stay in step with
 /// `count_structure_fields` in `spvd_decode.rs`, which numbers the bits.
+///
+/// Each path is built once and pushed by value; the nested recursion borrows it
+/// back out of `out` rather than taking a second copy.
 fn flatten_field_paths(desc: &StructureDesc, prefix: &str, out: &mut Vec<String>) {
     for field in &desc.fields {
         let path = if prefix.is_empty() {
@@ -103,9 +110,11 @@ fn flatten_field_paths(desc: &StructureDesc, prefix: &str, out: &mut Vec<String>
         } else {
             format!("{prefix}.{}", field.name)
         };
-        out.push(path.clone());
+        let idx = out.len();
+        out.push(path);
         if let FieldType::Structure(nested) = &field.field_type {
-            flatten_field_paths(nested, &path, out);
+            let nested_prefix = out[idx].clone();
+            flatten_field_paths(nested, &nested_prefix, out);
         }
     }
 }
@@ -118,6 +127,20 @@ impl PvdDecoder {
         data: &[u8],
         desc: &StructureDesc,
     ) -> DecodeResult<MonitorUpdate> {
+        self.decode_monitor_update_with_paths(data, desc, bit_paths(desc))
+    }
+
+    /// [`PvdDecoder::decode_monitor_update`] with a caller-supplied path table.
+    ///
+    /// The table depends only on the descriptor, so a subscription should build
+    /// it once with [`bit_paths`] and pass the same `Arc` to every update
+    /// instead of paying ~31 string allocations per frame.
+    pub fn decode_monitor_update_with_paths(
+        &self,
+        data: &[u8],
+        desc: &StructureDesc,
+        paths: Arc<[String]>,
+    ) -> DecodeResult<MonitorUpdate> {
         let (changed, mut offset) = self.read_bitset(data, 0)?;
         let (value, consumed) =
             self.decode_structure_with_bitset_body(&data[offset..], desc, &changed)?;
@@ -128,7 +151,7 @@ impl PvdDecoder {
             changed,
             overrun,
             consumed: next,
-            paths: bit_paths(desc),
+            paths,
         })
     }
 
@@ -142,18 +165,19 @@ impl PvdDecoder {
         data: &[u8],
         desc: &StructureDesc,
     ) -> DecodeResult<(MonitorUpdate, MonitorLayout)> {
+        let paths = bit_paths(desc);
         let candidates = [
             (
                 MonitorLayout::SpecOrder,
-                self.decode_monitor_update(data, desc),
+                self.decode_monitor_update_with_paths(data, desc, Arc::clone(&paths)),
             ),
             (
                 MonitorLayout::OverrunBeforeData,
-                self.decode_overrun_before_data(data, desc),
+                self.decode_overrun_before_data(data, desc, Arc::clone(&paths)),
             ),
             (
                 MonitorLayout::ChangedOnly,
-                self.decode_changed_only(data, desc),
+                self.decode_changed_only(data, desc, Arc::clone(&paths)),
             ),
         ];
 
@@ -186,6 +210,7 @@ impl PvdDecoder {
         &self,
         data: &[u8],
         desc: &StructureDesc,
+        paths: Arc<[String]>,
     ) -> DecodeResult<MonitorUpdate> {
         let (changed, offset) = self.read_bitset(data, 0)?;
         let (overrun, mut offset) = self.read_bitset(data, offset)?;
@@ -197,7 +222,7 @@ impl PvdDecoder {
             changed,
             overrun,
             consumed: offset,
-            paths: bit_paths(desc),
+            paths,
         })
     }
 
@@ -206,6 +231,7 @@ impl PvdDecoder {
         &self,
         data: &[u8],
         desc: &StructureDesc,
+        paths: Arc<[String]>,
     ) -> DecodeResult<MonitorUpdate> {
         let (changed, mut offset) = self.read_bitset(data, 0)?;
         let (value, consumed) =
@@ -216,7 +242,7 @@ impl PvdDecoder {
             changed,
             overrun: Vec::new(),
             consumed: offset,
-            paths: bit_paths(desc),
+            paths,
         })
     }
 
@@ -323,6 +349,7 @@ fn score_decoded(value: &DecodedValue) -> i32 {
 mod tests {
     use super::*;
     use crate::spvd_decode::{FieldDesc, FieldType, PvdDecoder, StructureDesc, TypeCode};
+    use std::sync::Arc;
 
     fn nt_scalar_desc() -> StructureDesc {
         let mut alarm = StructureDesc::new();
@@ -554,6 +581,43 @@ mod tests {
         let (update, layout) = decoder.decode_monitor_update_lenient(&body, &desc).unwrap();
         assert_eq!(layout, MonitorLayout::ChangedOnly);
         assert!(update.overrun.is_empty());
+    }
+
+    #[test]
+    fn paths_are_shared_not_rebuilt_per_update() {
+        let decoder = PvdDecoder::new(false);
+        let desc = nt_scalar_desc();
+        let paths = bit_paths(&desc);
+        let body = spec_order_body(0b0000_0010, 42, 0);
+
+        let a = decoder
+            .decode_monitor_update_with_paths(&body, &desc, Arc::clone(&paths))
+            .unwrap();
+        let b = decoder
+            .decode_monitor_update_with_paths(&body, &desc, Arc::clone(&paths))
+            .unwrap();
+
+        assert!(
+            Arc::ptr_eq(&a.paths, &b.paths),
+            "two updates from one subscription must share one path table"
+        );
+        assert_eq!(a.changed_paths(), vec!["value"]);
+        assert_eq!(b.changed_paths(), vec!["value"]);
+    }
+
+    #[test]
+    fn bit_paths_allocates_each_path_once() {
+        let desc = nt_scalar_desc();
+        let paths = bit_paths(&desc);
+        assert_eq!(
+            &*paths,
+            &[
+                "<whole structure>".to_string(),
+                "value".to_string(),
+                "alarm".to_string(),
+                "alarm.severity".to_string(),
+            ]
+        );
     }
 
     #[test]

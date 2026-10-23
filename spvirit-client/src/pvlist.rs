@@ -18,7 +18,8 @@ use spvirit_codec::epics_decode::{DecodeMode, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::{
     DecodedValue, FieldDesc, FieldType, PvdDecoder, StructureDesc, extract_nt_scalar_value,
 };
-use spvirit_codec::spvd_encode::{encode_string_pvd, encode_structure_desc};
+use spvirit_codec::spvd_encode::encode_structure_desc;
+use spvirit_codec::spvirit_encode::encode_string_pva;
 use spvirit_codec::spvirit_encode::encode_rpc_request;
 
 use crate::client::{
@@ -192,9 +193,9 @@ fn encode_server_rpc_channels_request(is_be: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(0x80);
     out.extend_from_slice(&encode_structure_desc(&desc, is_be));
-    out.extend_from_slice(&encode_string_pvd("pva", is_be));
-    out.extend_from_slice(&encode_string_pvd("server", is_be));
-    out.extend_from_slice(&encode_string_pvd("channels", is_be));
+    out.extend_from_slice(&encode_string_pva("pva", is_be));
+    out.extend_from_slice(&encode_string_pva("server", is_be));
+    out.extend_from_slice(&encode_string_pva("channels", is_be));
     out
 }
 

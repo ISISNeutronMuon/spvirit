@@ -22,9 +22,10 @@ use spvirit_codec::epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand};
 use spvirit_codec::spvd_decode::{DecodedValue, PvdDecoder};
 use spvirit_codec::spvd_decode::{FieldDesc, FieldType, StructureDesc, TypeCode};
 use spvirit_codec::spvd_encode::{
-    decode_pv_request_fields, encode_size_pvd, filter_structure_desc, nt_payload_desc,
+    decode_pv_request_fields, filter_structure_desc, nt_payload_desc,
 };
 use spvirit_codec::spvirit_encode::encode_control_message;
+use spvirit_codec::spvirit_encode::encode_size_pva;
 use spvirit_codec::spvirit_encode::{
     encode_beacon, encode_connection_validation, encode_create_channel_error,
     encode_create_channel_response, encode_get_field_error, encode_get_field_response,
@@ -3033,7 +3034,7 @@ fn decode_put_body_shifted_bitset(
     let data = &body[consumed + size..];
     let shifted = shift_bitset_left(bitset, 1);
     let mut shifted_body = Vec::new();
-    shifted_body.extend_from_slice(&encode_size_pvd(shifted.len(), is_be));
+    shifted_body.extend_from_slice(&encode_size_pva(shifted.len(), is_be));
     shifted_body.extend_from_slice(&shifted);
     shifted_body.extend_from_slice(data);
     decoder
@@ -3129,7 +3130,7 @@ mod tests {
         let nt = NtScalar::from_value(spvirit_tools::spvirit_server::types::ScalarValue::F64(0.0));
         let desc = nt_scalar_desc(&nt.value);
         let mut body = Vec::new();
-        body.extend_from_slice(&encode_size_pvd(1, false));
+        body.extend_from_slice(&encode_size_pva(1, false));
         body.push(0x01); // bit0 set (value) with no struct bit
         body.extend_from_slice(&30.0f64.to_le_bytes());
 
