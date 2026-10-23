@@ -14,11 +14,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use spvirit_client::MonitorEnd;
 use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::pvstore::{PvInfo, Source, TryClaim};
 use spvirit_types::NtPayload;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::access::{AccessControl, Decision, Identity, Op};
 use crate::bridge::{
@@ -104,6 +103,24 @@ pub struct Binding {
 /// purpose — one timer wakeup per live upstream monitor, and a few seconds of
 /// extra upstream subscription is not worth a tighter loop.
 const IDLE_SWEEP: Duration = Duration::from_secs(2);
+
+/// Fires its channel when dropped.
+///
+/// Moved into the upstream monitor callback, which the client's subscription
+/// task owns and drops exactly when that task ends — on every exit path,
+/// including an early connect error before the first update. That makes the
+/// receiving half a prompt "the subscription task is over" signal, which the
+/// frozen `MonitorHandle` API does not otherwise offer without giving up the
+/// handle (its only completion future is the consuming `join`).
+struct EndSignal(Option<oneshot::Sender<()>>);
+
+impl Drop for EndSignal {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
 
 /// Forget the binding for downstream `name`.
 ///
@@ -581,6 +598,8 @@ impl Source for GatewaySource {
                 let callback_entry = entry.clone();
                 let callback_monitors = monitors.clone();
                 let callback_key = key.clone();
+                let (end_tx, mut ended) = oneshot::channel();
+                let end_signal = EndSignal(Some(end_tx));
 
                 // `pvmonitor_spawn` runs the subscription on its own task and
                 // hands back a handle immediately. There is no
@@ -589,6 +608,9 @@ impl Source for GatewaySource {
                 // deliberate, and unlike the flag it cannot go stale, because
                 // it is the same object the cancellation acts on.
                 let handle = client.pvmonitor_spawn(&real_name, move |update| {
+                    // Owned by the callback so that it is dropped — and fires —
+                    // when the subscription task ends. See `EndSignal`.
+                    let _end_signal = &end_signal;
                     merge_monitor_delta(&mut last_full, update);
 
                     // Patch in place when the delta names its changed fields;
@@ -624,48 +646,61 @@ impl Source for GatewaySource {
                     // so a subscription is never swept before it has run.
                     ticker.tick().await;
                     loop {
-                        ticker.tick().await;
-                        // Death BEFORE idleness. An upstream that closed (the
-                        // client surfaces that as `Err(Io)` from `join`) must
-                        // always take the "PV dead" path below — retired
-                        // binding, counted death, closed senders — even if the
-                        // last subscriber happened to leave in the same sweep
-                        // window. Sweeping for idleness first would retire a
-                        // dead upstream silently as merely unwanted and leave
-                        // its binding answering `Yes` to the next search
-                        // (design spec §4).
-                        match entry.upstream_state() {
-                            UpstreamState::Running => {}
-                            // A tick that found `subs` empty already retired
-                            // and cancelled this entry.
-                            UpstreamState::Cancelled => return,
-                            UpstreamState::Finished => break,
-                        }
-                        if monitors.retire_if_idle(&key, &entry) {
-                            // Every downstream receiver is gone and no upstream
-                            // tick was ever going to notice. The entry is out
-                            // of the map and the subscription is cancelled.
-                            // Not a fault: no death counted, no binding retired
-                            // (the PV is still perfectly claimable).
-                            return;
+                        tokio::select! {
+                            // Death BEFORE idleness: the end signal is polled
+                            // first, so a sweep never runs once the
+                            // subscription task is over, and an upstream close
+                            // is acted on at once instead of on the next tick.
+                            biased;
+                            _ = &mut ended => break,
+                            _ = ticker.tick() => {
+                                // Same rule inside the tick: a task that has
+                                // finished but whose signal is not yet seen is
+                                // a death, never an idle retire — sweeping it
+                                // would leave its binding answering `Yes` to
+                                // the next search (design spec §4).
+                                match entry.upstream_state() {
+                                    UpstreamState::Running => {}
+                                    // A tick that found `subs` empty already
+                                    // retired and cancelled this entry.
+                                    UpstreamState::Cancelled => return,
+                                    UpstreamState::Finished => break,
+                                }
+                                if monitors.retire_if_idle(&key, &entry) {
+                                    // Every downstream receiver is gone and no
+                                    // upstream tick was ever going to notice.
+                                    // The entry is out of the map and the
+                                    // subscription is cancelled. Not a fault:
+                                    // no death counted, no binding retired (the
+                                    // PV is still perfectly claimable).
+                                    return;
+                                }
+                            }
                         }
                     }
 
-                    // Upstream ended on its own — an error (an upstream close
-                    // surfaces as `Err(Io)`), a clean EOF, or the callback
-                    // breaking. Take the handle BEFORE `retire`, whose own
-                    // cancel would otherwise throw away the reason.
-                    let ended = entry.take_upstream();
+                    // The subscription task is over. Whether that was
+                    // deliberate is decided by the handle, not by timing:
+                    // every deliberate stop (`dispatch_or_retire`, `retire`,
+                    // `retire_if_idle`) takes the handle off the entry BEFORE
+                    // the task can end, so a handle still attached here means
+                    // the upstream ended on its own — closed (the client
+                    // surfaces that as `Err(Io)` from `join`), errored, or
+                    // never connected. A callback `Break` cannot get here with
+                    // the handle attached: it is always preceded by
+                    // `dispatch_or_retire`'s take. Taking it also keeps the
+                    // reason, which `retire`'s own cancel would throw away.
+                    let Some(handle) = entry.take_upstream() else {
+                        return;
+                    };
                     monitors.retire(&key, &entry);
                     // Without this, `try_claim` keeps answering `Yes` from the
                     // bindings map and a destroyed client hot-loops straight
                     // back into the dead upstream (design spec §4).
                     retire_binding_in(&bindings, &down_name);
                     deaths.fetch_add(1, Ordering::Relaxed);
-                    let end = match ended {
-                        Some(handle) => handle.join().await,
-                        None => Ok(MonitorEnd::Cancelled),
-                    };
+                    // Already finished, so this resolves at once.
+                    let end = handle.join().await;
                     tracing::warn!(
                         "upstream monitor ended for real='{}' downstream='{}' via client='{}' \
                          ({:?}); retired the cache entry and binding and closed every \

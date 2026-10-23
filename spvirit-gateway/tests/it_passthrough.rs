@@ -1217,7 +1217,17 @@ async fn a_binding_refresh_clears_the_getholdoff_cache_only_when_the_descriptor_
 /// its own, and it is a cancellation, not a death.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_last_subscriber_cancels_the_upstream_monitor() {
-    let Some((src, _pool)) = spawn_gateway(|b| b.ao("IT:IDLE", 1.0), 0).await else {
+    // The upstream's own view of who is connected. The gateway's map length
+    // alone cannot prove the subscription was cancelled: an entry can leave
+    // the map while its handle (and so its TCP connection) lives on.
+    let reg = Arc::new(spvirit_server::diag::ClientRegistry::new());
+    let upstream_reg = reg.clone();
+    let Some((src, _pool)) = spawn_gateway(
+        move |b| b.ao("IT:IDLE", 1.0).client_registry(upstream_reg),
+        0,
+    )
+    .await
+    else {
         eprintln!("Skipping test: cannot bind a free port in this environment");
         return;
     };
@@ -1231,10 +1241,20 @@ async fn dropping_the_last_subscriber_cancels_the_upstream_monitor() {
     // case the sweep exists for.
     rx.recv().await.expect("initial monitor update");
     assert_eq!(src.upstream_monitor_count(), 1);
+    // The monitor runs on its own dedicated upstream connection; the pooled
+    // connection the claim's `pvinfo` used lingers for `conn_idle_ttl`, so
+    // compare against this count rather than against zero.
+    let upstream_conns_before = reg.snapshot().len();
+    assert!(
+        upstream_conns_before >= 1,
+        "the upstream must see the monitor's connection"
+    );
     drop(rx);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(12);
-    while src.upstream_monitor_count() != 0 && std::time::Instant::now() < deadline {
+    while (src.upstream_monitor_count() != 0 || reg.snapshot().len() >= upstream_conns_before)
+        && std::time::Instant::now() < deadline
+    {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -1243,6 +1263,11 @@ async fn dropping_the_last_subscriber_cancels_the_upstream_monitor() {
         0,
         "the idle upstream monitor must be swept away within a few IDLE_SWEEP \
          ticks of its last subscriber leaving"
+    );
+    assert_eq!(
+        reg.snapshot().len(),
+        upstream_conns_before - 1,
+        "the upstream must see the monitor's connection close: removing the \n         entry from the gateway's map is not enough, the handle must be cancelled"
     );
     assert_eq!(
         src.upstream_monitor_deaths(),

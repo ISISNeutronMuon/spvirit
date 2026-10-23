@@ -6,21 +6,18 @@
 //! task, every subsequent `subscribe` for the same key just adds another
 //! downstream `mpsc::Sender`/`Receiver` pair fed by that one task's updates.
 //!
-//! Cancellation for M1 is "next-tick": the upstream task notices its
-//! `subs` list is empty only when it goes to deliver the *next* update, at
-//! which point `MonitorCache::dispatch_or_retire` atomically (under the
-//! entries-map lock) removes the `MonitorEntry` from the map and reports
-//! that the upstream loop should end. That atomicity — retiring the entry
-//! and deciding to stop the loop as one map-locked step — is what prevents
-//! a concurrent `subscribe()` from attaching a new subscriber to an entry
-//! whose upstream loop has already (or is about to have) ended; see
-//! `dispatch_or_retire`'s doc comment for the exact race it closes. A PV
-//! that goes silent forever right after its last subscriber leaves does
-//! *not* get its upstream monitor torn down promptly — this "idle-linger"
-//! is a documented M1 simplification (see task-11-report.md), not a
-//! correctness bug: no downstream traffic is leaked, only an idle upstream
-//! monitor task outlives its last subscriber until the PV next changes (or
-//! forever, for a PV that never changes again).
+//! Cancellation happens on whichever comes first: the next upstream tick, or
+//! the next idle sweep. On a tick, `MonitorCache::dispatch_or_retire` notices
+//! an empty `subs` list and atomically (under the entries-map lock) removes
+//! the `MonitorEntry` from the map, then cancels its upstream subscription.
+//! That atomicity — retiring the entry and deciding to stop as one map-locked
+//! step — is what prevents a concurrent `subscribe()` from attaching a new
+//! subscriber to an entry whose upstream has already (or is about to have)
+//! ended; see `dispatch_or_retire`'s doc comment for the exact race it closes.
+//! A PV that goes quiet never ticks, so `proxy.rs`'s per-entry supervisor
+//! calls `MonitorCache::retire_if_idle` every `IDLE_SWEEP` to do the same for
+//! it. Every retirement path takes the entry's `MonitorHandle` and drops it,
+//! which cancels the upstream subscription and closes its connection.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -66,7 +63,9 @@ pub enum UpstreamState {
     /// The handle has been taken and dropped by a retirement path.
     Cancelled,
     /// The handle is still attached but its task has ended by itself — the
-    /// upstream closed, errored, or the callback returned `Break`.
+    /// upstream closed, errored, or never connected. (A callback `Break` never
+    /// lands here: it is always preceded by `dispatch_or_retire` taking the
+    /// handle, so that path reads `Cancelled`.)
     Finished,
 }
 
@@ -79,8 +78,14 @@ pub struct MonitorEntry {
     /// Owned *here* rather than by the spawning task because the cache is what
     /// learns the subscription is no longer wanted — `dispatch_or_retire` on a
     /// tick, `retire_if_idle` on a quiet PV — and dropping a `MonitorHandle`
-    /// cancels. It also means an entry that falls out of every `Arc` cancels
-    /// its upstream on the way down, with no teardown path to forget.
+    /// cancels.
+    ///
+    /// The explicit take is MANDATORY on every retirement path. While the
+    /// subscription runs there is an `Arc` cycle: the monitor callback (owned
+    /// by the subscription task) holds an `Arc<MonitorEntry>`, and the entry
+    /// holds the handle that keeps that task alive. The entry therefore never
+    /// falls out of every `Arc` on its own; drop a `cancel_upstream()` call as
+    /// "redundant" and the subscription and its connection run forever.
     upstream: Mutex<Option<MonitorHandle>>,
 }
 
