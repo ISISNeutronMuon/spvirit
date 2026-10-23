@@ -40,29 +40,25 @@ use spvirit_codec::spvirit_encode::{
 use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
 use spvirit_server::handler::{
-    infer_udp_response_ip, is_pattern_query, rand_guid, search_reply_target, wildcard_match,
+    PvListMode, infer_udp_response_ip, is_pattern_query, rand_guid, search_reply_target,
+    wildcard_match,
 };
 use spvirit_server::monitor::MonitorRegistry;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PvListMode {
-    Off,
-    Discover,
-    List,
-}
-
-impl PvListMode {
-    fn parse(raw: &str) -> Result<Self, String> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "off" => Ok(Self::Off),
-            "discover" => Ok(Self::Discover),
-            "list" => Ok(Self::List),
-            other => Err(format!(
-                "Invalid --pvlist-mode '{}'; expected off|discover|list",
-                other
-            )),
-        }
-    }
+/// Parse `--pvlist-mode` using the library's parser, but keep this binary's
+/// error wording. The library says "Invalid pvlist-mode"; the CLI has always
+/// said "Invalid --pvlist-mode" (naming the flag the user actually typed) and
+/// that text is a user-visible compatibility surface.
+fn parse_pvlist_mode_arg(raw: &str) -> Result<PvListMode, String> {
+    PvListMode::parse(raw).map_err(|_| {
+        // The deleted copy interpolated the already-trimmed, already-lowercased
+        // token (`other` in its `match`), not the raw argument. Reproduce that
+        // exactly so `--pvlist-mode NOPE` still reports `'nope'`.
+        format!(
+            "Invalid --pvlist-mode '{}'; expected off|discover|list",
+            raw.trim().to_ascii_lowercase()
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -234,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    let pvlist_mode = PvListMode::parse(&pvlist_mode_raw)?;
+    let pvlist_mode = parse_pvlist_mode_arg(&pvlist_mode_raw)?;
     let pvlist_allow_pattern = if pvlist_allow_pattern.trim().is_empty() {
         None
     } else {
@@ -3109,6 +3105,16 @@ async fn handle_control_message(state: &Arc<ServerState>, conn_id: u64, header: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pvlist_mode_comes_from_the_library_and_keeps_the_cli_error_text() {
+        assert_eq!(PvListMode::parse("list"), Ok(PvListMode::List));
+        assert_eq!(PvListMode::parse(" DISCOVER "), Ok(PvListMode::Discover));
+        assert_eq!(
+            parse_pvlist_mode_arg("nope"),
+            Err("Invalid --pvlist-mode 'nope'; expected off|discover|list".to_string())
+        );
+    }
 
     #[test]
     fn search_reply_target_prefers_payload_addr_and_port() {
