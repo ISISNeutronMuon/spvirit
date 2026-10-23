@@ -14,7 +14,7 @@ use tracing::{Level, debug, error, info, warn};
 use spvirit_tools::spvirit_server::db::load_db;
 use spvirit_tools::spvirit_server::state::{ConnState, MonitorState, MonitorSub};
 use spvirit_tools::spvirit_server::types::{
-    LinkExpr, NtPayload, NtScalar, OutputMode, RecordData, RecordInstance, ScalarArrayValue,
+    LinkExpr, NtPayload, OutputMode, RecordData, RecordInstance, ScalarArrayValue,
     ScalarValue, ScanMode,
 };
 
@@ -40,7 +40,8 @@ use spvirit_codec::spvirit_encode::{
 use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
 use spvirit_server::handler::{
-    PvListMode, infer_udp_response_ip, is_pattern_query, rand_guid, search_reply_target,
+    PvListMode, infer_udp_response_ip, is_pattern_query, is_pvlist_virtual_pv, is_server_rpc_pv,
+    is_virtual_event_pv, rand_guid, search_reply_target, virtual_event_nt, virtual_pvlist_nt,
     wildcard_match,
 };
 use spvirit_server::monitor::MonitorRegistry;
@@ -1792,18 +1793,6 @@ async fn send_msg(state: &Arc<ServerState>, conn_id: u64, msg: Vec<u8>) -> bool 
     }
 }
 
-fn is_pvlist_virtual_pv(pv_name: &str) -> bool {
-    pv_name == "__pvlist"
-}
-
-fn is_server_rpc_pv(pv_name: &str) -> bool {
-    pv_name == "server"
-}
-
-fn is_virtual_event_pv(pv_name: &str) -> bool {
-    pv_name.starts_with("__event:")
-}
-
 fn collect_visible_pv_names_from_store(
     pv_store: &HashMap<String, RecordInstance>,
     mode: PvListMode,
@@ -2051,21 +2040,6 @@ fn parse_virtual_event(pv_name: &str) -> Option<PostedEvent> {
     } else {
         Some(PostedEvent::Event(suffix.to_string()))
     }
-}
-
-fn virtual_event_nt(pv_name: &str) -> NtPayload {
-    NtPayload::Scalar(
-        NtScalar::from_value(ScalarValue::Bool(false))
-            .with_description(format!("Virtual event trigger for {}", pv_name)),
-    )
-}
-
-fn virtual_pvlist_nt(entries: Vec<String>) -> NtPayload {
-    NtPayload::ScalarArray(
-        spvirit_tools::spvirit_server::types::NtScalarArray::from_value(ScalarArrayValue::Str(
-            entries,
-        )),
-    )
 }
 
 /// Resolve an IOC-style `<record>.<FIELD>[$]` reference against the store.
@@ -3105,6 +3079,26 @@ async fn handle_control_message(state: &Arc<ServerState>, conn_id: u64, header: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spvirit_tools::spvirit_server::types::NtScalar;
+
+    #[test]
+    fn virtual_pv_helpers_come_from_the_library() {
+        // Same names, same answers: proving the local copies are gone and the
+        // library's are wired in. `virtual_pvlist_nt` is the one with a body
+        // worth pinning: it must produce a string ScalarArray, not a scalar.
+        assert!(is_pvlist_virtual_pv("__pvlist"));
+        assert!(!is_pvlist_virtual_pv("SOME:PV"));
+        assert!(is_server_rpc_pv("server"));
+        assert!(!is_server_rpc_pv("__server"));
+        assert!(is_virtual_event_pv("__event:MY_EVT"));
+        assert!(is_virtual_event_pv("__event:io:ADC0"));
+        assert!(!is_virtual_event_pv("SOME:PV"));
+        assert!(matches!(
+            virtual_pvlist_nt(vec!["A".to_string(), "B".to_string()]),
+            NtPayload::ScalarArray(_)
+        ));
+        assert!(matches!(virtual_event_nt("__event:MY_EVT"), NtPayload::Scalar(_)));
+    }
 
     #[test]
     fn pvlist_mode_comes_from_the_library_and_keeps_the_cli_error_text() {
