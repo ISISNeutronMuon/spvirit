@@ -1267,7 +1267,7 @@ async fn dropping_the_last_subscriber_cancels_the_upstream_monitor() {
     assert_eq!(
         reg.snapshot().len(),
         upstream_conns_before - 1,
-        "the upstream must see the monitor's connection close: removing the \n         entry from the gateway's map is not enough, the handle must be cancelled"
+        "the upstream must see the monitor's connection close: removing the entry from the gateway's map is not enough, the handle must be cancelled"
     );
     assert_eq!(
         src.upstream_monitor_deaths(),
