@@ -415,7 +415,15 @@ impl Source for GatewaySource {
                 }
             }
 
-            self.neg.record_miss(&name, now);
+            // Stamped now, not with the `now` taken at entry: the loop above
+            // just spent a full `PvaClient` operation timeout per configured
+            // client, and charging that against this entry would make any TTL
+            // shorter than the search expire the moment it is written.
+            // Stamped now, not with the `now` taken at entry: the loop above
+            // just spent a full `PvaClient` operation timeout per configured
+            // client, and charging that against this entry would make any TTL
+            // shorter than the search expire the moment it is written.
+            self.neg.record_miss(&name, Instant::now());
             None
         })
     }
@@ -773,6 +781,82 @@ mod tests {
 
     fn allow_all() -> Arc<AccessControl> {
         Arc::new(AccessControl::new(false, None, None))
+    }
+
+    /// A source with one upstream client pointed at a UDP port nothing is
+    /// listening on, so every `pvinfo_full`/`pvget` through it runs the full
+    /// `PvaClient` operation timeout (5 s by default — `UpstreamPool` never
+    /// sets one) and then fails. The port is bound and released just to obtain
+    /// a number the OS is not currently handing out; nothing ever answers on
+    /// it. `None` means this environment cannot bind a UDP port at all.
+    fn dead_upstream_source(neg: Arc<NegativeCache>) -> Option<GatewaySource> {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .ok()?
+            .local_addr()
+            .ok()?
+            .port();
+        let cfg_json = format!(
+            r#"{{
+                "version": 2,
+                "clients": [{{
+                    "name": "dead-client",
+                    "addrlist": "127.0.0.1",
+                    "autoaddrlist": false,
+                    "bcastport": {port},
+                    "interface": ["127.0.0.1"]
+                }}],
+                "servers": [{{
+                    "name": "s",
+                    "clients": ["dead-client"]
+                }}]
+            }}"#
+        );
+        let cfg = GatewayConfig::from_json_str(&cfg_json).ok()?;
+        let pool = Arc::new(UpstreamPool::from_config(&cfg));
+        let guard = Arc::new(LoopGuard::build(
+            &cfg,
+            &cfg.servers[0],
+            std::collections::HashSet::new(),
+        ));
+        Some(GatewaySource::new(
+            pool,
+            vec!["dead-client".to_string()],
+            neg,
+            guard,
+            0,
+            allow_all(),
+        ))
+    }
+
+    /// The negative-cache TTL must be measured from when the upstream search
+    /// FINISHED, not from when `claim` was entered: the search burns a full
+    /// client timeout per configured client, and charging that against the
+    /// miss entry makes a short TTL expire the instant it is written.
+    #[tokio::test]
+    async fn a_slow_miss_still_gets_its_full_negative_ttl() {
+        let neg = Arc::new(NegativeCache::new(Duration::from_secs(2), 128));
+        let Some(src) = dead_upstream_source(neg.clone()) else {
+            eprintln!("Skipping test: cannot bind a UDP port in this environment");
+            return;
+        };
+
+        let before = Instant::now();
+        assert!(src.claim("GONE:PV").await.is_none());
+        let search_took = before.elapsed();
+
+        if search_took < Duration::from_secs(3) {
+            eprintln!(
+                "Skipping assertion: the upstream search failed in {search_took:?}, faster \
+                 than the 2 s negative TTL, so this environment cannot tell the two apart"
+            );
+            return;
+        }
+
+        assert!(
+            neg.is_missing("GONE:PV", Instant::now()),
+            "the miss was recorded with the pre-search instant, so its 2 s TTL had already \
+             expired by the time claim returned after {search_took:?}"
+        );
     }
 
     /// The access decision must run before the value conversion. A read-only
