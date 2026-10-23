@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::types::PvGetError;
+use crate::client::{ValidatedConn, connect_and_validate, create_channel_on};
+use crate::types::{PvGetError, PvOptions};
 
 /// Tuning for [`crate::pva_client::PvaClient`]'s resolution cache and
 /// connection pool. A `None` TTL disables that layer completely, which
@@ -208,6 +209,10 @@ pub(crate) struct ClientCache {
     cfg: CacheConfig,
     counters: CacheCounters,
     resolution: ResolutionCache,
+    // Read only by `acquire`/`release`/`invalidate_at`, which Task 5 calls;
+    // remove this allow there.
+    #[allow(dead_code)]
+    pool: ConnPool,
 }
 
 impl ClientCache {
@@ -215,6 +220,7 @@ impl ClientCache {
         Self {
             resolution: ResolutionCache::new(cfg.resolve_ttl),
             counters: CacheCounters::default(),
+            pool: ConnPool::new(cfg.conn_idle_ttl, cfg.pool_max_per_addr),
             cfg,
         }
     }
@@ -245,6 +251,205 @@ impl ClientCache {
                 Ok(Resolved { addr, guid })
             })
             .await
+    }
+
+    /// Take a connection to `resolved.addr` — from the pool if one is idle
+    /// and fresh enough, otherwise newly dialled and validated.
+    // Consumed by Task 5 (`with_pooled_channel`) of plan
+    // 2026-09-02-client-connection-cache; remove this allow there.
+    #[allow(dead_code)]
+    pub(crate) async fn acquire(
+        &self,
+        opts: &PvOptions,
+        resolved: Resolved,
+    ) -> Result<PooledConn, PvGetError> {
+        if let Some(c) = self.pool.checkout(resolved.addr, &self.counters) {
+            return Ok(c);
+        }
+        let conn = connect_and_validate(resolved.addr, resolved.guid, opts).await?;
+        Ok(PooledConn::fresh(conn))
+    }
+
+    /// Return a connection that completed its operation successfully.
+    // Consumed by Task 5 (`with_pooled_channel`) of plan
+    // 2026-09-02-client-connection-cache; remove this allow there.
+    #[allow(dead_code)]
+    pub(crate) fn release(&self, conn: PooledConn) {
+        self.pool.checkin(conn);
+    }
+
+    // Consumed by Task 5 (`with_pooled_channel`) of plan
+    // 2026-09-02-client-connection-cache; remove this allow there.
+    #[allow(dead_code)]
+    pub(crate) fn counters(&self) -> &CacheCounters {
+        &self.counters
+    }
+
+    /// Forget the resolution for `pv_name` *and* close every idle connection
+    /// to the address it resolved to, if that address is known.
+    // Consumed by Task 5 (`with_pooled_channel`) of plan
+    // 2026-09-02-client-connection-cache; remove this allow there.
+    #[allow(dead_code)]
+    pub(crate) fn invalidate_at(&self, pv_name: &str, addr: SocketAddr) {
+        self.resolution.invalidate(pv_name);
+        self.pool.purge_addr(addr);
+    }
+}
+
+/// A validated connection plus the channels already created on it.
+///
+/// The pool's unit of storage. A connection is checked out *exclusively*:
+/// only one operation uses it at a time, so no reader task and no ioid
+/// demultiplexing is needed. (See "No multiplexing" in the Design section for
+/// the response-matching rule that exclusivity alone does not give you.)
+///
+/// No `#[derive(Debug)]`: it holds a `ValidatedConn`, which holds a
+/// `SegmentReassembler`, which does not implement `Debug`
+/// (`spvirit-codec/src/segment.rs:34`). Same for `ConnPool` below, and for
+/// `ClientCache`, which Task 2 already left underived. Nothing formats any of
+/// them: `PvaClient`'s hand-written `Debug` prints `self.cache.stats()` (a
+/// plain `CacheStats`), not the cache itself.
+// Consumed by Task 5 (`with_pooled_channel`) of plan
+// 2026-09-02-client-connection-cache; remove this allow there.
+#[allow(dead_code)]
+pub(crate) struct PooledConn {
+    pub(crate) conn: ValidatedConn,
+    /// PV name -> server-side sid, for channels already created here. The
+    /// spvirit server allocates one sid per cid in a CreateChannel batch
+    /// (spvirit-server/src/handler.rs:1383), so one connection can carry
+    /// several PVs.
+    channels: HashMap<String, u32>,
+    /// Next client-side channel id to hand out on this connection. Must be
+    /// unique for the connection's lifetime.
+    next_cid: u32,
+    /// When this connection was last checked in. Only meaningful while it
+    /// sits in the pool.
+    idle_since: Instant,
+    /// False for a connection dialled for this operation, true for one taken
+    /// from the pool. Only a reused connection may be retried after failure.
+    reused: bool,
+}
+
+// Consumed by Task 5 (`with_pooled_channel`) of plan
+// 2026-09-02-client-connection-cache; remove this allow there.
+#[cfg_attr(not(test), allow(dead_code))]
+impl PooledConn {
+    /// Wrap a just-dialled connection. Never eligible for a retry.
+    pub(crate) fn fresh(conn: ValidatedConn) -> Self {
+        Self {
+            conn,
+            channels: HashMap::new(),
+            next_cid: 1,
+            idle_since: Instant::now(),
+            reused: false,
+        }
+    }
+
+    pub(crate) fn was_reused(&self) -> bool {
+        self.reused
+    }
+
+    /// The server-side sid for `pv_name` on this connection, creating the
+    /// channel if this connection does not have one yet.
+    #[allow(dead_code)]
+    pub(crate) async fn channel_sid(
+        &mut self,
+        pv_name: &str,
+        timeout_dur: Duration,
+    ) -> Result<u32, PvGetError> {
+        if let Some(sid) = self.channels.get(pv_name) {
+            return Ok(*sid);
+        }
+        let cid = self.next_cid;
+        self.next_cid = self.next_cid.wrapping_add(1);
+        let sid = create_channel_on(&mut self.conn, pv_name, cid, timeout_dur).await?;
+        self.channels.insert(pv_name.to_string(), sid);
+        Ok(sid)
+    }
+}
+
+/// Server address -> a small LIFO stack of idle validated connections.
+///
+/// The mutex guards only the map and is never held across an `.await`.
+// Consumed by Task 5 (`with_pooled_channel`) of plan
+// 2026-09-02-client-connection-cache; remove this allow there.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ConnPool {
+    idle_ttl: Option<Duration>,
+    max_per_addr: usize,
+    idle: std::sync::Mutex<HashMap<SocketAddr, Vec<PooledConn>>>,
+}
+
+// Consumed by Task 5 (`with_pooled_channel`) of plan
+// 2026-09-02-client-connection-cache; remove this allow there.
+#[cfg_attr(not(test), allow(dead_code))]
+impl ConnPool {
+    pub(crate) fn new(idle_ttl: Option<Duration>, max_per_addr: usize) -> Self {
+        Self {
+            idle_ttl,
+            max_per_addr,
+            idle: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Take an idle connection for `addr`, dropping any that have sat longer
+    /// than the idle TTL. Returns `None` when the pool is cold or disabled.
+    pub(crate) fn checkout(
+        &self,
+        addr: SocketAddr,
+        counters: &CacheCounters,
+    ) -> Option<PooledConn> {
+        let Some(ttl) = self.idle_ttl else {
+            bump(&counters.conn_misses);
+            return None;
+        };
+
+        let mut idle = self.idle.lock().expect("conn pool mutex poisoned");
+        // A `?` here would return `None` without bumping `conn_misses`, which
+        // makes the counter the tests assert on wrong. Bump, then return.
+        let Some(stack) = idle.get_mut(&addr) else {
+            bump(&counters.conn_misses);
+            return None;
+        };
+
+        // LIFO: the most recently checked-in connection is the most likely
+        // to still be alive, so pop from the back.
+        while let Some(mut c) = stack.pop() {
+            if c.idle_since.elapsed() >= ttl {
+                // Dropping `c` closes its socket.
+                bump(&counters.conn_evicted_idle);
+                continue;
+            }
+            c.reused = true;
+            bump(&counters.conn_hits);
+            return Some(c);
+        }
+
+        bump(&counters.conn_misses);
+        None
+    }
+
+    /// Return a healthy connection to the pool. A connection that failed
+    /// must simply be dropped instead of checked in.
+    pub(crate) fn checkin(&self, mut conn: PooledConn) {
+        if self.idle_ttl.is_none() || self.max_per_addr == 0 {
+            return;
+        }
+        let addr = conn.conn.server_addr;
+        conn.idle_since = Instant::now();
+        conn.reused = false;
+        let mut idle = self.idle.lock().expect("conn pool mutex poisoned");
+        let stack = idle.entry(addr).or_default();
+        if stack.len() < self.max_per_addr {
+            stack.push(conn);
+        }
+        // Over the cap: `conn` is dropped here, closing the socket.
+    }
+
+    /// Close and forget every idle connection to `addr`.
+    pub(crate) fn purge_addr(&self, addr: SocketAddr) {
+        let mut idle = self.idle.lock().expect("conn pool mutex poisoned");
+        idle.remove(&addr);
     }
 }
 
@@ -617,6 +822,128 @@ mod tests {
             .unwrap();
         assert_eq!(got, resolved(5075));
         assert_eq!(fake.calls(), 2, "the follower resolves for itself");
+    }
+
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Build a `ValidatedConn` over a real loopback socket, with no PVA
+    /// handshake. Enough for pool mechanics (which never read or write).
+    async fn fake_conn(listener_addr: SocketAddr) -> crate::client::ValidatedConn {
+        let stream = TcpStream::connect(listener_addr).await.expect("connect");
+        crate::client::ValidatedConn {
+            stream,
+            version: 2,
+            is_be: false,
+            server_addr: listener_addr,
+            guid: [0u8; 12],
+            reassembler: spvirit_codec::SegmentReassembler::new(),
+        }
+    }
+
+    async fn loopback_listener() -> (TcpListener, SocketAddr) {
+        let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let a = l.local_addr().expect("local_addr");
+        (l, a)
+    }
+
+    #[tokio::test]
+    async fn a_checked_in_connection_is_handed_back_on_the_next_checkout() {
+        let (_l, addr) = loopback_listener().await;
+        let pool = ConnPool::new(Some(Duration::from_secs(30)), 4);
+        let counters = CacheCounters::default();
+
+        assert!(
+            pool.checkout(addr, &counters).is_none(),
+            "cold pool is empty"
+        );
+        assert_eq!(counters.snapshot().conn_misses, 1);
+
+        pool.checkin(PooledConn::fresh(fake_conn(addr).await));
+
+        let got = pool.checkout(addr, &counters).expect("warm pool must hit");
+        assert!(got.was_reused());
+        assert_eq!(counters.snapshot().conn_hits, 1);
+        assert_eq!(counters.snapshot().conn_misses, 1);
+    }
+
+    #[tokio::test]
+    async fn connections_are_pooled_per_address() {
+        let (_l1, a1) = loopback_listener().await;
+        let (_l2, a2) = loopback_listener().await;
+        let pool = ConnPool::new(Some(Duration::from_secs(30)), 4);
+        let counters = CacheCounters::default();
+
+        pool.checkin(PooledConn::fresh(fake_conn(a1).await));
+
+        assert!(
+            pool.checkout(a2, &counters).is_none(),
+            "wrong address must miss"
+        );
+        assert!(
+            pool.checkout(a1, &counters).is_some(),
+            "right address must hit"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_past_its_ttl_is_evicted_not_reused() {
+        let (_l, addr) = loopback_listener().await;
+        let pool = ConnPool::new(Some(Duration::from_secs(30)), 4);
+        let counters = CacheCounters::default();
+
+        pool.checkin(PooledConn::fresh(fake_conn(addr).await));
+        tokio::time::advance(Duration::from_secs(31)).await;
+
+        assert!(pool.checkout(addr, &counters).is_none());
+        let s = counters.snapshot();
+        assert_eq!(s.conn_evicted_idle, 1);
+        assert_eq!(s.conn_misses, 1);
+        assert_eq!(s.conn_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn the_pool_never_holds_more_than_max_per_addr() {
+        let (_l, addr) = loopback_listener().await;
+        let pool = ConnPool::new(Some(Duration::from_secs(30)), 2);
+        let counters = CacheCounters::default();
+
+        for _ in 0..5 {
+            pool.checkin(PooledConn::fresh(fake_conn(addr).await));
+        }
+
+        assert!(pool.checkout(addr, &counters).is_some());
+        assert!(pool.checkout(addr, &counters).is_some());
+        assert!(pool.checkout(addr, &counters).is_none(), "cap is 2");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_pool_never_stores_anything() {
+        let (_l, addr) = loopback_listener().await;
+        let pool = ConnPool::new(None, 4);
+        let counters = CacheCounters::default();
+
+        pool.checkin(PooledConn::fresh(fake_conn(addr).await));
+        assert!(pool.checkout(addr, &counters).is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_addr_drops_every_connection_to_that_server() {
+        let (_l, addr) = loopback_listener().await;
+        let pool = ConnPool::new(Some(Duration::from_secs(30)), 4);
+        let counters = CacheCounters::default();
+
+        pool.checkin(PooledConn::fresh(fake_conn(addr).await));
+        pool.checkin(PooledConn::fresh(fake_conn(addr).await));
+        pool.purge_addr(addr);
+
+        assert!(pool.checkout(addr, &counters).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_fresh_connection_reports_that_it_was_not_reused() {
+        let (_l, addr) = loopback_listener().await;
+        let c = PooledConn::fresh(fake_conn(addr).await);
+        assert!(!c.was_reused());
     }
 
     #[test]
