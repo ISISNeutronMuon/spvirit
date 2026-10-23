@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tracing::debug;
 
-use crate::auth::{default_authnz_host, default_authnz_user};
+use crate::auth::AuthnzCreds;
 use crate::transport::read_packet;
 use crate::types::{PvGetError, PvGetOptions};
 use spvirit_codec::SegmentReassembler;
@@ -756,21 +756,49 @@ pub fn parse_name_servers(env_val: &str) -> Vec<SocketAddr> {
 }
 
 /// Build a minimal PVA ConnectionValidation response for name server search.
-fn encode_search_validation(version: u8, is_be: bool) -> Vec<u8> {
-    let user = default_authnz_user();
-    let host = default_authnz_host();
-    encode_client_connection_validation(87_040, 32_767, 0, "ca", &user, &host, version, is_be)
+fn encode_search_validation(creds: &AuthnzCreds, version: u8, is_be: bool) -> Vec<u8> {
+    encode_client_connection_validation(
+        87_040,
+        32_767,
+        0,
+        "ca",
+        &creds.user,
+        &creds.host,
+        version,
+        is_be,
+    )
 }
 
-/// Search for a PV via a TCP connection to a PVA name server.
+/// Search for a PV via a TCP connection to a PVA name server, authenticating
+/// with the environment-derived defaults.
 ///
-/// Connects to the name server, performs the PVA handshake, sends a search
-/// request over TCP, and returns the server address from the search response.
+/// Kept at this exact signature because it is public API and `spvirit-py`
+/// calls it with four arguments (`spvirit-py/src/discovery.rs:172`).
 pub async fn search_pv_tcp(
     pv_name: &str,
     name_server: SocketAddr,
     timeout_dur: Duration,
     debug_enabled: bool,
+) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
+    let creds = AuthnzCreds::from_env();
+    search_pv_tcp_with_creds(pv_name, name_server, timeout_dur, debug_enabled, &creds).await
+}
+
+/// Search for a PV via a TCP connection to a PVA name server, presenting the
+/// caller's configured `ca` credentials.
+///
+/// Connects to the name server, performs the PVA handshake, sends a search
+/// request over TCP, and returns the server address from the search response.
+///
+/// Prefer this over [`search_pv_tcp`] anywhere a `PvOptions` is in hand: the
+/// four-argument form authenticates as whatever the *environment* says, which
+/// silently diverges from every other connection in this crate.
+pub async fn search_pv_tcp_with_creds(
+    pv_name: &str,
+    name_server: SocketAddr,
+    timeout_dur: Duration,
+    debug_enabled: bool,
+    creds: &AuthnzCreds,
 ) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
     let deadline = tokio::time::Instant::now() + timeout_dur;
 
@@ -810,7 +838,7 @@ pub async fn search_pv_tcp(
         }
     }
 
-    let validation = encode_search_validation(version, is_be);
+    let validation = encode_search_validation(creds, version, is_be);
     stream.write_all(&validation).await?;
 
     // Wait for ConnectionValidated.
@@ -914,10 +942,14 @@ pub async fn resolve_pv_server(opts: &PvGetOptions) -> Result<(SocketAddr, [u8; 
 
     let mut set = tokio::task::JoinSet::new();
 
+    let creds = AuthnzCreds::from_options(opts);
+
     for ns in name_servers {
         let pv = pv.clone();
+        let creds = creds.clone();
         set.spawn(async move {
-            let result = search_pv_tcp(&pv, ns, timeout_dur, debug_enabled).await?;
+            let result =
+                search_pv_tcp_with_creds(&pv, ns, timeout_dur, debug_enabled, &creds).await?;
             Ok::<(SocketAddr, [u8; 12]), PvGetError>(result)
         });
     }
@@ -1370,5 +1402,93 @@ mod tests {
             }
             other => panic!("expected Decode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn search_validation_carries_the_configured_credentials() {
+        use spvirit_codec::epics_decode::PvaConnectionValidationPayload;
+
+        let creds = crate::auth::AuthnzCreds {
+            user: "configured-user".to_string(),
+            host: "configured-host".to_string(),
+        };
+        let frame = encode_search_validation(&creds, 2, false);
+
+        // Skip the 8-byte PVA header; decode the client->server payload.
+        let payload = PvaConnectionValidationPayload::new(&frame[8..], false, false)
+            .expect("validation payload decodes");
+        assert_eq!(payload.user.as_deref(), Some("configured-user"));
+        assert_eq!(payload.host.as_deref(), Some("configured-host"));
+    }
+
+    #[test]
+    fn authnz_creds_from_options_prefer_the_configured_values() {
+        // `search.rs` imports the alias `PvGetOptions`, not `PvOptions`
+        // (`search.rs:16`), so `use super::*` gives you that spelling.
+        let mut opts = PvGetOptions::new("X".to_string());
+        opts.authnz_user = Some("u1".to_string());
+        opts.authnz_host = Some("h1".to_string());
+
+        let creds = crate::auth::AuthnzCreds::from_options(&opts);
+        assert_eq!(creds.user, "u1");
+        assert_eq!(creds.host, "h1");
+    }
+
+    /// End to end: a name server that reads the client's ConnectionValidation
+    /// must see the credentials the caller configured, not the environment's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn name_server_search_sends_the_configured_credentials() {
+        use spvirit_codec::epics_decode::PvaPacket;
+        use spvirit_codec::spvirit_encode::{encode_connection_validation, encode_control_message};
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ns_addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<(Option<String>, Option<String>)>();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Server side of the handshake: SET_BYTE_ORDER then
+            // CONNECTION_VALIDATION, little-endian, version 2.
+            let sbo = encode_control_message(true, false, 2, 2, 0);
+            stream.write_all(&sbo).await.unwrap();
+            let cv = encode_connection_validation(16_384, 0, &["ca", "anonymous"], 2, false);
+            stream.write_all(&cv).await.unwrap();
+
+            // Read exactly one frame back: the client's validation response.
+            let mut reassembler = SegmentReassembler::new();
+            let bytes = read_packet(&mut stream, Duration::from_secs(5), &mut reassembler)
+                .await
+                .expect("client validation frame");
+            let mut pkt = PvaPacket::new(&bytes);
+            let creds = match pkt.decode_payload() {
+                Some(PvaPacketCommand::ConnectionValidation(p)) => (p.user, p.host),
+                other => panic!("expected ConnectionValidation, got {other:?}"),
+            };
+            let _ = tx.send(creds);
+            // Never answer: the client times out, which is the outcome this
+            // test expects. The stream MUST be held open — dropping it here
+            // would close the socket and turn the client's next read into
+            // `PvGetError::Io(UnexpectedEof)` instead of a timeout.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(stream);
+        });
+
+        let creds = crate::auth::AuthnzCreds {
+            user: "search-user".to_string(),
+            host: "search-host".to_string(),
+        };
+        let err =
+            search_pv_tcp_with_creds("ANY:PV", ns_addr, Duration::from_secs(2), false, &creds)
+                .await
+                .expect_err("the fake name server never answers the search");
+        assert!(matches!(err, PvGetError::Timeout(_)), "got {err:?}");
+
+        let (user, host) = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("name server did not report the credentials")
+            .expect("oneshot dropped");
+        assert_eq!(user.as_deref(), Some("search-user"));
+        assert_eq!(host.as_deref(), Some("search-host"));
     }
 }
