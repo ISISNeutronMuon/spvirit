@@ -374,17 +374,25 @@ const NODE_BUDGET_EXCEEDED: &str = "introspection expands past the node budget";
 /// (`0xFE` splicing a stored tree in for 3 bytes), not size: a literal type
 /// node costs at least one wire byte and a legitimate `0xFE` repeat (pvxs
 /// caches types and resends them by id) carries its element's value bytes,
-/// so real payloads stay far below 64 nodes per byte. A 4-way registry chain
-/// is ~4^n nodes from ~23n bytes and passes it within a few levels.
-const NODES_PER_BYTE: usize = 64;
+/// so real payloads stay far below 16 nodes per byte (an `any[]` of literal
+/// `{double a; double b}` is ~0.12, pvxs-cached NTScalar-sized repeats
+/// ~0.13). A 4-way registry chain is ~4^n nodes from ~23n bytes and passes
+/// it within a few levels.
+///
+/// `input_len` is the bytes available to the call, including any trailing
+/// bytes after the descriptor, so padding a short hostile descriptor raises
+/// its share. That residual is bounded by `MAX_DECODE_NODES` (~1M nodes).
+const NODES_PER_BYTE: usize = 16;
 
 /// Absolute ceiling on resolved type nodes per top-level decode, whatever
 /// the input size. The proportional budget alone scales with the frame: at
-/// 64 nodes/byte a maximal 256 MiB frame would allow ~17G nodes. Legitimate
-/// payloads in the tests are <= ~100K nodes, and an NTMultiChannel of 100K
-/// NTScalars is ~2.5M; 4M nodes bounds the worst-case type-tree memory to
-/// roughly a few hundred MB regardless of frame size.
-const MAX_DECODE_NODES: usize = 4 * 1024 * 1024;
+/// 16 nodes/byte a maximal 256 MiB frame would allow ~4G nodes. Legitimate
+/// payloads in the tests are <= ~100K nodes; at ~25 nodes per NTScalar the
+/// largest legitimate message at this ceiling is roughly 40K NTScalar-sized
+/// elements (an NTMultiChannel of ~40K channels). 1M nodes also bounds what
+/// a padded hostile message (short descriptor + trailing bytes, see
+/// `NODES_PER_BYTE`) can build per message, regardless of frame size.
+const MAX_DECODE_NODES: usize = 1_048_576;
 
 /// The node ceiling for one top-level decode over `input_len` bytes:
 /// `max_struct_fields + NODES_PER_BYTE * input_len`, capped at
@@ -2676,21 +2684,47 @@ mod tests {
 
     /// The proportional budget is capped at `MAX_DECODE_NODES` for large
     /// frames. Unit-tested on the budget computation: an end-to-end frame
-    /// would have to build ~4M type nodes (hundreds of MB) before rejection.
+    /// would have to build ~1M type nodes before rejection.
     #[test]
     fn the_node_ceiling_is_proportional_then_capped() {
         let floor = DecodeLimits::default().max_struct_fields;
+        assert_eq!(MAX_DECODE_NODES, 1_048_576);
         assert_eq!(node_ceiling(floor, 0), floor);
-        assert_eq!(node_ceiling(floor, 1_000), floor + 64_000);
-        // 64 * 100 KB = 6.4M would exceed the cap.
+        assert_eq!(node_ceiling(floor, 1_000), floor + 16_000);
+        // 16 * 100 KB = 1.6M would exceed the cap.
         assert_eq!(node_ceiling(floor, 100_000), MAX_DECODE_NODES);
         assert_eq!(node_ceiling(floor, usize::MAX), MAX_DECODE_NODES);
         // A configured field ceiling above the cap is never undercut.
         assert_eq!(node_ceiling(8_000_000, 100_000), 8_000_000);
-        // A stored 65,536-node type referenced 70 times (~4.59M nodes) in a
+        // A stored 65,536-node type referenced 17 times (~1.11M nodes) in a
         // 100 KB value fits the proportional share but not the cap.
-        let expansion = 70 * 65_536;
+        let expansion = 17 * 65_536;
         assert!(expansion < floor + NODES_PER_BYTE * 100_000);
         assert!(expansion > node_ceiling(floor, 100_000));
+    }
+
+    /// Re-review residual: `input_len` counts bytes after the descriptor, so
+    /// trailing padding raises a hostile descriptor's proportional share. The
+    /// n=12 4-way chain plus 64 KB of padding must still be rejected, now at
+    /// the 1M-node ceiling, within the same debug/CI time bound as the bare
+    /// chain.
+    #[test]
+    fn a_padded_fourway_chain_is_rejected_at_the_ceiling() {
+        let decoder = PvdDecoder::new(false);
+        let mut data = fourway_chain_desc(12);
+        data.extend(std::iter::repeat_n(0u8, 64 * 1024));
+        let start = std::time::Instant::now();
+        let result = decoder.parse_introspection(&data);
+        let elapsed = start.elapsed();
+        match result {
+            Err(DecodeError::Malformed(what)) => assert_eq!(what, NODE_BUDGET_EXCEEDED),
+            Err(other) => panic!("expected the node budget error, got {other:?}"),
+            Ok(_) => panic!("expected the node budget to reject the padded chain"),
+        }
+        // Same debug/loaded-CI margin as the bare chain test.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "rejection took {elapsed:?}"
+        );
     }
 }
