@@ -18,8 +18,10 @@ import sys
 import zipfile
 from pathlib import Path
 
-# Every binary declared in spvirit-tools/Cargo.toml. Kept in step with the
-# tool table in docs/book/src/04-tools/index.md.
+# Every binary spvirit-tools/Cargo.toml builds with the default features --
+# what maturin packages. The opt-in `scry` tools and the internal `spload`
+# load generator (feature `load`) are deliberately not in the wheel. Kept in
+# step with the tool table in docs/book/src/04-tools/index.md.
 EXPECTED = {
     "spget",
     "spput",
@@ -33,6 +35,7 @@ EXPECTED = {
     "spserver",
     "sptable",
     "spdodeca",
+    "spgateway",
 }
 
 

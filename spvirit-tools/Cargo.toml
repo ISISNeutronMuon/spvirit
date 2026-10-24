@@ -28,6 +28,11 @@ scry = [
     "dep:toml",
     "dep:vergen-git2",
 ]
+# The internal gateway load generator (`spload`), used by the loadtest/
+# harness. Off by default so the pip wheel, which maturin builds from the
+# default features, does not ship it: `cargo build -p spvirit-tools
+# --features load --bin spload`.
+load = ["client"]
 
 [dependencies]
 spvirit-types.workspace = true
@@ -140,7 +145,7 @@ required-features = ["client", "server"]
 [[bin]]
 name = "spload"
 path = "src/bin/spvirit_load.rs"
-required-features = ["client"]
+required-features = ["load"]
 
 [[bin]]
 name = "spvirit-scry"
