@@ -2783,25 +2783,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_stops_the_tcp_acceptor() {
         use std::time::Duration;
-        use tokio::net::{TcpListener, TcpStream};
+        use tokio::net::TcpStream;
 
-        // Reserve a free port the same way tests elsewhere in this crate do
-        // (see `search_try_claim_metrics.rs`): bind ephemerally, read the
-        // port back, then drop the listener so the server can bind it.
-        let port = {
-            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            probe.local_addr().unwrap().port()
-        };
-
+        // Let the server pick its own port and wait for the bind:
+        // `start()` returns before the listeners are bound, so connecting
+        // straight after it raced the bind (ECONNREFUSED on CI).
         let server = PvaServer::builder()
             .ai("T:ABORTTCP", 0.0)
             .listen_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-            .port(port)
+            .port(0)
             .udp_port(0)
             .build();
         let running = server.start().await.expect("start");
-
-        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        let (addr, _udp) = tokio::time::timeout(Duration::from_secs(5), running.local_addrs())
+            .await
+            .expect("the server binds within 5 s")
+            .expect("the server binds its listeners");
 
         // Precondition: the server is actually up and accepting.
         TcpStream::connect(addr)
