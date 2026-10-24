@@ -122,11 +122,11 @@ callbacks to be idempotent regardless.
 
 ## Alarm limits are set but the severity stays `NO_ALARM`
 
-Limits set through `Pv::alarm_limits` are published in the payload's
-`valueAlarm` structure but never evaluated. Computed severity comes from the
-server-level `compute_alarms` flag, which is off by default
+Limits — from `Pv::alarm_limits` or a `.db` file — are only evaluated when
+the server-level `compute_alarms` flag is on, and it is off by default
 (`spvirit-server/src/server.rs:55`) — `spserver --compute-alarms`, or
-`.compute_alarms(true)` on the builder. See
+`.compute_alarms(true)` on the builder. The limits are not applied to the
+initial value: severity changes on the first write. See
 [Alarms and severity](../03-progressive/alarms.md).
 
 ## `cargo build` produced no binaries

@@ -70,27 +70,7 @@ records are not served either.
 
 **Where it is documented.** [Serving a .db file](../03-progressive/db-files.md).
 
-## 3. Alarm limits on a handle are published but never evaluated
-
-**What happens.** `Pv::alarm_limits(lolo, low, high, hihi)` puts the limits
-in the payload's `valueAlarm` structure. Severity stays `NO_ALARM` however
-far the value goes past them.
-
-**Why.** Severity computation is gated on the server-wide `compute_alarms`
-flag, which defaults to `false` (`spvirit-server/src/server.rs:57`). The
-handle-level limits do not turn it on.
-
-**Consequence.** A PV that looks alarmed to a human reading the metadata and
-healthy to anything that reads `severity`.
-
-**Workaround.** `spserver --compute-alarms`, or `.compute_alarms(true)` on
-the builder. That path derives MINOR from `LOW`/`HIGH` and MAJOR from
-`LOLO`/`HIHI`, and it works.
-
-**Where it is documented.** [Alarms and severity](../03-progressive/alarms.md),
-[`spserver`](../04-tools/spserver.md).
-
-## 4. `spput` delivers a rejected write twice
+## 3. `spput` delivers a rejected write twice
 
 **What happens.** A write a validator rejects reaches the server's `on_put`
 twice; an accepted write reaches it once.
@@ -107,7 +87,7 @@ hardware poke — doubles up on exactly the writes you were trying to refuse.
 **Where it is documented.** [`spput`](../04-tools/spput.md),
 [Reacting to writes](../03-progressive/reacting-to-writes.md).
 
-## 5. `ADEL` is parsed and exposed but not applied
+## 4. `ADEL` is parsed and exposed but not applied
 
 `MDEL` gates monitor posts (`should_post_update`,
 `spvirit-server/src/simple_store.rs:571`).
@@ -115,7 +95,7 @@ hardware poke — doubles up on exactly the writes you were trying to refuse.
 as a field, and no posting logic consults it. A `.db` that relies on `ADEL`
 behaves as though it were absent.
 
-## 6. Wire PUT is not wired for generic structures
+## 5. Wire PUT is not wired for generic structures
 
 The `Generic` arm of `RecordInstance::apply_put`
 (`spvirit-server/src/apply.rs:659`) is a no-op — it returns `false` without
@@ -124,7 +104,7 @@ into `apply.rs`'s table/ndarray helpers), so a generic record is now the one
 kind that reports itself writable and silently discards every wire PUT — the
 same failure shape as gap 1. Write it server-side with `store.put_nt()`.
 
-## 7. The builder has no `longin`/`longout`
+## 6. The builder has no `longin`/`longout`
 
 `PvaServerBuilder` covers fifteen record constructors and omits these two,
 which both the Rust handle API (`Pv::longin`, `Pv::longout`) and the Python
@@ -132,7 +112,7 @@ module do have. Combined with gap 2, the builder and `.db` are the only two
 routes that cannot produce a `longin`. The matrix is on
 [Record types](record-types.md).
 
-## 8. `CANCEL_REQUEST` is unimplemented
+## 7. `CANCEL_REQUEST` is unimplemented
 
 The server answers PVA command `CANCEL_REQUEST` with
 `"CANCEL_REQUEST command is not supported"`
@@ -141,7 +121,7 @@ The server answers PVA command `CANCEL_REQUEST` with
 Clients that cancel a request rather than destroying the channel will see the
 error; the common clients do not.
 
-## 9. Large values are sent as one frame, never segmented
+## 8. Large values are sent as one frame, never segmented
 
 spvirit reassembles segmented messages it receives — `SegmentReassembler` in
 `spvirit-codec/src/segment.rs:34`, driven by the client transport and the

@@ -120,9 +120,9 @@ Cross-referenced from the per-crate chapters.
 - `.db` parser: one-statement-per-line only; cannot load
   longin/longout/mbbi/mbbo/table/ndarray/generic (the repo's only two
   `TODO(follow-up)` markers: `types.rs:45`, `db.rs:562`).
-- `Pv::alarm_limits()` sets only the wire metadata fields, not the fields the
-  alarm engine reads — `.alarm_limits()` + `compute_alarms(true)` does not
-  auto-alarm. `compute_alarms` defaults to false.
+- `compute_alarms` defaults to false; with it on, `.db` limits and
+  `Pv::alarm_limits()` both drive severity (evaluated on write, not on
+  definition).
 - ADEL parsed but not enforced; beacon change counter only bumps on protocol
   PUTs.
 

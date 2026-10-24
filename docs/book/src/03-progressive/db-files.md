@@ -88,11 +88,10 @@ spserver --db spvirit-server/examples/example.db
 
 ## What to notice
 
-**`.db` is the only route to computed alarms.** As
-[Alarms](alarms.md) explains, the handle API's `.alarm_limits()` publishes
-limits without evaluating them. `LOW`/`HIGH`/`LOLO`/`HIHI` in a `.db` file
-are evaluated. If you want the server to derive severity from the value,
-this is how.
+**`.db` limits and handle limits are evaluated alike.**
+`LOW`/`HIGH`/`LOLO`/`HIHI` in a `.db` file and the handle API's
+`.alarm_limits()` set the same limits; with `.compute_alarms(true)` the
+server derives severity from either. See [Alarms](alarms.md).
 
 **Input records refuse writes.** `ai`, `bi`, `stringin`, `aai` are
 read-only on the wire, and the refusal is explicit rather than silent:

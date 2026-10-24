@@ -65,8 +65,8 @@ $ spput DEMO:SETPOINT 46 && spget DEMO:SETPOINT
 DEMO:SETPOINT  46 MAJOR READ HIHI
 ```
 
-This is currently the *only* route to computed alarms — limits set through
-the `Pv` handle API are published but never evaluated. See
+Limits set through the `Pv` handle API (`.alarm_limits(...)`) are
+evaluated the same way when the builder sets `.compute_alarms(true)`. See
 [Alarms](../03-progressive/alarms.md).
 
 ## Reload

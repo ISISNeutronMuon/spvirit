@@ -369,10 +369,11 @@ sources](../03-progressive/sources.md).
   and **`compute_alarms` defaults to `false`** (server.rs:55).
 - **Dual alarm-limit fields**: `NtScalar` has `alarm_low/high/lolo/hihi`
   (`Option<f64>` — what the alarm engine reads) *and*
-  `value_alarm_*_limit` (`f64` — the NT wire metadata). The `.db` parser sets
-  both; **`Pv::alarm_limits()` (pv.rs:329) sets only the wire fields**, so
-  handle-API alarm limits do not drive server-side severity computation. Known
-  inconsistency — fix or document before it bites a user.
+  `value_alarm_*_limit` (`f64` — the NT wire metadata). Both the `.db`
+  parser and `Pv::alarm_limits()` set both, through
+  `NtScalar::with_alarm_limits(low, high, lolo, hihi)` (note the order differs
+  from `Pv::alarm_limits(lolo, low, high, hihi)`). Neither evaluates the
+  initial value; severity is computed on the next write.
 - **MDEL** (monitor deadband): `should_post_update` (simple_store.rs:545)
   suppresses the *post* (not the store) when the record is a numeric scalar,
   MDEL > 0, severity unchanged, and the delta is under MDEL. **ADEL is parsed

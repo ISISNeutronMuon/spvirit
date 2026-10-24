@@ -326,14 +326,22 @@ impl<T: PvScalar> Pv<T> {
         })
     }
 
+    /// Alarm limits: crossing `low`/`high` is MINOR, `lolo`/`hihi` MAJOR.
+    ///
+    /// Fills both the published `valueAlarm` block and the limits the alarm
+    /// evaluator reads (via [`spvirit_types::NtScalar::with_alarm_limits`],
+    /// the same call the `.db` loader makes for LOW/HIGH/LOLO/HIHI), so with
+    /// `.compute_alarms(true)` every later write — wire PUT or [`Pv::set`] —
+    /// recomputes the severity. As with a `.db` record, the initial value is
+    /// not evaluated here: the severity changes on the first write.
     pub fn alarm_limits(self, lolo: f64, low: f64, high: f64, hihi: f64) -> Self {
         self.with_record(|r| {
             if let Some(nt) = r.nt_scalar_mut() {
+                // Note the argument order: with_alarm_limits(low, high, lolo, hihi).
+                *nt = nt
+                    .clone()
+                    .with_alarm_limits(Some(low), Some(high), Some(lolo), Some(hihi));
                 nt.value_alarm_active = true;
-                nt.value_alarm_low_alarm_limit = lolo;
-                nt.value_alarm_low_warning_limit = low;
-                nt.value_alarm_high_warning_limit = high;
-                nt.value_alarm_high_alarm_limit = hihi;
             }
         })
     }
@@ -1024,6 +1032,20 @@ mod tests {
         assert_eq!(nt.value_alarm_high_warning_limit, 5.0);
         assert_eq!(nt.value_alarm_high_alarm_limit, 10.0);
         assert!(nt.value_alarm_active);
+    }
+
+    #[test]
+    fn alarm_limits_feed_the_alarm_evaluator() {
+        // lolo, low, high, hihi — the evaluator's fields, in that mapping.
+        let pv = Pv::ao("SIM:A", 50.0).alarm_limits(-10.0, -5.0, 5.0, 10.0);
+        let nt = pv.pending_record().unwrap().to_ntscalar();
+        assert_eq!(nt.alarm_lolo, Some(-10.0));
+        assert_eq!(nt.alarm_low, Some(-5.0));
+        assert_eq!(nt.alarm_high, Some(5.0));
+        assert_eq!(nt.alarm_hihi, Some(10.0));
+        // Not evaluated at definition time (like a `.db` record): the
+        // severity changes on the first write, when `compute_alarms` is on.
+        assert_eq!(nt.alarm_severity, 0);
     }
 
     #[test]
