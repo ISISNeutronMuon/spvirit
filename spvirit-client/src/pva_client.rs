@@ -1621,33 +1621,24 @@ mod tests {
         pvs: &[&str],
     ) -> (spvirit_server::pva_server::RunningServer, u16, u16) {
         use spvirit_server::pva_server::PvaServer;
-        use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket as StdUdpSocket};
+        use std::net::{IpAddr, Ipv4Addr};
 
-        let tcp_port = TcpListener::bind("127.0.0.1:0")
-            .expect("bind tcp")
-            .local_addr()
-            .expect("local_addr")
-            .port();
-        let udp_port = StdUdpSocket::bind("127.0.0.1:0")
-            .expect("bind udp")
-            .local_addr()
-            .expect("local_addr")
-            .port();
-
+        // Port 0: the server binds and reports its own ports, so there is no
+        // probe-then-drop window for a parallel test to steal the port in.
         let mut b = PvaServer::builder();
         for pv in pvs {
             b = b.ao(*pv, 1.0);
         }
         let running = b
-            .port(tcp_port)
-            .udp_port(udp_port)
+            .port(0)
+            .udp_port(0)
             .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
             .build()
             .start()
             .await
             .expect("server start");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        (running, tcp_port, udp_port)
+        let (tcp, udp) = running.local_addrs().await.expect("server bind");
+        (running, tcp.port(), udp.port())
     }
 
     fn ns_client(tcp_port: u16, udp_port: u16, timeout: Duration) -> PvaClient {
@@ -1824,18 +1815,7 @@ mod tests {
         u16,
     ) {
         use spvirit_server::pva_server::PvaServer;
-        use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket as StdUdpSocket};
-
-        let tcp_port = TcpListener::bind("127.0.0.1:0")
-            .expect("bind tcp")
-            .local_addr()
-            .expect("local_addr")
-            .port();
-        let udp_port = StdUdpSocket::bind("127.0.0.1:0")
-            .expect("bind udp")
-            .local_addr()
-            .expect("local_addr")
-            .port();
+        use std::net::{IpAddr, Ipv4Addr};
 
         let mut b = PvaServer::builder();
         for pv in ao {
@@ -1844,15 +1824,16 @@ mod tests {
         for pv in ai {
             b = b.ai(*pv, 1.0);
         }
+        // Port 0 + `local_addrs`: see `start_test_server`.
         let mut server = b
-            .port(tcp_port)
-            .udp_port(udp_port)
+            .port(0)
+            .udp_port(0)
             .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
             .build();
         let registry = server.monitor_registry();
         let running = server.start().await.expect("server start");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        (running, registry, tcp_port, udp_port)
+        let (tcp, udp) = running.local_addrs().await.expect("server bind");
+        (running, registry, tcp.port(), udp.port())
     }
 
     /// Total per-request binding rows (`ioid_to_sid`) across every live

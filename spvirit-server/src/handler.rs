@@ -1162,9 +1162,25 @@ pub async fn run_udp_search(
     advertise_ip: Option<IpAddr>,
     multicast_iface: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = bind_udp_search_socket(addr)?;
+    run_udp_search_on_socket(state, socket, tcp_port, guid, advertise_ip, multicast_iface).await
+}
+
+/// [`run_udp_search`] on a socket the caller has already bound (with
+/// [`bind_udp_search_socket`]), so the caller can learn its real address —
+/// e.g. the port the OS picked for a port-0 bind — before serving starts.
+pub(crate) async fn run_udp_search_on_socket(
+    state: Arc<ServerState>,
+    socket: UdpSocket,
+    tcp_port: u16,
+    guid: [u8; 12],
+    advertise_ip: Option<IpAddr>,
+    multicast_iface: Option<Ipv4Addr>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = socket.local_addr()?;
     // `Arc` so a pattern-query reply can be sent from the task that computed
     // it, without that computation ever running on this loop.
-    let socket = Arc::new(bind_udp_search_socket(addr)?);
+    let socket = Arc::new(socket);
     socket.set_broadcast(true)?;
     if let Some(iface) = multicast_iface {
         const PVA_MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);

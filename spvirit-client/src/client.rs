@@ -383,7 +383,7 @@ mod tests {
     use super::*;
     use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand, PvaStatus};
 
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket as StdUdpSocket};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
     /// Two different PVs created on ONE validated connection get two
@@ -394,30 +394,20 @@ mod tests {
     async fn one_connection_can_host_two_channels_with_distinct_sids() {
         use spvirit_server::pva_server::PvaServer;
 
-        let tcp_port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let udp_port = StdUdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-
-        let server = PvaServer::builder()
+        // Port 0: the server binds and reports its own ports, so a
+        // parallel test cannot take the port between probe and bind.
+        let running = PvaServer::builder()
             .ao("MULTI:A", 1.0)
             .ao("MULTI:B", 2.0)
-            .port(tcp_port)
-            .udp_port(udp_port)
+            .port(0)
+            .udp_port(0)
             .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
-            .build();
-        tokio::spawn(async move {
-            let _ = server.run().await;
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let target: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+            .build()
+            .start()
+            .await
+            .expect("server start");
+        let (target, _udp): (SocketAddr, SocketAddr) =
+            running.local_addrs().await.expect("server bind");
         let mut opts = PvGetOptions::new("MULTI:A".to_string());
         opts.timeout = Duration::from_secs(5);
         opts.server_addr = Some(target);
@@ -442,29 +432,19 @@ mod tests {
     async fn establish_channel_still_returns_a_usable_channel_conn() {
         use spvirit_server::pva_server::PvaServer;
 
-        let tcp_port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let udp_port = StdUdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-
-        let server = PvaServer::builder()
+        // Port 0: the server binds and reports its own ports, so a
+        // parallel test cannot take the port between probe and bind.
+        let running = PvaServer::builder()
             .ao("SPLIT:PV", 1.0)
-            .port(tcp_port)
-            .udp_port(udp_port)
+            .port(0)
+            .udp_port(0)
             .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
-            .build();
-        tokio::spawn(async move {
-            let _ = server.run().await;
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let target: SocketAddr = format!("127.0.0.1:{tcp_port}").parse().unwrap();
+            .build()
+            .start()
+            .await
+            .expect("server start");
+        let (target, _udp): (SocketAddr, SocketAddr) =
+            running.local_addrs().await.expect("server bind");
         let mut opts = PvGetOptions::new("SPLIT:PV".to_string());
         opts.timeout = Duration::from_secs(5);
         opts.server_addr = Some(target);

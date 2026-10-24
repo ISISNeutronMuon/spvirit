@@ -71,6 +71,10 @@ fn free_udp_port() -> Option<u16> {
 struct Backend {
     kill: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The ports the backend actually bound, as reported by
+    /// `RunningServer::local_addrs`.
+    tcp: u16,
+    udp: u16,
 }
 
 impl Backend {
@@ -86,37 +90,63 @@ impl Backend {
     }
 }
 
+/// Start the backend on `tcp_port`/`udp_port` and return only once both are
+/// bound. Pass `0, 0` for a first start: the OS picks the ports and the real
+/// ones come back from `RunningServer::local_addrs` — no probe-then-drop port
+/// picking, which races every other test running in parallel. A restart
+/// passes the first instance's ports back in, so the IOC comes back on the
+/// same address as a real restarted IOC does; if one was taken meanwhile the
+/// bind failure panics with the reason instead of leaving a dead backend for
+/// the test to time out against.
 fn spawn_backend(pv: &str, tcp_port: u16, udp_port: u16) -> Backend {
     let pv = pv.to_string();
     let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(u16, u16), String>>();
     let thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("backend runtime builds");
-        rt.spawn(async move {
-            let server = PvaServer::builder()
+        let started = rt.block_on(async move {
+            let running = PvaServer::builder()
                 .ao(pv, 1.0)
                 .listen_ip("127.0.0.1".parse().unwrap())
                 .advertise_ip("127.0.0.1".parse().unwrap())
                 .port(tcp_port)
                 .udp_port(udp_port)
-                .build();
-            let _ = server.run().await;
+                .build()
+                .start()
+                .await?;
+            let (tcp, udp) = running.local_addrs().await?;
+            Ok::<_, String>((running, tcp.port(), udp.port()))
         });
-        let _ = ready_tx.send(());
+        // Keep the handle alive until the kill; the server's tasks live on
+        // `rt` either way.
+        let _running = match started {
+            Ok((running, tcp, udp)) => {
+                let _ = ready_tx.send(Ok((tcp, udp)));
+                running
+            }
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
         // Park until the test hangs up `kill_tx`, then DROP the runtime. The
         // drop IS the kill.
         let _ = kill_rx.recv();
         drop(rt);
     });
-    ready_rx.recv().expect("backend thread starts");
-    std::thread::sleep(Duration::from_millis(300));
+    let (tcp, udp) = ready_rx
+        .recv()
+        .expect("backend thread starts")
+        .unwrap_or_else(|e| panic!("the backend failed to bind: {e}"));
     Backend {
         kill: Some(kill_tx),
         thread: Some(thread),
+        tcp,
+        udp,
     }
 }
 
@@ -194,11 +224,8 @@ async fn claim_within(src: &Arc<GatewaySource>, pv: &str) -> bool {
 /// `upstream_monitor_count()` never returns to zero.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upstream_death_closes_subscribers_and_retires_the_entry_and_binding() {
-    let (Some(tcp), Some(udp)) = (free_tcp_port(), free_udp_port()) else {
-        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
-    };
-    let mut backend = spawn_backend("GW:DIE", tcp, udp);
-    let (src, _pool) = gateway_source(udp);
+    let mut backend = spawn_backend("GW:DIE", 0, 0);
+    let (src, _pool) = gateway_source(backend.udp);
 
     assert!(
         claim_within(&src, "GW:DIE").await,
@@ -299,10 +326,8 @@ async fn a_downstream_monitor_subscription_is_torn_down_when_the_upstream_dies()
 
     use spvirit_client::{PvOptions, pvmonitor};
 
-    let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
-        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
-    };
-    let mut backend = spawn_backend("GW:E2E", up_tcp, up_udp);
+    let mut backend = spawn_backend("GW:E2E", 0, 0);
+    let (up_tcp, up_udp) = (backend.tcp, backend.udp);
     let (src, _pool) = gateway_source(up_udp);
     assert!(claim_within(&src, "GW:E2E").await, "backend must be up");
 
@@ -405,49 +430,90 @@ async fn a_downstream_monitor_subscription_is_torn_down_when_the_upstream_dies()
 async fn a_live_metrics_endpoint_reports_the_upstream_death() {
     use spvirit_gateway::runtime::Runtime;
 
-    let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
-        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
-    };
-    let (Some(gw_tcp), Some(gw_udp)) = (free_tcp_port(), free_udp_port()) else {
-        panic!("cannot bind a free gateway port: {PORT_BIND_NOTE}");
-    };
-    let Some(metrics_port) = free_tcp_port() else {
-        panic!("cannot bind a free metrics port: {PORT_BIND_NOTE}");
-    };
     const PATH: &str = "/metrics";
 
-    let mut backend = spawn_backend("GW:METRIC", up_tcp, up_udp);
+    let mut backend = spawn_backend("GW:METRIC", 0, 0);
+    let up_udp = backend.udp;
 
-    let cfg_json = format!(
-        r#"{{
-            "version": 2,
-            "clients": [{{
-                "name": "up",
-                "addrlist": "127.0.0.1",
-                "bcastport": {up_udp},
-                "interface": ["127.0.0.1"]
-            }}],
-            "servers": [{{
-                "name": "gw",
-                "clients": ["up"],
-                "interface": ["127.0.0.1"],
-                "serverport": {gw_tcp},
-                "bcastport": {gw_udp}
-            }}],
-            "x-spvirit": {{
-                "metrics": {{
-                    "enabled": true,
-                    "listen": "127.0.0.1:{metrics_port}",
-                    "path": "{PATH}"
+    // The gateway `Runtime` cannot bind port 0 and report back (it has no
+    // handle API), so its ports are still probed with `free_*_port` — and,
+    // exactly like `spawn_downstream`, a gateway that fails to come up on
+    // them (another parallel test took a port in the probe-then-bind window,
+    // and the server's or the metrics endpoint's bind failed) is retried on
+    // fresh ones, a bounded number of times.
+    let mut started = None;
+    let mut last = String::from("no attempt was made");
+    for _ in 0..8 {
+        let (Some(gw_tcp), Some(gw_udp), Some(metrics_port)) =
+            (free_tcp_port(), free_udp_port(), free_tcp_port())
+        else {
+            last = format!("cannot bind a free gateway port: {PORT_BIND_NOTE}");
+            continue;
+        };
+        let cfg_json = format!(
+            r#"{{
+                "version": 2,
+                "clients": [{{
+                    "name": "up",
+                    "addrlist": "127.0.0.1",
+                    "bcastport": {up_udp},
+                    "interface": ["127.0.0.1"]
+                }}],
+                "servers": [{{
+                    "name": "gw",
+                    "clients": ["up"],
+                    "interface": ["127.0.0.1"],
+                    "serverport": {gw_tcp},
+                    "bcastport": {gw_udp}
+                }}],
+                "x-spvirit": {{
+                    "metrics": {{
+                        "enabled": true,
+                        "listen": "127.0.0.1:{metrics_port}",
+                        "path": "{PATH}"
+                    }}
                 }}
-            }}
-        }}"#
-    );
-    let cfg = GatewayConfig::from_json_str(&cfg_json).expect("parse gateway config");
-    let rt = Runtime::from_config(cfg).expect("valid config builds a Runtime");
-    let run = tokio::spawn(async move {
-        let _ = rt.run().await;
-    });
+            }}"#
+        );
+        let cfg = GatewayConfig::from_json_str(&cfg_json).expect("parse gateway config");
+        let rt = Runtime::from_config(cfg).expect("valid config builds a Runtime");
+        let run = tokio::spawn(async move {
+            let _ = rt.run().await;
+        });
+        // Ready = the gateway's TCP port accepts AND the metrics endpoint
+        // answers, with `run()` still going (a bind failure ends it).
+        let mut ready = false;
+        for _ in 0..200 {
+            if run.is_finished() {
+                break;
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", gw_tcp))
+                .await
+                .is_ok()
+                && http_get(metrics_port, PATH).await.is_some()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Re-check after the probe: a bind failure can land just after a
+        // successful connect to whatever else holds the port.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if ready && !run.is_finished() {
+            started = Some((run, gw_tcp, gw_udp, metrics_port));
+            break;
+        }
+        last = if run.is_finished() {
+            "the gateway's run() returned early (port taken?)".to_string()
+        } else {
+            "the gateway never started listening".to_string()
+        };
+        run.abort();
+    }
+    let Some((run, gw_tcp, gw_udp, metrics_port)) = started else {
+        panic!("could not start the gateway: {last}");
+    };
 
     // Establish a real monitor through the running gateway.
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -685,10 +751,8 @@ async fn spawn_downstream(
 async fn a_real_client_receives_destroy_channel_naming_its_own_channel() {
     const PV: &str = "GW:WIRE";
 
-    let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
-        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
-    };
-    let mut backend = spawn_backend(PV, up_tcp, up_udp);
+    let mut backend = spawn_backend(PV, 0, 0);
+    let up_udp = backend.udp;
     let (src, _pool) = gateway_source(up_udp);
     assert!(claim_within(&src, PV).await, "backend must be up");
     let (down_tcp, down_udp, _registry) = spawn_downstream(&src).await;
@@ -734,10 +798,8 @@ async fn a_real_client_receives_destroy_channel_naming_its_own_channel() {
 async fn a_real_client_re_searches_and_gets_data_again_after_destroy_channel() {
     const PV: &str = "GW:REVIVE";
 
-    let (Some(up_tcp), Some(up_udp)) = (free_tcp_port(), free_udp_port()) else {
-        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
-    };
-    let mut backend = spawn_backend(PV, up_tcp, up_udp);
+    let mut backend = spawn_backend(PV, 0, 0);
+    let (up_tcp, up_udp) = (backend.tcp, backend.udp);
     let (src, _pool) = gateway_source(up_udp);
     assert!(claim_within(&src, PV).await, "backend must be up");
     let (down_tcp, down_udp, _registry) = spawn_downstream(&src).await;
@@ -797,11 +859,8 @@ async fn a_real_client_re_searches_and_gets_data_again_after_destroy_channel() {
 /// polls on its tick would need ~1.9 s to notice — well past the 1 s budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upstream_death_reaches_downstream_without_waiting_for_a_sweep_tick() {
-    let (Some(tcp), Some(udp)) = (free_tcp_port(), free_udp_port()) else {
-        panic!("cannot bind a free loopback port: {PORT_BIND_NOTE}");
-    };
-    let mut backend = spawn_backend("GW:PROMPT", tcp, udp);
-    let (src, _pool) = gateway_source(udp);
+    let mut backend = spawn_backend("GW:PROMPT", 0, 0);
+    let (src, _pool) = gateway_source(backend.udp);
 
     assert!(claim_within(&src, "GW:PROMPT").await, "backend must be up");
     let mut rx = src.subscribe("GW:PROMPT").await.expect("subscribe");

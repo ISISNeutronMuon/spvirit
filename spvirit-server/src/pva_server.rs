@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +34,7 @@ use crate::handler::PvListMode;
 use crate::monitor::MonitorRegistry;
 use crate::pv::scalar_family_record_type;
 use crate::pvstore::{Source, SourceRegistry, StoreSource};
-use crate::server::{PvaServerConfig, run_pva_server_with_registry};
+use crate::server::{BoundAddrs, PvaServerConfig, run_pva_server_reporting};
 use crate::simple_store::{LinkDef, OnPutCallback, ScanCallback, SimplePvStore};
 use crate::types::{DbCommonState, OutputMode, RecordData, RecordInstance, RecordType};
 
@@ -792,6 +792,7 @@ impl PvaServerBuilder {
             client_registry: self.client_registry,
             bandwidth_counters: self.bandwidth_counters,
             scan_tasks: Arc::new(std::sync::Mutex::new(Some(Vec::new()))),
+            bound_tx: None,
         }
     }
 }
@@ -881,6 +882,10 @@ pub struct PvaServer {
     /// this and aborts its own handle on the spot instead of pushing it into
     /// a `Vec` `abort()` has already drained and will never look at again.
     scan_tasks: Arc<std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>,
+    /// Set by [`Self::start`] only: where `serve_after_start_hooks` reports
+    /// the real bound addresses (or the bind failure) for
+    /// [`RunningServer::local_addrs`]. `None` for every other entry point.
+    bound_tx: Option<tokio::sync::watch::Sender<Option<BoundAddrs>>>,
 }
 
 impl PvaServer {
@@ -1065,12 +1070,15 @@ impl PvaServer {
     /// so `RunningServer::pv(...)` cannot read pre-hook values.
     ///
     /// A failure *after* the hook phase (a bind error, say) still cannot be
-    /// returned here — the server is serving by then — and is logged from
-    /// the spawned task as before.
+    /// returned here — binding happens in the spawned task, after this
+    /// returns — and is logged from that task as before. It also surfaces as
+    /// the `Err` of [`RunningServer::local_addrs`], which waits for the bind.
     ///
     /// Shared by [`ServeBuilder::start`], which delegates here after
     /// building its `PvaServer`.
-    pub async fn start(self) -> Result<RunningServer, String> {
+    pub async fn start(mut self) -> Result<RunningServer, String> {
+        let (bound_tx, bound_rx) = tokio::sync::watch::channel(None);
+        self.bound_tx = Some(bound_tx);
         let store = self.store().clone();
         let events = self.events().clone();
         let scan_tasks = self.scan_tasks.clone(); // must precede the move below
@@ -1091,6 +1099,7 @@ impl PvaServer {
             events,
             scan_tasks,
             handle,
+            bound_rx,
         })
     }
 
@@ -1199,7 +1208,7 @@ impl PvaServer {
         );
 
         // 4. Bind and accept.
-        run_pva_server_with_registry(sources, self.config, registry).await
+        run_pva_server_reporting(sources, self.config, registry, self.bound_tx).await
     }
 }
 
@@ -1370,9 +1379,35 @@ pub struct RunningServer {
     /// field doc on `PvaServer::scan_tasks` for what `None` means.
     scan_tasks: Arc<std::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>,
     handle: tokio::task::JoinHandle<()>,
+    /// Filled by the spawned task once the listeners are bound; read by
+    /// [`Self::local_addrs`].
+    bound_rx: tokio::sync::watch::Receiver<Option<BoundAddrs>>,
 }
 
 impl RunningServer {
+    /// The addresses the server actually bound: `(tcp, udp)`.
+    ///
+    /// `start()` returns before the listeners are bound (binding happens in
+    /// the spawned server task), so this waits for the bind. With `.port(0)`
+    /// / `.udp_port(0)` it is how a caller learns the ports the OS picked —
+    /// the race-free alternative to probing a free port and handing its
+    /// number to the builder.
+    ///
+    /// Returns `Err` instead of hanging if either bind fails (e.g. the port
+    /// is taken), or if the server task ends — panics, or is stopped with
+    /// [`Self::abort`] — before binding. A UDP bind failure is an `Err` here
+    /// even though the server keeps serving TCP, as it always has.
+    pub async fn local_addrs(&self) -> Result<(SocketAddr, SocketAddr), String> {
+        let mut rx = self.bound_rx.clone();
+        match rx.wait_for(Option::is_some).await {
+            Ok(v) => v.clone().expect("wait_for returned a filled value"),
+            Err(_) => Err(
+                "the server task ended before binding its listeners (see its logged error)"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Mint a typed handle to any served record (handle-built or `.db`-loaded).
     pub async fn pv<T: crate::pv::PvScalar>(
         &self,
@@ -2729,7 +2764,6 @@ mod tests {
     /// stays bound and serving forever. FAILS at f066f59.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_stops_the_tcp_acceptor() {
-        use std::net::SocketAddr;
         use std::time::Duration;
         use tokio::net::{TcpListener, TcpStream};
 
@@ -2780,5 +2814,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A port-0 server must report the ports the OS actually picked, and be
+    /// reachable on them: TCP accepts, and a UDP search on the reported UDP
+    /// port is answered with the reported (real) TCP port — not the 0 it was
+    /// configured with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_addrs_reports_the_real_ports_of_a_port_zero_server() {
+        use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+        use spvirit_codec::spvirit_encode::encode_search_request;
+        use std::time::Duration;
+
+        let running = PvaServer::builder()
+            .ai("T:PORT0", 1.0)
+            .listen_ip(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .advertise_ip(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .discovery_parity(false)
+            .port(0)
+            .udp_port(0)
+            .build()
+            .start()
+            .await
+            .expect("start");
+        let (tcp, udp) = tokio::time::timeout(Duration::from_secs(5), running.local_addrs())
+            .await
+            .expect("local_addrs must not hang")
+            .expect("a port-0 bind succeeds");
+        assert_ne!(tcp.port(), 0, "the real TCP port, not the configured 0");
+        assert_ne!(udp.port(), 0, "the real UDP port, not the configured 0");
+        // Asking again returns the same answer (the value is kept).
+        assert_eq!(running.local_addrs().await, Ok((tcp, udp)));
+
+        tokio::net::TcpStream::connect(tcp)
+            .await
+            .expect("the reported TCP address must accept connections");
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let req = encode_search_request(7, 0x01, 0, [0u8; 16], &[(1, "T:PORT0")], 2, false);
+        let target: SocketAddr = ([127, 0, 0, 1], udp.port()).into();
+        let mut buf = vec![0u8; 4096];
+        let mut answered = None;
+        for _ in 0..20 {
+            client.send_to(&req, target).await.unwrap();
+            if let Ok(Ok((n, _))) =
+                tokio::time::timeout(Duration::from_millis(250), client.recv_from(&mut buf)).await
+            {
+                let mut pkt = PvaPacket::new(&buf[..n]);
+                if let Some(PvaPacketCommand::SearchResponse(r)) = pkt.decode_payload() {
+                    answered = Some(r);
+                    break;
+                }
+            }
+        }
+        let r = answered.expect("a search on the reported UDP port must be answered");
+        assert!(r.found);
+        assert_eq!(
+            r.port,
+            tcp.port(),
+            "search replies must advertise the real bound TCP port"
+        );
+        running.abort();
+    }
+
+    /// A bind failure must surface from `local_addrs` as an `Err`, not hang.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_addrs_is_an_error_when_the_tcp_bind_fails() {
+        use std::time::Duration;
+
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = holder.local_addr().unwrap().port();
+        let running = PvaServer::builder()
+            .ai("T:TAKEN", 1.0)
+            .listen_ip(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .port(taken)
+            .udp_port(0)
+            .build()
+            .start()
+            .await
+            .expect("start returns before binding");
+        let res = tokio::time::timeout(Duration::from_secs(5), running.local_addrs())
+            .await
+            .expect("local_addrs must not hang on a bind failure");
+        let err = res.expect_err("a taken TCP port must be reported as an error");
+        assert!(err.contains("TCP bind"), "unexpected error text: {err}");
+        drop(holder);
+    }
+
+    /// `abort()` before the bind lands must not leave `local_addrs` hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_addrs_does_not_hang_after_abort() {
+        use std::time::Duration;
+
+        let running = PvaServer::builder()
+            .ai("T:ABORTED", 1.0)
+            .listen_ip(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+            .port(0)
+            .udp_port(0)
+            .build()
+            .start()
+            .await
+            .expect("start");
+        running.abort();
+        // Either the bind won the race (Ok) or the task died first (Err);
+        // both are answers. Hanging is the failure.
+        let _either = tokio::time::timeout(Duration::from_secs(5), running.local_addrs())
+            .await
+            .expect("local_addrs must not hang after abort()");
     }
 }

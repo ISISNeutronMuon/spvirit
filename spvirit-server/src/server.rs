@@ -12,7 +12,9 @@ use tracing::{error, info};
 use crate::beacon::{BeaconConfig, run_beacon};
 use tokio::net::TcpListener;
 
-use crate::handler::{PvListMode, ServerState, rand_guid, run_tcp_server, run_udp_search};
+use crate::handler::{
+    PvListMode, ServerState, rand_guid, run_tcp_server, run_udp_search_on_socket,
+};
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::SourceRegistry;
 
@@ -183,10 +185,28 @@ pub async fn run_pva_server_with_registry(
     config: PvaServerConfig,
     registry: Arc<MonitorRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let server_state = PvaServerState::with_registry(sources, &config, registry);
-    let state = server_state.inner;
+    run_pva_server_reporting(sources, config, registry, None).await
+}
 
-    let guid = state.guid;
+/// The outcome of binding the listeners: the real `(tcp, udp)` addresses —
+/// so a port-0 configuration learns the ports the OS picked — or the bind
+/// error, as text.
+pub(crate) type BoundAddrs = Result<(SocketAddr, SocketAddr), String>;
+
+/// [`run_pva_server_with_registry`], additionally publishing the bound
+/// addresses (or the bind failure) on `bound` the moment both listeners are
+/// bound, before anything is served. `RunningServer::local_addrs` reads it.
+pub(crate) async fn run_pva_server_reporting(
+    sources: Arc<SourceRegistry>,
+    mut config: PvaServerConfig,
+    registry: Arc<MonitorRegistry>,
+    bound: Option<tokio::sync::watch::Sender<Option<BoundAddrs>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = |r: BoundAddrs| {
+        if let Some(tx) = &bound {
+            tx.send_replace(Some(r));
+        }
+    };
     let tcp_addr = SocketAddr::new(config.listen_ip, config.tcp_port);
     // TCP always binds the configured interface; the UDP search socket binds
     // by parity mode (0.0.0.0 + multicast join when on).
@@ -210,8 +230,48 @@ pub async fn run_pva_server_with_registry(
     // Bind TCP before spawning anything.  If the port is already in use we
     // return an error here and the beacon is never started, preventing a
     // ghost-beacon that advertises a port this process does not serve.
-    let tcp_listener = TcpListener::bind(tcp_addr).await?;
-    info!("TCP listener bound on {}", tcp_addr);
+    let tcp_listener = match TcpListener::bind(tcp_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            report(Err(format!("TCP bind {tcp_addr} failed: {e}")));
+            return Err(e.into());
+        }
+    };
+    let tcp_bound = match tcp_listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            report(Err(format!("TCP local_addr failed: {e}")));
+            return Err(e.into());
+        }
+    };
+    info!("TCP listener bound on {}", tcp_bound);
+    // A port-0 configuration only learns its real port here; everything
+    // downstream (search replies, beacons, the server-info PV) must
+    // advertise the port actually being served, not 0.
+    config.tcp_port = tcp_bound.port();
+
+    // Bound here rather than inside the UDP task so the real address (the
+    // OS-picked port for a port-0 configuration) is known before serving
+    // starts. A failure is still non-fatal for TCP, exactly as before: it is
+    // logged and the TCP acceptor and beacon carry on without search.
+    let udp_socket = match crate::handler::bind_udp_search_socket(udp_addr) {
+        Ok(sock) => {
+            match sock.local_addr() {
+                Ok(udp_bound) => report(Ok((tcp_bound, udp_bound))),
+                Err(e) => report(Err(format!("UDP local_addr failed: {e}"))),
+            }
+            Some(sock)
+        }
+        Err(e) => {
+            error!("UDP search server error: {}", e);
+            report(Err(format!("UDP search bind {udp_addr} failed: {e}")));
+            None
+        }
+    };
+
+    let server_state = PvaServerState::with_registry(sources, &config, registry);
+    let state = server_state.inner;
+    let guid = state.guid;
 
     let beacon_config = BeaconConfig {
         target: config.beacon_target,
@@ -223,13 +283,16 @@ pub async fn run_pva_server_with_registry(
     };
 
     let udp_state = state.clone();
+    let tcp_port = config.tcp_port;
+    let advertise_ip = config.advertise_ip;
     let udp_task = tokio::spawn(async move {
-        if let Err(e) = run_udp_search(
+        let Some(socket) = udp_socket else { return };
+        if let Err(e) = run_udp_search_on_socket(
             udp_state,
-            udp_addr,
-            config.tcp_port,
+            socket,
+            tcp_port,
             guid,
-            config.advertise_ip,
+            advertise_ip,
             multicast_iface,
         )
         .await
