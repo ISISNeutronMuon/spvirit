@@ -378,6 +378,25 @@ const NODE_BUDGET_EXCEEDED: &str = "introspection expands past the node budget";
 /// is ~4^n nodes from ~23n bytes and passes it within a few levels.
 const NODES_PER_BYTE: usize = 64;
 
+/// Absolute ceiling on resolved type nodes per top-level decode, whatever
+/// the input size. The proportional budget alone scales with the frame: at
+/// 64 nodes/byte a maximal 256 MiB frame would allow ~17G nodes. Legitimate
+/// payloads in the tests are <= ~100K nodes, and an NTMultiChannel of 100K
+/// NTScalars is ~2.5M; 4M nodes bounds the worst-case type-tree memory to
+/// roughly a few hundred MB regardless of frame size.
+const MAX_DECODE_NODES: usize = 4 * 1024 * 1024;
+
+/// The node ceiling for one top-level decode over `input_len` bytes:
+/// `max_struct_fields + NODES_PER_BYTE * input_len`, capped at
+/// `MAX_DECODE_NODES`, and never below `max_struct_fields` (so a configured
+/// field-count ceiling above the cap still admits one such structure).
+fn node_ceiling(max_struct_fields: usize, input_len: usize) -> usize {
+    max_struct_fields
+        .saturating_add(NODES_PER_BYTE.saturating_mul(input_len))
+        .min(MAX_DECODE_NODES)
+        .max(max_struct_fields)
+}
+
 /// The errors that mean "this input is hostile", as opposed to "this input
 /// is short or garbled". The lenient field loops stop quietly on the latter
 /// but must surface these, or the guard becomes a silent truncation.
@@ -414,9 +433,10 @@ pub struct PvdDecoder {
     /// and passing `node_limit` fails the decode. Reset at every top-level
     /// entry (`node_budget_scope`).
     nodes: std::cell::Cell<usize>,
-    /// The current top-level decode's node ceiling:
-    /// `max_struct_fields + NODES_PER_BYTE * input_len`, so the budget bounds
-    /// the amplification ratio rather than the size of legitimate data.
+    /// The current top-level decode's node ceiling (`node_ceiling`):
+    /// `max_struct_fields + NODES_PER_BYTE * input_len` capped at
+    /// `MAX_DECODE_NODES`, so the budget bounds the amplification ratio
+    /// rather than the size of legitimate data, with an absolute backstop.
     node_limit: std::cell::Cell<usize>,
     /// Nesting of public decode entry points, so only the outermost one
     /// resets `nodes`. Not `depth`: `decode_structure` does not `enter()`,
@@ -990,11 +1010,8 @@ impl PvdDecoder {
         let scope = self.budget_scope.get();
         if scope == 0 {
             self.nodes.set(0);
-            self.node_limit.set(
-                self.limits
-                    .max_struct_fields
-                    .saturating_add(NODES_PER_BYTE.saturating_mul(input_len)),
-            );
+            self.node_limit
+                .set(node_ceiling(self.limits.max_struct_fields, input_len));
         }
         self.budget_scope.set(scope + 1);
         DepthGuard(&self.budget_scope)
@@ -2655,5 +2672,25 @@ mod tests {
             panic!("expected a structure");
         };
         assert_eq!(fields.len(), 1);
+    }
+
+    /// The proportional budget is capped at `MAX_DECODE_NODES` for large
+    /// frames. Unit-tested on the budget computation: an end-to-end frame
+    /// would have to build ~4M type nodes (hundreds of MB) before rejection.
+    #[test]
+    fn the_node_ceiling_is_proportional_then_capped() {
+        let floor = DecodeLimits::default().max_struct_fields;
+        assert_eq!(node_ceiling(floor, 0), floor);
+        assert_eq!(node_ceiling(floor, 1_000), floor + 64_000);
+        // 64 * 100 KB = 6.4M would exceed the cap.
+        assert_eq!(node_ceiling(floor, 100_000), MAX_DECODE_NODES);
+        assert_eq!(node_ceiling(floor, usize::MAX), MAX_DECODE_NODES);
+        // A configured field ceiling above the cap is never undercut.
+        assert_eq!(node_ceiling(8_000_000, 100_000), 8_000_000);
+        // A stored 65,536-node type referenced 70 times (~4.59M nodes) in a
+        // 100 KB value fits the proportional share but not the cap.
+        let expansion = 70 * 65_536;
+        assert!(expansion < floor + NODES_PER_BYTE * 100_000);
+        assert!(expansion > node_ceiling(floor, 100_000));
     }
 }
