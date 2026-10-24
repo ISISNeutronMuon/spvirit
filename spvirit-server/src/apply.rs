@@ -4,15 +4,14 @@ use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_types::*;
 
 use crate::convert::*;
-use crate::types::{RecordData, RecordInstance, now_nt_timestamp};
+use crate::types::{now_nt_timestamp, RecordData, RecordInstance};
 
 /// Apply a scalar value update from a decoded PUT body to an `NtScalar`.
 pub fn apply_value_update(nt: &mut NtScalar, val: &DecodedValue, compute_alarms: bool) -> bool {
-    if let DecodedValue::Structure(fields) = val {
-        if let Some((_, inner)) = fields.iter().find(|(name, _)| name == "value") {
+    if let DecodedValue::Structure(fields) = val
+        && let Some((_, inner)) = fields.iter().find(|(name, _)| name == "value") {
             return apply_value_update(nt, inner, compute_alarms);
         }
-    }
     match &mut nt.value {
         ScalarValue::Bool(current) => {
             if let Some(v) = decoded_to_bool(val) {
@@ -50,35 +49,24 @@ pub fn apply_value_update(nt: &mut NtScalar, val: &DecodedValue, compute_alarms:
                 return true;
             }
         }
+        // Every remaining target width. Each one uses its own exact decoder
+        // rather than a shared f64 round-trip, so a 64-bit PUT keeps its full
+        // magnitude and an out-of-range PUT is refused instead of saturated.
+        // This is the same policy `RecordInstance::set_scalar_value` applies
+        // to host-API writes; the two paths must not disagree.
         _ => {
-            if let Some(v) = decoded_to_f64(val) {
-                match &mut nt.value {
-                    ScalarValue::I8(c) => {
-                        *c = v as i8;
-                    }
-                    ScalarValue::I16(c) => {
-                        *c = v as i16;
-                    }
-                    ScalarValue::I64(c) => {
-                        *c = v as i64;
-                    }
-                    ScalarValue::U8(c) => {
-                        *c = v as u8;
-                    }
-                    ScalarValue::U16(c) => {
-                        *c = v as u16;
-                    }
-                    ScalarValue::U32(c) => {
-                        *c = v as u32;
-                    }
-                    ScalarValue::U64(c) => {
-                        *c = v as u64;
-                    }
-                    ScalarValue::F32(c) => {
-                        *c = v as f32;
-                    }
-                    _ => return false,
-                }
+            let applied = match &mut nt.value {
+                ScalarValue::I8(c) => decoded_to_i8(val).map(|v| *c = v),
+                ScalarValue::I16(c) => decoded_to_i16(val).map(|v| *c = v),
+                ScalarValue::I64(c) => decoded_to_i64(val).map(|v| *c = v),
+                ScalarValue::U8(c) => decoded_to_u8(val).map(|v| *c = v),
+                ScalarValue::U16(c) => decoded_to_u16(val).map(|v| *c = v),
+                ScalarValue::U32(c) => decoded_to_u32(val).map(|v| *c = v),
+                ScalarValue::U64(c) => decoded_to_u64(val).map(|v| *c = v),
+                ScalarValue::F32(c) => decoded_to_f32(val).map(|v| *c = v),
+                _ => None,
+            };
+            if applied.is_some() {
                 if compute_alarms {
                     nt.update_alarm_from_value();
                 }
@@ -231,38 +219,60 @@ pub fn apply_control_update(nt: &mut NtScalar, val: &DecodedValue) -> bool {
 }
 
 /// Apply a scalar-array PUT update to an `NtScalarArray`.
+///
+/// Returns `Some(changed)` when the PUT was accepted (including a PUT that
+/// carries no `value` field at all), and `None` when it carried a `value`
+/// that is not representable in the array's element type. A refused PUT
+/// leaves the array untouched.
 pub fn apply_scalar_array_put(
     nt: &mut NtScalarArray,
     nord: &mut usize,
     value: &DecodedValue,
-) -> bool {
+) -> Option<bool> {
     let field_value = match value {
-        DecodedValue::Structure(fields) => fields
-            .iter()
-            .find(|(name, _)| name == "value")
-            .map(|(_, v)| v)
-            .unwrap_or(value),
+        DecodedValue::Structure(fields) => match fields.iter().find(|(name, _)| name == "value") {
+            Some((_, v)) => v,
+            None => return Some(false),
+        },
         _ => value,
     };
-    if let Some(next) = decoded_to_scalar_array(field_value, &nt.value) {
-        let changed = nt.value != next;
-        if changed {
-            *nord = next.len();
-            nt.value = next;
-        }
-        return changed;
+    let next = decoded_to_scalar_array(field_value, &nt.value)?;
+    let changed = nt.value != next;
+    if changed {
+        *nord = next.len();
+        nt.value = next;
     }
-    false
+    Some(changed)
 }
 
 /// Apply a table PUT update to an `NtTable`.
 ///
 /// Does not apply `timeStamp`: stamping is owned by
 /// [`RecordInstance::apply_put`], which restamps every accepted PUT.
-pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
+///
+/// Returns `None`, leaving the table untouched, when the PUT's `value`
+/// carries a column whose data is not representable in that column's
+/// element type; otherwise `Some(changed)`.
+pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> Option<bool> {
     let DecodedValue::Structure(fields) = value else {
-        return false;
+        return Some(false);
     };
+    // Decode every addressed column before mutating anything, so a refused
+    // column cannot leave the labels or an earlier column half-applied.
+    let mut next_columns: Vec<(usize, ScalarArrayValue)> = Vec::new();
+    for (name, field_value) in fields {
+        if name != "value" {
+            continue;
+        }
+        if let DecodedValue::Structure(cols) = field_value {
+            for (col_name, col_value) in cols {
+                if let Some(idx) = nt.columns.iter().position(|c| c.name == *col_name) {
+                    let next = decoded_to_scalar_array(col_value, &nt.columns[idx].values)?;
+                    next_columns.push((idx, next));
+                }
+            }
+        }
+    }
     let mut changed = false;
     for (name, field_value) in fields {
         match name.as_str() {
@@ -276,16 +286,11 @@ pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
                 }
             }
             "value" => {
-                if let DecodedValue::Structure(cols) = field_value {
-                    for (col_name, col_value) in cols {
-                        if let Some(col) = nt.columns.iter_mut().find(|c| c.name == *col_name) {
-                            if let Some(next) = decoded_to_scalar_array(col_value, &col.values) {
-                                if col.values != next {
-                                    col.values = next;
-                                    changed = true;
-                                }
-                            }
-                        }
+                for (idx, next) in std::mem::take(&mut next_columns) {
+                    let col = &mut nt.columns[idx];
+                    if col.values != next {
+                        col.values = next;
+                        changed = true;
                     }
                 }
             }
@@ -299,12 +304,11 @@ pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
                 }
             }
             "alarm" => {
-                if let Some(alarm) = decode_nt_alarm(field_value) {
-                    if nt.alarm.as_ref() != Some(&alarm) {
+                if let Some(alarm) = decode_nt_alarm(field_value)
+                    && nt.alarm.as_ref() != Some(&alarm) {
                         nt.alarm = Some(alarm);
                         changed = true;
                     }
-                }
             }
             // `timeStamp` is not a data field: `RecordInstance::apply_put`
             // owns stamping (it always restamps on an accepted PUT) and
@@ -316,7 +320,7 @@ pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
             _ => {}
         }
     }
-    changed
+    Some(changed)
 }
 
 /// Apply an NdArray PUT update to an `NtNdArray`.
@@ -324,56 +328,63 @@ pub fn apply_table_put(nt: &mut NtTable, value: &DecodedValue) -> bool {
 /// Does not apply `timeStamp` or `dataTimeStamp`: stamping is owned by
 /// [`RecordInstance::apply_put`], which restamps every accepted PUT and
 /// honours a client-supplied `dataTimeStamp` itself.
-pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> bool {
+///
+/// Returns `None`, leaving the array untouched, when the PUT carries a
+/// `value` that is not representable in the array's element type;
+/// otherwise `Some(changed)`.
+pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> Option<bool> {
     let DecodedValue::Structure(fields) = value else {
-        return false;
+        return Some(false);
+    };
+    // Decode `value` before mutating anything, so a refused PUT cannot leave
+    // the other fields half-applied. Only an array-shaped `value` can be
+    // refused: the union-shaped `value` a wire NTNDArray PUT delivers is not
+    // decoded here at all (a separate gap), and calling that "not
+    // representable" would be false.
+    let mut next_value = match fields.iter().find(|(name, _)| name == "value") {
+        Some((_, v @ DecodedValue::Array(_))) => Some(decoded_to_scalar_array(v, &nt.value)?),
+        _ => None,
     };
     let mut changed = false;
     for (name, field_value) in fields {
         match name.as_str() {
             "value" => {
-                if let Some(next) = decoded_to_scalar_array(field_value, &nt.value) {
-                    if nt.value != next {
+                if let Some(next) = next_value.take()
+                    && nt.value != next {
                         nt.value = next;
                         changed = true;
                     }
-                }
             }
             "compressedSize" => {
-                if let Some(v) = decoded_to_i64(field_value) {
-                    if nt.compressed_size != v {
+                if let Some(v) = decoded_to_i64(field_value)
+                    && nt.compressed_size != v {
                         nt.compressed_size = v;
                         changed = true;
                     }
-                }
             }
             "uncompressedSize" => {
-                if let Some(v) = decoded_to_i64(field_value) {
-                    if nt.uncompressed_size != v {
+                if let Some(v) = decoded_to_i64(field_value)
+                    && nt.uncompressed_size != v {
                         nt.uncompressed_size = v;
                         changed = true;
                     }
-                }
             }
             "uniqueId" => {
-                if let Some(v) = decoded_to_i32(field_value) {
-                    if nt.unique_id != v {
+                if let Some(v) = decoded_to_i32(field_value)
+                    && nt.unique_id != v {
                         nt.unique_id = v;
                         changed = true;
                     }
-                }
             }
             "codec" => {
                 if let DecodedValue::Structure(codec_fields) = field_value {
                     for (cname, cval) in codec_fields {
-                        if cname == "name" {
-                            if let Some(s) = decoded_to_string(cval) {
-                                if nt.codec.name != s {
+                        if cname == "name"
+                            && let Some(s) = decoded_to_string(cval)
+                                && nt.codec.name != s {
                                     nt.codec.name = s;
                                     changed = true;
                                 }
-                            }
-                        }
                     }
                 }
             }
@@ -431,12 +442,11 @@ pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> bool {
                 }
             }
             "alarm" => {
-                if let Some(alarm) = decode_nt_alarm(field_value) {
-                    if nt.alarm.as_ref() != Some(&alarm) {
+                if let Some(alarm) = decode_nt_alarm(field_value)
+                    && nt.alarm.as_ref() != Some(&alarm) {
                         nt.alarm = Some(alarm);
                         changed = true;
                     }
-                }
             }
             // `timeStamp`/`dataTimeStamp` are not data fields here — see the
             // comment on the matching arm removed from `apply_table_put`.
@@ -445,12 +455,11 @@ pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> bool {
             // relay `timeStamp` distinct from the acquisition
             // `dataTimeStamp` and both must survive independently.
             "display" => {
-                if let Some(display) = decode_nt_display(field_value) {
-                    if nt.display.as_ref() != Some(&display) {
+                if let Some(display) = decode_nt_display(field_value)
+                    && nt.display.as_ref() != Some(&display) {
                         nt.display = Some(display);
                         changed = true;
                     }
-                }
             }
             "attribute" => {
                 if let DecodedValue::Array(items) = field_value {
@@ -504,7 +513,7 @@ pub fn apply_ndarray_put(nt: &mut NtNdArray, value: &DecodedValue) -> bool {
             _ => {}
         }
     }
-    changed
+    Some(changed)
 }
 
 /// What an accepted PUT did to a record.
@@ -517,30 +526,27 @@ pub struct PutOutcome {
     pub client_stamped: bool,
 }
 
-/// Pull a usable `timeStamp` out of a decoded PUT body.
+/// Pull a usable timestamp field out of a decoded PUT body.
 ///
 /// Returns `None` when the field is absent or decodes to the epoch-0 default:
 /// that is the untouched value a client sends when it does not care about the
 /// timestamp, never a real acquisition time.
-fn client_timestamp(value: &DecodedValue) -> Option<NtTimeStamp> {
+fn client_timestamp_named(value: &DecodedValue, field_name: &str) -> Option<NtTimeStamp> {
     let DecodedValue::Structure(fields) = value else {
         return None;
     };
-    let (_, field) = fields.iter().find(|(name, _)| name == "timeStamp")?;
-    let ts = decode_nt_timestamp(field)?;
+    let ts = decode_nt_timestamp(crate::convert::field(fields, field_name)?)?;
     (ts != NtTimeStamp::default()).then_some(ts)
 }
 
-/// Pull a usable `dataTimeStamp` out of a decoded PUT body — the NdArray
-/// acquisition time, distinct from the relay `timeStamp`. Same absent/default
-/// handling as [`client_timestamp`].
+/// Pull a usable `timeStamp` out of a decoded PUT body.
+fn client_timestamp(value: &DecodedValue) -> Option<NtTimeStamp> {
+    client_timestamp_named(value, "timeStamp")
+}
+
+/// The NdArray acquisition time, distinct from the relay `timeStamp`.
 fn client_data_timestamp(value: &DecodedValue) -> Option<NtTimeStamp> {
-    let DecodedValue::Structure(fields) = value else {
-        return None;
-    };
-    let (_, field) = fields.iter().find(|(name, _)| name == "dataTimeStamp")?;
-    let ts = decode_nt_timestamp(field)?;
-    (ts != NtTimeStamp::default()).then_some(ts)
+    client_timestamp_named(value, "dataTimeStamp")
 }
 
 impl RecordInstance {
@@ -551,7 +557,20 @@ impl RecordInstance {
     /// originating acquisition time), otherwise with server time. EPICS Base
     /// advances TIME on every record process, so an accepted PUT that happens
     /// not to change the value still moves the timestamp.
-    pub fn apply_put(&mut self, value: &DecodedValue, compute_alarms: bool) -> PutOutcome {
+    ///
+    /// A PUT whose `value` field is not representable in the record's type
+    /// (for example 300 into a `byte` record, or NaN into an integer one) is
+    /// refused with `Err`: the record is left exactly as it was — not even
+    /// restamped — so the caller can answer the client with an error status
+    /// instead of a success. So is an enum PUT whose index is not an integer
+    /// or falls outside `choices`, and any PUT to a generic-structure record
+    /// (which has no wire PUT path). The `Err` text names the record and the
+    /// actual reason, e.g. `"B1: 300 not representable as ubyte"`.
+    pub fn apply_put(
+        &mut self,
+        value: &DecodedValue,
+        compute_alarms: bool,
+    ) -> Result<PutOutcome, String> {
         // A bare scalar arrives unwrapped; treat it as `{value: <scalar>}` so
         // the field walk below is the only code path.
         let wrapped;
@@ -563,7 +582,9 @@ impl RecordInstance {
             }
         };
 
-        let value_changed = self.apply_put_fields(value, compute_alarms);
+        let value_changed = self
+            .apply_put_fields(value, compute_alarms)
+            .map_err(|reason| format!("{}: {reason}", self.name))?;
 
         let client_ts = client_timestamp(value);
         let client_stamped = client_ts.is_some();
@@ -575,23 +596,31 @@ impl RecordInstance {
         // T_acquire}. `set_time_stamp` just set both fields from the chosen
         // `timeStamp`; override `data_time_stamp` here if the client sent its
         // own.
-        if let RecordData::NtNdArray { nt, .. } = &mut self.data {
-            if let Some(data_ts) = client_data_timestamp(value) {
+        if let RecordData::NtNdArray { nt, .. } = &mut self.data
+            && let Some(data_ts) = client_data_timestamp(value) {
                 nt.data_time_stamp = data_ts;
             }
-        }
 
-        PutOutcome {
+        Ok(PutOutcome {
             value_changed,
             client_stamped,
-        }
+        })
     }
 
     /// Apply the data-carrying fields of a PUT body. `value` is guaranteed to
     /// be a `Structure` by the caller.
-    fn apply_put_fields(&mut self, value: &DecodedValue, compute_alarms: bool) -> bool {
+    ///
+    /// `Err(reason)` means the PUT was refused (for example a `value` the
+    /// record's type cannot represent); nothing was modified. Otherwise
+    /// `Ok(changed)`.
+    fn apply_put_fields(
+        &mut self,
+        value: &DecodedValue,
+        compute_alarms: bool,
+    ) -> Result<bool, String> {
+        const ARRAY_REFUSAL: &str = "value not representable in the record's element type";
         let DecodedValue::Structure(fields) = value else {
-            return false;
+            return Ok(false);
         };
 
         match &mut self.data {
@@ -607,6 +636,21 @@ impl RecordInstance {
                 // before/after instead of trusting that return, so a PUT that
                 // re-sends the current value is correctly reported as
                 // unchanged while still being restamped by the caller.
+                //
+                // Its `false` does mean something, though: the value is not
+                // representable in the record's type. Find that out on a
+                // scratch copy of the value before anything is touched, so a
+                // refused PUT leaves alarm/display/control untouched too,
+                // while the walk below keeps the PUT's own field order.
+                if let Some((_, val)) = fields.iter().find(|(name, _)| name == "value")
+                    && !apply_value_update(&mut NtScalar::from_value(nt.value.clone()), val, false)
+                {
+                    return Err(format!(
+                        "{} not representable as {}",
+                        put_value_text(val),
+                        scalar_type_name(&nt.value)
+                    ));
+                }
                 let before = nt.value.clone();
                 let mut changed = false;
                 for (name, val) in fields {
@@ -620,44 +664,80 @@ impl RecordInstance {
                         _ => {}
                     }
                 }
-                changed || nt.value != before
+                Ok(changed || nt.value != before)
             }
             RecordData::Waveform { nt, nord, .. }
             | RecordData::Aai { nt, nord, .. }
             | RecordData::Aao { nt, nord, .. }
-            | RecordData::SubArray { nt, nord, .. } => apply_scalar_array_put(nt, nord, value),
-            RecordData::NtTable { nt, .. } => apply_table_put(nt, value),
-            RecordData::NtNdArray { nt, .. } => apply_ndarray_put(nt, value),
-            RecordData::NtEnum { nt, .. } => {
-                // Accept index updates for NtEnum PVs. Known gap #1: a wire
-                // PUT delivers `value` as a sub-structure, which no arm here
-                // matches — deliberately left alone, see known-gaps.md.
-                let mut changed = false;
-                for (name, val) in fields {
-                    if name != "value" {
-                        continue;
-                    }
-                    let idx = match val {
-                        DecodedValue::Int32(v) => Some(*v),
-                        DecodedValue::Int64(v) => Some(*v as i32),
-                        DecodedValue::Int16(v) => Some(*v as i32),
-                        DecodedValue::Int8(v) => Some(*v as i32),
-                        DecodedValue::Float64(v) => Some(*v as i32),
-                        _ => None,
-                    };
-                    if let Some(idx) = idx {
-                        if idx < 0 || (idx as usize) >= nt.choices.len() {
-                            // out-of-range index — reject, keep value
-                        } else if nt.index != idx {
-                            nt.index = idx;
-                            changed = true;
-                        }
-                    }
-                }
-                changed
+            | RecordData::SubArray { nt, nord, .. } => {
+                apply_scalar_array_put(nt, nord, value).ok_or_else(|| ARRAY_REFUSAL.to_string())
             }
-            RecordData::Generic { .. } => false,
+            RecordData::NtTable { nt, .. } => {
+                apply_table_put(nt, value).ok_or_else(|| ARRAY_REFUSAL.to_string())
+            }
+            RecordData::NtNdArray { nt, .. } => {
+                apply_ndarray_put(nt, value).ok_or_else(|| ARRAY_REFUSAL.to_string())
+            }
+            RecordData::NtEnum { nt, .. } => {
+                // A wire PUT delivers `value` as the NTEnum sub-structure
+                // `{index, choices}`; a bare integer (host-side callers and
+                // older clients) is accepted too. A `value` that yields no
+                // integer, or an index outside `choices`, is refused: `Err`
+                // leaves the record untouched, so the caller answers the
+                // client with an error instead of a success.
+                let Some((_, val)) = fields.iter().find(|(name, _)| name == "value") else {
+                    return Ok(false);
+                };
+                let idx = match val {
+                    DecodedValue::Structure(inner) => {
+                        crate::convert::field(inner, "index").and_then(decoded_to_i32)
+                    }
+                    other => decoded_to_i32(other),
+                }
+                .ok_or_else(|| {
+                    format!("enum value {} is not an integer index", put_value_text(val))
+                })?;
+                if idx < 0 || (idx as usize) >= nt.choices.len() {
+                    return Err(format!("index {idx} outside {} choices", nt.choices.len()));
+                }
+                let changed = nt.index != idx;
+                nt.index = idx;
+                Ok(changed)
+            }
+            // A generic structure has no wire PUT path: refuse it rather than
+            // report a success that changed nothing. Write it server-side with
+            // `store.put_nt()`.
+            RecordData::Generic { .. } => Err("no wire PUT path for this record type".to_string()),
         }
+    }
+}
+
+/// PVA type name of a scalar record value, for refusal messages.
+fn scalar_type_name(v: &ScalarValue) -> &'static str {
+    match v {
+        ScalarValue::Bool(_) => "boolean",
+        ScalarValue::I8(_) => "byte",
+        ScalarValue::I16(_) => "short",
+        ScalarValue::I32(_) => "int",
+        ScalarValue::I64(_) => "long",
+        ScalarValue::U8(_) => "ubyte",
+        ScalarValue::U16(_) => "ushort",
+        ScalarValue::U32(_) => "uint",
+        ScalarValue::U64(_) => "ulong",
+        ScalarValue::F32(_) => "float",
+        ScalarValue::F64(_) => "double",
+        ScalarValue::Str(_) => "string",
+    }
+}
+
+/// The PUT value as shown in a refusal message. Floats print without the
+/// fixed six decimals the `Display` impl uses, so NaN reads as `NaN` and 1.5
+/// as `1.5`.
+fn put_value_text(val: &DecodedValue) -> String {
+    match val {
+        DecodedValue::Float64(v) => v.to_string(),
+        DecodedValue::Float32(v) => v.to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -731,7 +811,7 @@ mod tests {
     #[test]
     fn put_with_compute_alarms_true_sets_hihi_severity() {
         let mut rec = ai_record_with_alarm_limits(5.0, 0.0, 8.0, -5.0, 15.0);
-        let outcome = rec.apply_put(&put_value(20.0), true);
+        let outcome = rec.apply_put(&put_value(20.0), true).expect("PUT accepted");
 
         assert!(outcome.value_changed);
         let (severity, message) = alarm_of(&rec);
@@ -742,7 +822,7 @@ mod tests {
     #[test]
     fn put_with_compute_alarms_true_sets_high_severity() {
         let mut rec = ai_record_with_alarm_limits(5.0, 0.0, 8.0, -5.0, 15.0);
-        let outcome = rec.apply_put(&put_value(10.0), true);
+        let outcome = rec.apply_put(&put_value(10.0), true).expect("PUT accepted");
 
         assert!(outcome.value_changed);
         let (severity, message) = alarm_of(&rec);
@@ -754,10 +834,10 @@ mod tests {
     fn put_with_compute_alarms_true_clears_alarm_within_normal_range() {
         let mut rec = ai_record_with_alarm_limits(20.0, 0.0, 8.0, -5.0, 15.0);
         // Prime a HIHI alarm, then PUT a value back in range.
-        rec.apply_put(&put_value(20.0), true);
+        rec.apply_put(&put_value(20.0), true).expect("PUT accepted");
         assert_eq!(alarm_of(&rec).0, 2);
 
-        let outcome = rec.apply_put(&put_value(4.0), true);
+        let outcome = rec.apply_put(&put_value(4.0), true).expect("PUT accepted");
 
         assert!(outcome.value_changed);
         let (severity, message) = alarm_of(&rec);
@@ -768,7 +848,9 @@ mod tests {
     #[test]
     fn put_with_compute_alarms_false_does_not_update_alarm() {
         let mut rec = ai_record_with_alarm_limits(5.0, 0.0, 8.0, -5.0, 15.0);
-        let outcome = rec.apply_put(&put_value(20.0), false);
+        let outcome = rec
+            .apply_put(&put_value(20.0), false)
+            .expect("PUT accepted");
 
         assert!(outcome.value_changed);
         assert_eq!(alarm_of(&rec).0, 0);
@@ -796,7 +878,7 @@ mod tests {
     #[test]
     fn put_without_timestamp_stamps_server_time() {
         let mut rec = ai_record(1.0);
-        let outcome = rec.apply_put(&put_value(2.0), false);
+        let outcome = rec.apply_put(&put_value(2.0), false).expect("PUT accepted");
 
         assert!(outcome.value_changed);
         assert!(!outcome.client_stamped);
@@ -810,7 +892,7 @@ mod tests {
             ("value".to_string(), DecodedValue::Float64(2.0)),
             ("timeStamp".to_string(), ts_field(5_000, 42)),
         ]);
-        let outcome = rec.apply_put(&body, false);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
 
         assert!(outcome.client_stamped);
         assert_eq!(
@@ -830,7 +912,7 @@ mod tests {
             ("value".to_string(), DecodedValue::Float64(2.0)),
             ("timeStamp".to_string(), ts_field(0, 0)),
         ]);
-        let outcome = rec.apply_put(&body, false);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
 
         assert!(!outcome.client_stamped);
         assert!(stamp_of(&rec).seconds_past_epoch > OLD.seconds_past_epoch);
@@ -839,7 +921,7 @@ mod tests {
     #[test]
     fn unchanged_value_still_restamps() {
         let mut rec = ai_record(1.0);
-        let outcome = rec.apply_put(&put_value(1.0), false);
+        let outcome = rec.apply_put(&put_value(1.0), false).expect("PUT accepted");
 
         assert!(!outcome.value_changed);
         assert!(stamp_of(&rec).seconds_past_epoch > OLD.seconds_past_epoch);
@@ -848,7 +930,9 @@ mod tests {
     #[test]
     fn bare_scalar_body_is_wrapped_and_stamped() {
         let mut rec = ai_record(1.0);
-        let outcome = rec.apply_put(&DecodedValue::Float64(3.0), false);
+        let outcome = rec
+            .apply_put(&DecodedValue::Float64(3.0), false)
+            .expect("PUT accepted");
 
         assert!(outcome.value_changed);
         assert!(stamp_of(&rec).seconds_past_epoch > OLD.seconds_past_epoch);
@@ -863,7 +947,7 @@ mod tests {
         let mut rec = ai_record(1.0);
         let body =
             DecodedValue::Structure(vec![("nosuchfield".to_string(), DecodedValue::Int32(1))]);
-        let outcome = rec.apply_put(&body, false);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
 
         assert!(!outcome.value_changed);
         assert!(stamp_of(&rec).seconds_past_epoch > OLD.seconds_past_epoch);
@@ -894,7 +978,7 @@ mod tests {
             "value".to_string(),
             DecodedValue::Array(vec![DecodedValue::Float64(3.0), DecodedValue::Float64(4.0)]),
         )]);
-        let outcome = rec.apply_put(&body, false);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
 
         assert!(outcome.value_changed);
         let RecordData::Waveform { nt, .. } = &rec.data else {
@@ -910,7 +994,7 @@ mod tests {
             "value".to_string(),
             DecodedValue::Array(vec![DecodedValue::Float64(1.0), DecodedValue::Float64(2.0)]),
         )]);
-        let outcome = rec.apply_put(&body, false);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
 
         assert!(!outcome.value_changed);
         let RecordData::Waveform { nt, .. } = &rec.data else {
@@ -935,13 +1019,150 @@ mod tests {
             },
             raw_fields: HashMap::new(),
         };
-        let outcome = rec.apply_put(&DecodedValue::Int32(1), false);
+        let outcome = rec
+            .apply_put(&DecodedValue::Int32(1), false)
+            .expect("PUT accepted");
 
         assert!(outcome.value_changed);
         let RecordData::NtEnum { nt, .. } = &rec.data else {
             panic!("expected NtEnum");
         };
         assert!(nt.time_stamp.seconds_past_epoch > OLD.seconds_past_epoch);
+    }
+
+    fn mbbo_record() -> RecordInstance {
+        let mut nt = NtEnum::new(0, vec!["A".to_string(), "B".to_string()]);
+        nt.time_stamp = OLD;
+        RecordInstance {
+            name: "E".to_string(),
+            record_type: RecordType::Mbbo,
+            common: DbCommonState::default(),
+            data: RecordData::NtEnum {
+                nt,
+                inp: None,
+                out: None,
+                omsl: OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        }
+    }
+
+    fn enum_index(rec: &RecordInstance) -> i32 {
+        let RecordData::NtEnum { nt, .. } = &rec.data else {
+            panic!("expected NtEnum");
+        };
+        nt.index
+    }
+
+    #[test]
+    fn enum_put_unwraps_the_wire_index_substructure() {
+        let mut rec = mbbo_record();
+        let body = DecodedValue::Structure(vec![(
+            "value".to_string(),
+            DecodedValue::Structure(vec![("index".to_string(), DecodedValue::Int32(1))]),
+        )]);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
+        assert!(outcome.value_changed);
+        assert_eq!(enum_index(&rec), 1);
+    }
+
+    #[test]
+    fn enum_put_out_of_range_or_without_an_index_is_refused() {
+        for value in [
+            DecodedValue::Structure(vec![("index".to_string(), DecodedValue::Int32(2))]),
+            DecodedValue::Int32(-1),
+            DecodedValue::Structure(vec![(
+                "choices".to_string(),
+                DecodedValue::Array(Vec::new()),
+            )]),
+            DecodedValue::String("B".to_string()),
+        ] {
+            let mut rec = mbbo_record();
+            let body = DecodedValue::Structure(vec![("value".to_string(), value.clone())]);
+            assert!(rec.apply_put(&body, false).is_err(), "{value:?} must be refused");
+            assert_eq!(enum_index(&rec), 0);
+            let RecordData::NtEnum { nt, .. } = &rec.data else {
+                unreachable!()
+            };
+            assert_eq!(nt.time_stamp, OLD, "a refused PUT must not restamp");
+        }
+    }
+
+    #[test]
+    fn generic_put_is_refused() {
+        let mut rec = RecordInstance {
+            name: "G".to_string(),
+            record_type: RecordType::Generic,
+            common: DbCommonState::default(),
+            data: RecordData::Generic {
+                struct_id: "x:1.0".to_string(),
+                fields: Vec::new(),
+                inp: None,
+                out: None,
+                omsl: OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        };
+        let err = rec
+            .apply_put(&DecodedValue::Int32(1), false)
+            .expect_err("a generic record has no wire PUT path");
+        assert_eq!(err, "G: no wire PUT path for this record type");
+    }
+
+    #[test]
+    fn enum_refusals_name_the_real_reason() {
+        let mut rec = mbbo_record();
+        let out_of_range = DecodedValue::Structure(vec![(
+            "value".to_string(),
+            DecodedValue::Structure(vec![("index".to_string(), DecodedValue::Int32(5))]),
+        )]);
+        assert_eq!(
+            rec.apply_put(&out_of_range, false).unwrap_err(),
+            "E: index 5 outside 2 choices"
+        );
+        assert_eq!(
+            rec.apply_put(&DecodedValue::String("B".to_string()), false)
+                .unwrap_err(),
+            "E: enum value \"B\" is not an integer index"
+        );
+    }
+
+    #[test]
+    fn array_refusal_still_says_not_representable() {
+        let mut rec = waveform_record(vec![1.0]);
+        let RecordData::Waveform { nt, .. } = &mut rec.data else {
+            unreachable!()
+        };
+        nt.value = ScalarArrayValue::U8(vec![1]);
+        let body = DecodedValue::Array(vec![DecodedValue::Int32(300)]);
+        let err = rec.apply_put(&body, false).unwrap_err();
+        assert!(err.contains("not representable"), "{err}");
+    }
+
+    #[test]
+    fn enum_put_of_the_whole_enum_t_applies_the_index_and_keeps_choices() {
+        let mut rec = mbbo_record();
+        let body = DecodedValue::Structure(vec![(
+            "value".to_string(),
+            DecodedValue::Structure(vec![
+                ("index".to_string(), DecodedValue::Int32(1)),
+                (
+                    "choices".to_string(),
+                    DecodedValue::Array(vec![
+                        DecodedValue::String("X".to_string()),
+                        DecodedValue::String("Y".to_string()),
+                        DecodedValue::String("Z".to_string()),
+                    ]),
+                ),
+            ]),
+        )]);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
+        assert!(outcome.value_changed);
+        let RecordData::NtEnum { nt, .. } = &rec.data else {
+            panic!("expected NtEnum");
+        };
+        assert_eq!(nt.index, 1);
+        assert_eq!(nt.choices, vec!["A".to_string(), "B".to_string()]);
     }
 
     fn ndarray_record() -> RecordInstance {
@@ -1001,7 +1222,7 @@ mod tests {
             ("timeStamp".to_string(), ts_field(5_000, 42)),
             ("dataTimeStamp".to_string(), ts_field(9_000, 7)),
         ]);
-        let outcome = rec.apply_put(&body, false);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
 
         assert!(outcome.value_changed);
         assert!(outcome.client_stamped);
@@ -1040,7 +1261,7 @@ mod tests {
             ("timeStamp".to_string(), ts_field(5_000, 42)),
             ("dataTimeStamp".to_string(), ts_field(9_000, 7)),
         ]);
-        let outcome = rec.apply_put(&body, false);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
 
         assert!(!outcome.value_changed);
         assert!(outcome.client_stamped);
@@ -1072,7 +1293,7 @@ mod tests {
             raw_fields: HashMap::new(),
         };
         let body = DecodedValue::Structure(vec![("timeStamp".to_string(), ts_field(5_000, 42))]);
-        let outcome = rec.apply_put(&body, false);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
 
         assert!(!outcome.value_changed);
         assert!(outcome.client_stamped);
@@ -1090,7 +1311,7 @@ mod tests {
                 DecodedValue::UInt8(8),
             ]),
         )]);
-        let outcome = rec.apply_put(&body, false);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
 
         assert!(outcome.value_changed);
         let RecordData::NtNdArray { nt, .. } = &rec.data else {
@@ -1100,5 +1321,207 @@ mod tests {
             nt.time_stamp.as_ref().expect("stamped").seconds_past_epoch > OLD.seconds_past_epoch
         );
         assert!(nt.data_time_stamp.seconds_past_epoch > OLD.seconds_past_epoch);
+    }
+
+    fn nt_of(value: ScalarValue) -> NtScalar {
+        NtScalar::from_value(value)
+    }
+
+    #[test]
+    fn a_wire_put_into_a_u64_record_is_exact_above_two_to_the_53() {
+        let mut nt = nt_of(ScalarValue::U64(0));
+        let big: u64 = 9_007_199_254_740_993; // 2^53 + 1, not representable in f64
+        assert!(apply_value_update(
+            &mut nt,
+            &DecodedValue::UInt64(big),
+            false
+        ));
+        assert_eq!(
+            nt.value,
+            ScalarValue::U64(big),
+            "the wire PUT path must not round 64-bit integers through f64"
+        );
+    }
+
+    #[test]
+    fn a_wire_put_that_does_not_fit_the_target_is_refused() {
+        let mut nt = nt_of(ScalarValue::U8(7));
+        assert!(
+            !apply_value_update(&mut nt, &DecodedValue::Int32(300), false),
+            "300 does not fit a U8 record; the PUT must be refused, not saturated"
+        );
+        assert_eq!(
+            nt.value,
+            ScalarValue::U8(7),
+            "a refused PUT must not mutate"
+        );
+    }
+
+    #[test]
+    fn a_wire_put_that_does_fit_the_target_still_applies() {
+        let mut nt = nt_of(ScalarValue::I16(0));
+        assert!(apply_value_update(
+            &mut nt,
+            &DecodedValue::Int32(-300),
+            false
+        ));
+        assert_eq!(nt.value, ScalarValue::I16(-300));
+    }
+
+    #[test]
+    fn a_wire_put_into_an_f32_record_still_applies() {
+        let mut nt = nt_of(ScalarValue::F32(0.0));
+        assert!(apply_value_update(
+            &mut nt,
+            &DecodedValue::Float64(1.5),
+            false
+        ));
+        assert_eq!(nt.value, ScalarValue::F32(1.5));
+    }
+
+    /// An `Ai`-shaped record holding a `byte` value, stamped `OLD`.
+    fn byte_record(v: i8) -> RecordInstance {
+        let mut rec = ai_record(0.0);
+        let RecordData::Ai { nt, .. } = &mut rec.data else {
+            unreachable!()
+        };
+        nt.value = ScalarValue::I8(v);
+        rec
+    }
+
+    #[test]
+    fn apply_put_refuses_an_unrepresentable_value_without_touching_the_record() {
+        let mut rec = byte_record(7);
+        // The alarm field comes first, so a field walk that applied as it
+        // went would already have written it before reaching the refusal.
+        let body = DecodedValue::Structure(vec![
+            (
+                "alarm".to_string(),
+                DecodedValue::Structure(vec![(
+                    "message".to_string(),
+                    DecodedValue::String("SHOULD NOT LAND".to_string()),
+                )]),
+            ),
+            ("value".to_string(), DecodedValue::Int32(300)),
+            ("timeStamp".to_string(), ts_field(5_000, 0)),
+        ]);
+        let before = rec.clone();
+        let err = rec
+            .apply_put(&body, true)
+            .expect_err("300 does not fit a byte");
+        assert_eq!(err, "T: 300 not representable as byte");
+        assert_eq!(
+            rec, before,
+            "a refused PUT must leave the record untouched, stamp included"
+        );
+        assert_eq!(stamp_of(&rec), OLD);
+
+        let nan = DecodedValue::Float64(f64::NAN);
+        let err = rec
+            .apply_put(&nan, true)
+            .expect_err("NaN does not fit a byte");
+        assert_eq!(err, "T: NaN not representable as byte");
+        assert_eq!(rec, before);
+    }
+
+    #[test]
+    fn apply_put_of_the_current_value_is_accepted_unchanged() {
+        let mut rec = byte_record(7);
+        let outcome = rec
+            .apply_put(&DecodedValue::Int32(7), false)
+            .expect("re-sending the current value is not a refusal");
+        assert!(!outcome.value_changed);
+        assert!(stamp_of(&rec).seconds_past_epoch > OLD.seconds_past_epoch);
+    }
+
+    #[test]
+    fn apply_put_without_a_value_field_is_not_refused() {
+        let mut rec = byte_record(7);
+        let body = DecodedValue::Structure(vec![("timeStamp".to_string(), ts_field(5_000, 0))]);
+        assert!(rec.apply_put(&body, false).is_ok());
+
+        let mut wf = waveform_record(vec![1.0]);
+        assert!(wf.apply_put(&body, false).is_ok());
+    }
+
+    #[test]
+    fn apply_put_refuses_an_array_with_an_unrepresentable_element() {
+        let mut rec = waveform_record(vec![1.0, 2.0]);
+        let RecordData::Waveform { nt, .. } = &mut rec.data else {
+            unreachable!()
+        };
+        nt.value = ScalarArrayValue::U8(vec![1, 2]);
+        let before = rec.clone();
+        let body = DecodedValue::Array(vec![DecodedValue::Int32(3), DecodedValue::Int32(300)]);
+        assert!(rec.apply_put(&body, false).is_err());
+        assert_eq!(rec, before);
+    }
+
+    #[test]
+    fn apply_put_refuses_a_table_column_without_applying_any_field() {
+        let mut rec = RecordInstance {
+            name: "TBL".to_string(),
+            record_type: RecordType::NtTable,
+            common: DbCommonState::default(),
+            data: RecordData::NtTable {
+                nt: NtTable {
+                    labels: vec!["a".to_string(), "b".to_string()],
+                    columns: vec![
+                        spvirit_types::NtTableColumn {
+                            name: "a".to_string(),
+                            values: ScalarArrayValue::F64(vec![1.0]),
+                        },
+                        spvirit_types::NtTableColumn {
+                            name: "b".to_string(),
+                            values: ScalarArrayValue::U8(vec![1]),
+                        },
+                    ],
+                    descriptor: None,
+                    alarm: None,
+                    time_stamp: Some(OLD),
+                },
+                inp: None,
+                out: None,
+                omsl: OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        };
+        let before = rec.clone();
+        let body = DecodedValue::Structure(vec![
+            (
+                "descriptor".to_string(),
+                DecodedValue::String("new".to_string()),
+            ),
+            (
+                "value".to_string(),
+                DecodedValue::Structure(vec![
+                    (
+                        "a".to_string(),
+                        DecodedValue::Array(vec![DecodedValue::Float64(9.0)]),
+                    ),
+                    (
+                        "b".to_string(),
+                        DecodedValue::Array(vec![DecodedValue::Int32(300)]),
+                    ),
+                ]),
+            ),
+        ]);
+        assert!(rec.apply_put(&body, false).is_err());
+        assert_eq!(rec, before, "neither the descriptor nor column a may land");
+    }
+
+    #[test]
+    fn apply_put_refuses_an_ndarray_value_array_without_applying_any_field() {
+        let mut rec = ndarray_record();
+        let before = rec.clone();
+        let body = DecodedValue::Structure(vec![
+            ("uniqueId".to_string(), DecodedValue::Int32(99)),
+            (
+                "value".to_string(),
+                DecodedValue::Array(vec![DecodedValue::Int32(300)]),
+            ),
+        ]);
+        assert!(rec.apply_put(&body, false).is_err());
+        assert_eq!(rec, before);
     }
 }

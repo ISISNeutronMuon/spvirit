@@ -44,7 +44,7 @@ use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 use crate::pva_server::{make_array_record, make_output_record, make_scalar_record};
-use crate::simple_store::SimplePvStore;
+use crate::simple_store::{SetOutcome, SimplePvStore};
 use crate::types::{RecordInstance, RecordType};
 
 /// Errors from typed PV handle operations.
@@ -54,7 +54,10 @@ pub enum PvError {
     Unbound,
     /// No record with this name exists in the store.
     NotFound(String),
-    /// The record's value type does not match the handle's `T`.
+    /// The record's value type does not match the handle's `T`, or the value
+    /// being written is not representable in the record's type (for example
+    /// 300 into a `ubyte` record); in the latter case `expected` names the
+    /// type the value had to fit and the record is left untouched.
     TypeMismatch {
         expected: &'static str,
         actual: String,
@@ -326,14 +329,22 @@ impl<T: PvScalar> Pv<T> {
         })
     }
 
+    /// Alarm limits: crossing `low`/`high` is MINOR, `lolo`/`hihi` MAJOR.
+    ///
+    /// Fills both the published `valueAlarm` block and the limits the alarm
+    /// evaluator reads (via [`spvirit_types::NtScalar::with_alarm_limits`],
+    /// the same call the `.db` loader makes for LOW/HIGH/LOLO/HIHI), so with
+    /// `.compute_alarms(true)` every later write — wire PUT or [`Pv::set`] —
+    /// recomputes the severity. As with a `.db` record, the initial value is
+    /// not evaluated here: the severity changes on the first write.
     pub fn alarm_limits(self, lolo: f64, low: f64, high: f64, hihi: f64) -> Self {
         self.with_record(|r| {
             if let Some(nt) = r.nt_scalar_mut() {
+                // Note the argument order: with_alarm_limits(low, high, lolo, hihi).
+                *nt = nt
+                    .clone()
+                    .with_alarm_limits(Some(low), Some(high), Some(lolo), Some(hihi));
                 nt.value_alarm_active = true;
-                nt.value_alarm_low_alarm_limit = lolo;
-                nt.value_alarm_low_warning_limit = low;
-                nt.value_alarm_high_warning_limit = high;
-                nt.value_alarm_high_alarm_limit = hihi;
             }
         })
     }
@@ -604,22 +615,29 @@ impl<T: PvScalar> Pv<T> {
 
     /// Write a value through the full posting pipeline (timestamp, alarms,
     /// MDEL gating, monitors, links).
+    ///
+    /// Re-setting the current value is a no-op and `Ok(())`. A value the
+    /// record's type cannot represent (for example 300 into a `byte` record,
+    /// or a non-finite float into an integer one) is refused, leaves the
+    /// record untouched and returns [`PvError::TypeMismatch`].
     pub async fn set(&self, value: T) -> Result<(), PvError> {
         let store = self.store()?;
-        if store
-            .set_value(&self.shared.name, value.into_scalar())
+        match store
+            .set_value_checked(&self.shared.name, value.into_scalar())
             .await
         {
-            Ok(())
-        } else if store.get_value(&self.shared.name).await.is_some() {
-            // Record exists — the write was a no-op (value unchanged). Records
-            // CAN now be removed at runtime (`SimplePvStore::remove`), so this
-            // is a genuine (benign) TOCTOU: if the record were removed between
-            // the failed set and this check we would fall through to the
-            // `NotFound` arm, which is the correct outcome.
-            Ok(())
-        } else {
-            Err(PvError::NotFound(self.shared.name.clone()))
+            SetOutcome::Changed | SetOutcome::Unchanged => Ok(()),
+            SetOutcome::Refused => {
+                // Read back only on the refusal path, so a successful set
+                // pays nothing for the error text.
+                let current = store.get_value(&self.shared.name).await;
+                Err(PvError::TypeMismatch {
+                    expected: current.as_ref().map_or("a representable value", fits_label),
+                    actual: current
+                        .map_or_else(|| "a removed record".to_string(), |c| format!("{c:?}")),
+                })
+            }
+            SetOutcome::NotFound => Err(PvError::NotFound(self.shared.name.clone())),
         }
     }
 
@@ -652,11 +670,16 @@ impl<T: PvScalar> Pv<T> {
             .get_value(&self.shared.name)
             .await
             .ok_or_else(|| PvError::NotFound(self.shared.name.clone()))?;
-        let actual = format!("{v:?}");
-        T::from_scalar(v).ok_or(PvError::TypeMismatch {
-            expected: T::TYPE_NAME,
-            actual,
-        })
+        // Format only when the conversion actually failed: `get` is the hot
+        // read path and this used to allocate a diagnostic string on every
+        // successful read.
+        match T::from_scalar(v.clone()) {
+            Some(t) => Ok(t),
+            None => Err(PvError::TypeMismatch {
+                expected: T::TYPE_NAME,
+                actual: format!("{v:?}"),
+            }),
+        }
     }
 
     /// Mint a bound handle to an existing record (e.g. loaded from a `.db`).
@@ -682,11 +705,10 @@ impl<T: PvScalar> Pv<T> {
             .get_value(name)
             .await
             .ok_or_else(|| PvError::NotFound(name.to_string()))?;
-        let actual = format!("{v:?}");
-        if T::from_scalar(v).is_none() {
+        if T::from_scalar(v.clone()).is_none() {
             return Err(PvError::TypeMismatch {
                 expected: T::TYPE_NAME,
-                actual,
+                actual: format!("{v:?}"),
             });
         }
         Ok(Self {
@@ -696,6 +718,25 @@ impl<T: PvScalar> Pv<T> {
             }),
             _marker: PhantomData,
         })
+    }
+}
+
+/// `expected` text for a `PvError::TypeMismatch` raised by a refused
+/// `Pv::set`, named after the record's current scalar type.
+fn fits_label(current: &ScalarValue) -> &'static str {
+    match current {
+        ScalarValue::Bool(_) => "a value that fits boolean",
+        ScalarValue::I8(_) => "a value that fits byte",
+        ScalarValue::I16(_) => "a value that fits short",
+        ScalarValue::I32(_) => "a value that fits int",
+        ScalarValue::I64(_) => "a value that fits long",
+        ScalarValue::U8(_) => "a value that fits ubyte",
+        ScalarValue::U16(_) => "a value that fits ushort",
+        ScalarValue::U32(_) => "a value that fits uint",
+        ScalarValue::U64(_) => "a value that fits ulong",
+        ScalarValue::F32(_) => "a value that fits float",
+        ScalarValue::F64(_) => "a value that fits double",
+        ScalarValue::Str(_) => "a value that fits string",
     }
 }
 
@@ -997,6 +1038,20 @@ mod tests {
     }
 
     #[test]
+    fn alarm_limits_feed_the_alarm_evaluator() {
+        // lolo, low, high, hihi — the evaluator's fields, in that mapping.
+        let pv = Pv::ao("SIM:A", 50.0).alarm_limits(-10.0, -5.0, 5.0, 10.0);
+        let nt = pv.pending_record().unwrap().to_ntscalar();
+        assert_eq!(nt.alarm_lolo, Some(-10.0));
+        assert_eq!(nt.alarm_low, Some(-5.0));
+        assert_eq!(nt.alarm_high, Some(5.0));
+        assert_eq!(nt.alarm_hihi, Some(10.0));
+        // Not evaluated at definition time (like a `.db` record): the
+        // severity changes on the first write, when `compute_alarms` is on.
+        assert_eq!(nt.alarm_severity, 0);
+    }
+
+    #[test]
     fn bool_and_string_constructors() {
         assert!(Pv::bo("B", true).pending_record().unwrap().writable());
         assert!(!Pv::bi("B2", false).pending_record().unwrap().writable());
@@ -1037,6 +1092,7 @@ mod tests {
         let rec = m.pending_record().unwrap();
         assert_eq!(rec.record_type, crate::types::RecordType::Mbbi);
         assert_eq!(rec.current_value(), ScalarValue::I32(1));
+        assert!(!rec.writable(), "mbbi is read-only over the wire");
 
         let o = Pv::mbbo("M:O", vec!["A".into(), "B".into()], 0);
         assert!(o.pending_record().unwrap().writable());
@@ -1199,6 +1255,55 @@ mod tests {
             Vec::new(),
             false,
         ))
+    }
+
+    /// A `byte` record behind a widened `Pv<i32>` handle: the Python `int`
+    /// handle path. 300 does not fit, so the set is refused and must say so.
+    #[tokio::test]
+    async fn set_of_an_unrepresentable_value_is_an_error() {
+        let store = empty_store();
+        store
+            .insert(
+                "S:BYTE".into(),
+                make_output_record("S:BYTE", RecordType::LongOut, ScalarValue::I8(7)),
+            )
+            .await;
+        let pv = Pv::<i32>::attach(&store, "S:BYTE").await.unwrap();
+
+        match pv.set(300).await {
+            Err(PvError::TypeMismatch { .. }) => {}
+            other => panic!("expected a TypeMismatch refusal, got {other:?}"),
+        }
+        assert_eq!(store.get_value("S:BYTE").await, Some(ScalarValue::I8(7)));
+
+        let dynamic = Pv::<ScalarValue>::attach(&store, "S:BYTE").await.unwrap();
+        assert!(matches!(
+            dynamic.set(ScalarValue::F64(f64::NAN)).await,
+            Err(PvError::TypeMismatch { .. })
+        ));
+        assert_eq!(store.get_value("S:BYTE").await, Some(ScalarValue::I8(7)));
+    }
+
+    #[tokio::test]
+    async fn set_of_the_current_value_is_still_ok() {
+        let store = empty_store();
+        store
+            .insert(
+                "S:BYTE2".into(),
+                make_output_record("S:BYTE2", RecordType::LongOut, ScalarValue::I8(7)),
+            )
+            .await;
+        let pv = Pv::<i32>::attach(&store, "S:BYTE2").await.unwrap();
+        assert_eq!(
+            pv.set(7).await,
+            Ok(()),
+            "an unchanged set is a no-op, not a refusal"
+        );
+        assert_eq!(pv.set(-100).await, Ok(()));
+        assert_eq!(
+            store.get_value("S:BYTE2").await,
+            Some(ScalarValue::I8(-100))
+        );
     }
 
     #[tokio::test]
@@ -1494,5 +1599,48 @@ mod tests {
             Some(ScalarValue::Str("hi".into()))
         );
         assert!(ScalarValue::from_decoded(&DecodedValue::Null).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_type_mismatch_still_reports_the_actual_value() {
+        // The `actual` string must survive the move of format! into the
+        // error path - it is user-facing diagnostic text.
+        let store = empty_store();
+        store
+            .insert(
+                "S:one".to_string(),
+                make_output_record(
+                    "S:one",
+                    RecordType::StringOut,
+                    ScalarValue::Str("hi".to_string()),
+                ),
+            )
+            .await;
+
+        // A String-valued record read as i32: `attach` gets past the payload
+        // sniff (it is an NtPayload::Scalar) and fails in `from_scalar`.
+        let err = match Pv::<i32>::attach(&store, "S:one").await {
+            Err(e) => e,
+            Ok(_) => panic!("expected attach to fail"),
+        };
+        match err {
+            PvError::TypeMismatch { actual, .. } => {
+                assert_eq!(actual, "Str(\"hi\")", "the actual-value text changed");
+            }
+            other => panic!("expected a TypeMismatch, got {other:?}"),
+        }
+
+        // Success path: same record read as String returns the same value.
+        let pv = Pv::<String>::attach(&store, "S:one").await.unwrap();
+        assert_eq!(pv.get().await.unwrap(), "hi");
+        // And `get` on a mismatched handle reports the same text.
+        let pv_i32: Pv<i32> = Pv {
+            shared: pv.shared.clone(),
+            _marker: PhantomData,
+        };
+        match pv_i32.get().await.unwrap_err() {
+            PvError::TypeMismatch { actual, .. } => assert_eq!(actual, "Str(\"hi\")"),
+            other => panic!("expected a TypeMismatch, got {other:?}"),
+        }
     }
 }

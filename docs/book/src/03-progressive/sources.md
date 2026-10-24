@@ -20,6 +20,7 @@ routes every GET, PUT and subscribe to you.
 
 ```rust
 fn claim(&self, name: &str)   -> Option<PvInfo>;   // do I own this name?
+fn try_claim(&self, name: &str) -> TryClaim;      // sync, no I/O; default Unknown
 fn get(&self, name: &str)     -> Option<NtPayload>;
 fn put(&self, name, value)    -> Result<Vec<(String, NtPayload)>, String>;
 fn subscribe(&self, name)     -> Option<Receiver<NtPayload>>;
@@ -30,10 +31,15 @@ fn names(&self)               -> Vec<String>;
 
 (Shown with the `Pin<Box<dyn Future<...>>>` wrappers elided — the trait is
 object-safe rather than `async fn`, so every method returns a boxed future.
-See `spvirit-server/src/pvstore.rs:55`.)
+See `spvirit-server/src/pvstore.rs:111`.)
 
-`claim` is the interesting one. It runs on every channel search, and
-returning `Some(PvInfo)` commits you to serving that name.
+`claim` is the interesting one: returning `Some(PvInfo)` commits you to
+serving that name. The UDP search path does not await it. Search calls the
+synchronous `try_claim` (default `Unknown`), and an undecided name is resolved
+by running `claim` in the background, so the client's retry is answered from a
+memo. `claim` also runs before every GET/PUT/subscribe/RPC on the name. Keep it
+cheap, and implement `try_claim` from the same in-memory predicate if you can
+answer without I/O, so a search is answered on the first datagram.
 
 In Python there is no trait to implement — a source is any object with the
 matching methods, checked by duck typing:
@@ -51,7 +57,7 @@ class MySource:
 Two differences from Rust worth knowing up front. `on_start` has no Rust
 counterpart — it is how a Python source gets the `Notifier` it needs to push
 monitor updates. And `subscribe` is *not* part of the Python protocol: define
-it and it is ignored (`spvirit-py/src/source.rs:716`). Monitors are driven by
+it and it is ignored (`spvirit-py/src/source.rs:733`). Monitors are driven by
 `notifier.notify(name, payload)` instead.
 
 `on_start` fires at server start (`start()`/`start_background()`/`run()`),
@@ -103,7 +109,7 @@ plus the notifier that publishes each PUT to subscribers:
 
 ```console
 $ spget XYZ:NEW
-XYZ:NEW   0          # sprang into existence on the search
+XYZ:NEW   0          # claimed on the search; reads the default until first written
 
 $ spput XYZ:NEW 42 && spget XYZ:NEW
 XYZ:NEW  42
@@ -169,8 +175,9 @@ were `true`.
 
 ## RPC
 
-`rpc` is the one trait method with a default implementation — it returns
-`Err("RPC not supported")`, so a source only opts in by overriding it:
+`rpc` has a default implementation that returns `Err("RPC not supported")`,
+as do `pushes_own_updates` (`false`) and `try_claim` (`Unknown`). A source
+opts in to RPC by overriding it:
 
 ```rust
 {{#include ../../../../spvirit-server/examples/rpc_source.rs:rpc}}
@@ -205,14 +212,16 @@ print(ctx.rpc('RPC:add', {'a': 3.0, 'b': 4.0}))   # 7.0
 
 The Python family is `demo_source_*.py` — `sensor`, `async`, `multi`,
 `passthrough`, `aggregate`, `rpc`, `wildcard`. `demo_source_async.py` is the
-one with no Rust counterpart here: it shows a source whose `get` is an
-`async def`, which the adapter awaits on the server's runtime.
+one with no Rust counterpart here: it shows a source whose methods are
+`async def`. The adapter runs each coroutine on a dedicated background
+asyncio loop (thread `spvirit-asyncio`) and awaits the result.
 
 ## What to notice
 
-**`claim` is on the hot path.** It is called for every channel search from
-every client on the network. Keep it cheap — no I/O, no locks held across
-awaits. Do the expensive work in `get`.
+**`claim` is on the hot path.** It runs (in the background, for a search
+`try_claim` could not answer) for names searched by every client on the
+network, and before every operation. Keep it cheap — no I/O, no locks held
+across awaits. Do the expensive work in `get`.
 
 **`names()` drives `splist`.** A source that returns an empty `names()`
 still serves its PVs; they just do not show up in listings. The wildcard
@@ -220,8 +229,11 @@ source cannot enumerate what does not exist yet, which is the honest
 answer for a dynamic namespace.
 
 **Sources bypass the record layer entirely.** No MDEL, no alarm
-computation, no scan, no `.FIELD` access — those are properties of
-`RecordInstance`, and a source does not have one. If you want deadbands,
+computation, no scan, and no `.FIELD` access unless you opt in: a Python
+source gains `<name>.<FIELD>` PVs by defining `fields(name)`, and a Rust
+source does so by implementing `RecordFieldProvider` and registering a
+`RecordFieldSource` for it. The rest are properties of `RecordInstance`, and
+a source does not have one. If you want deadbands,
 implement them in `subscribe`.
 
 **Returning `Some` from `claim` is a commitment.** There is no way to
@@ -284,8 +296,11 @@ XYZ:sensor/temp
 __pvlist
 ```
 
-Two things to notice. `spget XYZ:MyValue` prints **no timestamp** — the
-source returns a bare value and nothing stamped it, unlike a record. And
+Two things to notice. `spget XYZ:MyValue` prints **no timestamp**. The
+source's `claim` advertises a bare `{value}` structure (no
+`alarm`/`timeStamp`), and the server sends only what the descriptor declares.
+Claim with `descriptor_for_payload(&NtPayload::Scalar(..))` (as
+`multi_source` does) and a timestamp appears. And
 `splist` only reports the names created so far; a wildcard source cannot
 enumerate an infinite namespace.
 

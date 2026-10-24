@@ -1,18 +1,18 @@
 //! Example: alarm severity.
 //!
-//! `.alarm_limits(lolo, low, high, hihi)` fills in — and publishes — the
-//! NTScalar `valueAlarm` block, but the server does *not* evaluate values
-//! against it, even with `.compute_alarms(true)`. Only limits loaded from a
-//! `.db` file (LOW/HIGH/LOLO/HIHI) are evaluated. See the Alarms chapter.
+//! `.alarm_limits(lolo, low, high, hihi)` publishes the NTScalar
+//! `valueAlarm` block and, with `.compute_alarms(true)`, the server derives
+//! the severity from them on every write: MINOR past `low`/`high`, MAJOR
+//! past `lolo`/`hihi`. See the Alarms chapter.
 //!
-//! For handle-built PVs, set severity yourself with `set_alarm`.
+//! For alarms that do not follow from the value, use `set_alarm`.
 //!
 //! Try it:
 //!   cargo run -p spvirit-server --example alarms
 //!
 //! Then from another terminal:
 //!   spget SIM:LINK        # INVALID, "device unreachable"
-//!   spget SIM:PRESSURE    # limits published, severity 0
+//!   spput SIM:PRESSURE 95 # MINOR, HIGH
 
 use spvirit_server::{Pv, PvaServer};
 
@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pressure = Pv::ao("SIM:PRESSURE", 50.0)
         .units("bar")
         .desc("Vessel pressure")
-        // lolo, low, high, hihi — published to clients, not evaluated.
+        // lolo, low, high, hihi — published, and evaluated on every write.
         .alarm_limits(5.0, 10.0, 90.0, 110.0);
 
     let link = Pv::ai("SIM:LINK", 0.0).desc("Device link health");
@@ -34,8 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR_END: limits
 
     // ANCHOR: manual
-    // Alarms you decide yourself, independent of the value. This is the
-    // route that works for handle-built PVs.
+    // Alarms you decide yourself, independent of the value.
     // severity: 0=NONE 1=MINOR 2=MAJOR 3=INVALID
     link.set_alarm(3, 17, "device unreachable").await?;
     // ANCHOR_END: manual

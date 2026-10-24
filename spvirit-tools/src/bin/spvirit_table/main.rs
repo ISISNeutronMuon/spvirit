@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Table
 
 use spvirit_tools::spvirit_server::pv::AnyPv;
 use spvirit_tools::spvirit_server::pva_server::{PvaServer, RunningServer};
+use spvirit_tools::tui::centered_rect;
 use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 mod parse;
@@ -130,6 +131,10 @@ impl ServerHandle {
             .worker_threads(2)
             .enable_all()
             .build()?;
+        // `start()` fails on a port already in use (a second sptable or an
+        // spserver is running). The enclosing fn already returns Result; report
+        // the bind error instead of aborting the TUI with a backtrace. The `?`
+        // sits outside `block_on`: the async block's type is not a Result.
         let server = rt.block_on(async {
             PvaServer::serve(Vec::<AnyPv>::new())
                 .port(tcp)
@@ -137,8 +142,7 @@ impl ServerHandle {
                 .listen_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
                 .start()
                 .await
-                .expect("server start hooks must succeed")
-        });
+        })?;
         let animators: Animators = Arc::new(Mutex::new(HashMap::new()));
         let rate: RateHz = Arc::new(AtomicU64::new(rate_hz.to_bits()));
 
@@ -235,6 +239,33 @@ impl ServerHandle {
             }
             _ => None,
         }
+    }
+    /// Refresh every row's `display` in a single runtime entry.
+    ///
+    /// `read_scalar` / `read_enum` each do their own `self.rt.block_on`, and
+    /// `run_ui` calls `refresh_values` before every draw, so a 40-row table was
+    /// 40 runtime round trips per frame. The per-row accessors stay: they have
+    /// many other callers in the key handlers, where one read is exactly right.
+    fn refresh_displays(&self, rows: &mut [PvRow]) {
+        let store = self.server.store();
+        self.rt.block_on(async {
+            for r in rows.iter_mut() {
+                match &r.spec {
+                    PvSpec::Scalar(_) => {
+                        if let Some(v) = store.get_value(&r.name).await {
+                            r.display = format_scalar(&v);
+                        }
+                    }
+                    PvSpec::Enum { .. } => {
+                        if let Some(NtPayload::Enum(e)) = store.get_nt(&r.name).await {
+                            let choice = e.selected().unwrap_or("?");
+                            r.display = format!("{} ({})", e.index, choice);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
     /// Read a table row back as a `:add`-compatible value string:
     /// `col:type=v,v col2:type=v,v` (columns space-separated, values
@@ -491,9 +522,8 @@ fn exec_rename(app: &mut App, srv: &ServerHandle, old: &str, new: &str) {
     match &app.rows[i].spec {
         PvSpec::Scalar(ty) => {
             let ty = *ty;
-            if let Some(cur) = srv.read_scalar(old) {
-                if let Ok(v) = parse_scalar(ty, &cur) { srv.add_scalar(new, v, writable); }
-            }
+            if let Some(cur) = srv.read_scalar(old)
+                && let Ok(v) = parse_scalar(ty, &cur) { srv.add_scalar(new, v, writable); }
         }
         PvSpec::Enum { choices } => {
             let choices = choices.clone();
@@ -524,13 +554,12 @@ fn exec_access(app: &mut App, srv: &ServerHandle, pattern: &str, writable: bool)
         // Only scalar/enum have a meaningful access recreate.
         match app.rows[i].spec {
             PvSpec::Scalar(ty) => {
-                if let Some(cur) = srv.read_scalar(&name) {
-                    if let Ok(v) = parse_scalar(ty, &cur) {
+                if let Some(cur) = srv.read_scalar(&name)
+                    && let Ok(v) = parse_scalar(ty, &cur) {
                         srv.add_scalar(&name, v, writable);
                         app.rows[i].writable = writable;
                         changed += 1;
                     }
-                }
             }
             PvSpec::Enum { .. } => {
                 if let PvSpec::Enum { choices } = &app.rows[i].spec {
@@ -743,9 +772,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     if let Some((title, content)) = prompt_text(&app.mode) {
         let is_help = matches!(app.mode, Mode::Help);
         let area = if is_help {
-            centered(90, 90, frame.area())
+            centered_rect(90, 90, frame.area())
         } else {
-            centered(64, 30, frame.area())
+            centered_rect(64, 30, frame.area())
         };
         frame.render_widget(Clear, area);
         let mut para = Paragraph::new(content)
@@ -846,25 +875,6 @@ Patterns: {{1..8}} {{8..1}} {{0..100..10}} {{01..12}} {{A,B,C}}  and products S{
 {gens}  e.g. :anim RING:BPM{{01..99}} noise min=-1 max=1
 Value forms: enum -> OFF,ON,TRIP 1   table -> id:i32=1,2,3 x:f64=0.5,1.5"
     )
-}
-
-fn centered(pct_w: u16, pct_h: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - pct_h) / 2),
-            Constraint::Percentage(pct_h),
-            Constraint::Percentage((100 - pct_h) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - pct_w) / 2),
-            Constraint::Percentage(pct_w),
-            Constraint::Percentage((100 - pct_w) / 2),
-        ])
-        .split(v[1])[1]
 }
 
 fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
@@ -1137,21 +1147,7 @@ fn on_key(app: &mut App, srv: &ServerHandle, code: KeyCode) -> bool {
 }
 
 fn refresh_values(app: &mut App, srv: &ServerHandle) {
-    for r in app.rows.iter_mut() {
-        match &r.spec {
-            PvSpec::Scalar(_) => {
-                if let Some(s) = srv.read_scalar(&r.name) {
-                    r.display = s;
-                }
-            }
-            PvSpec::Enum { .. } => {
-                if let Some(s) = srv.read_enum(&r.name) {
-                    r.display = s;
-                }
-            }
-            _ => {}
-        }
-    }
+    srv.refresh_displays(&mut app.rows);
 }
 
 fn run_ui(
@@ -1298,5 +1294,31 @@ mod tests {
         assert!(command_hint("w").contains("<file>"));
         // unknown verb is called out
         assert!(command_hint("frobnicate").contains("unknown"));
+    }
+
+    // A source-shape guard: the per-row `block_on` is a performance defect with
+    // no observable behavioural difference (values come out the same), so a
+    // structural pin is the only thing that keeps it fixed. Needles are split
+    // with `concat!` so this test cannot match its own source.
+    #[test]
+    fn refresh_enters_the_runtime_once_and_start_returns_its_error() {
+        let src = include_str!("main.rs").replace("\r\n", "\n");
+        assert!(
+            src.contains(concat!("fn refresh_", "displays")),
+            "the batch refresh method must exist"
+        );
+        let refresh = src
+            .split_once(concat!("fn refresh_", "values("))
+            .expect("refresh_values must exist")
+            .1;
+        let body = &refresh[..refresh.find("\nfn ").unwrap_or(refresh.len())];
+        assert!(
+            !body.contains(concat!("read_", "scalar")) && !body.contains(concat!("read_", "enum")),
+            "refresh_values must not call the per-row accessors; it got:\n{body}"
+        );
+        assert!(
+            !src.contains(concat!("server start hooks ", "must succeed")),
+            "start() returns Result; it must not .expect()"
+        );
     }
 }

@@ -115,7 +115,8 @@ about the *network*. If all you have is a PV name, `search_pv` (Rust) or
 explicit `--server`, the lot — rather than a bare broadcast.
 
 **The second return value names the route that worked.** `pvlist_with_fallback`
-tries four strategies in turn and tells you which answered:
+tries up to four strategies in turn (the `GetField` one only when
+`EPICS_PVA_ENABLE_GET_FIELD_FALLBACK=YES`) and tells you which answered:
 `PvListSource::PvList`, `GetField`, `ServerRpc`, or `ServerGet`. Python returns
 it as the second element of a `(names, source)` tuple, with `source` spelled
 as one of the strings `"pvlist"`, `"getfield"`, `"server_rpc"`, or

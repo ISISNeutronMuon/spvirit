@@ -25,8 +25,8 @@ a landing page that points here.
 | 05 | [spvirit-py](05-python-bindings.md) | Before touching the Python bindings — especially the threading model |
 | 06 | [Testing Guide](06-testing.md) | Before writing tests; how to run the interop suites |
 | 07 | [Build, CI, and Release](07-build-ci-release.md) | Before releasing anything; repo conventions |
-| 08 | [Current State & Roadmap](08-current-state.md) | **First**, if you're picking up work — uncommitted changes, the in-flight Python value-types plan, known-gaps triage list |
-| 09 | [The record-processing engine](09-processing-engine.md) | Before touching `spvirit-ioc`: lock sets, load-time diagnostics, and what sub-projects B, C and D still owe |
+| 08 | [Current State & Roadmap](08-current-state.md) | **First**, if you're picking up work — known-gaps triage list and roadmap |
+| 09 | [The record-processing engine](09-processing-engine.md) | Before touching `spvirit-ioc`: lock sets, load-time diagnostics, scanning (capped at 64 distinct periods), and what sub-projects C and D still owe |
 
 ## Day-one checklist
 
@@ -48,15 +48,17 @@ python tests/test_pv_handles.py                    # expect ALL OK
 
 Then:
 
-1. Read chapter 08 and run `git status` / `git log origin/main..main` —
-   there is uncommitted work and unpushed commits at handover.
-2. Skim the top-level README's "Key Concepts" if EPICS/PVAccess is new to
-   you, then chapter 01 here.
+1. Read chapter 08 and run `git status` / `git log origin/main..main` to
+   see whether anything is uncommitted or unpushed before you start.
+2. Skim [EPICS in 10 minutes](../01-fundamentals/epics-in-10-minutes.md) if
+   EPICS/PVAccess is new to you, then chapter 01 here.
 
 ## Orientation in 60 seconds
 
-Six crates, strict layering: `types` (pure data) → `codec` (wire format) →
-`client`/`server` → `tools` (CLIs + integration tests) and `py` (PyO3).
+Nine crates, strict layering: `types` (pure data) → `codec` (wire format) →
+`client`/`server` → `ioc` (record processing, server-only) and `gateway`
+(client + server) → `tools` (CLIs + integration tests) and `py` (PyO3).
+`calc` (CALC expressions) stands apart.
 Everything on the wire is a Normative Type; the server offers an IOC-style
 record level (records, alarms, deadbands, auto-timestamps) as sugar over a
 raw-NT level (`put_nt`/`get_nt`, custom `Source` providers). Default ports:
@@ -69,9 +71,8 @@ Substantial features follow a spec → plan → TDD execution workflow: a design
 spec, then a checkbox implementation plan (exact commands, per-task commits,
 Conventional Commit messages), then task-by-task execution. Those working
 documents are kept out of the repository — the durable record is this guide,
-the commit history, and the tests. One such plan — Python NT value-type
-selection — is mid-flight; see chapter 08 before touching `spvirit-py` or
-`spvirit-server/src/pv.rs`.
+the commit history, and the tests. One such plan, Python NT value-type
+selection, has since landed; chapter 08 records how.
 
 ## Where to get answers
 
@@ -82,5 +83,6 @@ selection — is mid-flight; see chapter 08 before touching `spvirit-py` or
   commits are per-task and carry the reasoning in their messages.
 - Wire debugging: `spsearch` (search traffic TUI), `spget --raw` /
   `spmonitor --raw` (hex dumps), `spget_compare` (byte-compare against
-  captures), and the related
-  [spvirit-scry](https://crates.io/crates/spvirit-scry) capture tool.
+  captures), and `spvirit-scry` (passive packet capture, built from
+  `spvirit-tools` with `--features scry`; see
+  [spvirit-scry](../04-tools/spvirit-scry.md)).

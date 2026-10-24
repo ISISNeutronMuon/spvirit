@@ -10,7 +10,7 @@ Drive a PV with a sine wave by writing to it at a fixed rate. A load
 generator and a "make something move" button, not part of any IOC.
 
 ```
-spsine [OPTIONS] [PV]
+spsine [OPTIONS] PV
 ```
 
 Requires the `client` feature. It is a *client* — the PV must already
@@ -47,8 +47,9 @@ move.
 at least a few times the frequency or you will sample the sine into
 something that does not look like one.
 
-**Each write is a full PUT.** `spsine` uses the same client path as
-`spput`, so a server-side `on_put` callback fires on every sample. At
+**Each write is a full PUT.** `spsine` sends one PUT per sample
+(`Channel::put` on a persistent channel), so each sample triggers any
+server-side `on_put` callback. At
 `--rate 100` that is a hundred callbacks a second — which is precisely
 what makes this useful for load testing, and a nuisance if you forgot.
 

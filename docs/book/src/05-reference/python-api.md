@@ -46,11 +46,11 @@ usual platforms; building from source needs a Rust toolchain. See
 | Typed PV handles (tier 2) | `spvirit.ai`, `spvirit.ao`, … | IOC-style records you keep a handle to. The one to start with. |
 | IOC engine (tier 3) | `spvirit.ioc.ai`, …, `spvirit.Ioc` | A processing IOC built from record specs or `.db` text. Verbatim EPICS field names (`EGU`, `PREC`, …), record graph, `.db` round-trip. |
 | Server + store | `spvirit.Server` | Runs the PVAccess server; `store` reaches records by name. Accepts `pvs=`, `ioc=`, `sources=`, and `.db` via `db_file=`/`db_string=`. |
-| Client | `spvirit.get`, `spvirit.put`, `spvirit.monitor`, `spvirit.Channel` | Reading and writing other people's PVs. |
+| Client | `spvirit.Client` (`.get`, `.put`, `.monitor`, `.subscribe`, `.info`), `spvirit.lowlevel.Channel` | Reading and writing other people's PVs. |
 | Low level | `spvirit.lowlevel`, `spvirit.codec` | Raw frames and wire encoding, for proxies and analysers. |
 
-Monitor callbacks (`spvirit.monitor`, `Subscription`, `Channel.monitor`)
-receive a `MonitorUpdate` — `.value` plus `.changed`/`.overrun` (dotted field
+Monitor callbacks (`Client.monitor`, `Client.subscribe`,
+`lowlevel.Channel.monitor`) receive a `MonitorUpdate` — `.value` plus `.changed`/`.overrun` (dotted field
 paths) and `.has_overrun` — rather than the bare value.
 
 ## Constructors
@@ -83,10 +83,11 @@ they block, so they are safe to call from a thread. The README's
 
 ## The rule that catches everyone
 
-**Attach callbacks before starting the server.** `on_put`, `scan` and `calc`
-must be registered on a handle while it is still unbound. Once
-`Server.start()` has run, the handle is bound and a late `on_put` will not
-fire. The same rule holds in Rust, but Python makes it easier to trip over
+**Attach callbacks before constructing the server.** `on_put` and `scan`
+must be registered on a handle while it is still unbound, and `calc` PVs must
+be created before it. Constructing `spvirit.Server(pvs=[...])` binds the
+handles; after that a late `on_put`/`scan` is ignored (only a log
+warning). The same rule holds in Rust, but Python makes it easier to trip over
 because the server object is mutable and the failure is silent. See
 [Reacting to writes](../03-progressive/reacting-to-writes.md) and
 [Troubleshooting](troubleshooting.md).

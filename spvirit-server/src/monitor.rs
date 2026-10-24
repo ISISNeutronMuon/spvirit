@@ -8,9 +8,10 @@ use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::debug;
 
+use spvirit_codec::spvd_encode::nt_payload_changed_on_desc;
 use spvirit_codec::spvirit_encode::{
-    encode_destroy_channel_response, encode_monitor_data_response_delta,
-    encode_monitor_data_response_filtered, encode_monitor_data_response_payload,
+    encode_destroy_channel_response, encode_monitor_data_response_filtered,
+    encode_monitor_data_response_payload,
 };
 use spvirit_types::NtPayload;
 
@@ -99,6 +100,29 @@ struct PumpHandle {
 /// compared for equality, so a `u64` wrap is unreachable in practice. No test
 /// reads it (a test that did would have to live in its own binary).
 static PUMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One subscriber's share of a fan-out, decided under the `monitors` guard.
+///
+/// `prebuilt` is `Some` only for a subscriber whose frame *borrows* the
+/// `MonitorSub` — today that means a field-filtered one, which needs its
+/// projection desc and its own delta baseline. Everything else carries only
+/// `Copy` fields, so its frame is encoded after the guard is released. That is
+/// the whole point of the split: the encode fan-out is the expensive part, and
+/// it must not run inside a process-global lock.
+pub struct PendingFrame {
+    pub conn_id: u64,
+    pub ioid: u32,
+    pub version: u8,
+    pub is_be: bool,
+    pub pipelined: bool,
+    pub prebuilt: Option<Vec<u8>>,
+}
+
+impl Default for MonitorRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl MonitorRegistry {
     pub fn new() -> Self {
@@ -483,21 +507,16 @@ impl MonitorRegistry {
             // delta would silently corrupt the client's value.
             //
             // Still suppress no-op updates (filtered view unchanged) to preserve
-            // bandwidth and pipeline credit — the delta encoder returning `None`
-            // is the change detector here.
+            // bandwidth and pipeline credit.
             //
-            // PERF follow-up (codec audit): this detects change by building and
-            // discarding a delta frame; a lighter filtered-projection equality
-            // check would avoid the redundant encode.
-            encode_monitor_data_response_delta(
-                sub.ioid,
-                subcmd,
-                prev,
-                payload,
-                desc,
-                sub.version,
-                sub.is_be,
-            )?;
+            // Change detection builds no frame: the predicate is pinned to
+            // `encode_nt_payload_delta(..).is_some()` by the codec's
+            // `changed_on_desc_agrees_with_the_delta_encoder`, so a no-op
+            // update is suppressed exactly as before (and `nfree` is left
+            // alone by the caller, per this function's contract).
+            if !nt_payload_changed_on_desc(prev, payload, desc, sub.is_be) {
+                return None;
+            }
             Some(encode_monitor_data_response_filtered(
                 sub.ioid,
                 subcmd,
@@ -521,45 +540,106 @@ impl MonitorRegistry {
         }
     }
 
+    /// Decide, under the caller's `monitors` guard, what each subscriber in
+    /// `list` is owed for `payload`.
+    ///
+    /// Does only per-subscriber bookkeeping: the running/credit checks, the
+    /// credit decrement, and moving the change-detector baseline. The encode
+    /// itself is deferred to the caller for every subscriber it can be
+    /// deferred for.
+    pub fn plan_fanout(list: &mut [MonitorSub], payload: &NtPayload) -> Vec<PendingFrame> {
+        let mut plan = Vec::new();
+        for sub in list.iter_mut() {
+            if !sub.running {
+                continue;
+            }
+            if sub.pipeline_enabled && sub.nfree == 0 {
+                continue;
+            }
+            let prebuilt = if sub.filtered_desc.is_some() {
+                // Borrows `sub`: must be built here.
+                match Self::build_monitor_frame(sub, payload) {
+                    Some(bytes) => Some(bytes),
+                    // No-op update — preserve pipeline credit.
+                    None => continue,
+                }
+            } else {
+                // Unfiltered: the frame depends only on the Copy fields below
+                // plus `payload`. Suppress a duplicate here (cheap compare) and
+                // let the caller encode the rest outside the lock. This is the
+                // same suppression `build_monitor_frame`'s unfiltered branch
+                // does with `prev == payload`.
+                if sub.last_snapshot.as_ref() == Some(payload) {
+                    continue;
+                }
+                None
+            };
+            if sub.pipeline_enabled && sub.nfree > 0 {
+                sub.nfree -= 1;
+            }
+            sub.last_snapshot = Some(payload.clone());
+            plan.push(PendingFrame {
+                conn_id: sub.conn_id,
+                ioid: sub.ioid,
+                version: sub.version,
+                is_be: sub.is_be,
+                pipelined: sub.pipeline_enabled,
+                prebuilt,
+            });
+        }
+        plan
+    }
+
     /// Broadcast a monitor update for `pv_name` to all running subscribers.
     pub async fn notify_monitors(&self, pv_name: &str, payload: &NtPayload) {
-        let mut to_send: Vec<(u64, u32, Vec<u8>, bool)> = Vec::new();
-        {
+        // Decide under the guard; encode and account for it outside.
+        let plan = {
             let mut monitors = self.monitors.lock().await;
-            if let Some(list) = monitors.get_mut(pv_name) {
-                for sub in list.iter_mut() {
-                    if !sub.running {
-                        continue;
-                    }
-                    if sub.pipeline_enabled && sub.nfree == 0 {
-                        continue;
-                    }
-                    let Some(msg) = Self::build_monitor_frame(sub, payload) else {
-                        // No-op update — preserve pipeline credit.
-                        continue;
-                    };
-                    // Attribute the actual wire bytes this subscriber will
-                    // receive. Both counters take only short internal locks
-                    // (no `.await` in this block), so this is safe here.
-                    if let Some(c) = self.bandwidth_counters() {
-                        c.ds_bypv_tx.add(pv_name, msg.len() as u64);
-                    }
-                    if let Some(r) = self.client_registry() {
-                        r.add_tx(sub.conn_id, msg.len() as u64);
-                    }
-                    if sub.pipeline_enabled && sub.nfree > 0 {
-                        sub.nfree -= 1;
-                    }
-                    sub.last_snapshot = Some(payload.clone());
-                    to_send.push((sub.conn_id, sub.ioid, msg, sub.pipeline_enabled));
-                }
+            match monitors.get_mut(pv_name) {
+                Some(list) => Self::plan_fanout(list, payload),
+                None => return,
             }
+        };
+        if plan.is_empty() {
+            return;
         }
 
-        // Resolve every connection's writer with a SINGLE `conns` lock rather
-        // than re-locking per subscriber. The `monitors` lock is already
-        // released (its block ended above), so this does NOT nest `conns`
-        // inside `monitors` — preserving the lock ordering the pump relies on.
+        // Loop-invariant: each accessor clones an Arc out of a std mutex, so
+        // calling them per subscriber took two global locks per subscriber to
+        // fetch the same two pointers.
+        let counters = self.bandwidth_counters();
+        let clients = self.client_registry();
+
+        let mut to_send: Vec<(u64, u32, Vec<u8>, bool)> = Vec::with_capacity(plan.len());
+        let mut tx_credits: Vec<(u64, u64)> = Vec::with_capacity(plan.len());
+        let mut pv_bytes = 0u64;
+        for p in plan {
+            let msg = match p.prebuilt {
+                Some(bytes) => bytes,
+                None => {
+                    encode_monitor_data_response_payload(p.ioid, 0x00, payload, p.version, p.is_be)
+                }
+            };
+            pv_bytes += msg.len() as u64;
+            tx_credits.push((p.conn_id, msg.len() as u64));
+            to_send.push((p.conn_id, p.ioid, msg, p.pipelined));
+        }
+
+        // One ByteMap lock (and one String allocation) for the whole fan-out
+        // instead of one per subscriber, and one ClientRegistry lock instead
+        // of one per subscriber.
+        if let Some(c) = counters {
+            c.ds_bypv_tx.add(pv_name, pv_bytes);
+        }
+        if let Some(r) = clients {
+            r.add_tx_many(&tx_credits);
+        }
+
+        // UNCHANGED from the current code (prior-audit S3 fix): resolve every
+        // connection's writer with a SINGLE `conns` lock rather than re-locking
+        // per subscriber. The `monitors` lock is already released, so this does
+        // NOT nest `conns` inside `monitors` — preserving the lock ordering the
+        // pump relies on. Keep this block verbatim.
         let resolved: Vec<(u64, Arc<ConnWriter>, u32, Vec<u8>, bool)> = {
             let conns = self.conns.lock().await;
             to_send
@@ -621,8 +701,8 @@ impl MonitorRegistry {
         let mut to_send: Option<(u64, Vec<u8>, bool)> = None;
         {
             let mut monitors = self.monitors.lock().await;
-            if let Some(list) = monitors.get_mut(pv_name) {
-                if let Some(sub) = list
+            if let Some(list) = monitors.get_mut(pv_name)
+                && let Some(sub) = list
                     .iter_mut()
                     .find(|s| s.conn_id == conn_id && s.ioid == ioid)
                 {
@@ -651,14 +731,12 @@ impl MonitorRegistry {
                     sub.last_snapshot = Some(payload.clone());
                     to_send = Some((sub.conn_id, msg, sub.pipeline_enabled));
                 }
-            }
         }
 
-        if let Some((conn_id, msg, pipelined)) = to_send {
-            if let Some(cw) = self.conn_writer(conn_id).await {
+        if let Some((conn_id, msg, pipelined)) = to_send
+            && let Some(cw) = self.conn_writer(conn_id).await {
                 self.route_monitor_frame(&cw, ioid, msg, pipelined).await;
             }
-        }
     }
 
     /// Update a monitor subscription's running/pipeline state.
@@ -672,8 +750,8 @@ impl MonitorRegistry {
         pipeline_enabled: Option<bool>,
     ) -> bool {
         let mut monitors = self.monitors.lock().await;
-        if let Some(list) = monitors.get_mut(pv_name) {
-            if let Some(sub) = list
+        if let Some(list) = monitors.get_mut(pv_name)
+            && let Some(sub) = list
                 .iter_mut()
                 .find(|s| s.conn_id == conn_id && s.ioid == ioid)
             {
@@ -685,14 +763,12 @@ impl MonitorRegistry {
                     // unbounded (R1-H1).
                     sub.nfree = v.min(crate::handler::MAX_PIPELINE_WINDOW);
                 }
-                if let Some(enabled) = pipeline_enabled {
-                    if enabled {
+                if let Some(enabled) = pipeline_enabled
+                    && enabled {
                         sub.pipeline_enabled = true;
                     }
-                }
                 return true;
             }
-        }
         false
     }
 
@@ -938,6 +1014,12 @@ mod tests {
         let mut nt = NtScalar::from_value(ScalarValue::F64(value));
         nt.alarm_severity = severity;
         NtPayload::Scalar(nt)
+    }
+
+    /// The one-field projection used by the filtered-branch plan tests.
+    fn one_field_desc() -> StructureDesc {
+        let full = spvirit_codec::spvd_encode::nt_payload_desc(&nt_payload(0.0, 0));
+        spvirit_codec::spvd_encode::filter_structure_desc(&full, &["value".to_string()])
     }
 
     #[tokio::test]
@@ -1295,9 +1377,24 @@ mod tests {
             mons.insert("pv".to_string(), vec![sub]);
         }
 
-        let p1 = nt_payload(1.0, 0);
-        let p2 = nt_payload(2.0, 0);
-        let p3 = nt_payload(3.0, 0);
+        // Explicit `time_stamp`s: without one the encoder falls back to
+        // `SystemTime::now()`, and `want` below is computed by re-encoding
+        // independently of what `notify_monitors` actually sent — two
+        // separate `now()` samples would make the comparison flaky/always-fail.
+        let stamped = |value: f64, secs: i64| {
+            let mut p = nt_payload(value, 0);
+            if let NtPayload::Scalar(ref mut nt) = p {
+                nt.time_stamp = Some(spvirit_types::NtTimeStamp {
+                    seconds_past_epoch: secs,
+                    nanoseconds: 0,
+                    user_tag: 0,
+                });
+            }
+            p
+        };
+        let p1 = stamped(1.0, 1_700_000_001);
+        let p2 = stamped(2.0, 1_700_000_002);
+        let p3 = stamped(3.0, 1_700_000_003);
 
         // Park the flusher on the first frame.
         let r = reg.clone();
@@ -1311,20 +1408,43 @@ mod tests {
         reg.notify_monitors("pv", &p2).await;
         reg.notify_monitors("pv", &p3).await;
 
+        let want: Vec<u8> = [&p1, &p2, &p3]
+            .iter()
+            .flat_map(|p| encode_monitor_data_response_payload(42, 0x00, p, 2, false))
+            .collect();
+
         for _ in 0..40 {
             sink.release(4);
-            if sink.writes.lock().unwrap().len() >= 3 {
+            if sink
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+                >= want.len()
+            {
                 break;
             }
             tokio::task::yield_now().await;
         }
         t.await.unwrap();
 
-        let writes = sink.writes.lock().unwrap().clone();
+        // Batching is now at the write layer, so assert on the byte stream, not
+        // on the number of write_all calls: the control lane is FIFO and
+        // lossless, so every charged frame must appear, in order.
+        let got: Vec<u8> = sink
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
         assert_eq!(
-            writes.len(),
-            3,
-            "pipelined monitor frames must be delivered losslessly, not coalesced; got {writes:?}"
+            got, want,
+            "pipelined monitor frames must be delivered losslessly and in order, \
+             not coalesced"
         );
     }
 
@@ -2622,5 +2742,152 @@ mod tests {
             !reg.send_frame(1, vec![4, 5, 6]).await,
             "a dead writer drops the frame, so it must not be counted"
         );
+    }
+
+    #[test]
+    fn plan_fanout_leaves_unfiltered_encoding_outside_the_guard() {
+        // After the filtered_desc fix, an ordinary subscriber has no
+        // projection desc, so its frame depends only on Copy fields plus the
+        // payload — nothing borrowed from the MonitorSub. plan_fanout must
+        // therefore NOT build it: `prebuilt: None` is the structural proof
+        // that the encode happens after the `monitors` guard is released.
+        let mut subs = vec![make_sub(None)];
+        let payload = nt_payload(1.0, 0);
+        let expected_ioid = subs[0].ioid;
+
+        let plan = MonitorRegistry::plan_fanout(&mut subs, &payload);
+
+        assert_eq!(plan.len(), 1, "the running subscriber must be planned");
+        assert!(
+            plan[0].prebuilt.is_none(),
+            "an unfiltered subscriber's frame must be encoded outside the \
+             monitors lock, not prebuilt under it"
+        );
+        assert_eq!(plan[0].ioid, expected_ioid);
+        assert!(
+            subs[0].last_snapshot.is_some(),
+            "the change-detector baseline is per-subscriber state and must \
+             still be updated under the guard"
+        );
+    }
+
+    #[test]
+    fn plan_fanout_prebuilds_only_filtered_subscribers() {
+        // A filtered subscriber's frame needs its own desc and its own delta
+        // baseline, both of which live inside the MonitorSub, so it must still
+        // be built under the guard.
+        let mut subs = vec![make_sub(Some(one_field_desc()))];
+        let payload = nt_payload(1.0, 0);
+
+        let plan = MonitorRegistry::plan_fanout(&mut subs, &payload);
+
+        assert_eq!(plan.len(), 1);
+        assert!(
+            plan[0].prebuilt.is_some(),
+            "a filtered subscriber's frame borrows the sub, so it is built \
+             under the guard"
+        );
+    }
+
+    #[test]
+    fn plan_fanout_skips_stopped_and_credit_starved_subscribers() {
+        let mut stopped = make_sub(None);
+        stopped.running = false;
+        let mut starved = make_sub(None);
+        starved.pipeline_enabled = true;
+        starved.nfree = 0;
+        let mut ok = make_sub(None);
+        ok.pipeline_enabled = true;
+        ok.nfree = 2;
+
+        let mut subs = vec![stopped, starved, ok];
+        let payload = nt_payload(1.0, 0);
+
+        let plan = MonitorRegistry::plan_fanout(&mut subs, &payload);
+
+        assert_eq!(plan.len(), 1, "only the credited running subscriber sends");
+        assert!(plan[0].pipelined);
+        assert_eq!(subs[2].nfree, 1, "one credit must be consumed");
+        assert_eq!(subs[1].nfree, 0, "a skipped subscriber keeps its credit");
+        assert!(
+            subs[0].last_snapshot.is_none() && subs[1].last_snapshot.is_none(),
+            "a subscriber that was not sent to must not have its baseline moved"
+        );
+    }
+
+    #[test]
+    fn plan_fanout_suppresses_a_duplicate_and_preserves_credit() {
+        let mut sub = make_sub(None);
+        sub.pipeline_enabled = true;
+        sub.nfree = 3;
+        let payload = nt_payload(1.0, 0);
+        let mut subs = vec![sub];
+
+        let first = MonitorRegistry::plan_fanout(&mut subs, &payload);
+        assert_eq!(first.len(), 1, "the initial snapshot always sends");
+        assert_eq!(subs[0].nfree, 2);
+
+        let second = MonitorRegistry::plan_fanout(&mut subs, &payload);
+        assert!(
+            second.is_empty(),
+            "an unchanged payload is a no-op for an unfiltered subscriber"
+        );
+        assert_eq!(
+            subs[0].nfree, 2,
+            "a suppressed update must not burn pipeline credit"
+        );
+    }
+
+    /// The filtered branch of `build_monitor_frame` used to encode a whole
+    /// delta frame and throw it away just to learn whether the filtered view
+    /// changed. Change detection now goes through the codec's
+    /// `nt_payload_changed_on_desc`, which builds no frame. Pin that the
+    /// delta encoder is gone from this file — a reintroduction is a
+    /// double-encode-per-update regression, not a style choice.
+    #[test]
+    fn filtered_change_detection_builds_no_delta_frame() {
+        let src = include_str!("monitor.rs");
+        let needle = concat!("encode_monitor_data_", "response_delta");
+        assert!(
+            !src.contains(needle),
+            "monitor.rs still references the delta encoder ({needle});              the filtered branch must use nt_payload_changed_on_desc"
+        );
+        // Positive precondition so the guard is proven to look at live code.
+        assert!(src.contains("nt_payload_changed_on_desc("));
+    }
+
+    /// A MULTI-field narrowed descriptor (value + alarm): a change confined to
+    /// the unselected timeStamp is suppressed; a change to alarm.severity is
+    /// emitted as exactly the full filtered frame.
+    #[test]
+    fn multi_field_filtered_suppresses_unselected_change_and_emits_selected_change() {
+        let stamped = |value: f64, severity: i32, secs: i64| {
+            let mut nt = NtScalar::from_value(ScalarValue::F64(value));
+            nt.alarm_severity = severity;
+            nt.time_stamp = Some(spvirit_types::NtTimeStamp {
+                seconds_past_epoch: secs,
+                nanoseconds: 5,
+                user_tag: 0,
+            });
+            NtPayload::Scalar(nt)
+        };
+        let p1 = stamped(1.0, 0, 1_700_000_000);
+        let full = nt_payload_desc(&p1);
+        let desc = filter_structure_desc(&full, &["value".to_string(), "alarm".to_string()]);
+        let mut sub = make_sub(Some(desc.clone()));
+        sub.version = 2;
+        sub.is_be = true;
+        sub.ioid = 77;
+        sub.last_snapshot = Some(p1.clone());
+
+        // Only timeStamp differs: not part of the view, so suppressed.
+        let p_ts = stamped(1.0, 0, 1_700_000_999);
+        assert!(MonitorRegistry::build_monitor_frame(&sub, &p_ts).is_none());
+
+        // alarm.severity differs: emitted, byte-identical to the filtered encode.
+        let p_alarm = stamped(1.0, 2, 1_700_000_000);
+        let got = MonitorRegistry::build_monitor_frame(&sub, &p_alarm).expect("alarm change");
+        let want = encode_monitor_data_response_filtered(77, 0x00, &p_alarm, &desc, 2, true);
+        assert_eq!(got, want);
     }
 }

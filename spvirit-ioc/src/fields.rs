@@ -71,8 +71,8 @@ pub fn render_link(link: &Link, names: TargetNames, forward: bool) -> String {
                     names(id).unwrap_or_else(|| "<unresolved>".to_string())
                 }
             };
-            let field = format!("{field:?}").to_ascii_uppercase();
-            let field = (!forward && field != "VAL").then_some(field.as_str());
+            let field = field.epics_name();
+            let field = (!forward && field != "VAL").then_some(field);
             render_link_text(&name, field, *process_passive, *maximize_severity)
         }
     }
@@ -85,6 +85,9 @@ pub fn render_link(link: &Link, names: TargetNames, forward: bool) -> String {
 /// [`dbcommon_default_value`] — the same fallback tier 2 (`SimplePvStore`) uses — then `None`.
 pub fn record_field_value(record: &Record, field: &str, names: TargetNames) -> Option<ScalarValue> {
     let s = |v: &str| Some(ScalarValue::Str(v.to_string()));
+    // For values that are already owned: `s(&x)` on a `String` allocates a
+    // second copy of one that was just built.
+    let owned = |v: String| Some(ScalarValue::Str(v));
     let i = |v: i32| Some(ScalarValue::I32(v));
     let d = |v: f64| Some(ScalarValue::F64(v));
     let c = &record.common;
@@ -108,11 +111,11 @@ pub fn record_field_value(record: &Record, field: &str, names: TargetNames) -> O
         "DISA" => i(c.disa),
         "DISV" => i(c.disv),
         "DISS" => s(c.diss.epics_string()),
-        "SDIS" => s(&render_link(&c.sdis, names, false)),
-        "FLNK" => s(&render_link(&c.flnk, names, true)),
-        "INP" => s(&render_link(&record.inp, names, false)),
-        "OUT" => s(&render_link(&record.out, names, false)),
-        "DOL" => s(&render_link(&record.dol, names, false)),
+        "SDIS" => owned(render_link(&c.sdis, names, false)),
+        "FLNK" => owned(render_link(&c.flnk, names, true)),
+        "INP" => owned(render_link(&record.inp, names, false)),
+        "OUT" => owned(render_link(&record.out, names, false)),
+        "DOL" => owned(render_link(&record.dol, names, false)),
         "OMSL" => s(match record.omsl {
             Omsl::Supervisory => "supervisory",
             Omsl::ClosedLoop => "closed_loop",

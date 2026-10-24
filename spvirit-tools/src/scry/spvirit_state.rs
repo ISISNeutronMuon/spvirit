@@ -10,7 +10,52 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
-use crate::spvd_decode::StructureDesc;
+use spvirit_codec::spvd_decode::{FieldDesc, FieldType, StructureDesc};
+
+/// Heap accounting for decoded introspection, used by the memory ceiling.
+///
+/// These bodies lived on the codec types when this tracker was part of
+/// `spvirit-codec`; the codec dropped them along with the tracker, so the
+/// tracker carries them itself.
+pub trait HeapSize {
+    /// Bytes this value owns on the heap, walked recursively.
+    fn heap_size(&self) -> usize;
+}
+
+impl HeapSize for FieldType {
+    /// Only the nesting variants own anything; scalars are pure discriminant.
+    fn heap_size(&self) -> usize {
+        match self {
+            FieldType::Structure(s) | FieldType::StructureArray(s) => s.heap_size(),
+            FieldType::Union(f) | FieldType::UnionArray(f) => {
+                f.capacity() * std::mem::size_of::<FieldDesc>()
+                    + f.iter().map(HeapSize::heap_size).sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+}
+
+impl HeapSize for FieldDesc {
+    /// Bytes this field owns on the heap, including any nested structure.
+    fn heap_size(&self) -> usize {
+        self.name.capacity() + self.field_type.heap_size()
+    }
+}
+
+impl HeapSize for StructureDesc {
+    /// Introspection is the one term in the state tracker's memory estimate
+    /// that is both large and expensive to measure: an NTScalar carries
+    /// thirty-odd nested `FieldDesc` nodes, each with its own name. Callers
+    /// are expected to cache this at assignment rather than re-walk the tree
+    /// on every accounting pass.
+    fn heap_size(&self) -> usize {
+        let id = self.struct_id.as_ref().map_or(0, |s| s.capacity());
+        let fields = self.fields.capacity() * std::mem::size_of::<FieldDesc>()
+            + self.fields.iter().map(HeapSize::heap_size).sum::<usize>();
+        id + fields
+    }
+}
 
 /// Configuration for the PVA state tracker
 #[derive(Debug, Clone)]
@@ -509,9 +554,8 @@ impl PvaStateTracker {
         conn.touch();
 
         // Only add if not already present
-        if !conn.channels_by_cid.contains_key(&cid) {
-            conn.channels_by_cid
-                .insert(cid, ChannelInfo::new_pending(cid, pv_name));
+        if let std::collections::hash_map::Entry::Vacant(e) = conn.channels_by_cid.entry(cid) {
+            e.insert(ChannelInfo::new_pending(cid, pv_name));
             self.total_channels += 1;
             self.stats.channels_created += 1;
             debug!("CREATE_CHANNEL request: cid={}", cid);
@@ -630,10 +674,10 @@ impl PvaStateTracker {
 
     /// Handle operation DESTROY (subcmd & 0x10)
     pub fn on_op_destroy(&mut self, conn_key: &ConnectionKey, ioid: u32) {
-        if let Some(conn) = self.connections.get_mut(conn_key) {
-            if conn.operations.remove(&ioid).is_some() {
-                self.stats.operations_completed += 1;
-            }
+        if let Some(conn) = self.connections.get_mut(conn_key)
+            && conn.operations.remove(&ioid).is_some()
+        {
+            self.stats.operations_completed += 1;
         }
     }
 
@@ -680,11 +724,11 @@ impl PvaStateTracker {
             created_placeholder = true;
         }
 
-        if let Some(sid_val) = channel_sid {
-            if let Some(channel) = conn.get_channel_by_sid_mut(sid_val) {
-                channel.touch();
-                Self::record_update(&mut channel.update_times, max_update_rate);
-            }
+        if let Some(sid_val) = channel_sid
+            && let Some(channel) = conn.get_channel_by_sid_mut(sid_val)
+        {
+            channel.touch();
+            Self::record_update(&mut channel.update_times, max_update_rate);
         }
 
         // Deferred stat update — can't touch self.stats while conn borrows self
@@ -720,16 +764,16 @@ impl PvaStateTracker {
         let mut retroactive_count: u64 = 0;
         for conn in self.connections.values_mut() {
             for (cid, channel) in conn.channels_by_cid.iter_mut() {
-                if channel.pv_name.starts_with("<unknown") {
-                    if let Some(pv_name) = cid_to_pv.get(cid) {
-                        debug!(
-                            "Retroactive PV resolve from SEARCH: cid={} {} -> {}",
-                            cid, channel.pv_name, pv_name
-                        );
-                        channel.pv_name = pv_name.clone();
-                        channel.fully_established = true;
-                        retroactive_count += 1;
-                    }
+                if channel.pv_name.starts_with("<unknown")
+                    && let Some(pv_name) = cid_to_pv.get(cid)
+                {
+                    debug!(
+                        "Retroactive PV resolve from SEARCH: cid={} {} -> {}",
+                        cid, channel.pv_name, pv_name
+                    );
+                    channel.pv_name = pv_name.clone();
+                    channel.fully_established = true;
+                    retroactive_count += 1;
                 }
             }
 
@@ -740,12 +784,12 @@ impl PvaStateTracker {
                     None => true,
                     Some(name) => name.starts_with("<unknown"),
                 };
-                if needs_update && op.sid != 0 {
-                    if let Some(&cid) = conn.sid_to_cid.get(&op.sid) {
-                        if let Some(pv_name) = cid_to_pv.get(&cid) {
-                            op.pv_name = Some(pv_name.clone());
-                        }
-                    }
+                if needs_update
+                    && op.sid != 0
+                    && let Some(&cid) = conn.sid_to_cid.get(&op.sid)
+                    && let Some(pv_name) = cid_to_pv.get(&cid)
+                {
+                    op.pv_name = Some(pv_name.clone());
                 }
             }
         }
@@ -829,10 +873,10 @@ impl PvaStateTracker {
                 channel_sid = Some(op.sid);
             }
         }
-        if let Some(sid_val) = channel_sid {
-            if let Some(channel) = conn.get_channel_by_sid_mut(sid_val) {
-                Self::push_message(&mut channel.recent_messages, full_message);
-            }
+        if let Some(sid_val) = channel_sid
+            && let Some(channel) = conn.get_channel_by_sid_mut(sid_val)
+        {
+            Self::push_message(&mut channel.recent_messages, full_message);
         }
     }
 
@@ -871,19 +915,18 @@ impl PvaStateTracker {
         let conn = self.connections.get(conn_key)?;
 
         // First try by IOID (operation state) - works for server responses
-        if let Some(op) = conn.operations.get(&ioid) {
-            if let Some(ref name) = op.pv_name {
-                if !name.starts_with("<unknown") {
-                    return Some(name.clone());
-                }
-            }
+        if let Some(op) = conn.operations.get(&ioid)
+            && let Some(ref name) = op.pv_name
+            && !name.starts_with("<unknown")
+        {
+            return Some(name.clone());
         }
 
         // Fall back to SID lookup - works for client requests
-        if sid != 0 {
-            if let Some(name) = conn.get_pv_name_by_sid(sid) {
-                return Some(name.to_string());
-            }
+        if sid != 0
+            && let Some(name) = conn.get_pv_name_by_sid(sid)
+        {
+            return Some(name.to_string());
         }
 
         // Last resort: if there's exactly one channel AND at most one operation,
@@ -895,12 +938,12 @@ impl PvaStateTracker {
         // Phoebus). If we only captured one CREATE_CHANNEL but there are many
         // ops, the other ops likely belong to different PVs that were established
         // before our capture started.
-        if conn.channels_by_cid.len() == 1 && conn.operations.len() <= 1 {
-            if let Some(ch) = conn.channels_by_cid.values().next() {
-                if !ch.pv_name.starts_with("<unknown") {
-                    return Some(ch.pv_name.clone());
-                }
-            }
+        if conn.channels_by_cid.len() == 1
+            && conn.operations.len() <= 1
+            && let Some(ch) = conn.channels_by_cid.values().next()
+            && !ch.pv_name.starts_with("<unknown")
+        {
+            return Some(ch.pv_name.clone());
         }
 
         None
@@ -963,16 +1006,16 @@ impl PvaStateTracker {
         // Remove oldest
         let mut evicted = 0;
         for (conn_key, cid, _) in oldest.into_iter().take(count) {
-            if let Some(conn) = self.connections.get_mut(&conn_key) {
-                if let Some(channel) = conn.channels_by_cid.remove(&cid) {
-                    if let Some(sid) = channel.sid {
-                        conn.sid_to_cid.remove(&sid);
-                        conn.operations.retain(|_, op| op.sid != sid);
-                    }
-                    self.total_channels = self.total_channels.saturating_sub(1);
-                    self.stats.channels_evicted += 1;
-                    evicted += 1;
+            if let Some(conn) = self.connections.get_mut(&conn_key)
+                && let Some(channel) = conn.channels_by_cid.remove(&cid)
+            {
+                if let Some(sid) = channel.sid {
+                    conn.sid_to_cid.remove(&sid);
+                    conn.operations.retain(|_, op| op.sid != sid);
                 }
+                self.total_channels = self.total_channels.saturating_sub(1);
+                self.stats.channels_evicted += 1;
+                evicted += 1;
             }
         }
         evicted
@@ -1411,7 +1454,6 @@ impl PvaStateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FieldDesc, FieldType};
 
     fn test_conn_key() -> ConnectionKey {
         ConnectionKey::from_parts("192.168.1.1", 12345, "192.168.1.2", 5075).unwrap()

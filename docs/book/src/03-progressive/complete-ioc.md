@@ -40,7 +40,7 @@ Tokio task holding the same handles:
 Note the two-call construction. `PvaServer::serve()` takes one homogeneous
 iterator, so the four `Pv<f64>` handles go in the first call and the
 `PvArray` goes in through `.pvs()`
-(`spvirit-server/src/pva_server.rs:724`, `:741`). Chain `.pvs()` as many
+(`spvirit-server/src/pva_server.rs:1230`, `:1247`). Chain `.pvs()` as many
 times as you have distinct handle types.
 
 ## Python
@@ -63,7 +63,7 @@ layer with `store.put_nt(...)` after the server is up
 
 Array PVs reject the scalar keywords (`units`, `prec`, `desc`, `adel`,
 `mdel`, and both limit pairs) with `TypeError`, and `on_put`/`scan` raise
-`TypeError` on them too (`spvirit-py/src/pv.rs:307`, `:365`). `VAC:RGA` is
+`TypeError` on them too (`spvirit-py/src/pv.rs:299`, `:357`). `VAC:RGA` is
 therefore driven from a plain loop rather than a scan callback:
 
 ```python
@@ -73,7 +73,7 @@ therefore driven from a plain loop rather than a scan callback:
 Note the rejection path. Raising from `on_put` sends the exception's text
 to the client, matching the Rust `Err(String)`; returning `False` also
 rejects but the client sees a fixed `rejected by on_put`
-(`spvirit-py/src/pv.rs:559`).
+(`spvirit-py/src/pv.rs:552`).
 
 ## Run it
 
@@ -138,7 +138,7 @@ VAC:SETPOINT 2026-08-04 10:35:57.902 0.0003
 
 Each read carries the time of its own PUT, not the record's *creation*
 time. `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:546`) updates `value`, `alarm`, `display`
+(`spvirit-server/src/apply.rs:569`) updates `value`, `alarm`, `display`
 and `control` from the client's structure and then always restamps —
 with the client's `timeStamp` if the PUT carried a non-default one, so a
 gateway can forward the originating acquisition time, otherwise with

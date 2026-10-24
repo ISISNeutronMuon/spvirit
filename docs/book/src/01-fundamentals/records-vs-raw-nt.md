@@ -16,10 +16,10 @@ monitor fire on every tick".
 |  | IOC-style records | Raw NT payloads |
 |---|---|---|
 | You create them with | `Pv<T>` handles (`Pv::ai(...)` …), builder methods (`.ai()`, `.waveform()` …), `.db` files | `NtScalar`/`NtScalarArray`/… built by hand; hand-built `RecordInstance`; custom `Source` impls |
-| You read/write | plain values: `pv.set(21.5)`, `store.set_value(...)` | whole payloads: `store.put_nt(...)` / `get_nt(...)`, `Notifier` posts |
-| Alarm state | computed for you from HIHI/HIGH/LOW/LOLO limits (`compute_alarms`), or `pv.set_alarm(...)` | you set `alarm` on every payload yourself |
+| You read/write | plain values: `pv.set(21.5)`, `store.set_value(...)` | whole payloads: `store.put_nt(...)` / `get_nt(...)`; in Python, `Notifier.notify(...)` |
+| Alarm state | computed from the `HIHI`/`HIGH`/`LOW`/`LOLO` limits (`.db` fields or a handle's `alarm_limits`) when the server runs with `compute_alarms` (off by default), or set with `pv.set_alarm(...)` | you set `alarm` on every payload yourself |
 | Timestamps | stamped automatically on every update, client PUT included | yours to fill in — an explicit `timeStamp` is honoured, a zero one is stamped for you |
-| Display/control metadata (EGU, PREC, limits) | record fields, visible QSRV-style (`PV.EGU`, `PV.DESC`, …) | whatever you put in the payload, each update |
+| Display/control metadata (EGU, PREC, limits) | record fields (NTScalar `display`/`control`); `PV.EGU`-style field channels exist only for fields literally present in a `.db` file, plus dbCommon fields and `MDEL`/`ADEL` | whatever you put in the payload, each update |
 | Monitor deadbands (MDEL/ADEL) | applied by the server | not applied — every `put_nt`/notify posts |
 | Best for | soft IOCs, simulators, anything that should feel like an EPICS record | gateways/bridges, tables, images, PVs whose metadata changes per update |
 
@@ -51,15 +51,16 @@ relay the value.
 
 At the record level this restamp happens on every accepted PUT, whether or
 not the value itself changed — `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:546`) applies `value`, `alarm`, `display` and
+(`spvirit-server/src/apply.rs:569`) applies `value`, `alarm`, `display` and
 `control`, then always calls `set_time_stamp`. Server-side updates —
 `set_value`, a `scan` callback, a `.link()` recomputation — restamp the same
 way. EPICS Base does the same: `recGblGetTimeStampSimm()` runs
 unconditionally in `process()`, independent of whether the value moved.
 [Reading and writing](../03-progressive/read-write.md) shows it happening.
 
-**Alarms are only computed at the record level.** `compute_alarms` walks the
-`HIHI`/`HIGH`/`LOW`/`LOLO` thresholds and sets severity. Raw payloads get the
+**Alarms are only computed at the record level.** With `compute_alarms` on,
+the server walks the `HIHI`/`HIGH`/`LOW`/`LOLO` thresholds
+(`update_alarm_from_value`) and sets severity. Raw payloads get the
 severity you put in them, which for a hand-built `NtScalar::from_value` is
 `NO_ALARM` — a silently un-alarming PV.
 

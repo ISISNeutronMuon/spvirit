@@ -26,6 +26,16 @@ pub struct DecodeLimits {
     pub max_struct_array: usize,
     pub max_union_array: usize,
     pub max_variant_array: usize,
+    /// Ceiling on the field count in one structure descriptor. Matches the
+    /// non-scalar array ceilings above; real NT structures have ~30 fields.
+    /// Checked *before* the `Vec::with_capacity`, because a `Vec` allocation
+    /// failure aborts the process rather than unwinding.
+    pub max_struct_fields: usize,
+    /// Ceiling on introspection / value nesting depth. Unbounded recursion
+    /// here overflows the native stack -- an uncatchable process kill. The
+    /// deepest normative NT type nests fewer than ten levels; 32 leaves a 3x
+    /// margin for vendor extensions.
+    pub max_depth: usize,
 }
 
 impl Default for DecodeLimits {
@@ -36,6 +46,8 @@ impl Default for DecodeLimits {
             max_struct_array: 65_536,
             max_union_array: 65_536,
             max_variant_array: 65_536,
+            max_struct_fields: 65_536,
+            max_depth: 32,
         }
     }
 }
@@ -145,20 +157,6 @@ impl FieldType {
             FieldType::BoundedString(_) => "string",
         }
     }
-
-    /// Bytes this type owns on the heap, walked recursively.
-    ///
-    /// Only the nesting variants own anything; scalars are pure discriminant.
-    pub fn heap_size(&self) -> usize {
-        match self {
-            FieldType::Structure(s) | FieldType::StructureArray(s) => s.heap_size(),
-            FieldType::Union(f) | FieldType::UnionArray(f) => {
-                f.capacity() * std::mem::size_of::<FieldDesc>()
-                    + f.iter().map(FieldDesc::heap_size).sum::<usize>()
-            }
-            _ => 0,
-        }
-    }
 }
 
 /// Field description (name + type)
@@ -166,13 +164,6 @@ impl FieldType {
 pub struct FieldDesc {
     pub name: String,
     pub field_type: FieldType,
-}
-
-impl FieldDesc {
-    /// Bytes this field owns on the heap, including any nested structure.
-    pub fn heap_size(&self) -> usize {
-        self.name.capacity() + self.field_type.heap_size()
-    }
 }
 
 /// Structure description with optional ID
@@ -193,20 +184,6 @@ impl StructureDesc {
     /// Look up a field by name.
     pub fn field(&self, name: &str) -> Option<&FieldDesc> {
         self.fields.iter().find(|f| f.name == name)
-    }
-
-    /// Bytes this description owns on the heap, walked recursively.
-    ///
-    /// Introspection is the one term in the state tracker's memory estimate
-    /// that is both large and expensive to measure: an NTScalar carries
-    /// thirty-odd nested `FieldDesc` nodes, each with its own name. Callers
-    /// are expected to cache this at assignment rather than re-walk the tree
-    /// on every accounting pass.
-    pub fn heap_size(&self) -> usize {
-        let id = self.struct_id.as_ref().map_or(0, |s| s.capacity());
-        let fields = self.fields.capacity() * std::mem::size_of::<FieldDesc>()
-            + self.fields.iter().map(FieldDesc::heap_size).sum::<usize>();
-        id + fields
     }
 }
 
@@ -355,13 +332,136 @@ impl fmt::Display for DecodedValue {
     }
 }
 
+/// Height of a type tree in `PvdDecoder::enter` units: a leaf is 1, a
+/// structure or union is 1 + its tallest field. Only called on trees the
+/// decoder has already built under the depth limit, so the recursion is
+/// bounded by `DecodeLimits::max_depth`.
+fn type_height(ft: &FieldType) -> usize {
+    let fields = match ft {
+        FieldType::Structure(d) | FieldType::StructureArray(d) => &d.fields,
+        FieldType::Union(f) | FieldType::UnionArray(f) => f,
+        _ => return 1,
+    };
+    1 + fields
+        .iter()
+        .map(|f| type_height(&f.field_type))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Node count of a type tree: every structure, union and leaf is one node.
+/// Like `type_height`, only called on trees already built under the depth
+/// limit and the node budget, so it is bounded by both.
+fn type_nodes(ft: &FieldType) -> usize {
+    let fields = match ft {
+        FieldType::Structure(d) | FieldType::StructureArray(d) => &d.fields,
+        FieldType::Union(f) | FieldType::UnionArray(f) => f,
+        _ => return 1,
+    };
+    1 + fields
+        .iter()
+        .map(|f| type_nodes(&f.field_type))
+        .sum::<usize>()
+}
+
+/// The `DecodeError::Malformed` text for a descriptor whose resolved type
+/// tree passes the node budget. A named constant so the lenient field loop
+/// in `parse_structure_desc` can surface it instead of swallowing it.
+const NODE_BUDGET_EXCEEDED: &str = "introspection expands past the node budget";
+
+/// Resolved type nodes allowed per input byte, on top of the
+/// `DecodeLimits::max_struct_fields` floor. The threat is *amplification*
+/// (`0xFE` splicing a stored tree in for 3 bytes), not size: a literal type
+/// node costs at least one wire byte and a legitimate `0xFE` repeat (pvxs
+/// caches types and resends them by id) carries its element's value bytes,
+/// so real payloads stay far below 16 nodes per byte (an `any[]` of literal
+/// `{double a; double b}` is ~0.12, pvxs-cached NTScalar-sized repeats
+/// ~0.13). A 4-way registry chain is ~4^n nodes from ~23n bytes and passes
+/// it within a few levels.
+///
+/// `input_len` is the bytes available to the call, including any trailing
+/// bytes after the descriptor, so padding a short hostile descriptor raises
+/// its share. That residual is bounded by `MAX_DECODE_NODES` (~1M nodes).
+const NODES_PER_BYTE: usize = 16;
+
+/// Absolute ceiling on resolved type nodes per top-level decode, whatever
+/// the input size. The proportional budget alone scales with the frame: at
+/// 16 nodes/byte a maximal 256 MiB frame would allow ~4G nodes. Legitimate
+/// payloads in the tests are <= ~100K nodes; at ~25 nodes per NTScalar the
+/// largest legitimate message at this ceiling is roughly 40K NTScalar-sized
+/// elements (an NTMultiChannel of ~40K channels). 1M nodes also bounds what
+/// a padded hostile message (short descriptor + trailing bytes, see
+/// `NODES_PER_BYTE`) can build per message, regardless of frame size.
+const MAX_DECODE_NODES: usize = 1_048_576;
+
+/// The node ceiling for one top-level decode over `input_len` bytes:
+/// `max_struct_fields + NODES_PER_BYTE * input_len`, capped at
+/// `MAX_DECODE_NODES`, and never below `max_struct_fields` (so a configured
+/// field-count ceiling above the cap still admits one such structure).
+fn node_ceiling(max_struct_fields: usize, input_len: usize) -> usize {
+    max_struct_fields
+        .saturating_add(NODES_PER_BYTE.saturating_mul(input_len))
+        .min(MAX_DECODE_NODES)
+        .max(max_struct_fields)
+}
+
+/// The errors that mean "this input is hostile", as opposed to "this input
+/// is short or garbled". The lenient field loops stop quietly on the latter
+/// but must surface these, or the guard becomes a silent truncation.
+///
+/// `Malformed(NODE_BUDGET_EXCEEDED)` is a *value* comparison of the `&str`
+/// payload against the constant: any other `Malformed` text never matches,
+/// so the constant must be the only way this error is ever built.
+fn is_hostile(e: &DecodeError) -> bool {
+    matches!(
+        e,
+        DecodeError::DepthExceeded { .. } | DecodeError::Malformed(NODE_BUDGET_EXCEEDED)
+    )
+}
+
 /// PVD Decoder state
 pub struct PvdDecoder {
     is_be: bool,
     limits: DecodeLimits,
     /// IntrospectionRegistry: maps int16 keys to previously seen FieldTypes.
     /// Populated when parsing `0xFD` (full-with-id) entries, looked up on `0xFE` (only-id).
-    registry: std::cell::RefCell<std::collections::HashMap<u16, FieldType>>,
+    /// Each entry carries the stored type's height (see `type_height`) and
+    /// node count (see `type_nodes`), recorded once on insert so a `0xFE`
+    /// reference can be depth- and budget-checked in O(1) instead of
+    /// re-walking the tree.
+    registry: std::cell::RefCell<std::collections::HashMap<u16, (FieldType, usize, usize)>>,
+    /// Current recursion depth. A `Cell` rather than a `&mut self` parameter
+    /// so no public signature changes (which would ripple into the frozen
+    /// `spvirit-py` surface).
+    depth: std::cell::Cell<usize>,
+    /// Type nodes built by the current top-level decode. The depth limit
+    /// bounds height but not breadth: a structure whose fields all
+    /// `0xFE`-reference the previous level grows 4^n nodes from O(n) bytes.
+    /// Each parsed type charges 1, each `0xFE` charges the stored node count,
+    /// and passing `node_limit` fails the decode. Reset at every top-level
+    /// entry (`node_budget_scope`).
+    nodes: std::cell::Cell<usize>,
+    /// The current top-level decode's node ceiling (`node_ceiling`):
+    /// `max_struct_fields + NODES_PER_BYTE * input_len` capped at
+    /// `MAX_DECODE_NODES`, so the budget bounds the amplification ratio
+    /// rather than the size of legitimate data, with an absolute backstop.
+    node_limit: std::cell::Cell<usize>,
+    /// Nesting of public decode entry points, so only the outermost one
+    /// resets `nodes`. Not `depth`: `decode_structure` does not `enter()`,
+    /// so its fields' `decode_value` calls run at depth 0 and would each
+    /// get a fresh budget.
+    budget_scope: std::cell::Cell<usize>,
+}
+
+/// Decrements the decoder's depth counter (or node-budget scope counter) on
+/// *every* exit path, including the `?` early returns that are the whole
+/// point of the recursion being dangerous.
+struct DepthGuard<'a>(&'a std::cell::Cell<usize>);
+
+impl Drop for DepthGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 impl PvdDecoder {
@@ -375,6 +475,10 @@ impl PvdDecoder {
             is_be,
             limits,
             registry: std::cell::RefCell::new(std::collections::HashMap::new()),
+            depth: std::cell::Cell::new(0),
+            nodes: std::cell::Cell::new(0),
+            node_limit: std::cell::Cell::new(limits.max_struct_fields),
+            budget_scope: std::cell::Cell::new(0),
         }
     }
 
@@ -401,6 +505,7 @@ impl PvdDecoder {
 
     /// Parse field description from introspection data
     pub fn parse_field_desc(&self, data: &[u8]) -> DecodeResult<(FieldDesc, usize)> {
+        let _scope = self.node_budget_scope(data.len());
         if data.is_empty() {
             return Err(DecodeError::Truncated {
                 needed: 1,
@@ -430,6 +535,7 @@ impl PvdDecoder {
 
     /// Parse type descriptor
     fn parse_type_desc(&self, data: &[u8]) -> DecodeResult<(FieldType, usize)> {
+        let _depth = self.enter()?;
         if data.is_empty() {
             return Err(DecodeError::Truncated {
                 needed: 1,
@@ -439,6 +545,11 @@ impl PvdDecoder {
 
         let type_byte = data[0];
         let mut offset = 1;
+
+        // 0xFD charges through its recursive parse, 0xFE the stored count.
+        if type_byte != 0xFD && type_byte != 0xFE {
+            self.charge_nodes(1)?;
+        }
 
         // Check for NULL type
         if type_byte == 0xFF {
@@ -460,7 +571,11 @@ impl PvdDecoder {
                 u16::from_le_bytes([data[1], data[2]])
             };
             let (field_type, consumed) = self.parse_type_desc(&data[3..])?;
-            self.registry.borrow_mut().insert(key, field_type.clone());
+            let height = type_height(&field_type);
+            let nodes = type_nodes(&field_type);
+            self.registry
+                .borrow_mut()
+                .insert(key, (field_type.clone(), height, nodes));
             return Ok((field_type, 3 + consumed));
         }
 
@@ -478,7 +593,9 @@ impl PvdDecoder {
             } else {
                 u16::from_le_bytes([data[1], data[2]])
             };
-            if let Some(ft) = self.registry.borrow().get(&key) {
+            if let Some((ft, height, nodes)) = self.registry.borrow().get(&key) {
+                self.check_resolved_height(*height)?;
+                self.charge_nodes(*nodes)?;
                 return Ok((ft.clone(), 3));
             }
             debug!(
@@ -605,17 +722,53 @@ impl PvdDecoder {
         let (field_count, consumed) = self.decode_size(&data[offset..])?;
         offset += consumed;
 
-        let mut fields = Vec::with_capacity(field_count);
+        // Reject on the configured ceiling *before* reserving -- a failed
+        // `Vec` allocation aborts the process instead of unwinding.
+        //
+        // Deliberately NOT a bytes-remaining check (`check_array_count`'s
+        // second half): a descriptor cut short by a third-party IOC must keep
+        // parsing leniently via the `break` in the loop below, and the codec
+        // plan pins that contract with `truncated_descriptor_parses_leniently_by_design`.
+        // The reserve is instead capped at the number of two-byte fields
+        // (one-byte empty-name prefix + one-byte type code) the remaining
+        // bytes could possibly hold, so a legal-but-oversized count cannot
+        // over-allocate either.
+        if field_count > self.limits.max_struct_fields {
+            return Err(DecodeError::ArrayTooLarge {
+                kind: "structure fields",
+                count: field_count,
+                limit: self.limits.max_struct_fields,
+            });
+        }
 
+        let mut fields =
+            Vec::with_capacity(field_count.min(data.len().saturating_sub(offset) / 2));
+
+        // Lenient by design. A descriptor that announces more fields than the
+        // buffer holds returns `Ok` with the fields that did parse rather than
+        // an error: spvirit is a passive observer and a gateway, and one
+        // malformed descriptor from a third-party IOC must not drop a
+        // connection carrying other channels. Callers therefore cannot tell
+        // "2 fields" from "6 announced, 2 salvaged" - if you need that
+        // distinction, add a returned count rather than making this strict.
+        // Pinned by `truncated_descriptor_parses_leniently_by_design`.
+        // Same choice, same reason, in `decode_structure` below.
         for _ in 0..field_count {
             if offset >= data.len() {
                 break;
             }
-            if let Ok((field, consumed)) = self.parse_field_desc(&data[offset..]) {
-                offset += consumed;
-                fields.push(field);
-            } else {
-                break;
+            match self.parse_field_desc(&data[offset..]) {
+                Ok((field, consumed)) => {
+                    offset += consumed;
+                    fields.push(field);
+                }
+                // Truncated/garbage input stays lenient: stop and return what
+                // parsed. A depth or node-budget violation does NOT --
+                // swallowing it here would turn the guard into a silent
+                // truncation and the caller would never learn the descriptor
+                // was hostile. See `is_hostile`.
+                Err(e) if is_hostile(&e) => return Err(e),
+                Err(_) => break,
             }
         }
 
@@ -630,6 +783,8 @@ impl PvdDecoder {
 
     /// Parse full type introspection and return consumed bytes.
     pub fn parse_introspection_with_len(&self, data: &[u8]) -> DecodeResult<(StructureDesc, usize)> {
+        let _scope = self.node_budget_scope(data.len());
+        let _depth = self.enter()?;
         if data.is_empty() {
             return Err(DecodeError::Truncated {
                 needed: 1,
@@ -642,6 +797,7 @@ impl PvdDecoder {
 
         // Should be a structure (0x80)
         if type_byte == 0x80 {
+            self.charge_nodes(1)?;
             let (desc, consumed) = self.parse_structure_desc(&data[1..])?;
             return Ok((desc, 1 + consumed));
         }
@@ -662,9 +818,12 @@ impl PvdDecoder {
             };
             let (desc, consumed) = self.parse_introspection_with_len(&data[3..])?;
             // Register this structure type for later 0xFE references
+            let field_type = FieldType::Structure(desc.clone());
+            let height = type_height(&field_type);
+            let nodes = type_nodes(&field_type);
             self.registry
                 .borrow_mut()
-                .insert(key, FieldType::Structure(desc.clone()));
+                .insert(key, (field_type, height, nodes));
             return Ok((desc, 3 + consumed));
         }
 
@@ -682,11 +841,12 @@ impl PvdDecoder {
             } else {
                 u16::from_le_bytes([data[1], data[2]])
             };
-            if let Some(ft) = self.registry.borrow().get(&key) {
-                if let FieldType::Structure(desc) = ft {
+            if let Some((ft, height, nodes)) = self.registry.borrow().get(&key)
+                && let FieldType::Structure(desc) = ft {
+                    self.check_resolved_height(*height)?;
+                    self.charge_nodes(*nodes)?;
                     return Ok((desc.clone(), 3));
                 }
-            }
             debug!(
                 "Introspection ONLY_ID (0xFE) key={} not found in registry",
                 key
@@ -817,12 +977,81 @@ impl PvdDecoder {
         Ok(())
     }
 
+    /// Enter one level of recursion, or fail. Hold the returned guard for the
+    /// duration of the recursive call.
+    fn enter(&self) -> DecodeResult<DepthGuard<'_>> {
+        let next = self.depth.get() + 1;
+        if next > self.limits.max_depth {
+            return Err(DecodeError::DepthExceeded {
+                depth: next,
+                limit: self.limits.max_depth,
+            });
+        }
+        self.depth.set(next);
+        Ok(DepthGuard(&self.depth))
+    }
+
+    /// A `0xFE` reference splices a stored type of `height` levels in at
+    /// the current depth with O(1) wire recursion, so `enter()` alone never
+    /// sees its nesting. Reject it if the resolved tree would pass
+    /// `max_depth`; otherwise chained `0xFD`/`0xFE` entries build an
+    /// unboundedly deep tree (and overflow the stack in the derived
+    /// `Clone`/`Drop`) from wire nesting that never exceeds the limit.
+    fn check_resolved_height(&self, height: usize) -> DecodeResult<()> {
+        let depth = (self.depth.get() + height).saturating_sub(1);
+        if depth > self.limits.max_depth {
+            return Err(DecodeError::DepthExceeded {
+                depth,
+                limit: self.limits.max_depth,
+            });
+        }
+        Ok(())
+    }
+
+    /// Enter a node-budget scope; the outermost one starts a fresh budget
+    /// sized to its input (`input_len` = the bytes available to that call).
+    /// A nested entry (`0xFD` recursion, a structure's fields, a variant's
+    /// descriptor, every element of an array) is charged to the decode
+    /// already in progress. Hold the returned guard for the duration of the
+    /// call.
+    fn node_budget_scope(&self, input_len: usize) -> DepthGuard<'_> {
+        let scope = self.budget_scope.get();
+        if scope == 0 {
+            self.nodes.set(0);
+            self.node_limit
+                .set(node_ceiling(self.limits.max_struct_fields, input_len));
+        }
+        self.budget_scope.set(scope + 1);
+        DepthGuard(&self.budget_scope)
+    }
+
+    /// Charge `n` type nodes to the current decode's budget, or fail once
+    /// the resolved nodes pass `node_limit`. The `max_struct_fields` floor
+    /// (one structure's field-count ceiling) covers any single descriptor;
+    /// the per-byte share lets linear-size values (an `any[]` of thousands of
+    /// NTScalars, literal or `0xFE`-cached) through while capping the
+    /// amplification a few bytes of `0xFE` references can buy.
+    fn charge_nodes(&self, n: usize) -> DecodeResult<()> {
+        let used = self.nodes.get().saturating_add(n);
+        self.nodes.set(used);
+        if used > self.node_limit.get() {
+            return Err(DecodeError::Malformed(NODE_BUDGET_EXCEEDED));
+        }
+        Ok(())
+    }
+
     /// Decode value according to field type
     pub fn decode_value(
         &self,
         data: &[u8],
         field_type: &FieldType,
     ) -> DecodeResult<(DecodedValue, usize)> {
+        // A `Variant` value carries its own type descriptor, charged to the
+        // node budget. One budget per top-level value: a long-lived decoder
+        // never accumulates charges across values, and one value cannot
+        // splice more than the budget's worth of `0xFE` clones.
+        let _scope = self.node_budget_scope(data.len());
+        let _depth = self.enter()?;
         match field_type {
             FieldType::Scalar(tc) => self.decode_scalar(data, *tc),
             FieldType::String | FieldType::BoundedString(_) => {
@@ -982,19 +1211,24 @@ impl PvdDecoder {
         data: &[u8],
         desc: &StructureDesc,
     ) -> DecodeResult<(DecodedValue, usize)> {
+        let _scope = self.node_budget_scope(data.len());
         let mut offset = 0;
         let mut fields: Vec<(String, DecodedValue)> = Vec::new();
 
+        // Lenient by design - see the note in `parse_structure_desc`.
         for field in &desc.fields {
             if offset >= data.len() {
                 break;
             }
-            if let Ok((value, consumed)) = self.decode_value(&data[offset..], &field.field_type) {
-                fields.push((field.name.clone(), value));
-                offset += consumed;
-            } else {
-                // Can't decode this field, stop
-                break;
+            match self.decode_value(&data[offset..], &field.field_type) {
+                Ok((value, consumed)) => {
+                    fields.push((field.name.clone(), value));
+                    offset += consumed;
+                }
+                // Same rule as `parse_structure_desc`: a depth or node-budget
+                // violation is surfaced, everything else stops the loop as before.
+                Err(e) if is_hostile(&e) => return Err(e),
+                Err(_) => break,
             }
         }
 
@@ -1039,6 +1273,7 @@ impl PvdDecoder {
         desc: &StructureDesc,
         bitset: &[u8],
     ) -> DecodeResult<(DecodedValue, usize)> {
+        let _scope = self.node_budget_scope(data.len());
         // Bit 0 is for the whole structure, field bits start at bit 1
         debug!(
             "Bitset: {:02x?} (size={}), total_fields={}",
@@ -1063,14 +1298,19 @@ impl PvdDecoder {
             }
         }
         if !has_field_bits && !bitset.is_empty() && (bitset[0] & 0x01) != 0 {
-            if let Ok((value, consumed)) = self.decode_structure(data, desc) {
-                return Ok((value, consumed));
+            match self.decode_structure(data, desc) {
+                Ok((value, consumed)) => return Ok((value, consumed)),
+                // A hostile input is not retried through the per-field walk.
+                Err(e) if is_hostile(&e) => return Err(e),
+                Err(_) => {}
             }
         }
 
         let mut fields: Vec<(String, DecodedValue)> = Vec::new();
         let mut offset = 0usize;
 
+        // Recursive decoder threads its whole state explicitly; a context struct would widen this byte-critical path.
+        #[allow(clippy::too_many_arguments)]
         fn decode_with_bitset_recursive(
             decoder: &PvdDecoder,
             data: &[u8],
@@ -1078,8 +1318,12 @@ impl PvdDecoder {
             desc: &StructureDesc,
             bitset: &[u8],
             bit_offset: &mut usize,
+            counts: &[usize],
             fields: &mut Vec<(String, DecodedValue)>,
-        ) -> bool {
+        ) -> DecodeResult<bool> {
+            // `Ok(false)` stops the walk leniently (short/garbled data, the
+            // partial structure is returned); a hostile error (`is_hostile`)
+            // is propagated so the guard is never a silent truncation.
             for field in &desc.fields {
                 let byte_idx = *bit_offset / 8;
                 let bit_idx = *bit_offset % 8;
@@ -1099,7 +1343,7 @@ impl PvdDecoder {
 
                 if let FieldType::Structure(nested_desc) = &field.field_type {
                     let child_start_bit = *bit_offset;
-                    let child_field_count = count_structure_fields(nested_desc);
+                    let child_field_count = counts[current_bit - 1];
 
                     let mut any_child_bits_set = false;
                     for i in 0..child_field_count {
@@ -1124,18 +1368,23 @@ impl PvdDecoder {
                     if field_present && !any_child_bits_set {
                         *bit_offset += child_field_count;
                         if *offset < data.len() {
-                            if let Ok((value, consumed)) =
-                                decoder.decode_structure(&data[*offset..], nested_desc)
-                            {
-                                debug!(
-                                    "Decoded full nested structure '{}', consumed {} bytes",
-                                    field.name, consumed
-                                );
-                                fields.push((field.name.clone(), value));
-                                *offset += consumed;
-                            } else {
-                                debug!("Failed to decode full nested structure '{}'", field.name);
-                                return false;
+                            match decoder.decode_structure(&data[*offset..], nested_desc) {
+                                Ok((value, consumed)) => {
+                                    debug!(
+                                        "Decoded full nested structure '{}', consumed {} bytes",
+                                        field.name, consumed
+                                    );
+                                    fields.push((field.name.clone(), value));
+                                    *offset += consumed;
+                                }
+                                Err(e) if is_hostile(&e) => return Err(e),
+                                Err(_) => {
+                                    debug!(
+                                        "Failed to decode full nested structure '{}'",
+                                        field.name
+                                    );
+                                    return Ok(false);
+                                }
                             }
                         }
                     } else if any_child_bits_set {
@@ -1147,9 +1396,10 @@ impl PvdDecoder {
                             nested_desc,
                             bitset,
                             bit_offset,
+                            counts,
                             &mut nested_fields,
-                        ) {
-                            return false;
+                        )? {
+                            return Ok(false);
                         }
                         debug!(
                             "Nested structure '{}' decoded {} fields",
@@ -1169,21 +1419,22 @@ impl PvdDecoder {
                             "Data exhausted at offset {} for field '{}'",
                             *offset, field.name
                         );
-                        return false;
+                        return Ok(false);
                     }
-                    if let Ok((value, consumed)) =
-                        decoder.decode_value(&data[*offset..], &field.field_type)
-                    {
-                        fields.push((field.name.clone(), value));
-                        *offset += consumed;
-                    } else {
-                        return false;
+                    match decoder.decode_value(&data[*offset..], &field.field_type) {
+                        Ok((value, consumed)) => {
+                            fields.push((field.name.clone(), value));
+                            *offset += consumed;
+                        }
+                        Err(e) if is_hostile(&e) => return Err(e),
+                        Err(_) => return Ok(false),
                     }
                 }
             }
-            true
+            Ok(true)
         }
 
+        let counts = subtree_field_counts(desc);
         let mut bit_offset = 1;
         decode_with_bitset_recursive(
             self,
@@ -1192,8 +1443,9 @@ impl PvdDecoder {
             desc,
             bitset,
             &mut bit_offset,
+            &counts,
             &mut fields,
-        );
+        )?;
         Ok((DecodedValue::Structure(fields), offset))
     }
 }
@@ -1211,6 +1463,29 @@ pub(crate) fn count_structure_fields(desc: &StructureDesc) -> usize {
         }
     }
     count
+}
+
+/// Descendant field-bit counts in bitset-bit order.
+///
+/// `counts[n]` is the number of bits owned by the *subtree* of the field
+/// addressed by bit `n + 1` (bit 0 is the whole structure and has no entry).
+/// Built once per decode so the bitset walk stops re-running
+/// `count_structure_fields` for every nested field of every frame.
+pub(crate) fn subtree_field_counts(desc: &StructureDesc) -> Vec<usize> {
+    let mut out = Vec::with_capacity(count_structure_fields(desc));
+    push_subtree_counts(desc, &mut out);
+    out
+}
+
+fn push_subtree_counts(desc: &StructureDesc, out: &mut Vec<usize>) {
+    for field in &desc.fields {
+        let slot = out.len();
+        out.push(0);
+        if let FieldType::Structure(nested) = &field.field_type {
+            push_subtree_counts(nested, out);
+        }
+        out[slot] = out.len() - slot - 1;
+    }
 }
 
 /// Extract a sub-field from a StructureDesc by dot-separated path.
@@ -1349,16 +1624,14 @@ fn format_field_value_compact(name: &str, val: &DecodedValue) -> String {
                     let severity = fields.iter().find(|(n, _)| n == "severity");
                     let message = fields.iter().find(|(n, _)| n == "message");
                     let mut parts = Vec::new();
-                    if let Some((_, DecodedValue::Int32(s))) = severity {
-                        if *s != 0 {
+                    if let Some((_, DecodedValue::Int32(s))) = severity
+                        && *s != 0 {
                             parts.push(format!("sev={}", s));
                         }
-                    }
-                    if let Some((_, DecodedValue::String(m))) = message {
-                        if !m.is_empty() {
+                    if let Some((_, DecodedValue::String(m))) = message
+                        && !m.is_empty() {
                             parts.push(format!("\"{}\"", m));
                         }
-                    }
                     if parts.is_empty() {
                         String::new() // Don't show alarm if it's OK
                     } else {
@@ -1419,7 +1692,7 @@ fn format_scalar_value(val: &DecodedValue) -> String {
             if arr.is_empty() {
                 "[]".to_string()
             } else {
-                let items: Vec<String> = arr.iter().map(|v| format_scalar_value(v)).collect();
+                let items: Vec<String> = arr.iter().map(format_scalar_value).collect();
                 format!("[{}]", items.join(", "))
             }
         }
@@ -1443,6 +1716,89 @@ fn format_scalar_value(val: &DecodedValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lenient contract: a descriptor that announces more fields than the
+    /// buffer holds yields `Ok` with the fields that did parse. Deliberate - see
+    /// the comment at the `break`. Change this test only with a protocol decision.
+    #[test]
+    fn truncated_descriptor_parses_leniently_by_design() {
+        let decoder = PvdDecoder::new(false);
+        // Build a well-formed 3-field structure descriptor, then cut it short so
+        // only the first field survives.
+        let mut desc = StructureDesc::new();
+        for name in ["a", "b", "c"] {
+            desc.fields.push(FieldDesc {
+                name: name.to_string(),
+                field_type: FieldType::Scalar(TypeCode::Int32),
+            });
+        }
+        // `encode_structure_desc` emits 11 bytes here: 1 (empty struct id) +
+        // 1 (field count 3) + 3 fields x 3 bytes (1-byte length + 1 name byte +
+        // 1 type tag). Dropping the last 6 leaves exactly the header plus field
+        // "a", so the loop parses one field and then breaks on `offset >= len`.
+        let full = crate::spvd_encode::encode_structure_desc(&desc, false);
+        assert_eq!(full.len(), 11, "descriptor layout changed; recompute the cut");
+        let cut = &full[..full.len() - 6];
+
+        let (parsed, _consumed) = decoder
+            .parse_structure_desc(cut)
+            .expect("lenient parse returns Ok, not Err");
+        // 11 bytes = 1 (0x80) + 1 (field count 3) + 3 x 3-byte fields; cutting
+        // 6 leaves exactly one complete field, so the lenient loop must stop
+        // after it. Pinned exactly: salvaging a second field would be a change.
+        assert_eq!(
+            parsed.fields.len(),
+            1,
+            "the test buffer must actually be short"
+        );
+        assert_eq!(parsed.fields[0].name, "a");
+    }
+
+    /// `counts[n]` must equal what `count_structure_fields` returns for the field
+    /// addressed by bit `n + 1`. Walk the descriptor independently and compare.
+    #[test]
+    fn subtree_field_counts_match_count_structure_fields() {
+        fn walk(desc: &StructureDesc, out: &mut Vec<usize>) {
+            for field in &desc.fields {
+                match &field.field_type {
+                    FieldType::Structure(nested) => {
+                        out.push(count_structure_fields(nested));
+                        walk(nested, out);
+                    }
+                    _ => out.push(0),
+                }
+            }
+        }
+
+        let mut leaf = StructureDesc::new();
+        leaf.fields.push(FieldDesc {
+            name: "deep".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+        let mut mid = StructureDesc::new();
+        mid.fields.push(FieldDesc {
+            name: "a".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+        mid.fields.push(FieldDesc {
+            name: "leaf".to_string(),
+            field_type: FieldType::Structure(leaf),
+        });
+        let mut top = StructureDesc::new();
+        top.fields.push(FieldDesc {
+            name: "mid".to_string(),
+            field_type: FieldType::Structure(mid),
+        });
+        top.fields.push(FieldDesc {
+            name: "z".to_string(),
+            field_type: FieldType::Scalar(TypeCode::Int32),
+        });
+
+        let mut expected = Vec::new();
+        walk(&top, &mut expected);
+        assert_eq!(subtree_field_counts(&top), expected);
+        assert_eq!(subtree_field_counts(&top).len(), count_structure_fields(&top));
+    }
 
     #[test]
     fn test_decode_size() {
@@ -1516,6 +1872,77 @@ mod tests {
         assert_eq!(d.max_struct_array, 65_536);
         assert_eq!(d.max_union_array, 65_536);
         assert_eq!(d.max_variant_array, 65_536);
+        assert_eq!(d.max_struct_fields, 65_536);
+        assert_eq!(d.max_depth, 32);
+    }
+
+    /// Site 5. `parse_structure_desc` reserved `Vec::with_capacity(count)`
+    /// straight off the wire. `Vec`'s allocation failure calls
+    /// `handle_alloc_error`, which aborts the process -- it is not a
+    /// catchable panic, so this must be rejected before the reserve.
+    ///
+    /// Driven with a *configured* small ceiling so the test never asks for a
+    /// real over-large allocation. The u32::MAX case is
+    /// `an_enormous_field_count_is_rejected_before_the_reserve` below.
+    #[test]
+    fn a_field_count_over_the_configured_limit_is_rejected() {
+        let decoder = PvdDecoder::with_limits(
+            false,
+            DecodeLimits {
+                max_struct_fields: 4,
+                ..DecodeLimits::default()
+            },
+        );
+        // 0x80 structure, empty struct id, nine fields declared, no field
+        // bytes at all.
+        let data = [0x80u8, 0x00, 0x09];
+        let err = decoder
+            .parse_introspection(&data)
+            .expect_err("a field count over the limit must be an error");
+        match err {
+            DecodeError::ArrayTooLarge { kind, count, limit } => {
+                assert_eq!(kind, "structure fields");
+                assert_eq!(count, 9);
+                assert_eq!(limit, 4);
+            }
+            other => panic!("expected ArrayTooLarge, got {other:?}"),
+        }
+    }
+
+    /// A realistic structure must still parse. The guard is a backstop, not a
+    /// new ceiling on real data.
+    #[test]
+    fn an_ordinary_structure_still_parses_under_the_field_limit() {
+        let decoder = PvdDecoder::new(false);
+        let mut data = vec![0x80u8, 0x00, 0x03];
+        for name in ["a", "bb", "ccc"] {
+            data.push(name.len() as u8);
+            data.extend_from_slice(name.as_bytes());
+            data.push(0x43); // float64
+        }
+        let desc = decoder.parse_introspection(&data).expect("parses");
+        assert_eq!(desc.fields.len(), 3);
+    }
+
+    /// The actual bomb from the review: a seven-byte blob declaring
+    /// `u32::MAX` fields. Pre-fix this reached
+    /// `Vec::<FieldDesc>::with_capacity(4_294_967_295)`, which aborts the
+    /// process; post-fix it is rejected on the count alone, with no
+    /// allocation at all.
+    #[test]
+    fn an_enormous_field_count_is_rejected_before_the_reserve() {
+        let decoder = PvdDecoder::new(false);
+        let mut data = vec![0x80u8, 0x00, 254];
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(data.len(), 7);
+        match decoder.parse_introspection(&data) {
+            Err(DecodeError::ArrayTooLarge { kind, count, limit }) => {
+                assert_eq!(kind, "structure fields");
+                assert_eq!(count, u32::MAX as usize);
+                assert_eq!(limit, 65_536);
+            }
+            other => panic!("expected ArrayTooLarge, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1839,5 +2266,465 @@ mod tests {
             panic!("expected an array");
         };
         assert_eq!(items.len(), 5);
+    }
+
+    /// Build a descriptor that nests `levels` structures inside each other.
+    ///
+    /// One level on the wire is: `0x80` (structure) + `0x00` (empty struct
+    /// id) + `0x01` (one field) + `0x00` (empty field name), then the next
+    /// level's type byte. The innermost structure is `0x80 0x00 0x00`
+    /// (empty id, zero fields).
+    fn nested_structure_desc(levels: usize) -> Vec<u8> {
+        assert!(levels >= 1);
+        let mut data = vec![0x80u8];
+        for _ in 0..levels - 1 {
+            data.extend_from_slice(&[0x00, 0x01, 0x00, 0x80]);
+        }
+        data.extend_from_slice(&[0x00, 0x00]);
+        data
+    }
+
+    /// Site 6. Nothing bounded the introspection recursion, so a crafted
+    /// descriptor could nest until the native stack overflowed -- an
+    /// immediate process kill, not an unwind.
+    ///
+    /// 65 levels is deliberately shallow enough that the *pre-fix* decoder
+    /// returns `Ok` rather than actually crashing the test runner: the test
+    /// fails cleanly and instantly on the missing error.
+    #[test]
+    fn a_deeply_nested_descriptor_is_rejected_at_the_depth_limit() {
+        let decoder = PvdDecoder::new(false);
+        let data = nested_structure_desc(65);
+        assert_eq!(data.len(), 259);
+        match decoder.parse_introspection(&data) {
+            Err(DecodeError::DepthExceeded { depth, limit }) => {
+                assert_eq!(limit, 32);
+                assert!(depth > limit, "depth {depth} should exceed limit {limit}");
+            }
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+    }
+
+    /// The bound must clear every real type. The deepest normative NT type
+    /// nests fewer than ten levels.
+    #[test]
+    fn a_realistically_nested_descriptor_still_parses() {
+        let decoder = PvdDecoder::new(false);
+        let desc = decoder
+            .parse_introspection(&nested_structure_desc(10))
+            .expect("ten levels is well inside the limit");
+        assert_eq!(desc.fields.len(), 1);
+    }
+
+    /// The counter is per-decoder state, and a `PvdDecoder` is reused for the
+    /// whole connection. If a rejected parse left the depth counter raised,
+    /// every subsequent decode on that connection would fail -- one hostile
+    /// frame would poison the channel.
+    #[test]
+    fn a_rejected_deep_parse_does_not_poison_the_decoder() {
+        let decoder = PvdDecoder::new(false);
+        assert!(decoder.parse_introspection(&nested_structure_desc(65)).is_err());
+        decoder
+            .parse_introspection(&nested_structure_desc(3))
+            .expect("the decoder must be usable again after a rejected parse");
+    }
+
+    /// The `Variant` arm of `decode_value` re-enters `parse_type_desc` on
+    /// wire bytes, so the same nesting arrives through the *value* path too.
+    #[test]
+    fn a_deeply_nested_variant_value_is_rejected() {
+        let decoder = PvdDecoder::new(false);
+        let data = nested_structure_desc(65);
+        match decoder.decode_value(&data, &FieldType::Variant) {
+            Err(DecodeError::DepthExceeded { .. }) => {}
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+    }
+
+    /// Depth of a decoded type tree, counted the way the wire recursion
+    /// counts it: a leaf is 1, a structure/union is 1 + its deepest field.
+    fn tree_depth(ft: &FieldType) -> usize {
+        match ft {
+            FieldType::Structure(d) | FieldType::StructureArray(d) => {
+                1 + d.fields.iter().map(|f| tree_depth(&f.field_type)).max().unwrap_or(0)
+            }
+            FieldType::Union(f) | FieldType::UnionArray(f) => {
+                1 + f.iter().map(|f| tree_depth(&f.field_type)).max().unwrap_or(0)
+            }
+            _ => 1,
+        }
+    }
+
+    /// Top-level structure with `fields` fields. Field `i` is
+    /// `0xFD key_i` + 25 one-field wrapper structures + `0xFE key_{i-1}`
+    /// (field 0 ends in an empty structure instead). Each field stays well
+    /// inside the wire depth limit, but every `0xFE` splices in the whole
+    /// previous chain, so the *resolved* tree grows by ~25 levels per field.
+    fn registry_chain_desc(fields: u8) -> Vec<u8> {
+        let mut data = vec![0x80u8, 0x00, fields];
+        for i in 0..fields {
+            data.push(0x00); // empty field name
+            data.push(0xFD);
+            data.extend_from_slice(&u16::from(i).to_le_bytes());
+            for _ in 0..25 {
+                data.extend_from_slice(&[0x80, 0x00, 0x01, 0x00]);
+            }
+            if i == 0 {
+                data.extend_from_slice(&[0x80, 0x00, 0x00]);
+            } else {
+                data.push(0xFE);
+                data.extend_from_slice(&u16::from(i - 1).to_le_bytes());
+            }
+        }
+        data
+    }
+
+    /// Review finding on site 6: a `0xFE` only-id reference clones a stored
+    /// type with O(1) wire recursion, so chaining `0xFD`/`0xFE` built an
+    /// unboundedly deep tree (and a stack overflow in the derived
+    /// `Clone`/`Drop`) while the wire nesting never passed 32.
+    #[test]
+    fn registry_references_cannot_build_a_tree_deeper_than_the_limit() {
+        let decoder = PvdDecoder::new(false);
+        match decoder.parse_introspection(&registry_chain_desc(3)) {
+            Err(DecodeError::DepthExceeded { depth, limit }) => {
+                assert_eq!(limit, 32);
+                assert!(depth > limit, "depth {depth} should exceed limit {limit}");
+            }
+            Ok(desc) => panic!(
+                "expected DepthExceeded, got Ok with a tree {} levels deep",
+                tree_depth(&FieldType::Structure(desc))
+            ),
+            Err(other) => panic!("expected DepthExceeded, got {other:?}"),
+        }
+        // The rejection must not poison the decoder either.
+        decoder
+            .parse_introspection(&nested_structure_desc(3))
+            .expect("the decoder must be usable again after a rejected parse");
+    }
+
+    /// Legitimate registry reuse inside the limit still resolves.
+    #[test]
+    fn a_shallow_registry_reference_still_resolves() {
+        let decoder = PvdDecoder::new(false);
+        let data = [
+            0x80, 0x00, 0x02, // top structure, two fields
+            0x01, b'a', 0xFD, 0x07, 0x00, 0x80, 0x00, 0x01, 0x01, b'x', 0x43,
+            0x01, b'b', 0xFE, 0x07, 0x00,
+        ];
+        let desc = decoder.parse_introspection(&data).expect("parses");
+        assert_eq!(desc.fields.len(), 2);
+        assert_eq!(desc.fields[0].field_type, desc.fields[1].field_type);
+        assert_eq!(tree_depth(&FieldType::Structure(desc)), 3);
+    }
+
+    /// Top-level structure whose field `i` is `0xFD key_i` + a structure
+    /// of four fields that all reference `key_{i-1}` with `0xFE` (field 0's
+    /// four fields are scalars). Each level costs ~23 wire bytes and adds one
+    /// level of height, but resolving the references multiplies the tree by
+    /// four, so the decoded tree has ~4^levels nodes.
+    fn fourway_chain_desc(levels: u8) -> Vec<u8> {
+        let mut data = vec![0x80u8, 0x00, levels];
+        for i in 0..levels {
+            data.push(0x00); // empty field name
+            data.push(0xFD);
+            data.extend_from_slice(&u16::from(i).to_le_bytes());
+            data.extend_from_slice(&[0x80, 0x00, 0x04]);
+            for _ in 0..4 {
+                if i == 0 {
+                    data.extend_from_slice(&[0x00, 0x43]); // empty name, float64
+                } else {
+                    data.extend_from_slice(&[0x00, 0xFE]); // empty name, only-id
+                    data.extend_from_slice(&u16::from(i - 1).to_le_bytes());
+                }
+            }
+        }
+        data
+    }
+
+    /// TRIAGE F1: `check_resolved_height` bounds depth but not breadth, so
+    /// a few hundred bytes of `0xFE` references expanded to 4^n type nodes
+    /// (1.41 s at n=11 in release, x4 per further 23 bytes). The per-decode
+    /// node budget must reject it promptly.
+    #[test]
+    fn a_fourway_registry_chain_is_rejected_by_the_node_budget() {
+        let decoder = PvdDecoder::new(false);
+        let data = fourway_chain_desc(12);
+        let start = std::time::Instant::now();
+        let result = decoder.parse_introspection(&data);
+        let elapsed = start.elapsed();
+        match result {
+            Err(DecodeError::Malformed(_)) => {}
+            Err(other) => panic!("expected Malformed (node budget), got {other:?}"),
+            Ok(desc) => panic!(
+                "expected the node budget to reject the chain, got Ok with {} fields after {elapsed:?}",
+                count_structure_fields(&desc)
+            ),
+        }
+        // The rejection itself is microseconds; 500 ms (not the triage's
+        // 50 ms) because this runs in an unoptimised debug build on loaded,
+        // shared CI hosts. BASE took seconds at n=11 and is ~x4 per level,
+        // so any regression blows far past this bound.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "rejection took {elapsed:?}"
+        );
+        // The rejection must not poison the decoder.
+        decoder
+            .parse_introspection(&nested_structure_desc(3))
+            .expect("the decoder must be usable again after a rejected parse");
+    }
+
+    /// The node budget is a backstop, not a ceiling on real types. Flat
+    /// structures up to the field-count ceiling (a very wide NTTable) and a
+    /// 7-level 4-way registry chain (~29K resolved nodes, every `0xFE`
+    /// legitimately reused) still decode.
+    #[test]
+    fn large_legitimate_structures_fit_the_node_budget() {
+        let decoder = PvdDecoder::new(false);
+
+        let flat = |fields: u32| {
+            let mut data = vec![0x80u8, 0x00, 254];
+            data.extend_from_slice(&fields.to_le_bytes());
+            for _ in 0..fields {
+                data.extend_from_slice(&[0x00, 0x43]); // empty name, float64
+            }
+            data
+        };
+        let desc = decoder
+            .parse_introspection(&flat(65_535))
+            .expect("a 65,535-field structure is inside the node budget");
+        assert_eq!(desc.fields.len(), 65_535);
+        // Literal nodes cost wire bytes, so the budget scales past the
+        // floor: the field-count ceiling (65,536) is the binding limit here.
+        let desc = decoder
+            .parse_introspection(&flat(65_536))
+            .expect("a 65,536-field structure is at the field-count ceiling");
+        assert_eq!(desc.fields.len(), 65_536);
+
+        let desc = decoder
+            .parse_introspection(&fourway_chain_desc(7))
+            .expect("a 7-level 4-way chain is inside the node budget");
+        let nodes = type_nodes(&FieldType::Structure(desc));
+        assert!(
+            (20_000..=65_536).contains(&nodes),
+            "expected a near-budget tree, got {nodes} nodes"
+        );
+    }
+
+    /// `0xFD key` + a structure of `fields` empty structures: `fields + 1`
+    /// nodes whose value is zero bytes, so every `0xFE` reference to it is
+    /// pure amplification (3 wire bytes, `fields + 1` nodes, no value bytes).
+    fn register_empty_struct_type(decoder: &PvdDecoder, key: u16, fields: u32) {
+        let mut data = vec![0xFDu8];
+        data.extend_from_slice(&key.to_le_bytes());
+        data.extend_from_slice(&[0x80, 0x00, 254]);
+        data.extend_from_slice(&fields.to_le_bytes());
+        for _ in 0..fields {
+            data.extend_from_slice(&[0x00, 0x80, 0x00, 0x00]); // "" : struct {}
+        }
+        decoder.parse_introspection(&data).expect("registers the type");
+    }
+
+    /// The budget covers a whole value, not each top-level field: a
+    /// structure whose many `Variant` fields each `0xFE`-reference one large
+    /// stored type must not get a fresh budget per field.
+    #[test]
+    fn variant_fields_share_one_node_budget_per_value() {
+        let decoder = PvdDecoder::new(false);
+        // Key 0 is 20,001 nodes with a zero-byte value.
+        register_empty_struct_type(&decoder, 0, 20_000);
+
+        // A value of four variant fields, each typed `0xFE 0x00 0x00`:
+        // 4 x 20K nodes from 12 bytes passes the ~66K budget.
+        let desc = StructureDesc {
+            struct_id: None,
+            fields: (0..4)
+                .map(|i| FieldDesc {
+                    name: format!("v{i}"),
+                    field_type: FieldType::Variant,
+                })
+                .collect(),
+        };
+        let value = [0xFEu8, 0x00, 0x00].repeat(4);
+        match decoder.decode_structure(&value, &desc) {
+            Err(DecodeError::Malformed(what)) => assert_eq!(what, NODE_BUDGET_EXCEEDED),
+            other => panic!("expected the node budget to reject, got {:?}", other.map(|(_, n)| n)),
+        }
+        // Three references fit, and the decoder is not poisoned.
+        let three = StructureDesc {
+            struct_id: None,
+            fields: desc.fields[..3].to_vec(),
+        };
+        decoder
+            .decode_structure(&value[..9], &three)
+            .expect("three references are inside the budget");
+    }
+
+    /// Review Important 1: a legitimate `any[]` whose node count is linear
+    /// in its bytes must decode. 22,000 elements, each a literal
+    /// `{double a; double b}` type (3 nodes) plus 16 value bytes, is 66K
+    /// nodes from ~550 KB; an absolute 64K budget rejected it.
+    #[test]
+    fn a_large_any_array_of_literal_structures_decodes() {
+        let decoder = PvdDecoder::new(false);
+        let n: u32 = 22_000;
+        let mut data = vec![254u8];
+        data.extend_from_slice(&n.to_le_bytes());
+        for _ in 0..n {
+            data.extend_from_slice(&[0x80, 0x00, 0x02, 0x01, b'a', 0x43, 0x01, b'b', 0x43]);
+            data.extend_from_slice(&1.5f64.to_le_bytes());
+            data.extend_from_slice(&2.5f64.to_le_bytes());
+        }
+        let (value, consumed) = decoder
+            .decode_value(&data, &FieldType::VariantArray)
+            .expect("a linear-size any[] is not amplification");
+        assert_eq!(consumed, data.len());
+        let DecodedValue::Array(items) = value else {
+            panic!("expected an array");
+        };
+        assert_eq!(items.len(), n as usize);
+    }
+
+    /// pvxs caches types and resends repeats as `0xFE`: an NTMultiChannel-like
+    /// `any[]` of 3,000 elements, the first defining a 25-node structure with
+    /// `0xFD` and the rest referencing it, charges ~75K nodes legitimately.
+    #[test]
+    fn a_large_any_array_of_cached_type_references_decodes() {
+        let decoder = PvdDecoder::new(false);
+        let n: u32 = 3_000;
+        let mut data = vec![254u8];
+        data.extend_from_slice(&n.to_le_bytes());
+        for i in 0..n {
+            if i == 0 {
+                data.extend_from_slice(&[0xFD, 0x05, 0x00, 0x80, 0x00, 24]);
+                for f in 0..24u8 {
+                    data.extend_from_slice(&[0x01, b'a' + f, 0x43]);
+                }
+            } else {
+                data.extend_from_slice(&[0xFE, 0x05, 0x00]);
+            }
+            data.extend(std::iter::repeat_n(0u8, 24 * 8));
+        }
+        let (value, consumed) = decoder
+            .decode_value(&data, &FieldType::VariantArray)
+            .expect("cached-type repeats carry their value bytes");
+        assert_eq!(consumed, data.len());
+        let DecodedValue::Array(items) = value else {
+            panic!("expected an array");
+        };
+        assert_eq!(items.len(), n as usize);
+    }
+
+    /// The amplification the budget exists for: a stored ~65K-node type
+    /// (built within budget) referenced by 1,000 consecutive `0xFE` refs in
+    /// one value, ~20,000x nodes per byte, is rejected.
+    #[test]
+    fn repeated_references_to_a_huge_stored_type_are_rejected() {
+        let decoder = PvdDecoder::new(false);
+        register_empty_struct_type(&decoder, 9, 65_535);
+        let n: u32 = 1_000;
+        let mut data = vec![254u8];
+        data.extend_from_slice(&n.to_le_bytes());
+        for _ in 0..n {
+            data.extend_from_slice(&[0xFE, 0x09, 0x00]);
+        }
+        let start = std::time::Instant::now();
+        match decoder.decode_value(&data, &FieldType::VariantArray) {
+            Err(DecodeError::Malformed(what)) => assert_eq!(what, NODE_BUDGET_EXCEEDED),
+            other => panic!(
+                "expected the node budget to reject, got {:?}",
+                other.map(|(_, n)| n)
+            ),
+        }
+        // Same debug/CI margin as the 4-way chain test.
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    /// Review Minor 1: the MONITOR delta walk turned a hostile error into a
+    /// silently truncated `Ok`, and the bit-0 fast path swallowed it and
+    /// retried. Both must surface it.
+    #[test]
+    fn delta_decode_surfaces_a_node_budget_error() {
+        let decoder = PvdDecoder::new(false);
+        register_empty_struct_type(&decoder, 0, 40_000);
+        let desc = StructureDesc {
+            struct_id: None,
+            fields: vec![
+                FieldDesc {
+                    name: "a".into(),
+                    field_type: FieldType::Variant,
+                },
+                FieldDesc {
+                    name: "b".into(),
+                    field_type: FieldType::Variant,
+                },
+            ],
+        };
+        // Two refs: 80K nodes from 6 bytes passes the ~66K budget.
+        let data = [0xFEu8, 0x00, 0x00].repeat(2);
+        for bitset in [[0b0000_0110u8], [0b0000_0001u8]] {
+            match decoder.decode_structure_with_bitset_body(&data, &desc, &bitset) {
+                Err(DecodeError::Malformed(what)) => assert_eq!(what, NODE_BUDGET_EXCEEDED),
+                other => panic!(
+                    "bitset {bitset:02x?}: expected the node budget error, got {:?}",
+                    other.map(|(_, n)| n)
+                ),
+            }
+        }
+        // One ref fits, and the walk still decodes it.
+        let (value, _) = decoder
+            .decode_structure_with_bitset_body(&data[..3], &desc, &[0b0000_0010])
+            .expect("one reference is inside the budget");
+        let DecodedValue::Structure(fields) = value else {
+            panic!("expected a structure");
+        };
+        assert_eq!(fields.len(), 1);
+    }
+
+    /// The proportional budget is capped at `MAX_DECODE_NODES` for large
+    /// frames. Unit-tested on the budget computation: an end-to-end frame
+    /// would have to build ~1M type nodes before rejection.
+    #[test]
+    fn the_node_ceiling_is_proportional_then_capped() {
+        let floor = DecodeLimits::default().max_struct_fields;
+        assert_eq!(MAX_DECODE_NODES, 1_048_576);
+        assert_eq!(node_ceiling(floor, 0), floor);
+        assert_eq!(node_ceiling(floor, 1_000), floor + 16_000);
+        // 16 * 100 KB = 1.6M would exceed the cap.
+        assert_eq!(node_ceiling(floor, 100_000), MAX_DECODE_NODES);
+        assert_eq!(node_ceiling(floor, usize::MAX), MAX_DECODE_NODES);
+        // A configured field ceiling above the cap is never undercut.
+        assert_eq!(node_ceiling(8_000_000, 100_000), 8_000_000);
+        // A stored 65,536-node type referenced 17 times (~1.11M nodes) in a
+        // 100 KB value fits the proportional share but not the cap.
+        let expansion = 17 * 65_536;
+        assert!(expansion < floor + NODES_PER_BYTE * 100_000);
+        assert!(expansion > node_ceiling(floor, 100_000));
+    }
+
+    /// Re-review residual: `input_len` counts bytes after the descriptor, so
+    /// trailing padding raises a hostile descriptor's proportional share. The
+    /// n=12 4-way chain plus 64 KB of padding must still be rejected, now at
+    /// the 1M-node ceiling, within the same debug/CI time bound as the bare
+    /// chain.
+    #[test]
+    fn a_padded_fourway_chain_is_rejected_at_the_ceiling() {
+        let decoder = PvdDecoder::new(false);
+        let mut data = fourway_chain_desc(12);
+        data.extend(std::iter::repeat_n(0u8, 64 * 1024));
+        let start = std::time::Instant::now();
+        let result = decoder.parse_introspection(&data);
+        let elapsed = start.elapsed();
+        match result {
+            Err(DecodeError::Malformed(what)) => assert_eq!(what, NODE_BUDGET_EXCEEDED),
+            Err(other) => panic!("expected the node budget error, got {other:?}"),
+            Ok(_) => panic!("expected the node budget to reject the padded chain"),
+        }
+        // Same debug/loaded-CI margin as the bare chain test.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "rejection took {elapsed:?}"
+        );
     }
 }

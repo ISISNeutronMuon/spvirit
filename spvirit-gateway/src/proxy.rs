@@ -10,20 +10,23 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::ControlFlow;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use spvirit_codec::spvd_decode::DecodedValue;
+use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::pvstore::{PvInfo, Source, TryClaim};
 use spvirit_types::NtPayload;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::access::{AccessControl, Decision, Identity, Op};
-use crate::bridge::{merge_monitor_delta, nt_payload_from_decoded, nt_payload_from_get};
-use crate::cache::monitor::{MonitorCache, MonitorKey};
+use crate::bridge::{
+    merge_monitor_delta, nt_payload_from_decoded, nt_payload_from_get, patch_nt_payload,
+};
+use crate::cache::monitor::{MonitorCache, MonitorKey, UpstreamState};
 use crate::convert::decoded_to_json;
 use crate::cache::negative::NegativeCache;
+use crate::lockutil::{lock_or_recover, try_lock_or_recover};
 use crate::loopguard::LoopGuard;
 use crate::upstream::UpstreamPool;
 
@@ -77,14 +80,57 @@ fn current_identity() -> Identity {
 pub struct Binding {
     pub client_name: String,
     pub real_name: String,
-    /// The upstream introspection's `StructureDesc.struct_id` (e.g.
-    /// `"epics:nt/NTScalar:1.0"`), captured at `claim` time so `subscribe`
-    /// can stamp monitored payloads with the same struct id `get` already
-    /// reports (`nt_payload_from_get` sources it from
-    /// `PvGetResult::introspection` directly; `subscribe` has no per-tick
-    /// introspection round-trip, so it must carry this forward from claim).
-    struct_id: Option<String>,
+    /// The upstream introspection captured at resolve time.
+    ///
+    /// Held in full (not just `struct_id`) so `claim` can answer a repeat call
+    /// straight from this map instead of going back to the wire, and so
+    /// `subscribe` can keep stamping monitored payloads with the same struct
+    /// id `get` reports (`nt_payload_from_get` sources it from
+    /// `PvGetResult::introspection`; `subscribe` has no per-tick introspection
+    /// round trip, so it must carry this forward from claim).
+    pub descriptor: StructureDesc,
+    /// When this binding was last confirmed against upstream. Bounds how long
+    /// the fast path in `claim` may answer from memory.
+    pub bound_at: Instant,
     last_get: Mutex<Option<(Instant, NtPayload)>>,
+}
+
+/// How often each live upstream monitor's supervisor asks the cache whether
+/// every downstream subscriber has gone.
+///
+/// This is the resolution of the idle-linger fix: a PV that stops ticking is
+/// never noticed by `dispatch_or_retire`, which only runs on a tick. Coarse on
+/// purpose — one timer wakeup per live upstream monitor, and a few seconds of
+/// extra upstream subscription is not worth a tighter loop.
+const IDLE_SWEEP: Duration = Duration::from_secs(2);
+
+/// Fires its channel when dropped.
+///
+/// Moved into the upstream monitor callback, which the client's subscription
+/// task owns and drops exactly when that task ends — on every exit path,
+/// including an early connect error before the first update. That makes the
+/// receiving half a prompt "the subscription task is over" signal, which the
+/// frozen `MonitorHandle` API does not otherwise offer without giving up the
+/// handle (its only completion future is the consuming `join`).
+struct EndSignal(Option<oneshot::Sender<()>>);
+
+impl Drop for EndSignal {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Forget the binding for downstream `name`.
+///
+/// A free function over the map rather than a `GatewaySource` method because
+/// `subscribe`'s spawned upstream task is `'static` and holds only the
+/// `Arc<Mutex<..>>`, not `&self`. Both that task and
+/// [`GatewaySource::retire_binding`] go through here, so the teardown rule
+/// documented on `retire_binding` has exactly one implementation.
+fn retire_binding_in(bindings: &Mutex<HashMap<String, Binding>>, name: &str) {
+    lock_or_recover(bindings).remove(name);
 }
 
 /// A [`Source`] that resolves and forwards PVs to upstream PVA servers.
@@ -115,6 +161,17 @@ pub struct GatewaySource {
     /// ACF) lives entirely inside `AccessControl::decide` — this source only
     /// calls it and applies the returned `Decision`.
     access: Arc<AccessControl>,
+    /// How long a binding may answer `claim` without going back upstream.
+    ///
+    /// A staleness bound, not an eviction policy: an expired binding is
+    /// re-resolved and refreshed in place, never dropped. 30 s is the order of
+    /// magnitude of a PVA client's own search backoff, so a genuinely
+    /// restructured IOC is picked up in roughly the time a direct client would
+    /// take to notice.
+    binding_ttl: Duration,
+    /// How many times this source has gone to the wire to resolve a name.
+    /// Exposed for tests proving the binding fast path actually short-circuits.
+    resolves: std::sync::atomic::AtomicU64,
 }
 
 impl GatewaySource {
@@ -140,6 +197,8 @@ impl GatewaySource {
             monitors: Arc::new(MonitorCache::new()),
             deaths: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             access,
+            binding_ttl: Duration::from_secs(30),
+            resolves: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -148,6 +207,20 @@ impl GatewaySource {
     /// onto a single upstream monitor task.
     pub fn upstream_monitor_count(&self) -> usize {
         self.monitors.upstream_count()
+    }
+
+    /// Override the binding staleness bound. Test-serving builder; production
+    /// takes the 30 s default from [`GatewaySource::new`].
+    pub fn with_binding_ttl(mut self, ttl: Duration) -> Self {
+        self.binding_ttl = ttl;
+        self
+    }
+
+    /// How many upstream resolutions (`pvinfo_full` attempts) this source has
+    /// issued. Exposed for tests proving repeat claims are answered from the
+    /// binding map rather than from the wire.
+    pub fn upstream_resolve_count(&self) -> u64 {
+        self.resolves.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Names of the upstream channels currently held in the monitor cache —
@@ -171,13 +244,23 @@ impl GatewaySource {
     /// falls back to normal PVA search backoff and recovers on its own when
     /// the IOC returns.
     pub fn retire_binding(&self, name: &str) {
-        self.bindings.lock().unwrap().remove(name);
+        retire_binding_in(&self.bindings, name);
     }
 
     /// Number of upstream monitors torn down because their upstream ended.
     /// Mirrored onto `/metrics` as `spgateway_upstream_monitor_deaths_total`.
     pub fn upstream_monitor_deaths(&self) -> u64 {
         self.deaths.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many bindings currently hold a cached `get` value. Exposed for
+    /// tests proving the getholdoff cache is filled when the feature is on and
+    /// left completely alone when `getholdoff = 0`.
+    pub fn getholdoff_cache_len(&self) -> usize {
+        lock_or_recover(&self.bindings)
+            .values()
+            .filter(|b| lock_or_recover(&b.last_get).is_some())
+            .count()
     }
 }
 
@@ -192,7 +275,7 @@ impl Source for GatewaySource {
         if let Decision::Deny = self.access.decide(Op::Get, name, &current_identity()) {
             return TryClaim::No;
         }
-        let Ok(bindings) = self.bindings.try_lock() else {
+        let Some(bindings) = try_lock_or_recover(&self.bindings) else {
             return TryClaim::Unknown;
         };
         if bindings.contains_key(name) {
@@ -223,36 +306,159 @@ impl Source for GatewaySource {
                 Decision::AllowAliased(real) => real,
             };
 
-            for client_name in &self.client_order {
-                let Some(client) = self.pool.client(client_name) else {
-                    continue;
-                };
-                if let Ok((descriptor, server_addr, guid)) = client.pvinfo_full(&target).await {
-                    // Loop / self-connection prevention: if this name resolved
-                    // back into one of our own downstream server sockets (or an
-                    // `ignoreaddr` host), or the responder's GUID matches one of
-                    // our own servers' GUIDs, do NOT bind it — forwarding would
-                    // loop a search into ourselves. Skip to the next client.
-                    if self.guard.is_banned(server_addr) || self.guard.is_guid_banned(&guid) {
-                        continue;
-                    }
-                    self.bindings.lock().unwrap().insert(
-                        name.clone(),
-                        Binding {
-                            client_name: client_name.clone(),
-                            real_name: target.clone(),
-                            struct_id: descriptor.struct_id.clone(),
-                            last_get: Mutex::new(None),
-                        },
-                    );
+            // Fast path. `SourceRegistry` calls `claim` before EVERY
+            // get/put/subscribe/rpc/pushes_own_updates, so without this each
+            // downstream operation pays a fresh UDP search + TCP connect +
+            // CreateChannel + GET_FIELD whose only product — the
+            // `StructureDesc` — this map already holds.
+            //
+            // Three guards keep the shortcut honest, and their order matters:
+            //  * the negative cache and the access decision above already ran,
+            //    so a denied or negatively-cached name is never answered from a
+            //    stale binding (the same precedence `try_claim` uses);
+            //  * `real_name == target`, because the binding is keyed on the
+            //    *downstream* name while a pvlist ALIAS can map that name to a
+            //    different upstream target for a different identity —
+            //    answering with another identity's descriptor would be wrong;
+            //  * `bound_at` within `binding_ttl`, so an upstream that
+            //    restructured while nothing was monitoring it is re-resolved
+            //    within a bounded window rather than never.
+            //
+            // The loop guard is deliberately NOT re-checked here, and the
+            // honest reason is narrower than "the binding is already
+            // vetted". A binding exists only because some earlier resolve
+            // passed `is_banned`/`is_guid_banned` below — but `Binding` pins
+            // no address and no GUID, so that guarantee covers the address
+            // resolved *then*, not the address the next `pvget`/`pvput` will
+            // find: the data path re-searches every operation
+            // (`PvaClient::pvget` runs a fresh `low_level_pvget`). So a name
+            // that starts resolving to a banned address while a binding is
+            // live is answered unguarded until the binding expires.
+            //
+            // That TOCTOU is pre-existing — even before the fast path, claim
+            // validated the address *its own* search found, not the one the
+            // data path would re-resolve a moment later — but the fast path
+            // widens the window from roughly one search to `binding_ttl`.
+            // Accepted because `LoopGuard` is built once per server at
+            // startup (`runtime.rs`) and never replaced, so the ban set
+            // cannot change under a live binding; the only mover is upstream
+            // itself migrating onto a banned address, which the TTL bounds.
+            // Revisit this skip if either premise goes: a `LoopGuard` that
+            // can be reloaded, a `Binding` that pins its resolved address or
+            // GUID (then re-check it cheaply here), or client-side
+            // connection caching that makes the data path stop re-searching.
+            {
+                let bindings = lock_or_recover(&self.bindings);
+                if let Some(binding) = bindings.get(&name)
+                    && binding.real_name == target
+                    && now.duration_since(binding.bound_at) < self.binding_ttl
+                {
                     return Some(PvInfo {
-                        descriptor,
+                        descriptor: binding.descriptor.clone(),
                         writable: true,
                     });
                 }
             }
 
-            self.neg.record_miss(&name, now);
+            for client_name in &self.client_order {
+                let Some(client) = self.pool.client(client_name) else {
+                    continue;
+                };
+                self.resolves
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let (descriptor, server_addr, guid) = match client.pvinfo_full(&target).await {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        // Downstream a failed resolve is indistinguishable from
+                        // "no such PV", so this line is the only place the
+                        // difference is recorded. `debug` rather than `warn`:
+                        // on a multi-client gateway most clients legitimately
+                        // do not host most names, so a miss here is routine.
+                        tracing::debug!(
+                            "gateway: upstream resolve failed for downstream={name:?} \
+                             real={target:?} via client={client_name:?}: {e}"
+                        );
+                        continue;
+                    }
+                };
+                // Loop / self-connection prevention: if this name resolved
+                // back into one of our own downstream server sockets (or an
+                // `ignoreaddr` host), or the responder's GUID matches one of
+                // our own servers' GUIDs, do NOT bind it — forwarding would
+                // loop a search into ourselves. Skip to the next client.
+                if self.guard.is_banned(server_addr) || self.guard.is_guid_banned(&guid) {
+                    continue;
+                }
+                {
+                    let mut bindings = lock_or_recover(&self.bindings);
+                    // Two statements, not one `match` with an `insert` in
+                    // its fallback arm: `get_mut`'s borrow of `bindings`
+                    // would still be live in that arm, and the borrow
+                    // checker rejects it (NLL problem case 3). Reducing
+                    // the match to a `bool` ends the borrow at the
+                    // semicolon.
+                    let refreshed = match bindings.get_mut(&name) {
+                        // Refresh in place. Replacing the whole `Binding`
+                        // (what this used to do) resets `last_get` to
+                        // `None` — and `SourceRegistry` claims immediately
+                        // before every `get`, so the getholdoff cache was
+                        // wiped before every read it was meant to serve.
+                        Some(existing)
+                            if existing.client_name == *client_name
+                                && existing.real_name == target =>
+                        {
+                            // An upstream that restructured invalidates the
+                            // cached value: `handler.rs` encodes whatever
+                            // `last_get` holds against the descriptor this
+                            // binding currently advertises, so serving a
+                            // payload cached against the superseded one
+                            // emits a frame whose data does not match its
+                            // own introspection — and in this protocol one
+                            // malformed frame takes the whole TCP
+                            // connection down, not just that value. Do NOT
+                            // simplify this to an unconditional refresh:
+                            // the equality check is what keeps a stale
+                            // payload from outliving its structure. It is
+                            // equally not an unconditional clear — that
+                            // would wipe the cache on every claim and so
+                            // disable getholdoff altogether, which is the
+                            // very bug the in-place refresh above fixes.
+                            if existing.descriptor != descriptor {
+                                *lock_or_recover(&existing.last_get) = None;
+                            }
+                            existing.descriptor = descriptor.clone();
+                            existing.bound_at = Instant::now();
+                            true
+                        }
+                        // A different client or a different upstream target
+                        // is a different binding: the cached value came
+                        // from somewhere else and must not carry over.
+                        _ => false,
+                    };
+                    if !refreshed {
+                        bindings.insert(
+                            name.clone(),
+                            Binding {
+                                client_name: client_name.clone(),
+                                real_name: target.clone(),
+                                descriptor: descriptor.clone(),
+                                bound_at: Instant::now(),
+                                last_get: Mutex::new(None),
+                            },
+                        );
+                    }
+                }
+                return Some(PvInfo {
+                    descriptor,
+                    writable: true,
+                });
+            }
+
+            // Stamped now, not with the `now` taken at entry: the loop above
+            // just spent a full `PvaClient` operation timeout per configured
+            // client, and charging that against this entry would make any TTL
+            // shorter than the search expire the moment it is written.
+            self.neg.record_miss(&name, Instant::now());
             None
         })
     }
@@ -266,16 +472,21 @@ impl Source for GatewaySource {
             // within this block, before any `.await` — never held across
             // one.
             let (client_name, real_name) = {
-                let bindings = self.bindings.lock().unwrap();
+                let bindings = lock_or_recover(&self.bindings);
                 let binding = bindings.get(&name)?;
 
-                let cache = binding.last_get.lock().unwrap();
-                if let Some((t_last, payload)) = cache.as_ref()
-                    && Instant::now() < *t_last + Duration::from_millis(self.getholdoff_ms as u64)
-                {
-                    return Some(payload.clone());
+                // `getholdoff = 0` (the default) means the feature is off: the
+                // window can never be satisfied, so do not even take the inner
+                // lock to compare against a zero-length window.
+                if self.getholdoff_ms > 0 {
+                    let cache = lock_or_recover(&binding.last_get);
+                    if let Some((t_last, payload)) = cache.as_ref()
+                        && Instant::now()
+                            < *t_last + Duration::from_millis(self.getholdoff_ms as u64)
+                    {
+                        return Some(payload.clone());
+                    }
                 }
-                drop(cache);
 
                 (binding.client_name.clone(), binding.real_name.clone())
             };
@@ -284,12 +495,27 @@ impl Source for GatewaySource {
             match client.pvget(&real_name).await {
                 Ok(result) => {
                     let payload = nt_payload_from_get(&result);
-                    if let Some(binding) = self.bindings.lock().unwrap().get(&name) {
-                        *binding.last_get.lock().unwrap() = Some((Instant::now(), payload.clone()));
+                    // Only fill the cache when the feature is on: with the
+                    // default 0 the read above can never hit, so the clone and
+                    // the two locks would be pure cost on every read.
+                    if self.getholdoff_ms > 0
+                        && let Some(binding) = lock_or_recover(&self.bindings).get(&name)
+                    {
+                        *lock_or_recover(&binding.last_get) = Some((Instant::now(), payload.clone()));
                     }
                     Some(payload)
                 }
-                Err(_) => None,
+                Err(e) => {
+                    // `warn`, not `debug`: unlike `claim`, this PV is already
+                    // bound — the upstream answered a resolve for it moments
+                    // ago — so a failing read is a real fault, not a routine
+                    // miss.
+                    tracing::warn!(
+                        "gateway: upstream get failed for downstream={name:?} \
+                             real={real_name:?} via client={client_name:?}: {e}"
+                    );
+                    None
+                }
             }
         })
     }
@@ -300,19 +526,23 @@ impl Source for GatewaySource {
         value: &DecodedValue,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>> {
         let name = name.to_string();
+        // Converted eagerly (before `Box::pin`) only because `value` is a
+        // borrow the returned future must not capture; the RESULT is not
+        // inspected until after the access decision below, so a denied put
+        // never surfaces a conversion error.
         let json = decoded_to_json(value);
         Box::pin(async move {
-            let json = json?;
-
             if let Decision::Deny = self.access.decide(Op::Put, &name, &current_identity()) {
                 return Err("access denied".to_string());
             }
+
+            let json = json?;
 
             // Resolve the binding and clone out what's needed before the
             // `.await` below — never hold the bindings-map MutexGuard across
             // an await point, matching `get`'s discipline.
             let (client_name, real_name) = {
-                let bindings = self.bindings.lock().unwrap();
+                let bindings = lock_or_recover(&self.bindings);
                 let binding = bindings
                     .get(&name)
                     .ok_or_else(|| format!("no binding for unclaimed PV {name:?}"))?;
@@ -343,12 +573,12 @@ impl Source for GatewaySource {
         let name = name.to_string();
         Box::pin(async move {
             let (client_name, real_name, struct_id) = {
-                let bindings = self.bindings.lock().unwrap();
+                let bindings = lock_or_recover(&self.bindings);
                 let binding = bindings.get(&name)?;
                 (
                     binding.client_name.clone(),
                     binding.real_name.clone(),
-                    binding.struct_id.clone().unwrap_or_default(),
+                    binding.descriptor.struct_id.clone().unwrap_or_default(),
                 )
             };
 
@@ -360,59 +590,117 @@ impl Source for GatewaySource {
             let down_name = name.clone();
 
             let rx = self.monitors.subscribe(key.clone(), move |entry| {
-                tokio::spawn(async move {
-                    let mut last_full = DecodedValue::Null;
-                    // Set by the callback IMMEDIATELY BEFORE it returns
-                    // `Break`, i.e. ONLY on the "last subscriber left" path.
-                    //
-                    // This flag is load-bearing and cannot be replaced by
-                    // inspecting `pvmonitor`'s `Result`: a clean upstream EOF
-                    // and a callback-requested stop BOTH surface as `Ok(())`,
-                    // so a Result-based test would either miss real upstream
-                    // deaths or double-retire an entry `dispatch_or_retire`
-                    // has already removed (and possibly clobber a replacement
-                    // entry created for the same key in the meantime).
-                    let stopped_by_callback = Arc::new(AtomicBool::new(false));
-                    let callback_stopped = stopped_by_callback.clone();
-                    let callback_entry = entry.clone();
-                    let callback_monitors = monitors.clone();
-                    let callback_key = key.clone();
-                    let result = client
-                        .pvmonitor(&real_name, move |update| {
-                            merge_monitor_delta(&mut last_full, update);
-                            let payload = nt_payload_from_decoded(&last_full, struct_id.clone());
-                            if callback_monitors.dispatch_or_retire(
-                                &callback_key,
-                                &callback_entry,
-                                payload,
-                            ) {
-                                ControlFlow::Continue(())
-                            } else {
-                                callback_stopped.store(true, Ordering::SeqCst);
-                                ControlFlow::Break(())
-                            }
-                        })
-                        .await;
+                let mut last_full = DecodedValue::Null;
+                // The payload handed to subscribers, kept across ticks so a
+                // delta can be patched into it instead of rebuilding the whole
+                // structure.
+                let mut cached_payload: Option<NtPayload> = None;
+                let callback_entry = entry.clone();
+                let callback_monitors = monitors.clone();
+                let callback_key = key.clone();
+                let (end_tx, mut ended) = oneshot::channel();
+                let end_signal = EndSignal(Some(end_tx));
 
-                    if stopped_by_callback.load(Ordering::SeqCst) {
-                        // Last subscriber left. `dispatch_or_retire` already
-                        // removed this key's entry from the map (atomically,
-                        // under the map lock) the moment it decided the
-                        // upstream loop should end. This is the existing,
-                        // correct shutdown path: nothing to clean up, and no
-                        // fault to report.
-                        return;
+                // `pvmonitor_spawn` runs the subscription on its own task and
+                // hands back a handle immediately. There is no
+                // `stopped_by_callback` flag any more: the entry owning (or not
+                // owning) the handle IS the record of whether the stop was
+                // deliberate, and unlike the flag it cannot go stale, because
+                // it is the same object the cancellation acts on.
+                let handle = client.pvmonitor_spawn(&real_name, move |update| {
+                    // Owned by the callback so that it is dropped — and fires —
+                    // when the subscription task ends. See `EndSignal`.
+                    let _end_signal = &end_signal;
+                    merge_monitor_delta(&mut last_full, update);
+
+                    // Patch in place when the delta names its changed fields;
+                    // only rebuild (re-converting every field of the
+                    // structure) when it cannot be applied incrementally — a
+                    // whole-structure delta, the first tick, or a path the
+                    // payload does not yet have.
+                    let needs_rebuild = match cached_payload.as_mut() {
+                        Some(cached) => !patch_nt_payload(cached, &last_full, update),
+                        None => true,
+                    };
+                    if needs_rebuild {
+                        cached_payload =
+                            Some(nt_payload_from_decoded(&last_full, struct_id.clone()));
+                    }
+                    let payload = cached_payload.as_ref().expect("filled immediately above");
+
+                    if callback_monitors.dispatch_or_retire(&callback_key, &callback_entry, payload)
+                    {
+                        ControlFlow::Continue(())
+                    } else {
+                        // Belt and braces: `dispatch_or_retire` has already
+                        // cancelled us on its way out, so this only matters if
+                        // the cancel signal loses a race with the next update.
+                        ControlFlow::Break(())
+                    }
+                });
+                entry.attach_upstream(handle);
+
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(IDLE_SWEEP);
+                    // `interval` yields immediately on its first tick; skip it
+                    // so a subscription is never swept before it has run.
+                    ticker.tick().await;
+                    loop {
+                        tokio::select! {
+                            // Death BEFORE idleness: the end signal is polled
+                            // first, so a sweep never runs once the
+                            // subscription task is over, and an upstream close
+                            // is acted on at once instead of on the next tick.
+                            biased;
+                            _ = &mut ended => break,
+                            _ = ticker.tick() => {
+                                // Same rule inside the tick: a task that has
+                                // finished but whose signal is not yet seen is
+                                // a death, never an idle retire — sweeping it
+                                // would leave its binding answering `Yes` to
+                                // the next search (design spec §4).
+                                match entry.upstream_state() {
+                                    UpstreamState::Running => {}
+                                    // A tick that found `subs` empty already
+                                    // retired and cancelled this entry.
+                                    UpstreamState::Cancelled => return,
+                                    UpstreamState::Finished => break,
+                                }
+                                if monitors.retire_if_idle(&key, &entry) {
+                                    // Every downstream receiver is gone and no
+                                    // upstream tick was ever going to notice.
+                                    // The entry is out of the map and the
+                                    // subscription is cancelled. Not a fault:
+                                    // no death counted, no binding retired (the
+                                    // PV is still perfectly claimable).
+                                    return;
+                                }
+                            }
+                        }
                     }
 
-                    // Upstream ended — an error, or a clean EOF. Either way
-                    // there will never be another fan-out for this key, so
-                    // nothing else will ever tear the entry down.
+                    // The subscription task is over. Whether that was
+                    // deliberate is decided by the handle, not by timing:
+                    // every deliberate stop (`dispatch_or_retire`, `retire`,
+                    // `retire_if_idle`) takes the handle off the entry BEFORE
+                    // the task can end, so a handle still attached here means
+                    // the upstream ended on its own — closed (the client
+                    // surfaces that as `Err(Io)` from `join`), errored, or
+                    // never connected. A callback `Break` cannot get here with
+                    // the handle attached: it is always preceded by
+                    // `dispatch_or_retire`'s take. Taking it also keeps the
+                    // reason, which `retire`'s own cancel would throw away.
+                    let Some(handle) = entry.take_upstream() else {
+                        return;
+                    };
                     monitors.retire(&key, &entry);
                     // Without this, `try_claim` keeps answering `Yes` from the
                     // bindings map and a destroyed client hot-loops straight
                     // back into the dead upstream (design spec §4).
-                    bindings.lock().unwrap().remove(&down_name);
+                    retire_binding_in(&bindings, &down_name);
                     deaths.fetch_add(1, Ordering::Relaxed);
+                    // Already finished, so this resolves at once.
+                    let end = handle.join().await;
                     tracing::warn!(
                         "upstream monitor ended for real='{}' downstream='{}' via client='{}' \
                          ({:?}); retired the cache entry and binding and closed every \
@@ -420,30 +708,18 @@ impl Source for GatewaySource {
                         real_name,
                         down_name,
                         client_name,
-                        result.err(),
+                        end,
                     );
                     // LAST, deliberately: dropping the `Sender`s is the
                     // observable "upstream is gone" edge — it is what wakes
-                    // every downstream receiver with `rx.recv() == None` and,
-                    // once Layer 2 lands, what makes the server-side pump send
-                    // DESTROY_CHANNEL. Everything a woken client might
-                    // immediately observe (the retired cache entry, the retired
-                    // binding, the death count) must already be committed
-                    // before we signal, or a client re-searching the instant it
-                    // is woken can still be answered `Yes` from a binding we
-                    // were about to remove — the §4 hot loop.
-                    //
-                    // Honest note on why this call exists at all: today it is
-                    // *equivalent* to simply returning from this task, because
-                    // the only surviving `Arc<MonitorEntry>` clones are this
-                    // task's `entry` and the one the `pvmonitor` callback held
-                    // (already dropped with the callback), so the senders would
-                    // die microseconds later anyway. The call earns its place
-                    // by making the edge explicit and correctly ordered, and it
-                    // becomes strictly load-bearing the moment anything holds
-                    // an `Arc<MonitorEntry>` clone past this task's return.
-                    // Do not delete it on the grounds that a test still passes
-                    // without it.
+                    // every downstream receiver with `rx.recv() == None` and
+                    // what makes the server-side pump send DESTROY_CHANNEL.
+                    // Everything a woken client might immediately observe (the
+                    // retired cache entry, the retired binding, the death
+                    // count) must already be committed before we signal, or a
+                    // client re-searching the instant it is woken can still be
+                    // answered `Yes` from a binding we were about to remove —
+                    // the §4 hot loop.
                     entry.close_all();
                 });
             });
@@ -474,8 +750,9 @@ impl Source for GatewaySource {
         })
     }
 
-    /// Returns the sorted, deduplicated set of PV names this gateway has
-    /// already successfully `claim`ed (the keys of `bindings`), *not* a full
+    /// Returns the sorted set of PV names this gateway has already
+    /// successfully `claim`ed (the keys of `bindings`, so unique by
+    /// construction), *not* a full
     /// enumeration of every name available upstream.
     ///
     /// The plan's original design called for the union of `pvlist` results
@@ -489,11 +766,10 @@ impl Source for GatewaySource {
     /// §14 / M2).
     fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
         let mut names: Vec<String> = {
-            let bindings = self.bindings.lock().unwrap();
+            let bindings = lock_or_recover(&self.bindings);
             bindings.keys().cloned().collect()
         };
         names.sort();
-        names.dedup();
         Box::pin(async move { names })
     }
 }
@@ -503,6 +779,77 @@ mod tests {
     use super::*;
     use crate::config::GatewayConfig;
     use std::time::Duration;
+
+    fn test_binding(client: &str, real: &str) -> Binding {
+        Binding {
+            client_name: client.to_string(),
+            real_name: real.to_string(),
+            descriptor: StructureDesc::default(),
+            bound_at: Instant::now(),
+            last_get: Mutex::new(None),
+        }
+    }
+
+    /// The teardown rule documented on `retire_binding` (design spec §4) must
+    /// have exactly one implementation, shared by the `&self` entry point and
+    /// by `subscribe`'s `'static` spawned task. This exercises that shared
+    /// helper directly, including the "already gone" case the spawned task can
+    /// race into.
+    #[test]
+    fn retire_binding_in_removes_only_the_named_binding() {
+        let bindings: Mutex<HashMap<String, Binding>> = Mutex::new(HashMap::new());
+        bindings
+            .lock()
+            .unwrap()
+            .insert("A".to_string(), test_binding("c", "A:REAL"));
+        bindings
+            .lock()
+            .unwrap()
+            .insert("B".to_string(), test_binding("c", "B:REAL"));
+
+        retire_binding_in(&bindings, "A");
+        assert!(!bindings.lock().unwrap().contains_key("A"));
+        assert!(bindings.lock().unwrap().contains_key("B"));
+
+        // Retiring a name that is already gone is a no-op, not a panic: the
+        // upstream-death path can race a concurrent retirement.
+        retire_binding_in(&bindings, "A");
+        assert_eq!(bindings.lock().unwrap().len(), 1);
+    }
+
+    /// One panic while holding the bindings map must not take the whole
+    /// gateway offline. Every critical section over this map is a short,
+    /// panic-free `HashMap` operation, so the poison carries no broken
+    /// invariant — recovering is strictly better than refusing every later
+    /// search, get, subscribe and status read for the process's lifetime.
+    #[tokio::test]
+    async fn a_poisoned_bindings_map_does_not_take_the_gateway_down() {
+        let src = test_source(open_neg(), allow_all());
+        src.bindings
+            .lock()
+            .unwrap()
+            .insert("BOUND:PV".to_string(), test_binding("c", "BOUND:REAL"));
+
+        let bindings = src.bindings.clone();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::thread::spawn(move || {
+            let _guard = bindings.lock().unwrap();
+            panic!("poison the bindings map");
+        })
+        .join();
+        std::panic::set_hook(previous);
+        assert!(src.bindings.is_poisoned());
+
+        assert_eq!(
+            src.try_claim("BOUND:PV"),
+            TryClaim::Yes,
+            "a poisoned bindings map must not silence the search path"
+        );
+        assert_eq!(src.names().await, vec!["BOUND:PV".to_string()]);
+        src.retire_binding("BOUND:PV");
+        assert!(src.names().await.is_empty());
+    }
 
     fn test_source(neg: Arc<NegativeCache>, access: Arc<AccessControl>) -> GatewaySource {
         let cfg = GatewayConfig::from_json_str(r#"{"version":2,"clients":[],"servers":[]}"#)
@@ -542,6 +889,103 @@ mod tests {
         Arc::new(AccessControl::new(false, None, None))
     }
 
+    /// A source with one upstream client pointed at a UDP port nothing is
+    /// listening on, so every `pvinfo_full`/`pvget` through it runs the full
+    /// `PvaClient` operation timeout (5 s by default — `UpstreamPool` never
+    /// sets one) and then fails. The port is bound and released just to obtain
+    /// a number the OS is not currently handing out; nothing ever answers on
+    /// it. `None` means this environment cannot bind a UDP port at all.
+    fn dead_upstream_source(neg: Arc<NegativeCache>) -> Option<GatewaySource> {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .ok()?
+            .local_addr()
+            .ok()?
+            .port();
+        let cfg_json = format!(
+            r#"{{
+                "version": 2,
+                "clients": [{{
+                    "name": "dead-client",
+                    "addrlist": "127.0.0.1",
+                    "autoaddrlist": false,
+                    "bcastport": {port},
+                    "interface": ["127.0.0.1"]
+                }}],
+                "servers": [{{
+                    "name": "s",
+                    "clients": ["dead-client"]
+                }}]
+            }}"#
+        );
+        let cfg = GatewayConfig::from_json_str(&cfg_json).ok()?;
+        let pool = Arc::new(UpstreamPool::from_config(&cfg));
+        let guard = Arc::new(LoopGuard::build(
+            &cfg,
+            &cfg.servers[0],
+            std::collections::HashSet::new(),
+        ));
+        Some(GatewaySource::new(
+            pool,
+            vec!["dead-client".to_string()],
+            neg,
+            guard,
+            0,
+            allow_all(),
+        ))
+    }
+
+    /// The negative-cache TTL must be measured from when the upstream search
+    /// FINISHED, not from when `claim` was entered: the search burns a full
+    /// client timeout per configured client, and charging that against the
+    /// miss entry makes a short TTL expire the instant it is written.
+    #[tokio::test]
+    async fn a_slow_miss_still_gets_its_full_negative_ttl() {
+        let neg = Arc::new(NegativeCache::new(Duration::from_secs(2), 128));
+        let Some(src) = dead_upstream_source(neg.clone()) else {
+            eprintln!("Skipping test: cannot bind a UDP port in this environment");
+            return;
+        };
+
+        let before = Instant::now();
+        assert!(src.claim("GONE:PV").await.is_none());
+        let search_took = before.elapsed();
+
+        if search_took < Duration::from_secs(3) {
+            eprintln!(
+                "Skipping assertion: the upstream search failed in {search_took:?}, faster \
+                 than the 2 s negative TTL, so this environment cannot tell the two apart"
+            );
+            return;
+        }
+
+        assert!(
+            neg.is_missing("GONE:PV", Instant::now()),
+            "the miss was recorded with the pre-search instant, so its 2 s TTL had already \
+             expired by the time claim returned after {search_took:?}"
+        );
+    }
+
+    /// The access decision must run before the value conversion. A read-only
+    /// gateway asked to put an unrepresentable value must answer "access
+    /// denied" — not a conversion error that reveals the request got past the
+    /// gate. (The conversion itself still runs eagerly; only its outcome is
+    /// held back until after the decision.)
+    #[tokio::test]
+    async fn put_decides_access_before_converting_the_value() {
+        let read_only = Arc::new(AccessControl::new(true, None, None));
+        let src = test_source(open_neg(), read_only);
+
+        let err = src
+            .put("ANY:PV", &DecodedValue::Raw(vec![0xde, 0xad]))
+            .await
+            .expect_err("a read-only gateway must reject every put");
+
+        assert_eq!(
+            err, "access denied",
+            "expected the denial, got the JSON conversion's error instead"
+        );
+    }
+
     #[tokio::test]
     async fn claim_returns_none_when_no_clients_configured() {
         let src = test_source(open_neg(), allow_all());
@@ -569,7 +1013,8 @@ mod tests {
             Binding {
                 client_name: "c".into(),
                 real_name: "BOUND:PV".into(),
-                struct_id: None,
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
@@ -595,7 +1040,8 @@ mod tests {
             Binding {
                 client_name: "c".into(),
                 real_name: "BOUND:PV".into(),
-                struct_id: None,
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
@@ -617,7 +1063,8 @@ mod tests {
             Binding {
                 client_name: "c".into(),
                 real_name: "SECRET:PV".into(),
-                struct_id: None,
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
                 last_get: Mutex::new(None),
             },
         );
@@ -648,5 +1095,93 @@ mod tests {
         let src = test_source(open_neg(), access);
         assert_eq!(src.try_claim("SECRET:PV"), TryClaim::No);
         assert_eq!(src.try_claim("PUBLIC:PV"), TryClaim::Unknown);
+    }
+
+    /// An `io::Write` sink over a shared buffer, for capturing `tracing`
+    /// output during a test. Only ever touched synchronously by the
+    /// subscriber's own formatting call — never held across an `.await`.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Both upstream failure paths must leave a record. Downstream they are
+    /// indistinguishable from "no such PV", so without a log an upstream that
+    /// is up but erroring cannot be told apart from one that is absent.
+    ///
+    /// The capture is a process-wide default subscriber installed once, not a
+    /// thread-scoped `set_default`. With scoped dispatch, `tracing` evaluates
+    /// each callsite's interest across every live dispatcher and caches it
+    /// globally, and other tests in this binary running in parallel made the
+    /// claim-path `debug!` intermittently invisible to the scoped capture
+    /// (about half of full `--lib` runs, even with `rebuild_interest_cache`).
+    /// A single global subscriber has no such race. Every other test in the
+    /// binary then also logs into this buffer, which nobody else reads. The
+    /// PV names here (`LOGTEST:*`) are used by no other test, and each
+    /// assertion matches a `key="value"` fragment of the log line, so
+    /// another test's output cannot satisfy it.
+    #[tokio::test]
+    async fn a_failing_upstream_is_logged_by_both_claim_and_get() {
+        static CAPTURE: std::sync::OnceLock<CaptureWriter> = std::sync::OnceLock::new();
+        let buffer = CAPTURE
+            .get_or_init(|| {
+                let buffer = CaptureWriter::default();
+                let writer = buffer.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::DEBUG)
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(move || writer.clone())
+                    .finish();
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("no other test in this binary installs a global subscriber");
+                buffer
+            })
+            .clone();
+
+        let Some(src) = dead_upstream_source(open_neg()) else {
+            eprintln!("Skipping test: cannot bind a UDP port in this environment");
+            return;
+        };
+
+        // claim: every configured client fails to resolve.
+        assert!(src.claim("LOGTEST:GONE").await.is_none());
+
+        // get: insert a binding by hand — the upstream is dead, so no claim
+        // can create one — then `get` reaches `pvget` and fails there.
+        src.bindings.lock().unwrap().insert(
+            "LOGTEST:BOUND".to_string(),
+            Binding {
+                client_name: "dead-client".to_string(),
+                real_name: "LOGTEST:REAL".to_string(),
+                descriptor: StructureDesc::default(),
+                bound_at: Instant::now(),
+                last_get: Mutex::new(None),
+            },
+        );
+        assert!(src.get("LOGTEST:BOUND").await.is_none());
+
+        let captured = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains(
+                "downstream=\"LOGTEST:GONE\" real=\"LOGTEST:GONE\" via client=\"dead-client\""
+            ),
+            "claim's upstream failure must name the PV and the client: {captured:?}"
+        );
+        assert!(
+            captured.contains(
+                "downstream=\"LOGTEST:BOUND\" real=\"LOGTEST:REAL\" via client=\"dead-client\""
+            ),
+            "get's upstream failure must name the downstream and upstream names: {captured:?}"
+        );
     }
 }

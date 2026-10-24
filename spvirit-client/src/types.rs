@@ -42,13 +42,6 @@ impl PvOptions {
     }
 }
 
-/// A single monitor update delivered by [`PvaClient::pvmonitor`](crate::pva_client::PvaClient::pvmonitor).
-#[derive(Debug, Clone)]
-pub struct PvMonitorEvent {
-    pub pv_name: String,
-    pub value: DecodedValue,
-}
-
 #[derive(Debug)]
 pub struct PvGetResult {
     pub pv_name: String,

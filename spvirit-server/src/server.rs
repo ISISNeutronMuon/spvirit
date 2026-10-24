@@ -12,7 +12,9 @@ use tracing::{error, info};
 use crate::beacon::{BeaconConfig, run_beacon};
 use tokio::net::TcpListener;
 
-use crate::handler::{PvListMode, ServerState, rand_guid, run_tcp_server, run_udp_search};
+use crate::handler::{
+    PvListMode, ServerState, rand_guid, run_tcp_server, run_udp_search_on_socket,
+};
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::SourceRegistry;
 
@@ -131,10 +133,44 @@ impl PvaServerState {
     }
 }
 
+/// Aborts the wrapped tasks when dropped.
+///
+/// A bare `JoinHandle` only detaches its task on drop — it does not stop it.
+/// Cancelling the caller's own task (e.g. via `RunningServer::abort()`, which
+/// aborts the task running [`run_pva_server_with_registry`]) drops this
+/// guard along with the rest of that task's stack, which is what actually
+/// stops the UDP responder, the TCP acceptor and the beacon instead of
+/// merely orphaning them.
+struct AbortTasksOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// Run a PVA server (UDP search + TCP handler + beacon).
 ///
-/// This function drives the three server tasks in a `tokio::select!` loop and
-/// returns when any task errors or the future is dropped.
+/// Runs the UDP search responder, the TCP connection acceptor and the beacon
+/// emitter concurrently and returns when **all three** have finished
+/// (`tokio::join!`). None of the three returns under normal operation, so in
+/// practice this runs until one of two things happens:
+///
+/// - A task panics or is aborted individually: `join!` does not short-circuit
+///   on that — it still waits for the other two, which under normal
+///   operation never end on their own — so nothing is logged until all three
+///   have ended, which in practice means this branch only completes once the
+///   caller's task is itself aborted (see the next bullet) after one member
+///   already failed.
+/// - The caller's own task is aborted, e.g. via `RunningServer::abort()`.
+///   That drops this function's future, including the `AbortTasksOnDrop`
+///   guard held on its stack, which aborts all three inner tasks in turn.
+///   This stops the UDP responder, the TCP acceptor and the beacon; it does
+///   not stop tasks *they* spawned per connection or per pattern-match
+///   search (see [`RunningServer::abort`] for the complete picture,
+///   including what `abort()` itself additionally stops and does not stop).
 pub async fn run_pva_server(
     sources: Arc<SourceRegistry>,
     config: PvaServerConfig,
@@ -149,10 +185,28 @@ pub async fn run_pva_server_with_registry(
     config: PvaServerConfig,
     registry: Arc<MonitorRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let server_state = PvaServerState::with_registry(sources, &config, registry);
-    let state = server_state.inner;
+    run_pva_server_reporting(sources, config, registry, None).await
+}
 
-    let guid = state.guid;
+/// The outcome of binding the listeners: the real `(tcp, udp)` addresses —
+/// so a port-0 configuration learns the ports the OS picked — or the bind
+/// error, as text.
+pub(crate) type BoundAddrs = Result<(SocketAddr, SocketAddr), String>;
+
+/// [`run_pva_server_with_registry`], additionally publishing the bound
+/// addresses (or the bind failure) on `bound` the moment both listeners are
+/// bound, before anything is served. `RunningServer::local_addrs` reads it.
+pub(crate) async fn run_pva_server_reporting(
+    sources: Arc<SourceRegistry>,
+    mut config: PvaServerConfig,
+    registry: Arc<MonitorRegistry>,
+    bound: Option<tokio::sync::watch::Sender<Option<BoundAddrs>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = |r: BoundAddrs| {
+        if let Some(tx) = &bound {
+            tx.send_replace(Some(r));
+        }
+    };
     let tcp_addr = SocketAddr::new(config.listen_ip, config.tcp_port);
     // TCP always binds the configured interface; the UDP search socket binds
     // by parity mode (0.0.0.0 + multicast join when on).
@@ -176,8 +230,48 @@ pub async fn run_pva_server_with_registry(
     // Bind TCP before spawning anything.  If the port is already in use we
     // return an error here and the beacon is never started, preventing a
     // ghost-beacon that advertises a port this process does not serve.
-    let tcp_listener = TcpListener::bind(tcp_addr).await?;
-    info!("TCP listener bound on {}", tcp_addr);
+    let tcp_listener = match TcpListener::bind(tcp_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            report(Err(format!("TCP bind {tcp_addr} failed: {e}")));
+            return Err(e.into());
+        }
+    };
+    let tcp_bound = match tcp_listener.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            report(Err(format!("TCP local_addr failed: {e}")));
+            return Err(e.into());
+        }
+    };
+    info!("TCP listener bound on {}", tcp_bound);
+    // A port-0 configuration only learns its real port here; everything
+    // downstream (search replies, beacons, the server-info PV) must
+    // advertise the port actually being served, not 0.
+    config.tcp_port = tcp_bound.port();
+
+    // Bound here rather than inside the UDP task so the real address (the
+    // OS-picked port for a port-0 configuration) is known before serving
+    // starts. A failure is still non-fatal for TCP, exactly as before: it is
+    // logged and the TCP acceptor and beacon carry on without search.
+    let udp_socket = match crate::handler::bind_udp_search_socket(udp_addr) {
+        Ok(sock) => {
+            match sock.local_addr() {
+                Ok(udp_bound) => report(Ok((tcp_bound, udp_bound))),
+                Err(e) => report(Err(format!("UDP local_addr failed: {e}"))),
+            }
+            Some(sock)
+        }
+        Err(e) => {
+            error!("UDP search server error: {}", e);
+            report(Err(format!("UDP search bind {udp_addr} failed: {e}")));
+            None
+        }
+    };
+
+    let server_state = PvaServerState::with_registry(sources, &config, registry);
+    let state = server_state.inner;
+    let guid = state.guid;
 
     let beacon_config = BeaconConfig {
         target: config.beacon_target,
@@ -189,13 +283,16 @@ pub async fn run_pva_server_with_registry(
     };
 
     let udp_state = state.clone();
+    let tcp_port = config.tcp_port;
+    let advertise_ip = config.advertise_ip;
     let udp_task = tokio::spawn(async move {
-        if let Err(e) = run_udp_search(
+        let Some(socket) = udp_socket else { return };
+        if let Err(e) = run_udp_search_on_socket(
             udp_state,
-            udp_addr,
-            config.tcp_port,
+            socket,
+            tcp_port,
             guid,
-            config.advertise_ip,
+            advertise_ip,
             multicast_iface,
         )
         .await
@@ -218,7 +315,28 @@ pub async fn run_pva_server_with_registry(
         }
     });
 
-    let _ = tokio::join!(udp_task, tcp_task, beacon_task);
+    // Abort all three the moment this function's future is dropped (e.g. by
+    // `RunningServer::abort()` aborting the task this is running in), not
+    // just when it returns normally. Without this a caller's abort only ever
+    // cancelled the *outer* task and dropped these three handles, which
+    // detaches them — the UDP responder, the TCP acceptor and the beacon all
+    // kept running (and the port stayed bound) for the life of the process.
+    let _abort_guard = AbortTasksOnDrop(vec![
+        udp_task.abort_handle(),
+        tcp_task.abort_handle(),
+        beacon_task.abort_handle(),
+    ]);
+
+    // All three are `JoinHandle<()>` — each spawned closure logs its own error
+    // and returns `()` — so `join!` yields three `Result<(), JoinError>`. A
+    // JoinError means the task panicked or was aborted, which the old
+    // `let _ = ...` swallowed entirely.
+    let (udp_res, tcp_res, beacon_res) = tokio::join!(udp_task, tcp_task, beacon_task);
+    for (name, res) in [("udp", udp_res), ("tcp", tcp_res), ("beacon", beacon_res)] {
+        if let Err(e) = res {
+            error!("{} server task ended abnormally: {}", name, e);
+        }
+    }
     Ok(())
 }
 
@@ -235,7 +353,10 @@ mod tests {
     fn udp_search_bind_parity_on_pinned_interface() {
         let listen = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
         let (addr, iface) = udp_search_bind(true, listen, 5076);
-        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076));
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076)
+        );
         assert_eq!(iface, Some(Ipv4Addr::new(10, 0, 0, 5)));
     }
 
@@ -243,7 +364,10 @@ mod tests {
     fn udp_search_bind_parity_on_unset_interface() {
         let listen = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         let (addr, iface) = udp_search_bind(true, listen, 5076);
-        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076));
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5076)
+        );
         assert_eq!(iface, Some(Ipv4Addr::UNSPECIFIED));
     }
 
@@ -253,5 +377,42 @@ mod tests {
         let (addr, iface) = udp_search_bind(false, listen, 5076);
         assert_eq!(addr, SocketAddr::new(listen, 5076));
         assert_eq!(iface, None);
+    }
+
+    /// A doc comment that describes a supervision strategy the code does not
+    /// implement is worse than no comment: it tells a reader a dead UDP task
+    /// would be noticed.
+    ///
+    /// The needle is just "`tokio::select!`" and the join! check is separate:
+    /// the offending sentence is wrapped across two `///` lines, so any needle
+    /// spanning the wrap would never match and the test would pass green
+    /// against the unfixed source.
+    #[test]
+    fn run_pva_server_doc_matches_its_actual_supervision() {
+        let full_src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server.rs"),
+        )
+        .expect("server.rs must be readable");
+        // Scan only the production code above this test module: this test's
+        // own doc comment and assertions quote the needle literally, so
+        // scanning the whole file would make the second assertion below
+        // fail unconditionally regardless of what run_pva_server's doc says.
+        // Cut at the `mod tests {` marker itself, not the first
+        // `#[cfg(test)]`: a `#[cfg(test)]` item placed above
+        // `run_pva_server` (e.g. a `#[cfg(test)] use ...`) would otherwise
+        // truncate the scan before it ever reaches the doc comment, and the
+        // second assertion would pass green against unfixed source.
+        let src = full_src
+            .split_once("mod tests {")
+            .map(|(before, _)| before)
+            .expect("server.rs must have a `mod tests {` module");
+        assert!(
+            src.contains("tokio::join!(udp_task, tcp_task, beacon_task)"),
+            "precondition: run_pva_server still joins its three tasks"
+        );
+        assert!(
+            !src.contains("tokio::select!"),
+            "the doc claims select!-based supervision; the code uses join!"
+        );
     }
 }

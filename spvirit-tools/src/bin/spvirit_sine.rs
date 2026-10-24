@@ -6,7 +6,7 @@ use tokio::runtime::Runtime;
 use tokio::time::{Instant, interval};
 
 use spvirit_client::client_from_opts;
-use spvirit_tools::spvirit_client::cli::CommonClientArgs;
+use spvirit_tools::spvirit_client::cli::{CommonClientArgs, require_pv_name};
 use spvirit_tools::spvirit_client::types::PvGetError;
 
 async fn pvsine(
@@ -31,13 +31,18 @@ async fn pvsine(
     loop {
         tick.tick().await;
         let t = start.elapsed().as_secs_f64();
-        if let Some(dur) = duration {
-            if t >= dur {
-                break;
-            }
+        if let Some(dur) = duration
+            && t >= dur
+        {
+            break;
         }
         let value = offset + amp * (2.0 * PI * freq_hz * t + phase).sin();
-        let input = Value::Number(serde_json::Number::from_f64(value).unwrap());
+        let number = serde_json::Number::from_f64(value).ok_or_else(|| {
+            PvGetError::Protocol(format!(
+                "computed value is not finite ({value}); check --amp/--offset/--phase"
+            ))
+        })?;
+        let input = Value::Number(number);
         channel.put(input).await?;
     }
 
@@ -78,6 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ap.parse_args_or_exit();
     }
 
+    require_pv_name(&pv_name)?;
     common.init_tracing();
     let opts = common.into_pv_get_options(pv_name.clone())?;
 

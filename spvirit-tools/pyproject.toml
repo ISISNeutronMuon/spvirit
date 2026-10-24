@@ -32,11 +32,12 @@ Issues = "https://github.com/ISISNeutronMuon/spvirit/issues"
 #
 # `bindings = "bin"` is stated explicitly rather than left to auto-detection:
 # maturin only infers it for a crate with a single binary target and no
-# library, and this crate has a library plus twelve binaries. In this mode the
-# binaries are packaged as wheel scripts, which pip installs into the
+# library, and this crate has a library plus sixteen binary targets. In this
+# mode the binaries are packaged as wheel scripts, which pip installs into the
 # environment's bin/Scripts directory -- i.e. onto PATH.
 #
 # The build uses the crate's default features (client, server, tui) so all
-# twelve tools are produced. No Python ABI is involved, so the wheel tags as
-# py3-none-<platform>.
+# thirteen default tools are produced (spvirit-tools/scripts/verify_wheel.py
+# lists them). The opt-in `scry` and `load` binaries are not in the wheel. No
+# Python ABI is involved, so the wheel tags as py3-none-<platform>.
 bindings = "bin"

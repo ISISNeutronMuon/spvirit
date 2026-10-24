@@ -7,12 +7,15 @@
 //! result as a `spvirit_server::pvstore::Source`, so it plugs into
 //! `PvaServerBuilder::source()` like any other source.
 //!
-//! Sub-project A — this crate's current scope — covers six record types
-//! (`ai`, `ao`, `bi`, `bo`, `longin`, `longout`) with no scanning, no
-//! channel-access links, and no async device support; see
-//! [`graph::DependencyGraph`]'s load-time diagnostics and the
-//! `docs/book/src/06-dev-guide/09-processing-engine.md` chapter for what
-//! that means in practice and what sub-projects B, C and D still owe.
+//! Six record types (`ai`, `ao`, `bi`, `bo`, `longin`, `longout`).
+//! Sub-project A built the processing core; sub-project B added the scan
+//! subsystem ([`scan::Scanner`] -- periodic, event and I/O-interrupt lists,
+//! the `PINI` sweep and `scanOnce`) and async device support
+//! ([`process::AsyncSupport`], bound with [`scan::Scanner::bind_async`] and
+//! finished with [`scan::Scanner::complete_async`]). Channel-access links are
+//! still absent; see [`graph::DependencyGraph`]'s load-time diagnostics and
+//! the `docs/book/src/06-dev-guide/09-processing-engine.md` chapter for what
+//! that means in practice and what sub-projects C and D still owe.
 
 pub mod alarm;
 pub mod build;

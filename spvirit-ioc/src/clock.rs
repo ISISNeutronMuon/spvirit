@@ -11,15 +11,24 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub trait Clock: Send + Sync {
     /// The current instant.
     fn now(&self) -> Instant;
-    /// Block the calling thread until `now() >= deadline`.
-    fn sleep_until(&self, deadline: Instant);
+    /// Block the calling thread until `now() >= deadline`, or until a
+    /// `wake_all` releases it early.
+    fn sleep_until(&self, deadline: Instant) {
+        self.sleep_until_or(deadline, &|| false);
+    }
+    /// [`Self::sleep_until`], but also return as soon as `cancelled()` is
+    /// true. `cancelled` is evaluated under the lock `wake_all` takes, before
+    /// each wait, so a caller that changes the state `cancelled` reads and
+    /// *then* calls `wake_all` can never have that wake lost, however the two
+    /// threads interleave. `cancelled` must not call back into this clock.
+    fn sleep_until_or(&self, deadline: Instant, cancelled: &dyn Fn() -> bool);
     /// Wall-clock nanoseconds since the UNIX epoch, for record timestamps.
     fn unix_nanos(&self) -> u64;
     /// Wake every thread currently parked in `sleep_until`, regardless of
-    /// whether their deadline has passed. Used by shutdown paths to unpark a
-    /// thread deterministically without waiting for a real timeout. A no-op
-    /// on clocks with nothing to notify (e.g. `SystemClock`, which parks via
-    /// `thread::sleep` rather than a shared condvar).
+    /// whether their deadline has passed. Used by shutdown (and by the
+    /// periodic-thread reap) to unpark a thread deterministically without
+    /// waiting for a real timeout. A woken sleeper returns early, so a caller
+    /// that needs its deadline must re-check `now()` and sleep again.
     fn wake_all(&self);
 }
 
@@ -33,25 +42,52 @@ fn real_unix_nanos() -> u64 {
 }
 
 /// The real OS clock. Used in production.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemClock;
+///
+/// `sleep_until` parks on a condvar with a timeout rather than calling
+/// `thread::sleep`, so `wake_all` can release a sleeper early: a scan thread
+/// on a very long period (`SCAN = "1e9 second"` is ~31 years) must not make
+/// `Scanner::shutdown`'s join wait out its deadline.
+#[derive(Debug, Default)]
+pub struct SystemClock {
+    /// Bumped by `wake_all`. A sleeper snapshots it on entry and returns as
+    /// soon as it changes, whether or not its deadline has passed.
+    wake_gen: Mutex<u64>,
+    cvar: Condvar,
+}
+
+impl SystemClock {
+    pub const fn new() -> Self {
+        Self {
+            wake_gen: Mutex::new(0),
+            cvar: Condvar::new(),
+        }
+    }
+}
 
 impl Clock for SystemClock {
     fn now(&self) -> Instant {
         Instant::now()
     }
-    fn sleep_until(&self, deadline: Instant) {
-        let now = Instant::now();
-        if deadline > now {
-            std::thread::sleep(deadline - now);
+    fn sleep_until_or(&self, deadline: Instant, cancelled: &dyn Fn() -> bool) {
+        let mut wake_gen = self.wake_gen.lock().unwrap();
+        let gen_at_entry = *wake_gen;
+        // Looped: `wait_timeout` may return spuriously, or early on a timer
+        // that rounds down, and neither is a reason to return.
+        loop {
+            let now = Instant::now();
+            if now >= deadline || *wake_gen != gen_at_entry || cancelled() {
+                return;
+            }
+            wake_gen = self.cvar.wait_timeout(wake_gen, deadline - now).unwrap().0;
         }
     }
     fn unix_nanos(&self) -> u64 {
         real_unix_nanos()
     }
     fn wake_all(&self) {
-        // Nothing to wake: sleep_until parks via thread::sleep, not a
-        // condvar this clock owns.
+        let mut wake_gen = self.wake_gen.lock().unwrap();
+        *wake_gen = wake_gen.wrapping_add(1);
+        self.cvar.notify_all();
     }
 }
 
@@ -118,11 +154,12 @@ impl Clock for ManualClock {
     fn now(&self) -> Instant {
         self.inner.anchor + *self.inner.accumulated.lock().unwrap()
     }
-    fn sleep_until(&self, deadline: Instant) {
+    fn sleep_until_or(&self, deadline: Instant, cancelled: &dyn Fn() -> bool) {
         let gen_at_entry = self.inner.wake_gen.load(Ordering::SeqCst);
         let mut acc = self.inner.accumulated.lock().unwrap();
         while self.inner.anchor + *acc < deadline
             && self.inner.wake_gen.load(Ordering::SeqCst) == gen_at_entry
+            && !cancelled()
         {
             acc = self.inner.cvar.wait(acc).unwrap();
         }
@@ -150,7 +187,7 @@ mod tests {
 
     #[test]
     fn system_clock_sleep_until_past_deadline_returns_immediately() {
-        let c = SystemClock;
+        let c = SystemClock::new();
         let start = Instant::now();
         c.sleep_until(start);
         assert!(
@@ -161,7 +198,7 @@ mod tests {
 
     #[test]
     fn system_clock_sleep_until_future_deadline_blocks_approximately() {
-        let c = SystemClock;
+        let c = SystemClock::new();
         let start = Instant::now();
         let deadline = start + Duration::from_millis(50);
         c.sleep_until(deadline);
@@ -169,6 +206,30 @@ mod tests {
             start.elapsed() >= Duration::from_millis(50),
             "a future deadline must actually block until it passes"
         );
+    }
+
+    #[test]
+    fn system_clock_wake_all_releases_a_far_future_sleeper() {
+        // F3: shutdown relies on `wake_all` to unpark a scan thread; a
+        // `thread::sleep` cannot be woken, so a long period hung the join.
+        let c = Arc::new(SystemClock::new());
+        let c2 = c.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            c2.sleep_until(Instant::now() + Duration::from_secs(1_000_000_000));
+            done_tx.send(()).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        // Repeat the wake: the sleeper may not have parked yet on the first.
+        for _ in 0..50 {
+            c.wake_all();
+            if done_rx.recv_timeout(Duration::from_millis(20)).is_ok() {
+                return;
+            }
+        }
+        panic!("wake_all did not release a sleeper within 1 s");
     }
 
     #[test]

@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // ── NTNDArray — tiny 4x4 image ───────────────────────────
             let pixels = (0..16)
-                .map(|i| (((i as i32 + tick as i32) % 16) * 16) as u8)
+                .map(|i| (((i + tick as i32) % 16) * 16) as u8)
                 .collect::<Vec<_>>();
             // ANCHOR: ndarray
             let ndarray_nt = NtNdArray {

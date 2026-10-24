@@ -63,7 +63,7 @@ it does not re-declare. See [Reacting to writes](reacting-to-writes.md).
 No code at all:
 
 ```bash
-spserver --db spvirit-server/examples/example.db
+spserver --db-file spvirit-server/examples/example.db --compute-alarms
 ```
 
 ## Fields that do something
@@ -78,21 +78,20 @@ spserver --db spvirit-server/examples/example.db
 | `LOW` / `HIGH` | MINOR alarm limits — **evaluated**, given `.compute_alarms(true)` |
 | `LOLO` / `HIHI` | MAJOR alarm limits — same |
 | `MDEL` | monitor deadband |
-| `ADEL` | archive deadband |
+| `ADEL` | stored and readable as a field; spvirit-server does not use it for archiving |
 | `DRVL` / `DRVH` | drive limits — **advisory only**, spvirit does not clamp |
-| `SCAN` | `"1 second"` etc., for periodic reprocessing |
-| `INP` | input link, for scanned records that copy another PV |
+| `SCAN` | `"1 second"` etc., for periodic reprocessing: honoured by `spserver` and by a `spvirit-ioc` engine (`.ioc()`, at most 64 distinct periods; extras are left unscanned with a warning). The library's `.db_file()` store parses it but does not process records; drive scans in code with `.scan()`/`Pv::scan` |
+| `INP` | input link, for scanned records that copy another PV (same caveat as `SCAN`) |
 | `FTVL` / `NELM` | element type and count, for array records |
 | `ZNAM` / `ONAM` | the two state names of a `bi`/`bo` |
 | `INDX` / `MALM` | window offset and max length, for `subArray` |
 
 ## What to notice
 
-**`.db` is the only route to computed alarms.** As
-[Alarms](alarms.md) explains, the handle API's `.alarm_limits()` publishes
-limits without evaluating them. `LOW`/`HIGH`/`LOLO`/`HIHI` in a `.db` file
-are evaluated. If you want the server to derive severity from the value,
-this is how.
+**`.db` limits and handle limits are evaluated alike.**
+`LOW`/`HIGH`/`LOLO`/`HIHI` in a `.db` file and the handle API's
+`.alarm_limits()` set the same limits; with `.compute_alarms(true)` the
+server derives severity from either. See [Alarms](alarms.md).
 
 **Input records refuse writes.** `ai`, `bi`, `stringin`, `aai` are
 read-only on the wire, and the refusal is explicit rather than silent:
@@ -112,9 +111,12 @@ rejected at construction. Build enum records in code — see
 **`longin`/`longout` are not recognised by the `.db` parser either.** They
 exist in the handle API only (`spvirit-server/src/types.rs:48`).
 
-**Loading is best-effort per record.** A record spvirit cannot build logs
-to stderr and is skipped; the rest of the file still serves. Check the log
-rather than assuming every PV made it.
+**Loading stops at the first record spvirit cannot build.** In `spserver`
+the load returns an error naming that record and its type, and the process
+exits without serving any record from the file.
+`PvaServer::builder().db_file()`/`.db_string()` (and Python
+`Server(db_file=...)`) panic with the same message, so the server never
+starts. Remove the record or create it through the host API instead.
 
 ## Run it
 

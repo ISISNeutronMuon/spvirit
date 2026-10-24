@@ -6,9 +6,9 @@ dependency on an EPICS base installation.
 
 ## Quickstart
 
-Install. This one command brings the Python module *and* the twelve `sp*`
-command-line tools; there is no compiler and no Rust toolchain involved on
-Linux, macOS, or Windows x86_64.
+Install. This one command brings the Python module *and* the `sp*`
+command-line tools (thirteen binaries); there is no compiler and no Rust
+toolchain involved on Linux, macOS, or Windows x86_64.
 
 ```bash
 pip install spvirit
@@ -35,9 +35,12 @@ SIM:SETPOINT OK
 
 $ spget SIM:SETPOINT
 SIM:SETPOINT 2026-08-06 09:38:00.729  30
+
+$ spput SIM:TEMPERATURE 5
+SIM:TEMPERATURE ERROR protocol error: PUT init error: Write access denied
 ```
 
-If you see those three lines you have a working PVAccess server. Nobody
+If you see those lines you have a working PVAccess server. Nobody
 configured a port, an address, or a permission: the client broadcast the PV
 name, the server answered, and `SIM:TEMPERATURE` refused the write it should
 refuse because `ai` is an input record.
@@ -87,6 +90,8 @@ on docs.rs, one page per crate:
 | `spvirit-server` | [docs.rs/spvirit-server](https://docs.rs/spvirit-server/latest/spvirit_server/) |
 | `spvirit-tools` | [docs.rs/spvirit-tools](https://docs.rs/spvirit-tools/latest/spvirit_tools/) |
 | `spvirit-calc` | [docs.rs/spvirit-calc](https://docs.rs/spvirit-calc/latest/spvirit_calc/) |
+| `spvirit-ioc` | [docs.rs/spvirit-ioc](https://docs.rs/spvirit-ioc/latest/spvirit_ioc/) |
+| `spvirit-gateway` | [docs.rs/spvirit-gateway](https://docs.rs/spvirit-gateway/latest/spvirit_gateway/) |
 
 For Python there is no generated site; the
 [Python API](05-reference/python-api.md) chapter is the reference, and every
@@ -100,8 +105,9 @@ object carries a docstring, so `help(spvirit.ai)` works at the prompt.
 - **Contributing** — [Licence and support](licence.md) has the short version;
   the [Developer guide](06-dev-guide/index.md) has the long one.
 
-Every code sample on this site is included verbatim from a file in the
-repository that is compiled by CI. The badge at the top of each chapter links
+Every Rust sample is included verbatim from an example that CI compiles;
+Python samples are included from examples that CI syntax-checks. Console
+output and small `.db` fragments are shown inline. The badge at the top of each chapter links
 to that source and to the test that checks it — including the quickstart
 above:
 

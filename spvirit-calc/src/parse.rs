@@ -604,6 +604,16 @@ pub fn compile(src: &str) -> Result<Expression, CalcError> {
         return Err(CalcError::MissingOperand);
     }
 
+    // The in-loop guard bounds `out` per token, but every op still on the
+    // operator stack lands in `out` during the unwind above, after that guard
+    // has run for the last time. A right-associative chain (`---...-1`, whose
+    // Negs never pop each other) stacks up entirely and flushes at once, so
+    // the cap has to be re-checked on the finished vector or it does not
+    // apply to that shape at all.
+    if out.len() > MAX_OPS {
+        return Err(CalcError::TooLong);
+    }
+
     check_arity(&out)?;
     Ok(Expression { ops: out })
 }
@@ -1425,6 +1435,28 @@ mod tests {
     fn rejects_expression_exceeding_max_ops() {
         let src = format!("{}A", "A+".repeat(600));
         assert_eq!(compile(&src), Err(CalcError::TooLong));
+    }
+
+    #[test]
+    fn a_long_unary_chain_is_capped_like_any_other_long_expression() {
+        // Unary minus is right-associative, so `pop_while` never pops a Neg
+        // for another Neg: the whole chain sits on the operator stack and
+        // flushes into `out` during the end-of-input unwind, after the last
+        // in-loop MAX_OPS check has already run.
+        let src = format!("{}1", "-".repeat(2_000));
+        assert_eq!(compile(&src), Err(CalcError::TooLong));
+    }
+
+    #[test]
+    fn a_short_unary_chain_still_compiles() {
+        // The cap must not start rejecting reasonable expressions.
+        let expr = compile("---1").expect("a three-deep unary chain is fine");
+        // `Expression::eval(&self, args: &mut [f64; 21]) -> f64`
+        // (`spvirit-calc/src/eval.rs:196`): a fixed 21-slot A..U argument
+        // array, taken by `&mut` because `:=` can write back into it, and
+        // returning a bare `f64` -- there is no `Option`.
+        let mut args = [0.0f64; 21];
+        assert_eq!(expr.eval(&mut args), -1.0);
     }
 
     // Review fix (Important 1): CALC has no zero-argument calls. Before the

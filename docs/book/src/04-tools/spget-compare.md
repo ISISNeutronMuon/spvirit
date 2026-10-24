@@ -6,8 +6,8 @@
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
 
-Replay a captured PVAccess GET exchange and check spvirit's encoders
-against it byte for byte. A protocol-debugging tool, not something you
+Compare a captured PVAccess GET exchange against spvirit's encoders, byte
+for byte, offline. A protocol-debugging tool, not something you
 reach for day to day.
 
 ```
@@ -47,11 +47,11 @@ S->C
 
 Anything that is not a two-character hex byte is ignored, so annotated
 captures usually paste in unchanged
-(`spvirit-tools/src/bin/spvirit_get_compare.rs:265`).
+(`spvirit-tools/src/bin/spvirit_get_compare.rs:257`).
 
 `--dump-raw` has no direction markers. The tool infers direction from the
 server bit in each frame's command flags
-(`spvirit-tools/src/bin/spvirit_get_compare.rs:256`).
+(`spvirit-tools/src/bin/spvirit_get_compare.rs:204-208`).
 
 ## What it checks
 
@@ -68,5 +68,5 @@ encoder, and compares. One line per frame, in one of two shapes
 
 The offset of the first differing byte is usually enough to identify the
 field. This is how a wire-compatibility bug against EPICS Base gets
-localised: capture the exchange from a working `pvget`, replay it here,
+localised: capture the exchange from a working `pvget`, feed it here,
 and read off where spvirit diverges.

@@ -181,10 +181,11 @@ SIM:TEMPERATURE 22.534399
 ...
 ```
 
-`spmonitor` prints the timestamp only on the first update of each
-wall-clock second — that is a display convenience, not a change in the
-data. Every update carries a full timestamp on the wire. Counting the
-lines between two timestamps is a quick way to see your actual update rate.
+`spmonitor` prints the timestamp only when the update carries
+`timeStamp.secondsPastEpoch`. Monitor updates are deltas: the seconds field
+is sent only when it changes, which is the first update of each wall-clock
+second. Counting the lines between two timestamps is a quick way to see your
+actual update rate.
 
 Stop it with `Ctrl-C`.
 

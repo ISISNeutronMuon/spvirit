@@ -18,8 +18,10 @@ import sys
 import zipfile
 from pathlib import Path
 
-# Every binary declared in spvirit-tools/Cargo.toml. Kept in step with the
-# tool table in docs/book/src/04-tools/index.md.
+# Every binary spvirit-tools/Cargo.toml builds with the default features --
+# what maturin packages. The opt-in `scry` tools and the internal `spload`
+# load generator (feature `load`) are deliberately not in the wheel. Kept in
+# step with the tool table in docs/book/src/04-tools/index.md.
 EXPECTED = {
     "spget",
     "spput",
@@ -33,6 +35,16 @@ EXPECTED = {
     "spserver",
     "sptable",
     "spdodeca",
+    "spgateway",
+}
+
+# Binaries that must NOT be in the wheel: the internal load generator
+# (feature `load`) and the opt-in `scry` tools (feature `scry`). A wheel that
+# ships any of them was built with the wrong feature set.
+FORBIDDEN = {
+    "spload",
+    "spvirit-scry",
+    "spvirit-scry_influx_collector",
 }
 
 
@@ -69,6 +81,16 @@ def main() -> int:
             print(
                 f"{wheel.name}: missing {len(missing)} of {len(EXPECTED)} tools: "
                 f"{', '.join(sorted(missing))}",
+                file=sys.stderr,
+            )
+            continue
+
+        forbidden = found & FORBIDDEN
+        if forbidden:
+            failed = True
+            print(
+                f"{wheel.name}: ships binaries that must not be in the wheel: "
+                f"{', '.join(sorted(forbidden))}",
                 file=sys.stderr,
             )
             continue

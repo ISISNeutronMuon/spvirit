@@ -222,6 +222,59 @@ pub struct PerClientLimits {
     pub burst: u32,
 }
 
+/// The only gateway config schema revision that exists.
+///
+/// This is the `version` field of the JSON config **file** — p4p's schema
+/// marker, which every example, doc page and test in this repo sets to 2. It
+/// is deliberately a hard-coded constant and has nothing whatsoever to do with
+/// the workspace crate version: a crate release must never imply a config
+/// schema change, and bumping one must never require bumping the other.
+pub const SUPPORTED_CONFIG_VERSION: u32 = 2;
+
+/// Keys that are `discovery_parity` misspelled.
+///
+/// `discovery_parity` is spvirit-specific but lives at the top level of a
+/// `server` block (documented in `docs/book/src/04-tools/spgateway.md`, placed
+/// there deliberately per the feature brief), and `ServerCfg` cannot use
+/// `deny_unknown_fields` because p4p forward compatibility requires tolerating
+/// keys we have never heard of. Combined with the field defaulting to `true`,
+/// that made a misspelling silent: the operator writes
+/// `"discoveryParity": false`, serde ignores it, and discovery parity stays
+/// ON.
+///
+/// So: near-misses are rejected by name, and only near-misses. A key is a
+/// near-miss when lower-casing it and reducing every non-alphanumeric run to
+/// nothing yields `discoveryparity` — that catches case, separator and
+/// `x-spvirit`-prefix variants while leaving any genuinely unrelated future
+/// p4p key alone.
+fn reject_discovery_parity_near_misses(raw: &serde_json::Value) -> Result<(), ConfigError> {
+    fn squash(key: &str) -> String {
+        key.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
+    }
+
+    let Some(servers) = raw.get("servers").and_then(|s| s.as_array()) else {
+        return Ok(());
+    };
+    for server in servers {
+        let Some(obj) = server.as_object() else {
+            continue;
+        };
+        for key in obj.keys() {
+            if key != "discovery_parity" && squash(key).ends_with("discoveryparity") {
+                return Err(ConfigError::Validation(format!(
+                    "unknown server key `{key}`: did you mean `discovery_parity`? \
+                     (spvirit reads this key at the top level of a server block; \
+                     a misspelling would silently leave discovery parity at its default)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Errors that can occur while loading a gateway configuration.
 #[derive(Debug, Clone)]
 pub enum ConfigError {
@@ -241,15 +294,37 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl GatewayConfig {
-    /// Parse a gateway configuration from a JSON string (p4p-compatible schema).
+    /// Parses a p4p-compatible gateway config from JSON.
+    ///
+    /// Unknown top-level and unknown `server`/`client` keys are tolerated for
+    /// p4p forward compatibility, with one exception: a key that is
+    /// [`discovery_parity`](reject_discovery_parity_near_misses) misspelled is
+    /// a hard error rather than a silent no-op.
     pub fn from_json_str(s: &str) -> Result<Self, ConfigError> {
-        serde_json::from_str(s).map_err(|e| ConfigError::Json(e.to_string()))
+        let raw: serde_json::Value =
+            serde_json::from_str(s).map_err(|e| ConfigError::Json(e.to_string()))?;
+        reject_discovery_parity_near_misses(&raw)?;
+        serde_json::from_value(raw).map_err(|e| ConfigError::Json(e.to_string()))
     }
 
-    /// Semantic validation beyond what serde can express: uniqueness of
-    /// names and cross-references between clients/servers.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    /// Runs every semantic check and builds one [`AccessControl`] per server,
+    /// in `self.servers` order, reading each pvlist/`.acf` file **exactly
+    /// once**.
+    ///
+    /// The two used to be separate passes: `validate` built a control per
+    /// server to prove the files parsed and dropped it, and the runtime then
+    /// built them all over again. That doubled the startup file I/O and, worse,
+    /// opened a TOCTOU window — a file edited between the two reads is
+    /// validated in one state and enforced in another, silently.
+    pub fn validate_and_build(&self) -> Result<Vec<AccessControl>, ConfigError> {
         use std::collections::HashSet;
+
+        if self.version != SUPPORTED_CONFIG_VERSION {
+            return Err(ConfigError::Validation(format!(
+                "unsupported config version {}: only version {SUPPORTED_CONFIG_VERSION} exists",
+                self.version
+            )));
+        }
 
         let mut client_names: HashSet<&str> = HashSet::new();
         for c in &self.clients {
@@ -311,13 +386,20 @@ impl GatewayConfig {
         // Fail-closed: load+parse every access/pvlist file now, so
         // `spgateway -T` catches a missing/unreadable/unparseable file
         // before the gateway ever serves a request. The built
-        // `AccessControl` is discarded here; the live Runtime (Task 11)
-        // calls `build_access_control` again to get one it keeps.
-        for s in &self.servers {
-            let _ = self.build_access_control(s)?;
-        }
+        // `AccessControl`s are handed back to the caller so this is the
+        // only time each file is read.
+        self.servers
+            .iter()
+            .map(|s| self.build_access_control(s))
+            .collect()
+    }
 
-        Ok(())
+    /// Runs every semantic check, discarding the [`AccessControl`]s built
+    /// along the way. For callers that only want a yes/no — `spgateway -T`,
+    /// principally. A caller that is about to *use* the controls should call
+    /// [`Self::validate_and_build`] instead of validating and then rebuilding.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_and_build().map(|_| ())
     }
 
     /// Loads and parses `server`'s `access` (ACF) and `pvlist` files into a
@@ -496,6 +578,85 @@ mod tests {
         GatewayConfig::from_json_str(s).unwrap()
     }
 
+    /// A minimal valid config with every key these tests mutate present and
+    /// explicit, so a `str::replace` in a test cannot silently no-op.
+    ///
+    /// Same shape as `minimal_valid_config()` (one `pva` client, one server
+    /// referencing it, no `access`/`pvlist` files) so it passes `validate` for
+    /// reasons unrelated to this task, plus an explicit `discovery_parity`.
+    fn minimal_config_json() -> String {
+        r#"{
+            "version": 2,
+            "clients": [{"name": "cli", "provider": "pva"}],
+            "servers": [{"name": "srv", "clients": ["cli"], "access": "", "pvlist": "", "discovery_parity": true}]
+        }"#
+        .to_string()
+    }
+
+    /// `version` is required by serde and then never looked at, so a config
+    /// written for a different schema revision is accepted in full and
+    /// silently reinterpreted under today's rules. Only 2 exists.
+    ///
+    /// NB: this is the CONFIG FILE's schema version. It has nothing to do with
+    /// the workspace crate version and must never be derived from it.
+    #[test]
+    fn validate_rejects_an_unsupported_config_version() {
+        let base = minimal_config_json();
+        let ok = GatewayConfig::from_json_str(&base).unwrap();
+        assert_eq!(ok.version, SUPPORTED_CONFIG_VERSION);
+        ok.validate().expect("version 2 is the supported schema");
+
+        for bad in [0u32, 1, 3, 42] {
+            let cfg = GatewayConfig::from_json_str(&base.replace("\"version\": 2", &format!("\"version\": {bad}")))
+                .unwrap();
+            let err = cfg
+                .validate()
+                .expect_err(&format!("version {bad} must be rejected"));
+            let msg = format!("{err}");
+            assert!(msg.contains("version"), "error must name the offending key: {msg}");
+            assert!(msg.contains(&bad.to_string()), "error must quote the bad value: {msg}");
+        }
+    }
+
+    /// `discovery_parity` defaults to true and lives in a struct that must
+    /// tolerate unknown keys (p4p forward compatibility), so a misspelling is
+    /// silently ignored and the operator gets parity ON while their file says
+    /// OFF. Near-misses are rejected by name; genuinely unknown p4p keys are
+    /// still accepted.
+    #[test]
+    fn a_misspelled_discovery_parity_is_a_hard_error() {
+        for typo in [
+            "discoveryParity",
+            "discovery-parity",
+            "Discovery_Parity",
+            "x-spvirit-discovery_parity",
+        ] {
+            let json = minimal_config_json().replace(
+                "\"discovery_parity\": true",
+                &format!("\"{typo}\": false"),
+            );
+            let err = GatewayConfig::from_json_str(&json)
+                .expect_err(&format!("{typo} must be rejected, not silently ignored"));
+            let msg = format!("{err}");
+            assert!(msg.contains(typo), "error must quote what was written: {msg}");
+            assert!(
+                msg.contains("discovery_parity"),
+                "error must name the correct spelling: {msg}"
+            );
+        }
+    }
+
+    /// The scan must stay narrow: an unrelated future p4p key in a server
+    /// block is not a near-miss and must still be tolerated, exactly as
+    /// `unknown_p4p_key_is_ignored` requires at the top level.
+    #[test]
+    fn an_unrelated_unknown_server_key_is_still_tolerated() {
+        let json = minimal_config_json()
+            .replace("\"discovery_parity\": true", "\"someFutureP4pKey\": 7");
+        let cfg = GatewayConfig::from_json_str(&json).expect("unknown p4p keys stay tolerated");
+        assert!(cfg.servers[0].discovery_parity, "and the default still applies");
+    }
+
     /// A unique, self-cleaning temp directory (no `tempfile` dev-dependency
     /// exists in this crate; both `std::env::temp_dir` + a unique suffix and
     /// `Drop`-based cleanup are all that's needed).
@@ -553,5 +714,60 @@ mod tests {
         let mut cfg = minimal_valid_config();
         cfg.servers[0].pvlist = path.to_string_lossy().into();
         assert!(cfg.validate().is_err());
+    }
+
+    /// Validation and construction must be one pass over the ACL files, not
+    /// two. Proven by rewriting every pvlist file to its opposite *after* the
+    /// call returns: if the returned controls still enforce what was
+    /// validated, the files were read once and the result kept. Two reads
+    /// would leave a TOCTOU window in which the config that got validated is
+    /// not the config that gets enforced.
+    ///
+    /// Also pins the ordering contract runtime.rs depends on: one control per
+    /// server, in `self.servers` order.
+    #[test]
+    fn validate_and_build_reads_each_acl_file_once_and_returns_them_in_server_order() {
+        use crate::access::{Decision, Identity, Op};
+
+        // `tempdir()` is this module's existing helper (config.rs:516-525);
+        // its `TempDir` has no `new()`.
+        let dir = tempdir();
+        let allow = dir.path().join("allow.pvlist");
+        let deny = dir.path().join("deny.pvlist");
+        std::fs::write(&allow, ".* ALLOW\n").unwrap();
+        std::fs::write(&deny, "SECRET:.* DENY\n.* ALLOW\n").unwrap();
+
+        let json = format!(
+            r#"{{
+                "version": 2,
+                "clients": [{{"name": "cli", "provider": "pva", "addrlist": "127.0.0.1"}}],
+                "servers": [
+                  {{"name": "open",   "clients": ["cli"], "pvlist": "{}"}},
+                  {{"name": "closed", "clients": ["cli"], "pvlist": "{}"}}
+                ]
+            }}"#,
+            allow.display().to_string().replace('\\', "\\\\"),
+            deny.display().to_string().replace('\\', "\\\\"),
+        );
+        let cfg = GatewayConfig::from_json_str(&json).unwrap();
+
+        let controls = cfg.validate_and_build().expect("a valid config builds");
+        assert_eq!(controls.len(), cfg.servers.len(), "one control per server");
+
+        // Swap the files out from under the returned controls.
+        std::fs::write(&allow, "SECRET:.* DENY\n.* ALLOW\n").unwrap();
+        std::fs::write(&deny, ".* ALLOW\n").unwrap();
+
+        let who = Identity::default();
+        assert_eq!(
+            controls[0].decide(Op::Get, "SECRET:X", &who),
+            Decision::Allow,
+            "servers[0] must still enforce the ruleset that was validated"
+        );
+        assert_eq!(
+            controls[1].decide(Op::Get, "SECRET:X", &who),
+            Decision::Deny,
+            "servers[1] must still enforce the ruleset that was validated, in order"
+        );
     }
 }

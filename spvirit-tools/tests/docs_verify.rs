@@ -440,3 +440,33 @@ fn python_examples_compile() {
         Err(e) => panic!("failed to run python: {e}"),
     }
 }
+
+#[test]
+fn the_tools_crate_does_not_depend_on_all_of_tokio() {
+    let manifest: toml::Value = toml::from_str(include_str!("../Cargo.toml"))
+        .expect("Cargo.toml parses");
+    let tokio = manifest
+        .get("dependencies")
+        .and_then(|d| d.get("tokio"))
+        .expect("a tokio dependency");
+    let features = tokio
+        .get("features")
+        .and_then(|f| f.as_array())
+        .expect("tokio features are listed explicitly");
+    assert!(
+        !features.iter().any(|f| f.as_str() == Some("full")),
+        "spvirit-tools is the only crate pulling all of tokio; list what it uses"
+    );
+    // Only the opt-in `scry` tools resolve hostnames; the default build must
+    // not carry dns-lookup.
+    if let Some(dns) = manifest
+        .get("dependencies")
+        .and_then(|d| d.get("dns-lookup"))
+    {
+        assert_eq!(
+            dns.get("optional").and_then(|o| o.as_bool()),
+            Some(true),
+            "dns-lookup is used only by the `scry` feature; keep it optional"
+        );
+    }
+}

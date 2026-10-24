@@ -30,6 +30,7 @@ use spvirit_types::{NtPayload, ScalarValue};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::mpsc;
 
@@ -58,6 +59,14 @@ fn feed_subscribers(subscribers: &Mutex<HashMap<String, Vec<mpsc::Sender<NtPaylo
 /// Depth of a subscriber's monitor channel. Matches `SimplePvStore`'s
 /// `mpsc::channel(64)` in `Source::subscribe`.
 const SUBSCRIBER_QUEUE: usize = 64;
+
+/// Depth of the monitor-notify queue between `EgressSink::flush` (any thread)
+/// and the async drain task. Matches `SCAN_ONCE_CAPACITY`: deep enough to ride
+/// out a burst or a scheduling hiccup, bounded so a stalled drain task costs a
+/// fixed amount of memory instead of growing without limit. Overflow drops the
+/// update, exactly as a full subscriber channel does -- a processing pass must
+/// never block on a consumer.
+const NOTIFY_QUEUE: usize = 1024;
 
 /// The processing engine as a `Source`.
 ///
@@ -218,8 +227,9 @@ impl IocSource {
         let egress = Arc::new(EgressSink {
             subscribers: subscribers.clone(),
             notify_tx: OnceLock::new(),
+            notify_dropped: AtomicU64::new(0),
         });
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
         let sink: Arc<dyn ProcSink> = egress.clone();
         let scanner = Arc::new(Scanner::new(db.clone(), clock, sink));
         let source = IocSource {
@@ -284,10 +294,12 @@ impl IocSource {
         self.registry.read().expect("registry lock poisoned").clone()
     }
 
-    /// Process every PINI record, in `.db` definition order.
+    /// Process every PINI record, in `PHAS` order (`.db` definition order
+    /// breaking ties) -- the same order `Scanner::process_pini` uses, via the
+    /// shared [`RecordDb::pini_order`].
     pub fn process_pini(&self) -> Vec<(String, NtPayload)> {
         let mut all = Vec::new();
-        for &id in self.db.order() {
+        for id in self.db.pini_order() {
             let mut ctx = ProcCtx::new();
             // A single lock acquisition: check PINI and, if set, run the pass
             // under the same guard, so there is no window between the check
@@ -367,6 +379,38 @@ impl IocSource {
         Ok(events)
     }
 
+    /// The value a PUT writes, whichever shape it arrives in.
+    ///
+    /// A real PVA client's PUT reaches `Source::put` as the channel's
+    /// structure, decoded by the server (`decode_put_body`):
+    /// `Structure([("value", ..), ..])`, possibly with other members the
+    /// client's bitset selected. Internal callers and unit tests pass the
+    /// bare scalar. Both mean "write this value", so a structure is unwrapped
+    /// to its `value` member and anything else is used as is — the same
+    /// unwrap `SimplePvStore` (`apply_value_update`) and `Pv::on_put`
+    /// perform.
+    ///
+    /// Only `value` is client-writable on an IOC record: alarm and timestamp
+    /// belong to the record's own processing, so other members of the
+    /// structure are ignored. A structure with *no* `value` member (e.g. a
+    /// PUT that selects only `alarm`) therefore has nothing this source can
+    /// apply. `SimplePvStore` would apply such a PUT's alarm members, which
+    /// an IOC record must not take from a client, and accepting it as a
+    /// silent no-op would tell the client its write landed when nothing
+    /// changed — so it is refused with an error naming the PV.
+    fn put_value<'a>(name: &str, value: &'a DecodedValue) -> Result<&'a DecodedValue, String> {
+        match value {
+            DecodedValue::Structure(fields) => fields
+                .iter()
+                .find(|(field, _)| field == "value")
+                .map(|(_, v)| v)
+                .ok_or_else(|| {
+                    format!("PUT to '{name}' has no 'value' member; only value is writable here")
+                }),
+            other => Ok(other),
+        }
+    }
+
     fn value_of(decoded: &DecodedValue) -> Result<Value, String> {
         match decoded {
             DecodedValue::Float64(v) => Ok(Value::Double(*v)),
@@ -444,6 +488,14 @@ impl IocSource {
         let raw = Self::decoded_as_string(value);
         // Parse first: an error here must leave membership unchanged.
         let spec = parse_scan(&raw).map_err(|e| e.to_string())?;
+        // ...and validate schedulability before it, for the same reason: the
+        // put path's contract is that a rejected SCAN write changes neither
+        // list membership nor `scan_raw`. `parse_scan` only proves the text is
+        // well formed; only the Scanner knows whether the resulting period
+        // fits its grid.
+        if let ScanSpec::Periodic(period) = spec {
+            self.scanner.check_period(id, period).map_err(|e| e.to_string())?;
+        }
         // Take the lock only to read PHAS/EVNT and update scan_raw, then drop
         // it before any Scanner call — the Scanner takes its own list locks and
         // must never be called while the record lock set is held.
@@ -456,7 +508,14 @@ impl IocSource {
         self.scanner.remove_event(id);
         self.scanner.unregister_io_intr(id);
         match spec {
-            ScanSpec::Periodic(period) => self.scanner.add_periodic(id, phas, period),
+            // Pre-validated above. The period checks cannot fail here; the
+            // MAX_PERIODIC_THREADS check can, if a concurrent put took the
+            // last free period slot since `check_period` -- then the client
+            // still gets the refusal, though this record has already left its
+            // old list. Propagate rather than ignore either way.
+            ScanSpec::Periodic(period) => {
+                self.scanner.add_periodic(id, phas, period).map_err(|e| e.to_string())?
+            }
             ScanSpec::Event => self.scanner.add_event(id, phas, evnt),
             // Explicit registration only (Task 11): a SCAN write never binds an
             // I/O-Intr record to a source.
@@ -489,7 +548,15 @@ impl IocSource {
         // re-order.
         if let Ok(spec) = spec {
             match spec {
-                ScanSpec::Periodic(period) => self.scanner.add_periodic(id, phas, period),
+                ScanSpec::Periodic(period) => {
+                    if let Err(e) = self.scanner.add_periodic(id, phas, period) {
+                        tracing::warn!(
+                            "put_phas: {:?} has an unschedulable stored SCAN period ({e}); \
+                             not re-ordering it",
+                            id
+                        );
+                    }
+                }
                 ScanSpec::Event => self.scanner.add_event(id, phas, evnt),
                 ScanSpec::IoIntr | ScanSpec::Passive => {}
             }
@@ -550,7 +617,40 @@ struct EgressSink {
     /// ("cannot start a runtime from within a runtime") whenever `flush` ran on
     /// a runtime worker — i.e. for every PINI and every posted event. See
     /// `events.rs`, which made `EventSink` async for exactly this reason.
-    notify_tx: OnceLock<mpsc::UnboundedSender<(String, NtPayload)>>,
+    ///
+    /// A bounded channel's `try_send` is synchronous and never blocks.
+    notify_tx: OnceLock<mpsc::Sender<(String, NtPayload)>>,
+    /// Monitor updates dropped because the notify queue was full (a stalled or
+    /// slow drain task). Counted rather than silently discarded so the warning
+    /// below can report the running total.
+    notify_dropped: AtomicU64,
+}
+
+impl EgressSink {
+    /// Hand one monitor update to the drain task, dropping it if the queue is
+    /// full or closed.
+    ///
+    /// Non-blocking on purpose: `flush` runs on a std scan thread, on the
+    /// serve worker during the PINI sweep, and on a runtime worker during a
+    /// posted event, and none of those may stall behind a monitor consumer.
+    /// The warning is rate-limited to powers of two, exactly as
+    /// `Scanner::scan_once` rate-limits its own overflow warning, so a
+    /// persistently stalled consumer costs O(log n) log lines, not one per
+    /// update.
+    fn send_notify(&self, event: (String, NtPayload)) {
+        let Some(tx) = self.notify_tx.get() else {
+            return;
+        };
+        if tx.try_send(event).is_err() {
+            let dropped = self.notify_dropped.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    "monitor-notify queue full or closed; dropped {dropped} update(s) so far \
+                     (queue depth {NOTIFY_QUEUE})"
+                );
+            }
+        }
+    }
 }
 
 impl ProcSink for EgressSink {
@@ -559,17 +659,8 @@ impl ProcSink for EgressSink {
             tracing::debug!(target: "spvirit_ioc", "{line}");
         }
         feed_subscribers(&self.subscribers, &events);
-        // Hand the monitor-registry half to the drain task. `send` on an
-        // unbounded channel is synchronous and never blocks, so this is safe on
-        // any thread — unlike the `block_on` it replaces. No sender (Scanner
-        // never started) means nobody to publish to: correct for a bare engine,
-        // unreachable in a running server, which sets it before `Scanner::start`.
-        let Some(tx) = self.notify_tx.get() else {
-            return;
-        };
         for event in events {
-            // `Err` only if the drain task is gone (teardown); nothing to do.
-            let _ = tx.send(event);
+            self.send_notify(event);
         }
     }
 }
@@ -708,8 +799,9 @@ impl Source for IocSource {
         value: &DecodedValue,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>> {
         let name = name.to_string();
-        let value = value.clone();
+        let value = Self::put_value(name.as_str(), value).cloned();
         Box::pin(async move {
+            let value = value?;
             let id = match self.db.lookup(&name) {
                 Some(id) => id,
                 // A field PV: SCAN/EVNT/PHAS are writable and route into the
@@ -801,7 +893,7 @@ impl StoreSource for IocSource {
         // are each meant to run once. A duplicate `start_scanning` is a caller
         // bug, not something to paper over, but the set at least stays sane —
         // and we only spawn a drain for the sender that actually took.
-        let (tx, mut rx) = mpsc::unbounded_channel::<(String, NtPayload)>();
+        let (tx, mut rx) = mpsc::channel::<(String, NtPayload)>(NOTIFY_QUEUE);
         if self.egress.notify_tx.set(tx).is_ok() {
             let registry = self.registry.clone();
             let drain = handle.spawn(async move {
@@ -851,6 +943,35 @@ impl Drop for IocSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    #[tokio::test]
+    async fn a_full_monitor_notify_queue_drops_instead_of_growing() {
+        // The drain task awaits notify_monitors per item; if it stalls, flush
+        // must drop rather than queue without bound. Same rule as
+        // feed_subscribers: never block a processing pass.
+        let egress = EgressSink {
+            subscribers: Arc::new(Mutex::new(HashMap::new())),
+            notify_tx: OnceLock::new(),
+            notify_dropped: AtomicU64::new(0),
+        };
+        // Capacity 1, and _rx is never polled: a stalled drain task.
+        let (tx, _rx) = mpsc::channel::<(String, NtPayload)>(1);
+        // `is_ok()` rather than `expect`: `OnceLock::set`'s error carries the
+        // sender back, and `expect` would demand `Sender<...>: Debug`.
+        assert!(egress.notify_tx.set(tx).is_ok(), "first set wins");
+
+        let payload = || NtPayload::Generic { struct_id: "t".into(), fields: Vec::new() };
+        egress.send_notify(("PV:A".to_string(), payload()));
+        egress.send_notify(("PV:A".to_string(), payload()));
+        egress.send_notify(("PV:A".to_string(), payload()));
+
+        assert_eq!(
+            egress.notify_dropped.load(AtomicOrdering::Relaxed),
+            2,
+            "one item fits the queue; the other two must be dropped, not buffered"
+        );
+    }
 
     /// A minimal `tracing::Subscriber` that captures every event's
     /// formatted `message` field, so a test can assert on log content
@@ -1041,6 +1162,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_scan_period_too_small_to_schedule_is_rejected_and_changes_nothing() {
+        // "1e-12 seconds" parses fine today but rounds to zero whole
+        // nanoseconds, so the scanner cannot schedule it. Accepting it would
+        // put the record on no list while telling the client the write
+        // succeeded. Deliberately a *small* period: the large-period case is
+        // owned by the parse_scan clamp in a separate plan and is tested at
+        // the Scanner level instead.
+        //
+        // The message assertion is deliberately loose. Once that other plan's
+        // MIN_SCAN_PERIOD_SECS lands, `parse_scan` refuses this same string
+        // first, with ScanParseError's text instead of ScanRegisterError's.
+        // What this test pins either way is the property that matters: an
+        // unschedulable SCAN put is REJECTED and changes nothing.
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        let id = source.db.lookup("PV:A").expect("record exists");
+        Source::put(&source, "PV:A.SCAN", &s("1 second")).await.expect("put");
+
+        let err = Source::put(&source, "PV:A.SCAN", &s("1e-12 seconds"))
+            .await
+            .expect_err("an unschedulable SCAN period must be rejected");
+        assert!(
+            err.contains("greater than zero") || err.contains("not a valid SCAN value"),
+            "error must explain the refusal, got: {err}"
+        );
+        // Membership is untouched: still on the 1 Hz list.
+        assert_eq!(
+            source.scanner_for_test().periodic_members(Duration::from_secs(1)),
+            vec![id]
+        );
+        // And scan_raw is untouched too.
+        assert_eq!(
+            source.field_value("PV:A", "SCAN").await,
+            Some(ScalarValue::Str("1 second".into())),
+            "a rejected SCAN put must not have altered scan_raw"
+        );
+    }
+
+    #[tokio::test]
     async fn writing_phas_reorders_the_list() {
         let source = IocSource::from_raw(vec![
             raw_with_field("PV:A", "ai", "EGU", "C"),
@@ -1133,6 +1293,84 @@ mod tests {
             Some(ScalarValue::Str("eight".into())),
             "EVNT must reflect the written value"
         );
+    }
+
+    /// F3: a SCAN put of a distinct period spawns a scan thread. 100 records
+    /// written to 100 distinct periods must not create 100 threads: puts that
+    /// would exceed the cap are refused (the client sees the error) and change
+    /// nothing.
+    #[tokio::test]
+    async fn distinct_period_scan_puts_beyond_the_cap_are_refused() {
+        let raws = (0..100)
+            .map(|i| raw_with_field(&format!("PV:{i}"), "ai", "EGU", "C"))
+            .collect();
+        let source = IocSource::from_raw(raws).expect("build");
+        source.scanner_for_test().start();
+
+        let mut refused = 0;
+        for i in 0..100 {
+            let name = format!("PV:{i}.SCAN");
+            let value = format!("1.{:06} second", i + 1);
+            match Source::put(&source, &name, &s(&value)).await {
+                Ok(_) => {}
+                Err(err) => {
+                    refused += 1;
+                    assert!(err.contains("too many"), "refusal must say why, got: {err}");
+                    assert_eq!(
+                        source.field_value(&format!("PV:{i}"), "SCAN").await,
+                        Some(ScalarValue::Str("Passive".into())),
+                        "a refused SCAN put must not alter scan_raw"
+                    );
+                }
+            }
+        }
+        let threads = source.scanner_for_test().periodic_thread_count();
+        assert!(threads <= 64, "thread count must stay within the cap, got {threads}");
+        assert_eq!(refused, 100 - 64, "every put past the cap must be refused");
+    }
+
+    /// F3: one record cycled through many distinct periods leaves at most one
+    /// scan thread behind, because each move empties (and reaps) the old
+    /// period. Under the cap, these moves are never refused.
+    #[tokio::test]
+    async fn cycling_one_record_through_many_periods_leaves_one_thread() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        source.scanner_for_test().start();
+        for i in 0..100 {
+            let value = format!("1.{:06} second", i + 1);
+            Source::put(&source, "PV:A.SCAN", &s(&value))
+                .await
+                .expect("moving one record never exceeds the cap");
+        }
+        let scanner = source.scanner_for_test();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while scanner.periodic_thread_count() > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(scanner.periodic_thread_count(), 1, "emptied periods must be reaped");
+    }
+
+    /// F3: a `SCAN = "1e9 second"` put leaves a scan thread sleeping for ~31
+    /// years. Shutdown must still return promptly.
+    #[tokio::test]
+    async fn shutdown_after_a_very_long_period_returns_promptly() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        source.scanner_for_test().start();
+        Source::put(&source, "PV:A.SCAN", &s("1e9 second")).await.expect("put");
+        // Let the scan thread actually park in its sleep.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            drop(source); // `IocSource::drop` -> `Scanner::shutdown`
+            let _ = tx.send(start.elapsed());
+        });
+        let took = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown did not return within 1 s of a 1e9-second SCAN put");
+        assert!(took < Duration::from_secs(1), "shutdown took {took:?}");
     }
 
     #[tokio::test]

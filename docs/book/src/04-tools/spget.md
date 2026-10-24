@@ -19,7 +19,9 @@ more than one.
 ## Flags
 
 The shared client flags apply ([see the index](index.md)).
-`spget` adds none of its own.
+`spget` adds two flags of its own: `--raw` also prints the raw PVA header and
+payload as hex (`raw_pva:` / `raw_pvd:` lines), and `--json` prints the
+result as JSON.
 
 `-F`/`--fields` is the one worth knowing: it narrows the field request
 sent to the server, so `-F value` fetches the value without the alarm,

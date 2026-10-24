@@ -37,6 +37,11 @@ const RESOLVED_TTL: Duration = Duration::from_secs(10);
 /// that a client's search already raced past once.
 const RESOLVED_NEGATIVE_TTL: Duration = Duration::from_secs(2);
 
+/// Upper bound on `shadow_checked`. The set is a diagnostic aid, not a
+/// correctness mechanism: dropping it wholesale at the cap costs at most a
+/// repeated warning, and bounds a client-controlled allocation.
+const SHADOW_CHECKED_CAP: usize = 10_000;
+
 /// Upper bound on remembered outcomes, so an unbounded stream of distinct
 /// miss-names cannot grow the memo without limit.
 const RESOLVED_CAPACITY: usize = 4096;
@@ -317,10 +322,14 @@ struct MemoKey {
 
 pub struct SourceRegistry {
     sources: RwLock<Vec<SourceEntry>>,
-    /// PVs whose shadowing status has already been determined. Bounded by
-    /// the number of distinct names clients search for, and only ever grown
-    /// by a claim that a non-store source won.
-    shadow_checked: RwLock<HashSet<String>>,
+    /// PVs whose shadowing status has already been determined.
+    ///
+    /// A plain `std::sync::Mutex`: both uses are statement-scoped and no
+    /// `.await` happens while the guard is held, and the *synchronous*
+    /// `invalidate_memo` has to be able to clear it. Capped, because it
+    /// otherwise grows with the number of distinct names any client has ever
+    /// searched for.
+    shadow_checked: std::sync::Mutex<HashSet<String>>,
     /// Outcomes of background resolutions, keyed by identity as well as name.
     ///
     /// `std::sync::Mutex`, never held across an `.await`, and only ever
@@ -336,7 +345,7 @@ impl SourceRegistry {
     pub fn new() -> Self {
         Self {
             sources: RwLock::new(Vec::new()),
-            shadow_checked: RwLock::new(HashSet::new()),
+            shadow_checked: std::sync::Mutex::new(HashSet::new()),
             resolved: Mutex::new(HashMap::new()),
             positive_ttl: RESOLVED_TTL,
             negative_ttl: RESOLVED_NEGATIVE_TTL,
@@ -370,6 +379,28 @@ impl SourceRegistry {
     /// this task exists to fix.
     fn lock_resolved(&self) -> std::sync::MutexGuard<'_, HashMap<MemoKey, (Instant, bool)>> {
         self.resolved.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_shadow_checked(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {
+        self.shadow_checked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Record that `name`'s shadowing status has been determined. Returns
+    /// `true` when this call is the one that determined it.
+    pub(crate) fn note_shadow_checked(&self, name: &str) -> bool {
+        let mut set = self.lock_shadow_checked();
+        if set.len() >= SHADOW_CHECKED_CAP {
+            set.clear();
+        }
+        set.insert(name.to_string())
+    }
+
+    /// Number of names currently recorded. Test-only.
+    #[cfg(test)]
+    pub(crate) fn shadow_checked_len(&self) -> usize {
+        self.lock_shadow_checked().len()
     }
 
     /// Memo key for `name` under the current request identity. The one
@@ -477,6 +508,10 @@ impl SourceRegistry {
     /// full TTL after `add`/`add_store`/`remove`.
     fn invalidate_memo(&self) {
         self.lock_resolved().clear();
+        // Who serves a name has changed, so a previously determined
+        // shadowing status is stale for exactly the same reason the resolve
+        // memo is.
+        self.lock_shadow_checked().clear();
     }
 
     // ── Delegating operations ────────────────────────────────────────
@@ -521,11 +556,8 @@ impl SourceRegistry {
         winner: &str,
         name: &str,
     ) {
-        if self.shadow_checked.read().await.contains(name) {
-            return;
-        }
-        if !self.shadow_checked.write().await.insert(name.to_string()) {
-            // Another task got there between the read and the write.
+        if !self.note_shadow_checked(name) {
+            // Already determined, here or by another task.
             return;
         }
         for (label, source, _) in snapshot.iter().filter(|(_, _, is_store)| *is_store) {
@@ -589,12 +621,24 @@ impl SourceRegistry {
         self.claim(name).await.is_some()
     }
 
+    /// Snapshot the registered sources and release the read guard.
+    ///
+    /// Every delegating method goes through this rather than iterating under
+    /// the guard: a proxying source's `claim` is a full upstream round trip,
+    /// and tokio's `RwLock` is writer-fair, so one `add`/`remove` queued behind
+    /// a held read guard also fails every `try_read` the search path depends
+    /// on. [`claim`](Self::claim) and [`names`](Self::names) already did this;
+    /// these methods are catching up.
+    async fn source_snapshot(&self) -> Vec<Arc<dyn Source>> {
+        let sources = self.sources.read().await;
+        sources.iter().map(|e| e.source.clone()).collect()
+    }
+
     /// Get the value from the first source that claims the PV.
     pub async fn get(&self, name: &str) -> Option<NtPayload> {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.get(name).await;
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.get(name).await;
             }
         }
         None
@@ -616,10 +660,9 @@ impl SourceRegistry {
         name: &str,
         value: &DecodedValue,
     ) -> Result<Vec<(String, NtPayload)>, String> {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.put(name, value).await;
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.put(name, value).await;
             }
         }
         Err(format!("PV '{}' not found", name))
@@ -627,10 +670,9 @@ impl SourceRegistry {
 
     /// Subscribe via the first source that claims the PV.
     pub async fn subscribe(&self, name: &str) -> Option<mpsc::Receiver<NtPayload>> {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.subscribe(name).await;
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.subscribe(name).await;
             }
         }
         None
@@ -642,10 +684,9 @@ impl SourceRegistry {
     /// Returns `false` for an unclaimed PV — there is nothing to pump and no
     /// source to ask, so the caller's decision (pump vs. skip) is moot.
     pub async fn pushes_own_updates(&self, name: &str) -> bool {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.pushes_own_updates();
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.pushes_own_updates();
             }
         }
         false
@@ -653,10 +694,9 @@ impl SourceRegistry {
 
     /// Execute an RPC call via the first source that claims the channel.
     pub async fn rpc(&self, name: &str, args: &DecodedValue) -> Result<NtPayload, String> {
-        let sources = self.sources.read().await;
-        for entry in sources.iter() {
-            if entry.source.claim(name).await.is_some() {
-                return entry.source.rpc(name, args).await;
+        for source in self.source_snapshot().await {
+            if source.claim(name).await.is_some() {
+                return source.rpc(name, args).await;
             }
         }
         Err(format!("RPC channel '{}' not found", name))
@@ -672,10 +712,7 @@ impl SourceRegistry {
     /// every other `try_read`-based reader, since tokio's `RwLock` is
     /// writer-fair — for that whole duration.
     pub async fn names(&self) -> Vec<String> {
-        let snapshot: Vec<Arc<dyn Source>> = {
-            let sources = self.sources.read().await;
-            sources.iter().map(|e| e.source.clone()).collect()
-        };
+        let snapshot = self.source_snapshot().await;
         let mut seen = HashSet::new();
         let mut all = Vec::new();
         for source in &snapshot {
@@ -834,6 +871,114 @@ mod tests {
         // (The snapshot predates the `late` registration, so `B` is correctly
         // absent from it.)
         assert_eq!(enumerating.await.unwrap(), vec!["SLOW:PV".to_string()]);
+    }
+
+    /// A source whose `claim` is slow — the shape of every proxying source,
+    /// where a claim is an upstream search plus a TCP connect.
+    ///
+    /// `claim`, `get`, `put`, `subscribe` and `names` are all required methods
+    /// on `Source` (only `try_claim`, `pushes_own_updates` and `rpc` have
+    /// defaults), so all five are written out even though only `claim` matters
+    /// here — the same shape `SlowNamesSource` just above already uses.
+    struct SlowClaimSource {
+        delay: Duration,
+    }
+
+    impl Source for SlowClaimSource {
+        fn claim(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<PvInfo>> + Send + '_>> {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                None
+            })
+        }
+
+        fn get(&self, _name: &str) -> Pin<Box<dyn Future<Output = Option<NtPayload>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn put(
+            &self,
+            _name: &str,
+            _value: &DecodedValue,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>>
+        {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn subscribe(
+            &self,
+            _name: &str,
+        ) -> Pin<Box<dyn Future<Output = Option<mpsc::Receiver<NtPayload>>> + Send + '_>> {
+            Box::pin(async { None })
+        }
+
+        fn names(&self) -> Pin<Box<dyn Future<Output = Vec<String>> + Send + '_>> {
+            Box::pin(async { Vec::new() })
+        }
+    }
+
+    /// Drive one of the five delegating methods by name, so the test below can
+    /// cover all of them without five near-identical bodies.
+    async fn drive_registry_op(reg: Arc<SourceRegistry>, op: &'static str) {
+        // `let _ =` on every arm: `Option` and `Result` are `#[must_use]`, and
+        // it also keeps all five arms at type `()`.
+        match op {
+            "get" => {
+                let _ = reg.get("SLOW:PV").await;
+            }
+            "put" => {
+                let _ = reg.put("SLOW:PV", &DecodedValue::Int32(1)).await;
+            }
+            "subscribe" => {
+                let _ = reg.subscribe("SLOW:PV").await;
+            }
+            "rpc" => {
+                let _ = reg.rpc("SLOW:PV", &DecodedValue::Int32(1)).await;
+            }
+            "pushes_own_updates" => {
+                let _ = reg.pushes_own_updates("SLOW:PV").await;
+            }
+            other => panic!("unknown op {other}"),
+        }
+    }
+
+    /// The five delegating methods must snapshot the source list and release
+    /// the read guard before awaiting any `claim`, exactly as `claim` and
+    /// `names` already do. A proxying source's claim is an upstream round
+    /// trip; holding the registry lock across it blocks every add/remove — and,
+    /// because tokio's `RwLock` is writer-fair, every concurrent `try_read` the
+    /// search path depends on.
+    #[tokio::test]
+    async fn the_delegating_methods_do_not_hold_the_sources_lock_across_claim() {
+        for op in ["get", "put", "subscribe", "rpc", "pushes_own_updates"] {
+            let reg = Arc::new(SourceRegistry::new());
+            reg.add(
+                "slow",
+                0,
+                Arc::new(SlowClaimSource {
+                    delay: Duration::from_millis(400),
+                }),
+            )
+            .await;
+
+            let running = {
+                let reg = reg.clone();
+                tokio::spawn(async move { drive_registry_op(reg, op).await })
+            };
+            tokio::time::sleep(Duration::from_millis(80)).await;
+
+            let before = Instant::now();
+            reg.add("late", 1, Arc::new(StubSource::new(&["OTHER:PV"])))
+                .await;
+            let blocked = before.elapsed();
+
+            assert!(
+                blocked < Duration::from_millis(200),
+                "registering a source waited {blocked:?} behind {op}()'s in-flight claim"
+            );
+            running.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1225,5 +1370,45 @@ mod tests {
         let seen_again =
             crate::request_ctx::scope_with(alice, async move { r.try_claim("OWN:PV") }).await;
         assert_eq!(seen_again, TryClaim::Yes);
+    }
+
+    #[tokio::test]
+    async fn adding_a_source_re_arms_the_shadow_check() {
+        let registry = SourceRegistry::new();
+        // Determine the status of a name once, through the same helper the
+        // production path (`warn_if_shadowing_a_store`) uses.
+        assert!(
+            registry.note_shadow_checked("SHADOW:one"),
+            "the first call is the one that determines the status"
+        );
+        assert!(
+            !registry.note_shadow_checked("SHADOW:one"),
+            "a second call must report the status as already determined"
+        );
+        assert_eq!(registry.shadow_checked_len(), 1);
+
+        // `add` changes who can serve that name, so the cached shadow
+        // determination must be discarded along with the resolve memo.
+        registry
+            .add("later", 0, Arc::new(StubSource::new(&["SHADOW:one"])))
+            .await;
+        assert_eq!(
+            registry.shadow_checked_len(),
+            0,
+            "add()/invalidate_memo must clear shadow_checked, not just the resolve memo"
+        );
+    }
+
+    #[test]
+    fn shadow_checked_is_bounded() {
+        let registry = SourceRegistry::new();
+        for i in 0..(SHADOW_CHECKED_CAP * 2) {
+            registry.note_shadow_checked(&format!("PV:{i}"));
+        }
+        assert!(
+            registry.shadow_checked_len() <= SHADOW_CHECKED_CAP,
+            "shadow_checked grew past its cap: {}",
+            registry.shadow_checked_len()
+        );
     }
 }

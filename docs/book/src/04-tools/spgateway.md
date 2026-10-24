@@ -17,6 +17,7 @@ spgateway <config.json>
 spgateway -T <config.json>
 spgateway --test-config <config.json>
 spgateway -v <config.json>
+spgateway --metrics [--metrics-listen ADDR] <config.json>
 ```
 
 Requires the `client` and `server` features.
@@ -25,6 +26,8 @@ Requires the `client` and `server` features.
 |---|---|
 | `-T`, `--test-config` | Parse and validate the configuration, print `OK` or the error, and exit (0 on success, 1 on error). Does not start the gateway. |
 | `-v`, `--verbose` | Raise the log level from the default `INFO` to `DEBUG`. Ignored under `-T`. |
+| `--metrics` | Serve the Prometheus `/metrics` endpoint even if `x-spvirit.metrics.enabled` is false or absent. Applies under `-T` too. |
+| `--metrics-listen ADDR` | Override the metrics listen address (default `0.0.0.0:9090`). Does not by itself enable metrics. An empty value is an error. |
 | `--discovery-parity` / `--no-discovery-parity` | Force the per-server `discovery_parity` field on / off for **every** server, overriding whatever the JSON says. Passing both is an error. The override also applies under `-T`, so `-T` validates the effective config. |
 
 Flags may appear in any position relative to the config path; the first
@@ -113,8 +116,12 @@ reads (`get`), writes (`put`), and monitors (`subscribe`) PVs across networks,
 with per-server negative-search caching, `getholdoff`, `readOnly`/`pvlist`/ACF
 enforcement (see below), and loop/self-connection prevention.
 
+The `x-spvirit.metrics` block (`{enabled, listen, path}`, defaults
+`0.0.0.0:9090` and `/metrics`) serves a Prometheus endpoint; a metrics bind
+failure stops the gateway.
+
 Not yet enforced in M1 (parsed but inert, or deferred to a later milestone):
-the `x-spvirit` metrics / audit / hot-reload / rate-limit blocks, RPC
+the `x-spvirit` audit / hot-reload / rate-limit blocks, RPC
 forwarding to upstream servers (the local `asTest` status RPC below is
 answered by the gateway itself, not proxied), and a true upstream `pvlist`
 fan-out for downstream `splist` (`names()` reports only PVs this gateway has
@@ -208,11 +215,11 @@ once and then stays quiet — matching p4p's post-on-change).
 
 | Group | PVs | Shape / Notes |
 |---|---|---|
-| Live | `clients`, `cache` | `NTScalarArray` (string list). `cache` is the live list of upstream channels held in the monitor cache — it updates as monitors come and go. `clients` (the downstream-peer list) has no M1 registry to read yet, so it is served as an empty list (correct shape; data-population follow-up). |
+| Live | `clients`, `cache` | `NTScalarArray` (string list). `cache` is the live list of upstream channels held in the monitor cache — it updates as monitors come and go. `clients` is the live list of connected downstream peers, one entry per connection: `user@ip` when the client identified itself, else the bare peer IP, sorted. |
 | Live | `refs` | `NTTable` with columns `type`/`count`/`delta` (labels `Type`/`Count`/`Delta`), matching p4p's `RefAdapter`. No object-refcount collector exists in M1, so the rows are empty (correct shape; data follow-up). |
 | Live | `stats` | `epics:p2p/Stats:1.0` structure of cache-size counters, matching p4p's `statsType` (six `NTScalar('L')` ulong fields: `ccacheSize`, `mcacheSize`, `gcacheSize`, `banHostSize`, `banPVSize`, `banHostPVSize`). `mcacheSize` is live (the active upstream-monitor count); the other five are `0` — spvirit has no channel/GC caches or ban lists in M1 (correct shape; data follow-up). |
 | Live (writable) | `poke` | `NTScalar`. The one writable status PV: a `put` bumps an internal generation counter, and `poke`'s own value reports it — useful for confirming the status source is alive. |
-| Static | `ds:bypv:rx/tx`, `ds:byhost:rx/tx`, `us:bypv:rx/tx`, `us:byhost:rx/tx` | `NTTable`s matching p4p's bandwidth tables (`bypv` -> `PV`/rate; `us:byhost` -> `Server`/rate; `ds:byhost` -> `Account`/`Client`/rate; the rate column is labelled `TX (B/s)`/`RX (B/s)`). All have empty rows in M1 — no per-PV/per-host byte accounting exists yet, so `0` rows != "no traffic". |
+| Live | `ds:bypv:rx/tx`, `ds:byhost:rx/tx`, `us:bypv:rx/tx`, `us:byhost:rx/tx` | `NTTable`s matching p4p's bandwidth tables (`bypv` -> `PV`/rate; `us:byhost` -> `Server`/rate; `ds:byhost` -> `Account`/`Client`/rate; the rate column is labelled `TX (B/s)`/`RX (B/s)`). Rows are per-second rates, recomputed once a second by the gateway's bandwidth sampler, and the table's timeStamp is the sample time. `ds:bypv:rx` counts PUT frames only (an approximation). |
 | Static + RPC | `threads` | Gettable/subscribable static `NTScalar('s')` whose value is the constant string `"RPC only"`, matching p4p's `SharedPV(nt=NTScalar('s'), initial='RPC only')`. It **also** responds to RPC, which returns a shape-correct best-effort thread summary (available-parallelism plus a note that an OS-level stack dump is not collected and that work runs on tokio async tasks). As in p4p, the get/subscribe value never changes — the richer detail is available only via RPC. |
 | RPC | `asTest` | Diagnostic: evaluates `put`/`rpc` access for a `{pv, user, host}` argument struct against this server's `AccessControl`, without touching any upstream. Returns p4p's `epics:p2p/Permission:1.0` structure (`pv`, `account`, `peer`, plus a nested `permission` sub-structure of `put`/`rpc`/`uncached`/`audit` booleans). `roles`/`asg`/`asl` are present for shape parity but empty/zero — spvirit's `AccessControl` does not model them yet. |
 

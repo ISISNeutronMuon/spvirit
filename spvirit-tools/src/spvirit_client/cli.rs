@@ -39,6 +39,12 @@ pub struct CommonClientArgs {
     pub fields: String,
 }
 
+impl Default for CommonClientArgs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommonClientArgs {
     pub fn new() -> Self {
         Self {
@@ -61,7 +67,7 @@ impl CommonClientArgs {
     ///
     /// Short flags `-w` and `-d` are included so that tools like `pvlist`
     /// that historically accepted them keep working.
-    pub fn add_to_parser<'a, 'b>(&'a mut self, ap: &'b mut ArgumentParser<'a>) {
+    pub fn add_to_parser<'a>(&'a mut self, ap: &mut ArgumentParser<'a>) {
         ap.refer(&mut self.timeout_secs).add_option(
             &["-w", "--timeout"],
             Store,
@@ -165,6 +171,26 @@ impl CommonClientArgs {
     pub fn fields_list(&self) -> Vec<String> {
         parse_fields_arg(&self.fields)
     }
+}
+
+/// Reject an empty PV name at the CLI boundary.
+///
+/// Deliberately NOT folded into `into_pv_get_options`: `spexplore` and
+/// `spmonitor` pass an empty name on purpose, because they discover PVs rather
+/// than being given one. Only the PV-taking bins call this.
+pub fn require_pv_name(pv: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if pv.trim().is_empty() {
+        return Err("a PV name is required (got an empty argument)".into());
+    }
+    Ok(())
+}
+
+/// Build a JSON number, rejecting NaN and the infinities.
+///
+/// `serde_json::Number::from_f64` returns `None` for those, and the call sites
+/// used to `.unwrap()` it, so `spput MY:PV 1e999` aborted with a backtrace.
+pub fn finite_number(v: f64) -> Result<serde_json::Number, Box<dyn std::error::Error>> {
+    serde_json::Number::from_f64(v).ok_or_else(|| format!("value must be finite, got {v}").into())
 }
 
 /// Parse the comma-separated `--fields` value into a list of dotted paths.

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use spvirit_client::{ByteSink, PvaClient};
+use spvirit_client::{ByteSink, CacheConfig, PvaClient};
 use spvirit_server::diag::BandwidthCounters;
 
 use crate::config::{ClientCfg, GatewayConfig};
@@ -132,7 +132,15 @@ fn build_client(c: &ClientCfg) -> PvaClient {
         b = b.bind_addr(addr);
     }
 
-    b.build()
+    // State the cache posture rather than inheriting it. `CacheConfig::default()`
+    // is what `PvaClientBuilder::build` already installs, so this changes no
+    // behaviour today — it exists so a later change to the client's default
+    // cannot silently change how often a gateway searches upstream. A config
+    // key was considered and rejected: `ClientCfg` carries only p4p's own
+    // fields and has no `x-spvirit` block, and the schema's one cache-shaped
+    // extension (`ServerExt.negative_cache`) is the gateway's search-miss
+    // cache on a `ServerCfg` this function never sees.
+    b.build().with_cache_config(CacheConfig::default())
 }
 
 #[cfg(test)]

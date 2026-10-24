@@ -82,6 +82,19 @@ pub struct Events {
     /// Incremented on every successful enqueue, decremented after the handler
     /// finishes. `drain()` waits for this to reach zero.
     inflight: Arc<AtomicU64>,
+    /// The dispatcher task, so a shutting-down server can actually stop it.
+    dispatcher: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Set by `abort_dispatcher` *before* it aborts the task. The dispatcher
+    /// checks it after every `recv()`, because `JoinHandle::abort()` only
+    /// takes effect at the task's next yield and `recv()` on a non-empty
+    /// queue does not yield: without this flag a handler posted while the
+    /// dispatcher poll is still in flight would run after `abort()`
+    /// returned. `post()` and `drain()` read it too.
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    /// Signalled whenever `inflight` reaches zero, so `drain` can wait rather
+    /// than spin. `Arc` because `start_dispatcher` clones it into the spawned
+    /// dispatcher task, which has no `self`.
+    idle: Arc<tokio::sync::Notify>,
 }
 
 impl Events {
@@ -96,6 +109,9 @@ impl Events {
             failed: Arc::new(AtomicU64::new(0)),
             dispatcher_started: std::sync::atomic::AtomicBool::new(false),
             inflight: Arc::new(AtomicU64::new(0)),
+            dispatcher: std::sync::Mutex::new(None),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            idle: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -140,9 +156,20 @@ impl Events {
         };
         let inflight = self.inflight.clone();
         let failed = self.failed.clone();
+        let idle = self.idle.clone();
+        let stopped = self.stopped.clone();
         self.dispatcher_started.store(true, Ordering::SeqCst);
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             while let Some(Dispatch { handler, event }) = rx.recv().await {
+                // `abort_dispatcher` may have run while this poll was still
+                // in flight; the task-level abort has not landed yet, so
+                // stop here rather than start a handler after it returned.
+                if stopped.load(Ordering::SeqCst) {
+                    if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        idle.notify_waiters();
+                    }
+                    break;
+                }
                 let fut = handler(store.clone(), event.clone());
                 // AssertUnwindSafe: on panic we drop the handler's state and
                 // continue; the store's own invariants are upheld by its locks.
@@ -152,9 +179,34 @@ impl Events {
                     warn!("event handler for '{}' panicked", event);
                     failed.fetch_add(1, Ordering::Relaxed);
                 }
-                inflight.fetch_sub(1, Ordering::SeqCst);
+                // `fetch_sub` returns the PREVIOUS value, so `== 1` means this
+                // decrement is the one that emptied the queue.
+                if inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    idle.notify_waiters();
+                }
             }
         });
+        *self.dispatcher.lock().unwrap() = Some(handle);
+    }
+
+    /// Stop the dispatcher task. Idempotent.
+    ///
+    /// Once this returns, no handler for an event posted afterwards will
+    /// run, and the dispatcher starts no further queued handler. A handler
+    /// already running when this is called is cancelled at its next yield
+    /// point (or completes if it never yields). Inline sinks are unaffected:
+    /// they run on the posting task, not the dispatcher.
+    pub fn abort_dispatcher(&self) {
+        // Order matters: the flag must be visible before the abort request,
+        // so a dispatcher poll that is still in flight sees it on its next
+        // `recv()` instead of running the dequeued handler.
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Some(h) = self.dispatcher.lock().unwrap().take() {
+            h.abort();
+        }
+        // Wake any `drain()` already waiting: the aborted task will never
+        // decrement `inflight` for what was left in its queue.
+        self.idle.notify_waiters();
     }
 
     /// Post `event`: await every sink, then queue handlers and return.
@@ -189,6 +241,14 @@ impl Events {
             let map = self.handlers.read().unwrap();
             map.get(event).cloned().unwrap_or_default()
         };
+        if !handlers.is_empty() && self.stopped.load(Ordering::SeqCst) {
+            tracing::debug!(
+                "posted '{}' after the event dispatcher was aborted; {} handler(s) not queued",
+                event,
+                handlers.len()
+            );
+            return;
+        }
         // Count the whole batch as in-flight before enqueueing any of it, so
         // a concurrent drain() can never observe inflight == 0 partway
         // through this loop (e.g. because the dispatcher already finished
@@ -210,7 +270,9 @@ impl Events {
                 event: event.to_string(),
             });
             if queued.is_err() {
-                self.inflight.fetch_sub(1, Ordering::SeqCst);
+                if self.inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    self.idle.notify_waiters();
+                }
                 let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     warn!(
@@ -223,6 +285,9 @@ impl Events {
     }
 
     /// Wait until every queued handler has finished. Test helper.
+    ///
+    /// After [`Self::abort_dispatcher`] nothing queued will ever run, so this
+    /// returns immediately instead of waiting.
     ///
     /// Bounded rather than an unconditional spin: this doubles as a deadlock
     /// detector. If a future change ever breaks the invariant that the
@@ -247,8 +312,26 @@ impl Events {
             );
         }
         let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
-        while self.inflight.load(Ordering::SeqCst) > 0 {
-            if tokio::time::Instant::now() >= deadline {
+        loop {
+            // tokio guarantees a `Notified` created here already catches any
+            // `notify_waiters()` that runs before its first poll, so this is
+            // already safe against the lost-wakeup window between the check
+            // and the await without `enable()`. `enable()` is kept anyway as
+            // belt-and-braces, explicit-intent registration (it is what
+            // actually matters if this ever switches to `notify_one`, whose
+            // single stored permit `enable()` claims immediately rather than
+            // leaving to be raced for on first poll).
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inflight.load(Ordering::SeqCst) == 0 || self.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                if self.inflight.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
                 panic!(
                     "Events::drain() timed out after {DRAIN_TIMEOUT:?} with {} handler(s) still in flight — \
                      the dispatcher likely stopped consuming (e.g. a handler future \
@@ -256,7 +339,6 @@ impl Events {
                     self.inflight.load(Ordering::SeqCst)
                 );
             }
-            tokio::task::yield_now().await;
         }
     }
 }
@@ -732,5 +814,181 @@ mod tests {
             1,
             "sink registered from inside a call-out must take effect"
         );
+    }
+
+    /// The wait must not miss a completion that lands between the inflight
+    /// check and the await, and must return promptly once the queue empties.
+    #[tokio::test]
+    async fn drain_returns_once_every_handler_has_run() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let events = Events::new();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        events.add_handler(
+            "GO",
+            Arc::new(move |_s, _e| {
+                let h = h.clone();
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    h.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        events.start_dispatcher(test_store());
+
+        for _ in 0..5 {
+            events.post("GO").await;
+        }
+        events.drain().await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            5,
+            "drain must not return until every posted handler has finished"
+        );
+    }
+
+    /// A lost wakeup (the notify call dropped from a decrement site) does
+    /// not make `drain` panic or hang forever — it just makes it sleep to
+    /// the 10s deadline before its post-timeout re-check sees `inflight ==
+    /// 0` and returns normally. That silent slowdown is otherwise
+    /// undetectable, so run under a paused clock: a real wait completes in
+    /// well under a second of virtual time, while a lost wakeup makes the
+    /// clock jump straight to the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn drain_does_not_sleep_to_the_deadline_for_a_normal_completion() {
+        let events = Events::new();
+        events.add_handler(
+            "GO",
+            Arc::new(|_s, _e| {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                })
+            }),
+        );
+        events.start_dispatcher(test_store());
+
+        events.post("GO").await;
+        let t0 = tokio::time::Instant::now();
+        events.drain().await;
+
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "drain took {:?} of virtual time; a real notify-driven wait \
+             completes in well under 1s, a lost wakeup sleeps to the 10s \
+             deadline",
+            t0.elapsed()
+        );
+    }
+
+    /// `abort_dispatcher()` must stop handlers deterministically, even when
+    /// the dispatcher task is mid-poll at the moment it is called.
+    /// `JoinHandle::abort()` alone only takes effect at the task's next
+    /// yield, and `rx.recv()` on a non-empty queue does not yield — so a
+    /// handler already queued while the poll is still running would run
+    /// after `abort_dispatcher()` returned. Made deterministic by blocking
+    /// the dispatcher's worker thread inside the first handler (a
+    /// synchronous wait, so the poll stays in flight), posting the second
+    /// event while it is blocked (so it is queued, past `post()`'s
+    /// `stopped` gate), then aborting and releasing it. Only the
+    /// dispatcher-side `stopped` check after `recv()` can stop that queued
+    /// handler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_stops_handlers_even_while_the_dispatcher_is_mid_poll() {
+        let events = Events::new();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        let r = ran.clone();
+        events.add_handler(
+            "GO",
+            Arc::new(move |_s, _e| {
+                let r = r.clone();
+                let entered_tx = entered_tx.clone();
+                let release_rx = release_rx.clone();
+                Box::pin(async move {
+                    if let Some(tx) = entered_tx.lock().unwrap().take() {
+                        // First invocation: hold the dispatcher's poll open
+                        // by blocking its worker thread until released.
+                        let _ = tx.send(());
+                        let _ = release_rx.lock().unwrap().recv();
+                    }
+                    r.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        events.start_dispatcher(test_store());
+
+        events.post("GO").await;
+        entered_rx.await.expect("first handler entered");
+
+        // The dispatcher's poll is in flight on the other worker. Queue the
+        // second handler while it is still blocked, then abort.
+        events.post("GO").await;
+        events.abort_dispatcher();
+        release_tx.send(()).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "a handler queued before abort_dispatcher() ran after it returned"
+        );
+        // drain() after a stop must return promptly, not hang to its deadline.
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.drain())
+            .await
+            .expect("drain() after abort_dispatcher() must not hang");
+    }
+
+    /// `post()` after `abort_dispatcher()` must not queue anything: the
+    /// `stopped` gate in `post()` rejects it, so the handler never runs and
+    /// `drain()` returns promptly. The aborted dispatcher would never run a
+    /// queued item either, so "the handler did not run" alone cannot tell
+    /// the gate apart from no gate; `inflight` and `dropped_count` both
+    /// staying 0 is what proves no enqueue was attempted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_after_abort_dispatcher_queues_nothing() {
+        let events = Events::new();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = ran.clone();
+        events.add_handler(
+            "GO",
+            Arc::new(move |_s, _e| {
+                let r = r.clone();
+                Box::pin(async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        events.start_dispatcher(test_store());
+        events.abort_dispatcher();
+        events.post("GO").await;
+        // Without the gate the item is either still queued (`inflight` 1,
+        // if the aborted task has not dropped its receiver yet) or refused
+        // by the closed channel (`dropped_count` 1). The gate leaves both 0.
+        assert_eq!(
+            events.inflight.load(Ordering::SeqCst),
+            0,
+            "post() after abort_dispatcher() queued a handler"
+        );
+        assert_eq!(
+            events.dropped_count(),
+            0,
+            "post() after abort_dispatcher() tried to queue a handler"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "a handler posted after abort_dispatcher() ran"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.drain())
+            .await
+            .expect("drain() after abort_dispatcher() must not hang");
     }
 }

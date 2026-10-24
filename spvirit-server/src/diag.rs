@@ -81,6 +81,25 @@ impl ClientRegistry {
         }
     }
 
+    /// Credit many connections' transmit counters under a **single** registry
+    /// lock. The monitor fan-out produces one `(conn_id, bytes)` pair per
+    /// subscriber; taking the registry mutex once per pair made a global lock
+    /// acquisition part of the per-subscriber cost of every update.
+    ///
+    /// Repeated connection ids are summed; unknown ids are ignored, exactly as
+    /// [`Self::add_tx`] does.
+    pub fn add_tx_many(&self, items: &[(u64, u64)]) {
+        if items.is_empty() {
+            return;
+        }
+        let conns = self.conns.lock().unwrap();
+        for (conn_id, n) in items {
+            if let Some(rec) = conns.get(conn_id) {
+                rec.tx.fetch_add(*n, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Add `n` bytes to the receive counter for `conn_id`. No-op if unknown.
     pub fn add_rx(&self, conn_id: u64, n: u64) {
         let conns = self.conns.lock().unwrap();
@@ -125,6 +144,28 @@ impl ClientRegistry {
             .map(|((account, client_ip), bytes)| (account, client_ip, bytes))
             .collect()
     }
+
+    /// Total `tx` (or `rx`) bytes across every live connection.
+    ///
+    /// Equivalent to `byhost(tx).iter().map(|(_, _, b)| b).sum()`, but without
+    /// building the per-`(account, client_ip)` aggregation `HashMap` — two
+    /// cloned `String`s per connection — that the `/metrics` scrape path
+    /// immediately collapses back to one number. Grouping cannot change a sum,
+    /// so the two agree by construction (pinned by
+    /// `byhost_total_equals_the_sum_of_byhost_rows`).
+    pub fn byhost_total(&self, tx: bool) -> u64 {
+        let conns = self.conns.lock().unwrap();
+        conns
+            .values()
+            .map(|rec| {
+                if tx {
+                    rec.tx.load(Ordering::Relaxed)
+                } else {
+                    rec.rx.load(Ordering::Relaxed)
+                }
+            })
+            .sum()
+    }
 }
 
 impl Default for ClientRegistry {
@@ -146,15 +187,33 @@ impl ByteMap {
     }
 
     /// Add `n` bytes to the counter for `key`, creating it if absent.
+    ///
+    /// Looks up before inserting: `entry(key.to_string())` would heap-allocate
+    /// a fresh `String` on every call, and this is called per frame and per
+    /// monitor fan-out, where the key is essentially always already present.
     pub fn add(&self, key: &str, n: u64) {
         let mut counts = self.counts.lock().unwrap();
-        *counts.entry(key.to_string()).or_insert(0) += n;
+        if let Some(v) = counts.get_mut(key) {
+            *v += n;
+            return;
+        }
+        counts.insert(key.to_string(), n);
     }
 
     /// Snapshot all key/count pairs.
     pub fn snapshot(&self) -> Vec<(String, u64)> {
         let counts = self.counts.lock().unwrap();
         counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    /// Sum of every key's byte count, without cloning a single key.
+    ///
+    /// The `/metrics` scrape path only ever wants this number;
+    /// [`Self::snapshot`] allocates a `String` per key to produce it, which on
+    /// a gateway proxying thousands of PVs is thousands of allocations per
+    /// scrape. Use `snapshot` when the keys are actually needed.
+    pub fn total(&self) -> u64 {
+        self.counts.lock().unwrap().values().sum()
     }
 }
 
@@ -267,5 +326,74 @@ mod tests {
         c.us_byhost_rx.add("H", 2);
         assert_eq!(c.ds_bypv_tx.snapshot(), vec![("P".to_string(), 1)]);
         assert_eq!(c.us_byhost_rx.snapshot(), vec![("H".to_string(), 2)]);
+    }
+
+    /// `total` must agree with summing `snapshot()` exactly — it exists only
+    /// to skip cloning every key on the `/metrics` scrape path, which sums and
+    /// then discards them.
+    #[test]
+    fn byte_map_total_equals_the_sum_of_its_snapshot() {
+        let m = ByteMap::new();
+        assert_eq!(m.total(), 0, "an empty map totals zero");
+        m.add("PV:A", 10);
+        m.add("PV:B", 5);
+        m.add("PV:A", 7); // accumulates onto the existing key
+        let by_snapshot: u64 = m.snapshot().iter().map(|(_, b)| *b).sum();
+        assert_eq!(m.total(), 22);
+        assert_eq!(m.total(), by_snapshot);
+    }
+
+    /// `byhost_total` must agree with summing `byhost()` exactly — it exists
+    /// only to skip building the per-(account, client_ip) aggregation map,
+    /// which the scrape path immediately collapses to one number. Two
+    /// connections sharing an account+IP aggregate into one `byhost` row, so
+    /// this also pins that the total is unaffected by that grouping.
+    #[test]
+    fn byhost_total_equals_the_sum_of_byhost_rows() {
+        // `IpAddr`/`Ipv4Addr` come from this test module's own import at
+        // diag.rs:202 and `SocketAddr` from `use super::*`; no local `use`.
+        let reg = ClientRegistry::new();
+        assert_eq!(reg.byhost_total(true), 0, "no connections totals zero");
+
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        reg.connect(1, SocketAddr::new(ip, 40000));
+        reg.connect(2, SocketAddr::new(ip, 40001));
+        reg.connect(3, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6)), 40002));
+        reg.set_identity(1, Some("alice".to_string()), None);
+        reg.set_identity(2, Some("alice".to_string()), None); // same account+IP as 1
+        reg.add_tx(1, 100);
+        reg.add_tx(2, 20);
+        reg.add_tx(3, 3);
+        reg.add_rx(1, 7);
+
+        let tx_by_rows: u64 = reg.byhost(true).iter().map(|(_, _, b)| *b).sum();
+        let rx_by_rows: u64 = reg.byhost(false).iter().map(|(_, _, b)| *b).sum();
+        assert_eq!(reg.byhost_total(true), 123);
+        assert_eq!(reg.byhost_total(true), tx_by_rows);
+        assert_eq!(reg.byhost_total(false), 7);
+        assert_eq!(reg.byhost_total(false), rx_by_rows);
+    }
+
+    #[test]
+    fn add_tx_many_credits_every_connection_in_one_pass() {
+        let reg = ClientRegistry::new();
+        reg.connect(1, "127.0.0.1:1111".parse().unwrap());
+        reg.connect(2, "127.0.0.1:2222".parse().unwrap());
+
+        // Includes a repeat for conn 1 (two subscriptions on one connection)
+        // and an unknown conn 9, which must be ignored exactly as add_tx does.
+        reg.add_tx_many(&[(1, 10), (2, 20), (1, 5), (9, 100)]);
+
+        let mut got: Vec<(u16, u64)> = reg
+            .snapshot()
+            .into_iter()
+            .map(|e| (e.peer.port(), e.tx))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(1111, 15), (2222, 20)],
+            "add_tx_many must sum per connection and ignore unknown ids"
+        );
     }
 }

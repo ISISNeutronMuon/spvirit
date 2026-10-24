@@ -29,13 +29,13 @@ the value itself is inside the deadband.
 **Alarm transitions always post.** The MDEL deadband gates value changes
 only — a severity change reaches every subscriber regardless of how small
 the value moved (`should_post_update`,
-`spvirit-server/src/simple_store.rs:571`).
+`spvirit-server/src/simple_store.rs:644`).
 
 ## Two ways to get a severity
 
 | | How | Evaluated by |
 |---|---|---|
-| **Computed** | `LOW`/`HIGH`/`LOLO`/`HIHI` in a `.db` file, plus `.compute_alarms(true)` | the server, on every write |
+| **Computed** | `LOW`/`HIGH`/`LOLO`/`HIHI` in a `.db` file, or `.alarm_limits(lolo, low, high, hihi)` on a handle, plus `.compute_alarms(true)` | the server, on every write |
 | **Explicit** | `set_alarm(severity, status, message)` | you |
 
 ### Computed, from a `.db` file
@@ -95,29 +95,26 @@ argument rather than a builder call:
 
 ## What to notice
 
-**`.alarm_limits()` is published but not evaluated.** This is the trap in
-this chapter. Calling `.alarm_limits(lolo, low, high, hihi)` on a `Pv`
-handle — or passing `alarm_limits=(...)` in Python — fills in the
-`valueAlarm` structure, and clients can read those limits back with
-`spinfo`. But the value is never compared against them, **even with
-`.compute_alarms(true)`**:
+**`.alarm_limits()` is published and evaluated.** Calling
+`.alarm_limits(lolo, low, high, hihi)` on a `Pv` handle — or passing
+`alarm_limits=(...)` in Python — fills in the `valueAlarm` structure that
+clients read back with `spinfo`, and also sets the limits the evaluator
+reads, the same ones the `.db` loader sets for `LOLO`/`LOW`/`HIGH`/`HIHI`. With `.compute_alarms(true)` every write is
+evaluated, whether it is a client `spput` or a host-side `pv.set(...)`:
 
 ```console
-$ spget SIM:PRESSURE
-SIM:PRESSURE  50
-
 $ spput SIM:PRESSURE 95 && spget SIM:PRESSURE
-SIM:PRESSURE  95          # no MINOR, despite high = 90
+SIM:PRESSURE  95 MINOR READ HIGH
+
+$ spput SIM:PRESSURE 120 && spget SIM:PRESSURE
+SIM:PRESSURE  120 MAJOR READ HIHI
 ```
 
-The cause is two parallel sets of fields. `Pv::alarm_limits` writes
-`nt.value_alarm_*` (`spvirit-server/src/pv.rs:329`), while the evaluator
-`update_alarm_from_value` reads `nt.alarm_low`/`alarm_high`/`alarm_lolo`/
-`alarm_hihi` (`spvirit-types/src/lib.rs:271`) — and only the `.db` loader
-populates those (`spvirit-server/src/db.rs:360`).
-
-So today: **computed alarms require a `.db` file.** For handle-built PVs,
-call `set_alarm` yourself, as the examples above do.
+As with a `.db` record, the limits are not applied to the *initial* value:
+a PV created already past a limit reads `NO_ALARM` until its first write.
+`set_alarm` remains the route for alarms that do not follow from the
+value, and an explicit `set_alarm` is overwritten by the next computed
+write while `compute_alarms` is on.
 
 **INVALID is for "I don't know", not "bad value".** Severity 3 means the
 reading cannot be trusted — the device is unreachable, the scan threw, the
@@ -166,9 +163,9 @@ spmonitor SIM:PRESSURE                      # terminal 2
 ```console
 SIM:PRESSURE 2026-08-06 09:26:17.437  50
 SIM:PRESSURE 2026-08-06 09:26:18.438  95
-SIM:PRESSURE {alarm={severity=1, status=4, message="HIGH"}} MINOR HIGH
+SIM:PRESSURE {alarm={severity=1, status=1, message="HIGH"}} MINOR READ HIGH
 SIM:PRESSURE 2026-08-06 09:26:19.439 120
-SIM:PRESSURE {alarm={severity=2, status=4, message="HIHI"}} MAJOR HIGH HIHI
+SIM:PRESSURE {alarm={severity=2, status=1, message="HIHI"}} MAJOR READ HIHI
 ```
 
 Two things worth pausing on. The value and the alarm arrive as **separate

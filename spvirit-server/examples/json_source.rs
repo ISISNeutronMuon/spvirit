@@ -79,10 +79,10 @@ impl JsonSource {
     /// Write the current PV map back to disk.
     async fn persist(&self) {
         let pvs = self.pvs.read().await;
-        if let Ok(json) = serde_json::to_string_pretty(&*pvs) {
-            if let Err(e) = std::fs::write(&self.path, json) {
-                eprintln!("[json_source] failed to persist: {e}");
-            }
+        if let Ok(json) = serde_json::to_string_pretty(&*pvs)
+            && let Err(e) = std::fs::write(&self.path, json)
+        {
+            eprintln!("[json_source] failed to persist: {e}");
         }
     }
 }

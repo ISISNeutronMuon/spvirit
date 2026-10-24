@@ -53,41 +53,35 @@ file. If you need the labels on the wire, use `mbbi`/`mbbo`.
 accepted. An `NtEnum` has no engineering units to carry.
 
 **`.db` files cannot define enum records.** `mbbi` and `mbbo` parse, then
-fail at construction with:
+the load fails at construction with:
 
 ```text
-Record 'DEMO:STATE': type 'mbbi' is not a standard EPICS Base record type
-and cannot be loaded from .db files
+record 'DEMO:STATE' of type 'mbbi' is not yet supported by the .db loader; create it through the host API instead
 ```
 
-The message is misleading — `mbbi` *is* a standard EPICS Base record type;
-it is spvirit's `.db` loader that does not build it — the `mbbi`/`mbbo` arm
-at `spvirit-server/src/db.rs:550` (message at db.rs:558). Build enum records
-in code.
+`mbbi` is a standard EPICS Base record type; it is spvirit's `.db` loader
+that does not build it yet (`to_record` in `spvirit-server/src/db.rs`).
+Build enum records in code.
 
-**Writing to an `mbbo` from a client does not work today.** The record is
-advertised writable and the PUT is accepted on the wire — `spput` prints
-`OK`, the Python client's `put()` returns without raising — but the value
-does not change:
+**Clients write an `mbbo`; an `mbbi` is read-only.** A wire PUT carries the
+index inside the NTEnum structure, and the server unwraps it:
 
 ```console
 $ spput SIM:MODE --json '{"value":{"index":2}}'
 SIM:MODE OK
 
 $ spget SIM:MODE
-SIM:MODE {index=0, choices=["Standby", "Acquire", "Calibrate"]}
+SIM:MODE {index=2, choices=["Standby", "Acquire", "Calibrate"]}
 ```
 
-The enum PUT branch (`RecordInstance::apply_put` →
-`RecordData::NtEnum`, `spvirit-server/src/apply.rs:631`) matches only a bare
-integer under `value` (`DecodedValue::Int32`/`Int64`/…), but the NTEnum wire
-format nests the index one level deeper as `value.index` — a sub-structure no
-arm matches, so the update is left alone. The code comment there flags this as
-Known gap #1. **Drive enum records server-side with `pv.set(index)`** and treat
-them as read-only from the client until this is fixed.
+An `mbbi` is an input record and refuses client writes with
+`Write access denied`. That is deliberate: it is read-only over the wire in
+spvirit, although EPICS Base allows VAL writes to input records. Drive it
+server-side with `pv.set(index)`.
 
-**Out-of-range indices are rejected, not clamped.** The store checks
-`idx < 0 || idx >= choices.len()` and leaves the value alone.
+**Out-of-range indices are refused, not clamped.** A PUT whose index is
+outside `choices` (or whose `value` carries no integer index) is answered
+with a PUT error, and the record is left as it was — not even restamped.
 
 ## Run it
 

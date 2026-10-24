@@ -11,8 +11,10 @@ PVAccess does not send plain numbers. It sends structured payloads called
 timestamp, display limits, engineering units, and control metadata — all in
 one message.
 
-This is the single biggest difference from Channel Access, and it is why a
-`pvget` shows you a timestamp and a severity without a second round trip.
+This is the single biggest difference from Channel Access: CA returns a value
+in one of a fixed set of DBR types (with time/alarm or graphic/control
+metadata chosen per request), while PVA returns a self-describing structure
+whose shape the server defines.
 
 ```mermaid
 flowchart TD
@@ -33,8 +35,8 @@ flowchart TD
     NTSA --> A2["alarm"]
     NTSA --> D2["display"]
 
-    NTT --> L["labels + columns"]
-    NTNA --> DIM["dimensions + codec + attributes"]
+    NTT --> L["labels + value (one array per column)"]
+    NTNA --> DIM["value + codec + dimension + attribute + dataTimeStamp"]
     NTE --> V3["index: i32 + choices: Vec&lt;String&gt;"]
     NTE --> A3["alarm"]
 ```
@@ -50,8 +52,9 @@ flowchart TD
 | NTNDArray | `NtNdArray` | `ScalarArrayValue` + dimensions + attributes | Image / detector data (areaDetector) |
 
 All five live in `spvirit-types`, and the enum that unifies them is
-`NtPayload`. Everything the server sends and the client receives is one of
-these.
+`NtPayload`, which also has a `Generic` variant for arbitrary non-normative
+structures (group PVs, `.generic()` records). Everything the server sends is
+one of these six.
 
 ## What is inside an NTScalar
 

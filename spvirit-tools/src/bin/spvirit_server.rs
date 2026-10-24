@@ -14,15 +14,14 @@ use tracing::{Level, debug, error, info, warn};
 use spvirit_tools::spvirit_server::db::load_db;
 use spvirit_tools::spvirit_server::state::{ConnState, MonitorState, MonitorSub};
 use spvirit_tools::spvirit_server::types::{
-    LinkExpr, NtPayload, NtScalar, OutputMode, RecordData, RecordInstance, ScalarArrayValue,
+    LinkExpr, NtPayload, OutputMode, RecordData, RecordInstance, ScalarArrayValue,
     ScalarValue, ScanMode,
 };
 
 use spvirit_codec::epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand};
-use spvirit_codec::spvd_decode::{DecodedValue, PvdDecoder};
-use spvirit_codec::spvd_decode::{FieldDesc, FieldType, StructureDesc, TypeCode};
+use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_codec::spvd_encode::{
-    decode_pv_request_fields, encode_size_pvd, filter_structure_desc, nt_payload_desc,
+    decode_pv_request_fields, filter_structure_desc, nt_payload_desc,
 };
 use spvirit_codec::spvirit_encode::encode_control_message;
 use spvirit_codec::spvirit_encode::{
@@ -34,34 +33,33 @@ use spvirit_codec::spvirit_encode::{
     encode_op_put_get_init_error_response, encode_op_put_get_init_response,
     encode_op_put_getput_response_payload, encode_op_put_response, encode_op_put_status_response,
     encode_op_rpc_data_response_payload, encode_op_status_error_response,
-    encode_op_status_response, encode_search_response, ip_from_bytes, ip_to_bytes,
+    encode_op_status_response, encode_search_response, ip_to_bytes,
 };
 use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
+use spvirit_server::decode::decode_put_body;
 use spvirit_server::handler::{
-    infer_udp_response_ip, is_pattern_query, rand_guid, search_reply_target, wildcard_match,
+    PvListMode, build_pvlist_structure, collect_visible_pv_names_iter, dump_hex_packet,
+    infer_udp_response_ip, is_pattern_query, is_pvlist_virtual_pv, is_server_rpc_pv,
+    is_virtual_event_pv, rand_guid, requested_pvlist_pattern, search_reply_target,
+    validate_encoded_packet, virtual_event_nt, virtual_pvlist_nt, wildcard_match,
 };
 use spvirit_server::monitor::MonitorRegistry;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PvListMode {
-    Off,
-    Discover,
-    List,
-}
-
-impl PvListMode {
-    fn parse(raw: &str) -> Result<Self, String> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "off" => Ok(Self::Off),
-            "discover" => Ok(Self::Discover),
-            "list" => Ok(Self::List),
-            other => Err(format!(
-                "Invalid --pvlist-mode '{}'; expected off|discover|list",
-                other
-            )),
-        }
-    }
+/// Parse `--pvlist-mode` using the library's parser, but keep this binary's
+/// error wording. The library says "Invalid pvlist-mode"; the CLI has always
+/// said "Invalid --pvlist-mode" (naming the flag the user actually typed) and
+/// that text is a user-visible compatibility surface.
+fn parse_pvlist_mode_arg(raw: &str) -> Result<PvListMode, String> {
+    PvListMode::parse(raw).map_err(|_| {
+        // The deleted copy interpolated the already-trimmed, already-lowercased
+        // token (`other` in its `match`), not the raw argument. Reproduce that
+        // exactly so `--pvlist-mode NOPE` still reports `'nope'`.
+        format!(
+            "Invalid --pvlist-mode '{}'; expected off|discover|list",
+            raw.trim().to_ascii_lowercase()
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -73,6 +71,10 @@ struct ServerState {
     monitors: Mutex<HashMap<String, Vec<MonitorSub>>>,
     conns: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
     sid_counter: AtomicU32,
+    /// Bumped whenever the whole store is replaced (DB reload). Long-lived
+    /// derived indexes — the scan scheduler's periodic-record list — cache
+    /// against this instead of rebuilding themselves every tick.
+    db_generation: AtomicU64,
     beacon_change: AtomicU16,
     compute_alarms: bool,
     event_tx: mpsc::Sender<PostedEvent>,
@@ -121,6 +123,7 @@ impl ServerState {
             monitors: Mutex::new(HashMap::new()),
             conns: Mutex::new(HashMap::new()),
             sid_counter: AtomicU32::new(1),
+            db_generation: AtomicU64::new(0),
             beacon_change: AtomicU16::new(0),
             compute_alarms,
             event_tx,
@@ -132,6 +135,14 @@ impl ServerState {
             advertise_ip,
             listen_ip,
         }
+    }
+
+    fn db_generation(&self) -> u64 {
+        self.db_generation.load(Ordering::Relaxed)
+    }
+
+    fn bump_db_generation(&self) {
+        self.db_generation.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -233,7 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    let pvlist_mode = PvListMode::parse(&pvlist_mode_raw)?;
+    let pvlist_mode = parse_pvlist_mode_arg(&pvlist_mode_raw)?;
     let pvlist_allow_pattern = if pvlist_allow_pattern.trim().is_empty() {
         None
     } else {
@@ -428,100 +439,92 @@ async fn run_udp_search(
         };
         let version = pkt.header.version;
         let is_be = pkt.header.flags.is_msb;
-        match cmd {
-            PvaPacketCommand::Search(payload) => {
-                debug!(
-                    "UDP search from {}: pv_count={} mask=0x{:02x}",
-                    peer,
-                    payload.pv_requests.len(),
-                    payload.mask
-                );
-                let accepts_tcp = payload.protocols.is_empty()
-                    || payload
-                        .protocols
-                        .iter()
-                        .any(|p| p.eq_ignore_ascii_case("tcp"));
-                if !accepts_tcp {
-                    debug!("UDP search: no compatible protocol (tcp not accepted)");
-                    continue;
-                }
-                let pv_store = state.pv_store.read().await;
-                let visible_names = collect_visible_pv_names_from_store(
-                    &pv_store,
-                    state.pvlist_mode,
-                    state.pvlist_allow_pattern.as_ref(),
-                    state.pvlist_max,
-                );
-                let mut cids = Vec::new();
-                for (cid, name) in &payload.pv_requests {
-                    if pv_store.contains_key(name)
+        if let PvaPacketCommand::Search(payload) = cmd {
+            debug!(
+                "UDP search from {}: pv_count={} mask=0x{:02x}",
+                peer,
+                payload.pv_requests.len(),
+                payload.mask
+            );
+            let accepts_tcp = payload.protocols.is_empty()
+                || payload
+                    .protocols
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case("tcp"));
+            if !accepts_tcp {
+                debug!("UDP search: no compatible protocol (tcp not accepted)");
+                continue;
+            }
+            let pv_store = state.pv_store.read().await;
+            let cids = resolve_search_cids(
+                &payload.pv_requests,
+                state.pvlist_mode,
+                |name| {
+                    pv_store.contains_key(name)
                         || resolve_field_nt(&pv_store, name).is_some()
                         || is_virtual_event_pv(name)
                         || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
                         || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
-                    {
-                        cids.push(*cid);
-                        continue;
-                    }
-                    if state.pvlist_mode != PvListMode::Off
-                        && is_pattern_query(name)
-                        && visible_names.iter().any(|pv| wildcard_match(name, pv))
-                    {
-                        cids.push(*cid);
-                    }
-                }
-                let response_required = (payload.mask & 0x01) != 0;
-                let server_discovery_ping = payload.pv_requests.is_empty();
-                let found = server_discovery_ping || !cids.is_empty();
-                if !found && !response_required {
-                    debug!("UDP search: no matches and response not required");
-                    continue;
-                }
-                let resp_ip = if let Some(ip) = advertise_ip {
-                    ip
-                } else if !addr.ip().is_unspecified() {
-                    addr.ip()
-                } else if let Some(ip) = infer_udp_response_ip(peer) {
-                    debug!("UDP search: inferred response address {}", ip);
-                    ip
-                } else {
-                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-                };
-                let addr_bytes = if resp_ip.is_unspecified() {
-                    debug!("UDP search: responding with zero address (unspecified listen)");
-                    [0u8; 16]
-                } else {
-                    ip_to_bytes(resp_ip)
-                };
-                let response = encode_search_response(
-                    guid,
-                    payload.seq,
-                    addr_bytes,
-                    tcp_port,
-                    "tcp",
-                    found,
-                    &cids,
-                    version,
-                    is_be,
-                );
-                let reply_target = search_reply_target(&payload.addr, payload.port, peer);
-                if let Err(e) = socket.send_to(&response, reply_target).await {
-                    debug!(
-                        "UDP search: failed sending {} matches to {}: {}",
-                        cids.len(),
-                        reply_target,
-                        e
-                    );
-                    continue;
-                }
-                debug!(
-                    "UDP search: responded found={} with {} matches to {}",
-                    found,
-                    cids.len(),
-                    reply_target
-                );
+                },
+                || {
+                    collect_visible_pv_names_iter(
+                        pv_store.keys().map(String::as_str),
+                        state.pvlist_mode,
+                        state.pvlist_allow_pattern.as_ref(),
+                        state.pvlist_max,
+                    )
+                },
+            );
+            let response_required = (payload.mask & 0x01) != 0;
+            let server_discovery_ping = payload.pv_requests.is_empty();
+            let found = server_discovery_ping || !cids.is_empty();
+            if !found && !response_required {
+                debug!("UDP search: no matches and response not required");
+                continue;
             }
-            _ => {}
+            let resp_ip = if let Some(ip) = advertise_ip {
+                ip
+            } else if !addr.ip().is_unspecified() {
+                addr.ip()
+            } else if let Some(ip) = infer_udp_response_ip(peer) {
+                debug!("UDP search: inferred response address {}", ip);
+                ip
+            } else {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            };
+            let addr_bytes = if resp_ip.is_unspecified() {
+                debug!("UDP search: responding with zero address (unspecified listen)");
+                [0u8; 16]
+            } else {
+                ip_to_bytes(resp_ip)
+            };
+            let response = encode_search_response(
+                guid,
+                payload.seq,
+                addr_bytes,
+                tcp_port,
+                "tcp",
+                found,
+                &cids,
+                version,
+                is_be,
+            );
+            let reply_target = search_reply_target(&payload.addr, payload.port, peer);
+            if let Err(e) = socket.send_to(&response, reply_target).await {
+                debug!(
+                    "UDP search: failed sending {} matches to {}: {}",
+                    cids.len(),
+                    reply_target,
+                    e
+                );
+                continue;
+            }
+            debug!(
+                "UDP search: responded found={} with {} matches to {}",
+                found,
+                cids.len(),
+                reply_target
+            );
         }
     }
 }
@@ -1170,7 +1173,11 @@ async fn handle_connection(
                                     running: false,
                                     pipeline_enabled,
                                     nfree,
-                                    filtered_desc: Some(desc.clone()),
+                                    // Only a real field filter needs the
+                                    // projected descriptor; an unfiltered
+                                    // subscriber takes the single-encode
+                                    // branch of `build_monitor_frame`.
+                                    filtered_desc: pv_req_fields.is_some().then(|| desc.clone()),
                                     last_snapshot: None,
                                 });
                             info!(
@@ -1261,12 +1268,11 @@ async fn handle_connection(
                                 pipeline_ack,
                                 nfree
                             );
-                            if start {
-                                if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
+                            if start
+                                && let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     send_monitor_update_for(&state, &pv_name, conn_id, ioid, &nt)
                                         .await;
                                 }
-                            }
                         }
                     }
                     20 => {
@@ -1403,30 +1409,25 @@ async fn handle_connection(
                         .any(|p| p.eq_ignore_ascii_case("tcp"));
                 if accepts_tcp {
                     let pv_store = state.pv_store.read().await;
-                    let visible_names = collect_visible_pv_names_from_store(
-                        &pv_store,
+                    let cids = resolve_search_cids(
+                        &payload.pv_requests,
                         state.pvlist_mode,
-                        state.pvlist_allow_pattern.as_ref(),
-                        state.pvlist_max,
+                        |name| {
+                            pv_store.contains_key(name)
+                                || resolve_field_nt(&pv_store, name).is_some()
+                                || is_virtual_event_pv(name)
+                                || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
+                                || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
+                        },
+                        || {
+                            collect_visible_pv_names_iter(
+                                pv_store.keys().map(String::as_str),
+                                state.pvlist_mode,
+                                state.pvlist_allow_pattern.as_ref(),
+                                state.pvlist_max,
+                            )
+                        },
                     );
-                    let mut cids = Vec::new();
-                    for (cid, name) in &payload.pv_requests {
-                        if pv_store.contains_key(name)
-                            || resolve_field_nt(&pv_store, name).is_some()
-                            || is_virtual_event_pv(name)
-                            || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
-                            || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
-                        {
-                            cids.push(*cid);
-                            continue;
-                        }
-                        if state.pvlist_mode != PvListMode::Off
-                            && is_pattern_query(name)
-                            && visible_names.iter().any(|pv| wildcard_match(name, pv))
-                        {
-                            cids.push(*cid);
-                        }
-                    }
                     drop(pv_store);
                     let server_discovery_ping = payload.pv_requests.is_empty();
                     let found = server_discovery_ping || !cids.is_empty();
@@ -1489,17 +1490,66 @@ async fn cleanup_connection(state: &Arc<ServerState>, conn_id: u64) {
     }
 }
 
+/// Compute which PVs a reloaded store changed.
+///
+/// Each side's `NtPayload` is materialised exactly once, where the old code
+/// called `to_ntpayload()` twice and cloned the result a third time per PV.
+///
+/// Production code must reach this only through [`swap_store_and_diff`], under
+/// the same write guard as the swap. Diffing under a separate read lock opens a
+/// window in which a client PUT can land and then be reverted by the swap with
+/// no monitor update (fixed in e98ac0c). Tests may call it directly.
+fn diff_stores(
+    old: &HashMap<String, RecordInstance>,
+    new: &HashMap<String, RecordInstance>,
+) -> Vec<(String, NtPayload)> {
+    let mut changed = Vec::new();
+    for (name, new_val) in new {
+        let new_payload = new_val.to_ntpayload();
+        let unchanged = old
+            .get(name)
+            .is_some_and(|old_val| old_val.to_ntpayload() == new_payload);
+        if !unchanged {
+            changed.push((name.clone(), new_payload));
+        }
+    }
+    changed
+}
+
+/// Replace `store` with `new_store`, returning the PVs whose payload changed.
+/// The diff is taken against the live `store` immediately before the swap.
+/// The caller must hold the store write guard for the whole call and bump the
+/// db generation before releasing it; see [`diff_stores`] for why the diff may
+/// not run under a separate lock.
+fn swap_store_and_diff(
+    store: &mut HashMap<String, RecordInstance>,
+    new_store: HashMap<String, RecordInstance>,
+) -> Vec<(String, NtPayload)> {
+    let changed = diff_stores(store, &new_store);
+    *store = new_store;
+    changed
+}
+
 async fn run_db_reload(
     state: Arc<ServerState>,
     db_file: String,
     interval_secs: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut last_mtime = file_mtime(&db_file).unwrap_or(SystemTime::UNIX_EPOCH);
+    let db_path = db_file.clone();
+    let mut last_mtime = tokio::task::spawn_blocking(move || file_mtime(&db_path))
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
     loop {
         interval.tick().await;
-        let current_mtime = match file_mtime(&db_file) {
+        let db_path = db_file.clone();
+        let current_mtime = match tokio::task::spawn_blocking(move || file_mtime(&db_path))
+            .await
+            .unwrap_or(None)
+        {
             Some(t) => t,
             None => continue,
         };
@@ -1508,10 +1558,16 @@ async fn run_db_reload(
         }
         last_mtime = current_mtime;
 
-        let mut new_store = match load_db(&db_file) {
-            Ok(v) => v,
-            Err(e) => {
+        let db_path = db_file.clone();
+        let loaded = tokio::task::spawn_blocking(move || load_db(&db_path)).await;
+        let mut new_store = match loaded {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
                 error!("Failed to reload DB: {}", e);
+                continue;
+            }
+            Err(e) => {
+                error!("DB reload task panicked: {}", e);
                 continue;
             }
         };
@@ -1534,18 +1590,15 @@ async fn run_db_reload(
             new_store.len()
         );
 
-        let mut changed: Vec<(String, NtPayload)> = Vec::new();
-        {
+        // Diff, swap and generation bump share one write guard, so no PUT can
+        // land between the diff and the swap. Notifications go out after the
+        // guard is released.
+        let changed: Vec<(String, NtPayload)> = {
             let mut store = state.pv_store.write().await;
-            for (name, new_val) in &new_store {
-                let old_val = store.get(name);
-                let new_payload = new_val.to_ntpayload();
-                if old_val.map(|v| v.to_ntpayload()) != Some(new_payload.clone()) {
-                    changed.push((name.clone(), new_payload));
-                }
-            }
-            *store = new_store;
-        }
+            let changed = swap_store_and_diff(&mut store, new_store);
+            state.bump_db_generation();
+            changed
+        };
 
         for (name, payload) in changed {
             info!("PV changed: {}", name);
@@ -1634,11 +1687,15 @@ async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPa
         }
     }
 
-    // Phase 2: enqueue outside the lock; remember which subs actually took delivery.
-    let mut delivered: Vec<(u64, u32)> = Vec::new();
-    for (conn_id, ioid, msg) in to_send {
-        if send_msg(state, conn_id, msg).await {
-            delivered.push((conn_id, ioid));
+    // Phase 2: enqueue outside the monitors lock, under one `conns` lock.
+    // The result is a set, not a Vec: phase 3 walks every sub and asks "was this
+    // one delivered?", so a linear scan per sub would make the commit phase
+    // O(delivered x subs).
+    let delivered = send_msgs(state, to_send).await;
+    // Per-connection detail, as the old per-recipient loop logged it; the
+    // enabled! check keeps the walk off the hot path when DEBUG is off.
+    if tracing::enabled!(Level::DEBUG) {
+        for (conn_id, _ioid) in &delivered {
             debug!("Monitor update pv='{}' conn={} ", pv_name, conn_id);
         }
     }
@@ -1648,10 +1705,7 @@ async fn notify_monitors(state: &Arc<ServerState>, pv_name: &str, payload: &NtPa
         let mut monitors = state.monitors.lock().await;
         if let Some(list) = monitors.get_mut(pv_name) {
             for sub in list.iter_mut() {
-                if delivered
-                    .iter()
-                    .any(|&(c, i)| c == sub.conn_id && i == sub.ioid)
-                {
+                if delivered.contains(&(sub.conn_id, sub.ioid)) {
                     if sub.pipeline_enabled && sub.nfree > 0 {
                         sub.nfree -= 1;
                     }
@@ -1698,8 +1752,8 @@ async fn send_monitor_update_for(
     // Enqueue outside the lock; commit baseline + credit only on delivery.
     if send_msg(state, conn_id, msg).await {
         let mut monitors = state.monitors.lock().await;
-        if let Some(list) = monitors.get_mut(pv_name) {
-            if let Some(sub) = list
+        if let Some(list) = monitors.get_mut(pv_name)
+            && let Some(sub) = list
                 .iter_mut()
                 .find(|s| s.conn_id == conn_id && s.ioid == ioid)
             {
@@ -1708,7 +1762,6 @@ async fn send_monitor_update_for(
                 }
                 sub.last_snapshot = Some(payload.clone());
             }
-        }
     }
 }
 
@@ -1729,8 +1782,8 @@ async fn update_monitor_subscription(
     pipeline_enabled: Option<bool>,
 ) -> bool {
     let mut monitors = state.monitors.lock().await;
-    if let Some(list) = monitors.get_mut(pv_name) {
-        if let Some(sub) = list
+    if let Some(list) = monitors.get_mut(pv_name)
+        && let Some(sub) = list
             .iter_mut()
             .find(|s| s.conn_id == conn_id && s.ioid == ioid)
         {
@@ -1738,14 +1791,12 @@ async fn update_monitor_subscription(
             if let Some(v) = nfree {
                 sub.nfree = v.min(MAX_PIPELINE_WINDOW);
             }
-            if let Some(enabled) = pipeline_enabled {
-                if enabled {
+            if let Some(enabled) = pipeline_enabled
+                && enabled {
                     sub.pipeline_enabled = true;
                 }
-            }
             return true;
         }
-    }
     false
 }
 
@@ -1795,66 +1846,40 @@ async fn send_msg(state: &Arc<ServerState>, conn_id: u64, msg: Vec<u8>) -> bool 
     }
 }
 
-fn is_pvlist_virtual_pv(pv_name: &str) -> bool {
-    pv_name == "__pvlist"
-}
-
-fn is_server_rpc_pv(pv_name: &str) -> bool {
-    pv_name == "server"
-}
-
-fn is_virtual_event_pv(pv_name: &str) -> bool {
-    pv_name.starts_with("__event:")
-}
-
-fn collect_visible_pv_names_from_store(
-    pv_store: &HashMap<String, RecordInstance>,
-    mode: PvListMode,
-    allow_pattern: Option<&Regex>,
-    max_items: usize,
-) -> Vec<String> {
-    let mut names: Vec<String> = pv_store
-        .keys()
-        .filter(|name| {
-            allow_pattern
-                .as_ref()
-                .map(|re| re.is_match(name))
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
-    names.sort();
-    if names.len() > max_items {
-        names.truncate(max_items);
+/// Enqueue many frames under a single `conns` lock acquisition.
+///
+/// `send_msg` locks once per recipient, which turns a fan-out to N monitor
+/// subscribers into N lock round-trips on the same mutex. Returns the
+/// `(conn_id, ioid)` pairs that were actually enqueued - a full queue (slow
+/// client) or a closed/unknown connection is a non-delivery, exactly as in
+/// `send_msg`, so pipeline credits and delta baselines are not advanced for it.
+async fn send_msgs(
+    state: &Arc<ServerState>,
+    msgs: Vec<(u64, u32, Vec<u8>)>,
+) -> HashSet<(u64, u32)> {
+    let mut delivered = HashSet::new();
+    if msgs.is_empty() {
+        return delivered;
     }
-    if mode == PvListMode::List && names.len() < max_items {
-        names.push("__pvlist".to_string());
+    let conns = state.conns.lock().await;
+    for (conn_id, ioid, msg) in msgs {
+        let Some(tx) = conns.get(&conn_id) else {
+            continue;
+        };
+        match tx.try_send(msg) {
+            Ok(()) => {
+                delivered.insert((conn_id, ioid));
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    "Dropping monitor update for conn={}: send queue full (slow client)",
+                    conn_id
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
-    names
-}
-
-fn build_pvlist_structure(names: &[String]) -> StructureDesc {
-    StructureDesc {
-        struct_id: Some("epics:pva/pvlist:1.0".to_string()),
-        fields: names
-            .iter()
-            .map(|name| FieldDesc {
-                name: name.clone(),
-                field_type: FieldType::Scalar(TypeCode::Boolean),
-            })
-            .collect(),
-    }
-}
-
-fn requested_pvlist_pattern(field_name: Option<&str>) -> Option<&str> {
-    let raw = field_name.map(str::trim).unwrap_or("");
-    if raw.is_empty() || raw == "*" || raw == "__pvlist" || raw.eq_ignore_ascii_case("pvlist") {
-        return Some("*");
-    }
-    if is_pattern_query(raw) {
-        return Some(raw);
-    }
-    None
+    delivered
 }
 
 async fn handle_get_field_request(
@@ -1898,8 +1923,8 @@ async fn handle_get_field_request(
         (sid, pv)
     };
 
-    if let Some(sid) = sid {
-        if let Some(pv_name) = resolved_pv.as_ref() {
+    if let Some(sid) = sid
+        && let Some(pv_name) = resolved_pv.as_ref() {
             if let Some(nt) = get_nt_snapshot(state, pv_name).await {
                 let full_desc = nt_payload_desc(&nt);
                 // If a sub-field name was requested, filter the introspection
@@ -1941,7 +1966,6 @@ async fn handle_get_field_request(
             send_msg(state, conn_id, resp).await;
             return;
         }
-    }
 
     if state.pvlist_mode != PvListMode::List {
         let resp = encode_get_field_error(
@@ -1966,8 +1990,8 @@ async fn handle_get_field_request(
     };
 
     let pv_store = state.pv_store.read().await;
-    let mut names = collect_visible_pv_names_from_store(
-        &pv_store,
+    let mut names = collect_visible_pv_names_iter(
+        pv_store.keys().map(String::as_str),
         state.pvlist_mode,
         state.pvlist_allow_pattern.as_ref(),
         state.pvlist_max,
@@ -2023,8 +2047,8 @@ async fn handle_server_rpc(
 
     let names = {
         let store = state.pv_store.read().await;
-        collect_visible_pv_names_from_store(
-            &store,
+        collect_visible_pv_names_iter(
+            store.keys().map(String::as_str),
             state.pvlist_mode,
             state.pvlist_allow_pattern.as_ref(),
             state.pvlist_max,
@@ -2056,19 +2080,38 @@ fn parse_virtual_event(pv_name: &str) -> Option<PostedEvent> {
     }
 }
 
-fn virtual_event_nt(pv_name: &str) -> NtPayload {
-    NtPayload::Scalar(
-        NtScalar::from_value(ScalarValue::Bool(false))
-            .with_description(format!("Virtual event trigger for {}", pv_name)),
-    )
-}
-
-fn virtual_pvlist_nt(entries: Vec<String>) -> NtPayload {
-    NtPayload::ScalarArray(
-        spvirit_tools::spvirit_server::types::NtScalarArray::from_value(ScalarArrayValue::Str(
-            entries,
-        )),
-    )
+/// Decide which of a SEARCH packet's CIDs this server can answer.
+///
+/// `visible` is a *thunk*: it is invoked at most once per packet, and only if
+/// a pattern query is actually present. Materialising the visible-PV list means
+/// filtering, sorting and cloning every name in the store - far too expensive
+/// to pay on every SEARCH broadcast, when the common packet is a handful of
+/// exact names that never consults the list at all.
+fn resolve_search_cids<D, V>(
+    requests: &[(u32, String)],
+    mode: PvListMode,
+    mut direct_hit: D,
+    mut visible: V,
+) -> Vec<u32>
+where
+    D: FnMut(&str) -> bool,
+    V: FnMut() -> Vec<String>,
+{
+    let mut cids = Vec::new();
+    let mut visible_names: Option<Vec<String>> = None;
+    for (cid, name) in requests {
+        if direct_hit(name) {
+            cids.push(*cid);
+            continue;
+        }
+        if mode != PvListMode::Off && is_pattern_query(name) {
+            let names = visible_names.get_or_insert_with(&mut visible);
+            if names.iter().any(|pv| wildcard_match(name, pv)) {
+                cids.push(*cid);
+            }
+        }
+    }
+    cids
 }
 
 /// Resolve an IOC-style `<record>.<FIELD>[$]` reference against the store.
@@ -2102,8 +2145,8 @@ async fn get_nt_snapshot(state: &Arc<ServerState>, pv_name: &str) -> Option<NtPa
             return None;
         }
         let store = state.pv_store.read().await;
-        let names = collect_visible_pv_names_from_store(
-            &store,
+        let names = collect_visible_pv_names_iter(
+            store.keys().map(String::as_str),
             state.pvlist_mode,
             state.pvlist_allow_pattern.as_ref(),
             state.pvlist_max,
@@ -2150,33 +2193,58 @@ async fn process_pini_records(state: &Arc<ServerState>) {
     }
 }
 
+/// True when a cached periodic-record index must be rebuilt.
+fn periodic_index_is_stale(
+    cache: Option<&(u64, Vec<(String, Duration)>)>,
+    generation: u64,
+) -> bool {
+    match cache {
+        Some((cached_generation, _)) => *cached_generation != generation,
+        None => true,
+    }
+}
+
 async fn run_scan_scheduler(state: Arc<ServerState>) -> Result<(), Box<dyn std::error::Error>> {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     let mut next_due: HashMap<String, Instant> = HashMap::new();
+    // (db_generation, periodic records) — rebuilt only when the store is
+    // replaced, not on every 100 ms tick. `record.common.scan` is immutable at
+    // runtime; a whole-store swap in `run_db_reload` is the only thing that can
+    // change this set, and it bumps the generation.
+    let mut periodic_cache: Option<(u64, Vec<(String, Duration)>)> = None;
     loop {
         interval.tick().await;
         let now = Instant::now();
-        let periodic: Vec<(String, Duration)> = {
+        let generation = state.db_generation();
+        if periodic_index_is_stale(periodic_cache.as_ref(), generation) {
             let store = state.pv_store.read().await;
-            store
+            let records: Vec<(String, Duration)> = store
                 .iter()
                 .filter_map(|(name, record)| match &record.common.scan {
                     ScanMode::Periodic(period) => Some((name.clone(), *period)),
                     _ => None,
                 })
-                .collect()
-        };
+                .collect();
+            drop(store);
+            next_due.retain(|name, _| records.iter().any(|(n, _)| n == name));
+            periodic_cache = Some((generation, records));
+        }
+        let periodic = &periodic_cache
+            .as_ref()
+            .expect("periodic_cache populated above")
+            .1;
+
         let mut due: Vec<String> = Vec::new();
-        let periodic_names: HashSet<String> =
-            periodic.iter().map(|(name, _)| name.clone()).collect();
         for (name, period) in periodic {
-            let entry = next_due.entry(name.clone()).or_insert_with(|| now + period);
+            let entry = next_due
+                .entry(name.clone())
+                .or_insert_with(|| now + *period);
             if now >= *entry {
-                due.push(name);
-                *entry = now + period;
+                due.push(name.clone());
+                *entry = now + *period;
             }
         }
-        next_due.retain(|name, _| periodic_names.contains(name));
+
         for name in due {
             let changed = process_single_record(&state, &name).await;
             notify_changed_records(&state, changed).await;
@@ -2188,22 +2256,41 @@ async fn run_event_worker(
     state: Arc<ServerState>,
     mut event_rx: mpsc::Receiver<PostedEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // (db_generation, event-tag index, io-event-tag index). Rebuilt only when
+    // the store is replaced, not on every posted event. `record.common.scan` is
+    // immutable at runtime (its only two readers in the whole workspace are
+    // this function and `run_scan_scheduler`), and a whole-store swap in
+    // `run_db_reload` is the only thing that can change these sets — it bumps
+    // the generation. `Event` and `IoEvent` get separate maps because the
+    // original `filter_map` matched the (scan, event) pair: a soft event must
+    // never fire an `I/O Intr` record that happens to share its tag.
+    type EventIndex = (u64, HashMap<String, Vec<String>>, HashMap<String, Vec<String>>);
+    let mut event_cache: Option<EventIndex> = None;
     while let Some(event) = event_rx.recv().await {
-        let targets: Vec<String> = {
+        let generation = state.db_generation();
+        if event_cache.as_ref().map(|(g, _, _)| *g) != Some(generation) {
             let store = state.pv_store.read().await;
-            store
-                .iter()
-                .filter_map(|(name, record)| match (&record.common.scan, &event) {
-                    (ScanMode::Event(ev), PostedEvent::Event(trigger)) if ev == trigger => {
-                        Some(name.clone())
-                    }
-                    (ScanMode::IoEvent(ev), PostedEvent::IoEvent(trigger)) if ev == trigger => {
-                        Some(name.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
+            let mut soft: HashMap<String, Vec<String>> = HashMap::new();
+            let mut io: HashMap<String, Vec<String>> = HashMap::new();
+            for (name, record) in store.iter() {
+                match &record.common.scan {
+                    ScanMode::Event(tag) => soft.entry(tag.clone()).or_default().push(name.clone()),
+                    ScanMode::IoEvent(tag) => io.entry(tag.clone()).or_default().push(name.clone()),
+                    _ => {}
+                }
+            }
+            drop(store);
+            event_cache = Some((generation, soft, io));
+        }
+        let (_, soft, io) = event_cache.as_ref().expect("event_cache populated above");
+        let targets: &[String] = match &event {
+            PostedEvent::Event(trigger) => soft.get(trigger).map(Vec::as_slice).unwrap_or(&[]),
+            PostedEvent::IoEvent(trigger) => io.get(trigger).map(Vec::as_slice).unwrap_or(&[]),
         };
+        // `process_single_record` takes `&Arc<ServerState>` and awaits, which
+        // would hold the `event_cache` borrow across the await points. Copy the
+        // (small) target list out first so the borrow ends here.
+        let targets: Vec<String> = targets.to_vec();
         for target in targets {
             let changed = process_single_record(&state, &target).await;
             notify_changed_records(&state, changed).await;
@@ -2268,7 +2355,7 @@ async fn apply_put_and_process(
     }
     let mut changed_names: HashSet<String> = HashSet::new();
     let mut force_post: HashSet<String> = HashSet::new();
-    let outcome = record.apply_put(value, state.compute_alarms);
+    let outcome = record.apply_put(value, state.compute_alarms)?;
     if outcome.value_changed {
         // A value change is always judged by the deadband (should_post_update
         // must run so the MDEL reference point stays current); it is never
@@ -2388,15 +2475,13 @@ fn process_record_by_name(
     };
 
     let mut disabled = disa;
-    if !disabled {
-        if let Some(link) = sdis.as_ref() {
-            if let Some(ScalarValue::Bool(true)) =
+    if !disabled
+        && let Some(link) = sdis.as_ref()
+            && let Some(ScalarValue::Bool(true)) =
                 read_link_value(store, link, compute_alarms, active, changed_names)
             {
                 disabled = true;
             }
-        }
-    }
     if disabled {
         if let Some(record) = store.get_mut(pv_name) {
             let nt = record.nt_mut();
@@ -2424,6 +2509,195 @@ fn process_record_by_name(
     active.remove(pv_name);
 }
 
+/// The subset of a record that `process_record_body` actually reads.
+///
+/// `process_record_body` used to start with `store.get(pv_name).cloned()`,
+/// deep-copying the whole `RecordInstance` — `raw_fields`, and the entire value
+/// payload (`NtScalarArray`, `NtTable`, `NtNdArray`, `Generic::fields`) — on
+/// every PUT and every scan tick. None of it is used: every match arm binds
+/// only link expressions, a `bool`, an `OutputMode` and a few numeric limits.
+/// `RecordPlan` mirrors `RecordData`'s variant and field *names* exactly, so
+/// the arm bodies below are unchanged; only the arm heads say `RecordPlan::`.
+#[derive(Debug, Clone)]
+enum RecordPlan {
+    Ai {
+        inp: Option<LinkExpr>,
+        siml: Option<LinkExpr>,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    Ao {
+        out: Option<LinkExpr>,
+        dol: Option<LinkExpr>,
+        omsl: OutputMode,
+        drvl: Option<f64>,
+        drvh: Option<f64>,
+        oroc: Option<f64>,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    Bi {
+        inp: Option<LinkExpr>,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    Bo {
+        out: Option<LinkExpr>,
+        dol: Option<LinkExpr>,
+        omsl: OutputMode,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    StringIn {
+        inp: Option<LinkExpr>,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    StringOut {
+        out: Option<LinkExpr>,
+        dol: Option<LinkExpr>,
+        omsl: OutputMode,
+        siol: Option<LinkExpr>,
+        simm: bool,
+    },
+    Waveform {
+        inp: Option<LinkExpr>,
+    },
+    Aao {
+        out: Option<LinkExpr>,
+        dol: Option<LinkExpr>,
+        omsl: OutputMode,
+    },
+    SubArray {
+        inp: Option<LinkExpr>,
+        indx: usize,
+        nelm: usize,
+        malm: usize,
+    },
+    NtTable {
+        inp: Option<LinkExpr>,
+        out: Option<LinkExpr>,
+        omsl: OutputMode,
+    },
+    NtNdArray {
+        inp: Option<LinkExpr>,
+        out: Option<LinkExpr>,
+        omsl: OutputMode,
+    },
+    /// `NtEnum` and `Generic` have no processing behaviour.
+    Inert,
+}
+
+fn record_plan(data: &RecordData) -> RecordPlan {
+    match data {
+        RecordData::Ai {
+            inp,
+            siml,
+            siol,
+            simm,
+            ..
+        } => RecordPlan::Ai {
+            inp: inp.clone(),
+            siml: siml.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::Ao {
+            out,
+            dol,
+            omsl,
+            drvl,
+            drvh,
+            oroc,
+            siol,
+            simm,
+            ..
+        } => RecordPlan::Ao {
+            out: out.clone(),
+            dol: dol.clone(),
+            omsl: omsl.clone(),
+            drvl: *drvl,
+            drvh: *drvh,
+            oroc: *oroc,
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::Bi {
+            inp, siol, simm, ..
+        } => RecordPlan::Bi {
+            inp: inp.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::Bo {
+            out,
+            dol,
+            omsl,
+            siol,
+            simm,
+            ..
+        } => RecordPlan::Bo {
+            out: out.clone(),
+            dol: dol.clone(),
+            omsl: omsl.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::StringIn {
+            inp, siol, simm, ..
+        } => RecordPlan::StringIn {
+            inp: inp.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::StringOut {
+            out,
+            dol,
+            omsl,
+            siol,
+            simm,
+            ..
+        } => RecordPlan::StringOut {
+            out: out.clone(),
+            dol: dol.clone(),
+            omsl: omsl.clone(),
+            siol: siol.clone(),
+            simm: *simm,
+        },
+        RecordData::Waveform { inp, .. } | RecordData::Aai { inp, .. } => {
+            RecordPlan::Waveform { inp: inp.clone() }
+        }
+        RecordData::Aao { out, dol, omsl, .. } => RecordPlan::Aao {
+            out: out.clone(),
+            dol: dol.clone(),
+            omsl: omsl.clone(),
+        },
+        RecordData::SubArray {
+            inp,
+            indx,
+            nelm,
+            malm,
+            ..
+        } => RecordPlan::SubArray {
+            inp: inp.clone(),
+            indx: *indx,
+            nelm: *nelm,
+            malm: *malm,
+        },
+        RecordData::NtTable { inp, out, omsl, .. } => RecordPlan::NtTable {
+            inp: inp.clone(),
+            out: out.clone(),
+            omsl: omsl.clone(),
+        },
+        RecordData::NtNdArray { inp, out, omsl, .. } => RecordPlan::NtNdArray {
+            inp: inp.clone(),
+            out: out.clone(),
+            omsl: omsl.clone(),
+        },
+        RecordData::NtEnum { .. } | RecordData::Generic { .. } => RecordPlan::Inert,
+    }
+}
+
 fn process_record_body(
     store: &mut HashMap<String, RecordInstance>,
     pv_name: &str,
@@ -2431,12 +2705,15 @@ fn process_record_body(
     active: &mut HashSet<String>,
     changed_names: &mut HashSet<String>,
 ) {
-    let Some(record_snapshot) = store.get(pv_name).cloned() else {
+    // Extract only the fields the arms below read, under a short immutable
+    // borrow, then release it — the arms need `&mut store` for link reads and
+    // writes. See `RecordPlan` for why this is not `store.get(..).cloned()`.
+    let Some(plan) = store.get(pv_name).map(|record| record_plan(&record.data)) else {
         return;
     };
 
-    match record_snapshot.data {
-        RecordData::Ai {
+    match plan {
+        RecordPlan::Ai {
             inp,
             siml,
             siol,
@@ -2451,18 +2728,15 @@ fn process_record_body(
             if let Some(link) = chosen {
                 if let Some(value) =
                     read_link_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(v) = scalar_to_f64(&value) {
-                        if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(v) = scalar_to_f64(&value)
+                        && let Some(record) = store.get_mut(pv_name) {
                             record.set_scalar_value(ScalarValue::F64(v), compute_alarms);
                         }
-                    }
-                }
             } else if simm {
                 let _ = siml;
             }
         }
-        RecordData::Ao {
+        RecordPlan::Ao {
             out,
             dol,
             omsl,
@@ -2477,39 +2751,32 @@ fn process_record_body(
                 .get(pv_name)
                 .and_then(|rec| scalar_to_f64(&rec.current_value()))
                 .unwrap_or(0.0);
-            if matches!(omsl, OutputMode::ClosedLoop) {
-                if let Some(link) = dol.as_ref() {
-                    if let Some(value) =
+            if matches!(omsl, OutputMode::ClosedLoop)
+                && let Some(link) = dol.as_ref()
+                    && let Some(value) =
                         read_link_value(store, link, compute_alarms, active, changed_names)
-                    {
-                        if let Some(v) = scalar_to_f64(&value) {
+                        && let Some(v) = scalar_to_f64(&value) {
                             next = v;
                         }
-                    }
-                }
-            }
-            if let Some(min) = drvl {
-                if next < min {
+            if let Some(min) = drvl
+                && next < min {
                     next = min;
                 }
-            }
-            if let Some(max) = drvh {
-                if next > max {
+            if let Some(max) = drvh
+                && next > max {
                     next = max;
                 }
-            }
             let prev = store
                 .get(pv_name)
                 .and_then(|rec| scalar_to_f64(&rec.current_value()))
                 .unwrap_or(next);
-            if let Some(limit) = oroc {
-                if limit > 0.0 {
+            if let Some(limit) = oroc
+                && limit > 0.0 {
                     let delta = next - prev;
                     if delta.abs() > limit {
                         next = prev + delta.signum() * limit;
                     }
                 }
-            }
             if let Some(record) = store.get_mut(pv_name) {
                 record.set_scalar_value(ScalarValue::F64(next), compute_alarms);
             }
@@ -2529,7 +2796,7 @@ fn process_record_body(
                 );
             }
         }
-        RecordData::Bi {
+        RecordPlan::Bi {
             inp, siol, simm, ..
         } => {
             let chosen = if simm {
@@ -2537,19 +2804,15 @@ fn process_record_body(
             } else {
                 inp.as_ref()
             };
-            if let Some(link) = chosen {
-                if let Some(value) =
+            if let Some(link) = chosen
+                && let Some(value) =
                     read_link_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(v) = scalar_to_bool(&value) {
-                        if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(v) = scalar_to_bool(&value)
+                        && let Some(record) = store.get_mut(pv_name) {
                             record.set_scalar_value(ScalarValue::Bool(v), compute_alarms);
                         }
-                    }
-                }
-            }
         }
-        RecordData::Bo {
+        RecordPlan::Bo {
             out,
             dol,
             omsl,
@@ -2561,17 +2824,13 @@ fn process_record_body(
                 .get(pv_name)
                 .and_then(|rec| scalar_to_bool(&rec.current_value()))
                 .unwrap_or(false);
-            if matches!(omsl, OutputMode::ClosedLoop) {
-                if let Some(link) = dol.as_ref() {
-                    if let Some(value) =
+            if matches!(omsl, OutputMode::ClosedLoop)
+                && let Some(link) = dol.as_ref()
+                    && let Some(value) =
                         read_link_value(store, link, compute_alarms, active, changed_names)
-                    {
-                        if let Some(v) = scalar_to_bool(&value) {
+                        && let Some(v) = scalar_to_bool(&value) {
                             next = v;
                         }
-                    }
-                }
-            }
             if let Some(record) = store.get_mut(pv_name) {
                 record.set_scalar_value(ScalarValue::Bool(next), compute_alarms);
             }
@@ -2591,7 +2850,7 @@ fn process_record_body(
                 );
             }
         }
-        RecordData::StringIn {
+        RecordPlan::StringIn {
             inp, siol, simm, ..
         } => {
             let chosen = if simm {
@@ -2599,19 +2858,15 @@ fn process_record_body(
             } else {
                 inp.as_ref()
             };
-            if let Some(link) = chosen {
-                if let Some(value) =
+            if let Some(link) = chosen
+                && let Some(value) =
                     read_link_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(v) = scalar_to_string(&value) {
-                        if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(v) = scalar_to_string(&value)
+                        && let Some(record) = store.get_mut(pv_name) {
                             record.set_scalar_value(ScalarValue::Str(v), compute_alarms);
                         }
-                    }
-                }
-            }
         }
-        RecordData::StringOut {
+        RecordPlan::StringOut {
             out,
             dol,
             omsl,
@@ -2623,17 +2878,13 @@ fn process_record_body(
                 .get(pv_name)
                 .and_then(|rec| scalar_to_string(&rec.current_value()))
                 .unwrap_or_default();
-            if matches!(omsl, OutputMode::ClosedLoop) {
-                if let Some(link) = dol.as_ref() {
-                    if let Some(value) =
+            if matches!(omsl, OutputMode::ClosedLoop)
+                && let Some(link) = dol.as_ref()
+                    && let Some(value) =
                         read_link_value(store, link, compute_alarms, active, changed_names)
-                    {
-                        if let Some(v) = scalar_to_string(&value) {
+                        && let Some(v) = scalar_to_string(&value) {
                             next = v;
                         }
-                    }
-                }
-            }
             if let Some(record) = store.get_mut(pv_name) {
                 record.set_scalar_value(ScalarValue::Str(next.clone()), compute_alarms);
             }
@@ -2653,31 +2904,26 @@ fn process_record_body(
                 );
             }
         }
-        RecordData::Waveform { inp, .. } | RecordData::Aai { inp, .. } => {
-            if let Some(link) = inp.as_ref() {
-                if let Some(arr) =
+        RecordPlan::Waveform { inp } => {
+            if let Some(link) = inp.as_ref()
+                && let Some(arr) =
                     read_link_array_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(record) = store.get_mut(pv_name) {
                         set_record_array_value(record, arr);
                     }
-                }
-            }
         }
-        RecordData::Aao { out, dol, omsl, .. } => {
+        RecordPlan::Aao { out, dol, omsl } => {
             let mut next = store.get(pv_name).and_then(record_array_value).unwrap_or(
                 // Keep default deterministic in case parser left this empty.
                 ScalarArrayValue::F64(Vec::new()),
             );
-            if matches!(omsl, OutputMode::ClosedLoop) {
-                if let Some(link) = dol.as_ref() {
-                    if let Some(arr) =
+            if matches!(omsl, OutputMode::ClosedLoop)
+                && let Some(link) = dol.as_ref()
+                    && let Some(arr) =
                         read_link_array_value(store, link, compute_alarms, active, changed_names)
                     {
                         next = arr;
                     }
-                }
-            }
             if let Some(record) = store.get_mut(pv_name) {
                 set_record_array_value(record, next.clone());
             }
@@ -2685,7 +2931,7 @@ fn process_record_body(
                 write_link_array_value(store, link, next, compute_alarms, active, changed_names);
             }
         }
-        RecordData::SubArray {
+        RecordPlan::SubArray {
             inp,
             indx,
             nelm,
@@ -2706,22 +2952,19 @@ fn process_record_body(
                 }
             }
         }
-        RecordData::NtTable { inp, out, omsl, .. } => {
-            if let Some(link) = inp.as_ref() {
-                if let Some(arr) =
+        RecordPlan::NtTable { inp, out, omsl } => {
+            if let Some(link) = inp.as_ref()
+                && let Some(arr) =
                     read_link_array_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(record) = store.get_mut(pv_name) {
                         set_record_array_value(record, arr);
                     }
-                }
-            }
             if matches!(omsl, OutputMode::ClosedLoop) {
                 // closed-loop NtTable: intentionally no-op for now (table DOL not supported)
             }
-            if let Some(link) = out.as_ref() {
-                if let Some(record) = store.get(pv_name) {
-                    if let NtPayload::Table(nt) = record.data.payload() {
+            if let Some(link) = out.as_ref()
+                && let Some(record) = store.get(pv_name)
+                    && let NtPayload::Table(nt) = record.data.payload() {
                         for col in &nt.columns {
                             write_link_array_value(
                                 store,
@@ -2733,25 +2976,20 @@ fn process_record_body(
                             );
                         }
                     }
-                }
-            }
         }
-        RecordData::NtNdArray { inp, out, omsl, .. } => {
-            if let Some(link) = inp.as_ref() {
-                if let Some(arr) =
+        RecordPlan::NtNdArray { inp, out, omsl } => {
+            if let Some(link) = inp.as_ref()
+                && let Some(arr) =
                     read_link_array_value(store, link, compute_alarms, active, changed_names)
-                {
-                    if let Some(record) = store.get_mut(pv_name) {
+                    && let Some(record) = store.get_mut(pv_name) {
                         set_record_array_value(record, arr);
                     }
-                }
-            }
             if matches!(omsl, OutputMode::ClosedLoop) {
                 // closed-loop NtNdArray: intentionally no-op for now (ndarray DOL not supported)
             }
-            if let Some(link) = out.as_ref() {
-                if let Some(record) = store.get(pv_name) {
-                    if let NtPayload::NdArray(nt) = record.data.payload() {
+            if let Some(link) = out.as_ref()
+                && let Some(record) = store.get(pv_name)
+                    && let NtPayload::NdArray(nt) = record.data.payload() {
                         write_link_array_value(
                             store,
                             link,
@@ -2761,10 +2999,8 @@ fn process_record_body(
                             changed_names,
                         );
                     }
-                }
-            }
         }
-        RecordData::NtEnum { .. } | RecordData::Generic { .. } => {
+        RecordPlan::Inert => {
             // NtEnum and Generic records do not participate in link processing.
         }
     }
@@ -2859,11 +3095,10 @@ fn write_link_value(
     } = link
     {
         let resolved = normalize_link_target(target);
-        if let Some(target_record) = store.get_mut(&resolved) {
-            if target_record.set_scalar_value(value, compute_alarms) {
+        if let Some(target_record) = store.get_mut(&resolved)
+            && target_record.set_scalar_value(value, compute_alarms) {
                 changed_names.insert(resolved.clone());
             }
-        }
         if *process_passive {
             process_record_by_name(store, &resolved, compute_alarms, active, changed_names);
         }
@@ -2988,106 +3223,6 @@ fn scalar_to_string(value: &ScalarValue) -> Option<String> {
     }
 }
 
-fn decode_put_body(
-    body: &[u8],
-    desc: &spvirit_codec::spvd_decode::StructureDesc,
-    is_be: bool,
-) -> Option<DecodedValue> {
-    let decoder = PvdDecoder::new(is_be);
-    if let Ok((value, _)) = decoder.decode_structure_with_bitset(body, desc) {
-        if !decoded_is_empty(&value) {
-            return Some(value);
-        }
-    }
-    if !body.is_empty() && body[0] == 0xFF {
-        if let Ok((value, _)) = decoder.decode_structure_with_bitset(&body[1..], desc) {
-            if !decoded_is_empty(&value) {
-                return Some(value);
-            }
-        }
-    }
-    if let Some(value) = decode_put_body_shifted_bitset(body, desc, is_be) {
-        return Some(value);
-    }
-    if let Some(value) = decode_put_body_value_only(body, desc, is_be) {
-        return Some(value);
-    }
-    None
-}
-
-fn decoded_is_empty(value: &DecodedValue) -> bool {
-    matches!(value, DecodedValue::Structure(fields) if fields.is_empty())
-}
-
-fn decode_put_body_shifted_bitset(
-    body: &[u8],
-    desc: &spvirit_codec::spvd_decode::StructureDesc,
-    is_be: bool,
-) -> Option<DecodedValue> {
-    let decoder = PvdDecoder::new(is_be);
-    let (size, consumed) = decoder.decode_size(body).ok()?;
-    if size == 0 || body.len() < consumed + size {
-        return None;
-    }
-    let bitset = &body[consumed..consumed + size];
-    let data = &body[consumed + size..];
-    let shifted = shift_bitset_left(bitset, 1);
-    let mut shifted_body = Vec::new();
-    shifted_body.extend_from_slice(&encode_size_pvd(shifted.len(), is_be));
-    shifted_body.extend_from_slice(&shifted);
-    shifted_body.extend_from_slice(data);
-    decoder
-        .decode_structure_with_bitset(&shifted_body, desc)
-        .ok()
-        .map(|(value, _)| value)
-        .filter(|value| !decoded_is_empty(value))
-}
-
-fn decode_put_body_value_only(
-    body: &[u8],
-    desc: &spvirit_codec::spvd_decode::StructureDesc,
-    is_be: bool,
-) -> Option<DecodedValue> {
-    let decoder = PvdDecoder::new(is_be);
-    if let Ok((size, consumed)) = decoder.decode_size(body) {
-        if consumed + size <= body.len() {
-            let data = &body[consumed + size..];
-            if let Some(value) = decode_value_only_from_data(data, desc, &decoder) {
-                return Some(value);
-            }
-        }
-    }
-    decode_value_only_from_data(body, desc, &decoder)
-}
-
-fn decode_value_only_from_data(
-    data: &[u8],
-    desc: &spvirit_codec::spvd_decode::StructureDesc,
-    decoder: &PvdDecoder,
-) -> Option<DecodedValue> {
-    let value_field = desc.fields.iter().find(|f| f.name == "value")?;
-    decoder
-        .decode_value(data, &value_field.field_type)
-        .ok()
-        .map(|(value, _)| DecodedValue::Structure(vec![("value".to_string(), value)]))
-}
-
-fn shift_bitset_left(bitset: &[u8], shift: usize) -> Vec<u8> {
-    if shift == 0 {
-        return bitset.to_vec();
-    }
-    let total_bits = bitset.len() * 8;
-    let new_bits = total_bits + shift;
-    let mut out = vec![0u8; (new_bits + 7) / 8];
-    for bit in 0..total_bits {
-        if (bitset[bit / 8] & (1 << (bit % 8))) != 0 {
-            let new_bit = bit + shift;
-            out[new_bit / 8] |= 1 << (new_bit % 8);
-        }
-    }
-    out
-}
-
 async fn handle_control_message(state: &Arc<ServerState>, conn_id: u64, header: &PvaHeader) {
     debug!(
         "Conn {}: control (segmented) cmd={} data={}",
@@ -3105,62 +3240,309 @@ async fn handle_control_message(state: &Arc<ServerState>, conn_id: u64, header: 
     }
 }
 
+fn file_mtime(path: &str) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spvirit_codec::spvd_encode::{encode_nt_scalar_bitset_parts, nt_scalar_desc};
+    use spvirit_tools::spvirit_server::types::NtScalar;
 
+    /// `filtered_desc` must be `Some` only when the client actually sent a
+    /// field filter; storing the full descriptor for every subscriber forces
+    /// `build_monitor_frame` down the two-encodes-per-update filtered branch.
+    /// Mirrors the library fix in `spvirit-server/src/handler.rs`.
     #[test]
-    fn decode_put_body_accepts_status_prefix() {
-        let nt = NtScalar::from_value(spvirit_tools::spvirit_server::types::ScalarValue::F64(2.5));
-        let desc = nt_scalar_desc(&nt.value);
-        let (bitset, values) = encode_nt_scalar_bitset_parts(&nt, false);
-        let mut body = Vec::new();
-        body.push(0xFF);
-        body.extend_from_slice(&bitset);
-        body.extend_from_slice(&values);
-
-        let decoded = decode_put_body(&body, &desc, false);
-        assert!(decoded.is_some());
+    fn monitor_init_stores_a_filtered_desc_only_when_a_filter_was_requested() {
+        let src = include_str!("spvirit_server.rs");
+        let unconditional = concat!("filtered_desc: Some(desc", ".clone()),");
+        assert!(
+            !src.contains(unconditional),
+            "MONITOR INIT still stores filtered_desc unconditionally: {unconditional}"
+        );
+        // Positive precondition so the guard is proven to look at live code.
+        assert!(src.contains(concat!(
+            "filtered_desc: pv_req_fields.is_some().then(",
+            "|| desc.clone()),"
+        )));
     }
 
     #[test]
-    fn decode_put_body_accepts_bitset_without_struct_bit() {
-        let nt = NtScalar::from_value(spvirit_tools::spvirit_server::types::ScalarValue::F64(0.0));
-        let desc = nt_scalar_desc(&nt.value);
-        let mut body = Vec::new();
-        body.extend_from_slice(&encode_size_pvd(1, false));
-        body.push(0x01); // bit0 set (value) with no struct bit
-        body.extend_from_slice(&30.0f64.to_le_bytes());
+    fn record_plan_carries_every_field_the_processing_arms_read() {
+        let ai = RecordData::Ai {
+            nt: NtScalar::from_value(ScalarValue::F64(1.0)),
+            inp: None,
+            siml: None,
+            siol: None,
+            simm: true,
+        };
+        assert!(matches!(
+            record_plan(&ai),
+            RecordPlan::Ai { simm: true, .. }
+        ));
 
-        let decoded = decode_put_body(&body, &desc, false).expect("decoded");
-        if let DecodedValue::Structure(fields) = decoded {
-            let value = fields
-                .iter()
-                .find(|(name, _)| name == "value")
-                .expect("value field");
-            assert!(matches!(value.1, DecodedValue::Float64(v) if (v - 30.0).abs() < 1e-6));
-        } else {
-            panic!("expected structure");
+        let ao = RecordData::Ao {
+            nt: NtScalar::from_value(ScalarValue::F64(0.0)),
+            out: None,
+            dol: None,
+            omsl: OutputMode::ClosedLoop,
+            drvl: Some(-1.0),
+            drvh: Some(1.0),
+            oroc: Some(0.5),
+            siml: None,
+            siol: None,
+            simm: false,
+        };
+        match record_plan(&ao) {
+            RecordPlan::Ao {
+                omsl,
+                drvl,
+                drvh,
+                oroc,
+                simm,
+                ..
+            } => {
+                assert!(matches!(omsl, OutputMode::ClosedLoop));
+                assert_eq!(drvl, Some(-1.0));
+                assert_eq!(drvh, Some(1.0));
+                assert_eq!(oroc, Some(0.5));
+                assert!(!simm);
+            }
+            other => panic!("expected RecordPlan::Ao, got {:?}", other),
+        }
+
+        // `NtScalarArray` is NOT in the bin's top-level `use` list, so `use
+        // super::*` does not bring it into the test module. Spell it out, as
+        // `virtual_pvlist_nt` does.
+        use spvirit_tools::spvirit_server::types::NtScalarArray;
+
+        let subarray = RecordData::SubArray {
+            nt: NtScalarArray::from_value(ScalarArrayValue::F64(vec![1.0, 2.0, 3.0])),
+            inp: None,
+            ftvl: "DOUBLE".to_string(),
+            malm: 8,
+            nelm: 3,
+            nord: 3,
+            indx: 1,
+        };
+        assert!(matches!(
+            record_plan(&subarray),
+            RecordPlan::SubArray {
+                indx: 1,
+                nelm: 3,
+                malm: 8,
+                ..
+            }
+        ));
+
+        let generic = RecordData::Generic {
+            struct_id: "s".to_string(),
+            fields: Vec::new(),
+            inp: None,
+            out: None,
+            omsl: OutputMode::Supervisory,
+        };
+        assert!(matches!(record_plan(&generic), RecordPlan::Inert));
+    }
+
+    /// Every link slot gets a DISTINCT constant, so a constructor in
+    /// `record_plan` that swapped two same-typed fields (`out`/`dol`,
+    /// `inp`/`siol`, ...) fails here; the existing test used `None` for
+    /// every link and could not see a swap.
+    #[test]
+    fn record_plan_routes_each_link_to_its_own_slot() {
+        use spvirit_tools::spvirit_server::types::{LinkExpr, NtScalarArray};
+        let k = |n: i32| Some(LinkExpr::Constant(ScalarValue::I32(n)));
+        let sc = || NtScalar::from_value(ScalarValue::F64(0.0));
+        let arr = || NtScalarArray::from_value(ScalarArrayValue::F64(vec![0.0]));
+
+        match record_plan(&RecordData::Ai { nt: sc(), inp: k(1), siml: k(2), siol: k(3), simm: false }) {
+            RecordPlan::Ai { inp, siml, siol, .. } => {
+                assert_eq!((inp, siml, siol), (k(1), k(2), k(3)));
+            }
+            other => panic!("Ai -> {other:?}"),
+        }
+        match record_plan(&RecordData::Ao {
+            nt: sc(), out: k(1), dol: k(2), omsl: OutputMode::Supervisory,
+            drvl: None, drvh: None, oroc: None, siml: k(4), siol: k(3), simm: false,
+        }) {
+            RecordPlan::Ao { out, dol, siol, .. } => {
+                assert_eq!((out, dol, siol), (k(1), k(2), k(3)));
+            }
+            other => panic!("Ao -> {other:?}"),
+        }
+        match record_plan(&RecordData::Bi {
+            nt: sc(), inp: k(1), znam: String::new(), onam: String::new(),
+            siml: k(4), siol: k(3), simm: true,
+        }) {
+            RecordPlan::Bi { inp, siol, simm } => {
+                assert_eq!((inp, siol, simm), (k(1), k(3), true));
+            }
+            other => panic!("Bi -> {other:?}"),
+        }
+        match record_plan(&RecordData::Bo {
+            nt: sc(), out: k(1), dol: k(2), omsl: OutputMode::ClosedLoop,
+            znam: String::new(), onam: String::new(), siml: k(4), siol: k(3), simm: true,
+        }) {
+            RecordPlan::Bo { out, dol, omsl, siol, simm } => {
+                assert_eq!((out, dol, siol, simm), (k(1), k(2), k(3), true));
+                assert_eq!(omsl, OutputMode::ClosedLoop);
+            }
+            other => panic!("Bo -> {other:?}"),
+        }
+        match record_plan(&RecordData::StringIn { nt: sc(), inp: k(1), siml: k(4), siol: k(3), simm: true }) {
+            RecordPlan::StringIn { inp, siol, simm } => {
+                assert_eq!((inp, siol, simm), (k(1), k(3), true));
+            }
+            other => panic!("StringIn -> {other:?}"),
+        }
+        match record_plan(&RecordData::StringOut {
+            nt: sc(), out: k(1), dol: k(2), omsl: OutputMode::ClosedLoop,
+            siml: k(4), siol: k(3), simm: true,
+        }) {
+            RecordPlan::StringOut { out, dol, omsl, siol, simm } => {
+                assert_eq!((out, dol, siol, simm), (k(1), k(2), k(3), true));
+                assert_eq!(omsl, OutputMode::ClosedLoop);
+            }
+            other => panic!("StringOut -> {other:?}"),
+        }
+        for data in [
+            RecordData::Waveform { nt: arr(), inp: k(1), ftvl: String::new(), nelm: 1, nord: 1 },
+            RecordData::Aai { nt: arr(), inp: k(1), ftvl: String::new(), nelm: 1, nord: 1 },
+        ] {
+            match record_plan(&data) {
+                RecordPlan::Waveform { inp } => assert_eq!(inp, k(1)),
+                other => panic!("Waveform/Aai -> {other:?}"),
+            }
+        }
+        match record_plan(&RecordData::Aao {
+            nt: arr(), out: k(1), dol: k(2), omsl: OutputMode::ClosedLoop,
+            ftvl: String::new(), nelm: 1, nord: 1,
+        }) {
+            RecordPlan::Aao { out, dol, omsl } => {
+                assert_eq!((out, dol), (k(1), k(2)));
+                assert_eq!(omsl, OutputMode::ClosedLoop);
+            }
+            other => panic!("Aao -> {other:?}"),
+        }
+        match record_plan(&RecordData::SubArray {
+            nt: arr(), inp: k(1), ftvl: String::new(), malm: 9, nelm: 5, nord: 1, indx: 2,
+        }) {
+            RecordPlan::SubArray { inp, indx, nelm, malm } => {
+                assert_eq!(inp, k(1));
+                assert_eq!((indx, nelm, malm), (2, 5, 9));
+            }
+            other => panic!("SubArray -> {other:?}"),
         }
     }
 
     #[test]
-    fn decode_put_body_accepts_value_only_payload() {
-        let nt = NtScalar::from_value(spvirit_tools::spvirit_server::types::ScalarValue::F64(0.0));
-        let desc = nt_scalar_desc(&nt.value);
-        let body = 12.5f64.to_le_bytes();
+    fn packet_validation_and_hex_dump_are_total_functions() {
+        // Both are pure diagnostics: they return `()` and only emit `debug!`
+        // lines. The property worth pinning is therefore totality: neither may
+        // panic or index out of bounds on a header that lies about its payload
+        // length, which is exactly the input a hostile or buggy peer sends.
+        let good = encode_header(false, false, false, 2, 1, 0);
+        validate_encoded_packet(1, "well-formed", &good);
+        dump_hex_packet(1, "->", "well-formed", 2, false, &good);
 
-        let decoded = decode_put_body(&body, &desc, false).expect("decoded");
-        if let DecodedValue::Structure(fields) = decoded {
-            let value = fields
-                .iter()
-                .find(|(name, _)| name == "value")
-                .expect("value field");
-            assert!(matches!(value.1, DecodedValue::Float64(v) if (v - 12.5).abs() < 1e-6));
-        } else {
-            panic!("expected structure");
-        }
+        let mut truncated = encode_header(false, false, false, 2, 1, 16);
+        truncated.truncate(8);
+        validate_encoded_packet(1, "truncated", &truncated);
+        dump_hex_packet(1, "->", "truncated", 2, false, &truncated);
+
+        // A payload that is not a multiple of the 16-byte dump line width.
+        dump_hex_packet(1, "<-", "ragged", 2, true, &[0u8; 37]);
+        validate_encoded_packet(1, "empty", &[]);
+        dump_hex_packet(1, "<-", "empty", 2, false, &[]);
+    }
+
+    #[test]
+    fn virtual_pv_helpers_come_from_the_library() {
+        // Same names, same answers: proving the local copies are gone and the
+        // library's are wired in. `virtual_pvlist_nt` is the one with a body
+        // worth pinning: it must produce a string ScalarArray, not a scalar.
+        assert!(is_pvlist_virtual_pv("__pvlist"));
+        assert!(!is_pvlist_virtual_pv("SOME:PV"));
+        assert!(is_server_rpc_pv("server"));
+        assert!(!is_server_rpc_pv("__server"));
+        assert!(is_virtual_event_pv("__event:MY_EVT"));
+        assert!(is_virtual_event_pv("__event:io:ADC0"));
+        assert!(!is_virtual_event_pv("SOME:PV"));
+        assert!(matches!(
+            virtual_pvlist_nt(vec!["A".to_string(), "B".to_string()]),
+            NtPayload::ScalarArray(_)
+        ));
+        assert!(matches!(virtual_event_nt("__event:MY_EVT"), NtPayload::Scalar(_)));
+    }
+
+    #[test]
+    fn pvlist_mode_comes_from_the_library_and_keeps_the_cli_error_text() {
+        assert_eq!(PvListMode::parse("list"), Ok(PvListMode::List));
+        assert_eq!(PvListMode::parse(" DISCOVER "), Ok(PvListMode::Discover));
+        assert_eq!(
+            parse_pvlist_mode_arg("nope"),
+            Err("Invalid --pvlist-mode 'nope'; expected off|discover|list".to_string())
+        );
+    }
+
+    #[test]
+    fn search_does_not_enumerate_the_store_for_exact_names() {
+        let mut enumerations = 0usize;
+        let requests = vec![
+            (1u32, "A:PV".to_string()),
+            (2u32, "MISSING:PV".to_string()),
+        ];
+        let cids = resolve_search_cids(
+            &requests,
+            PvListMode::Discover,
+            |name| name == "A:PV",
+            || {
+                enumerations += 1;
+                vec!["A:PV".to_string(), "B:PV".to_string()]
+            },
+        );
+        assert_eq!(cids, vec![1]);
+        assert_eq!(enumerations, 0, "no pattern query, so no enumeration");
+    }
+
+    #[test]
+    fn search_enumerates_at_most_once_for_many_pattern_queries() {
+        let mut enumerations = 0usize;
+        let requests = vec![
+            (1u32, "A:*".to_string()),
+            (2u32, "B:*".to_string()),
+            (3u32, "Z:*".to_string()),
+        ];
+        let cids = resolve_search_cids(
+            &requests,
+            PvListMode::Discover,
+            |_| false,
+            || {
+                enumerations += 1;
+                vec!["A:PV".to_string(), "B:PV".to_string()]
+            },
+        );
+        assert_eq!(cids, vec![1, 2]);
+        assert_eq!(enumerations, 1, "the list is built once and reused");
+    }
+
+    #[test]
+    fn search_skips_pattern_matching_entirely_when_pvlist_is_off() {
+        let mut enumerations = 0usize;
+        let requests = vec![(1u32, "A:*".to_string())];
+        let cids = resolve_search_cids(
+            &requests,
+            PvListMode::Off,
+            |_| false,
+            || {
+                enumerations += 1;
+                vec!["A:PV".to_string()]
+            },
+        );
+        assert!(cids.is_empty());
+        assert_eq!(enumerations, 0);
     }
 
     #[test]
@@ -3195,6 +3577,34 @@ mod tests {
         assert_eq!(target, "130.246.90.69:60292".parse().unwrap());
     }
 
+    #[tokio::test]
+    async fn send_msgs_reports_only_the_frames_it_enqueued() {
+        let state = test_state(mdel_ai_record("test_pv", 1.0, "0"));
+        let (open_tx, mut open_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (full_tx, _full_rx_kept_but_never_drained) = mpsc::channel::<Vec<u8>>(1);
+        full_tx.try_send(vec![0u8]).expect("prime the queue to full");
+        {
+            let mut conns = state.conns.lock().await;
+            conns.insert(1, open_tx);
+            conns.insert(2, full_tx);
+        }
+
+        let delivered = send_msgs(
+            &state,
+            vec![
+                (1, 10, vec![0xAA]),
+                (2, 20, vec![0xBB]),
+                (3, 30, vec![0xCC]), // no such conn
+            ],
+        )
+        .await;
+
+        assert!(delivered.contains(&(1, 10)));
+        assert!(!delivered.contains(&(2, 20)), "full queue must not count as delivered");
+        assert!(!delivered.contains(&(3, 30)), "unknown conn must not count as delivered");
+        assert_eq!(open_rx.recv().await, Some(vec![0xAA]));
+    }
+
     fn test_state(record: RecordInstance) -> Arc<ServerState> {
         let mut store = HashMap::new();
         store.insert(record.name.clone(), record);
@@ -3211,6 +3621,48 @@ mod tests {
             None,
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
         ))
+    }
+
+    fn ai_record_with_value(name: &str, v: f64) -> RecordInstance {
+        // Built through the constructor, not `set_scalar_value`: the setter stamps
+        // the wall clock, which would make two equal-valued records differ.
+        mdel_ai_record(name, v, "0")
+    }
+
+    #[test]
+    fn diff_stores_reports_only_changed_payloads_and_materialises_each_once() {
+        let mut old = HashMap::new();
+        old.insert("A:PV".to_string(), ai_record_with_value("A:PV", 1.0));
+        old.insert("B:PV".to_string(), ai_record_with_value("B:PV", 2.0));
+
+        let mut new = HashMap::new();
+        new.insert("A:PV".to_string(), ai_record_with_value("A:PV", 1.0)); // unchanged
+        new.insert("B:PV".to_string(), ai_record_with_value("B:PV", 9.0)); // changed
+        new.insert("C:PV".to_string(), ai_record_with_value("C:PV", 3.0)); // added
+
+        let mut changed = diff_stores(&old, &new);
+        changed.sort_by(|a, b| a.0.cmp(&b.0));
+        let names: Vec<&str> = changed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["B:PV", "C:PV"]);
+    }
+
+    #[test]
+    fn swap_store_and_diff_reports_a_pv_a_put_moved_away_from_the_new_value() {
+        let mut live = HashMap::new();
+        live.insert("A:PV".to_string(), ai_record_with_value("A:PV", 1.0));
+        let mut reloaded = HashMap::new();
+        reloaded.insert("A:PV".to_string(), ai_record_with_value("A:PV", 1.0));
+
+        // A PUT lands before the reload's swap: live now differs from the DB.
+        live.insert("A:PV".to_string(), ai_record_with_value("A:PV", 7.0));
+
+        let changed = swap_store_and_diff(&mut live, reloaded);
+        let names: Vec<&str> = changed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["A:PV"], "the revert must be notified");
+        assert_eq!(
+            live["A:PV"].current_value(),
+            spvirit_tools::spvirit_server::types::ScalarValue::F64(1.0)
+        );
     }
 
     fn mdel_ai_record(name: &str, val: f64, mdel: &str) -> RecordInstance {
@@ -3230,6 +3682,197 @@ mod tests {
             },
             raw_fields,
         }
+    }
+
+    #[test]
+    fn periodic_index_is_stale_only_when_the_generation_moves() {
+        let cached: (u64, Vec<(String, Duration)>) =
+            (7, vec![("A:PV".to_string(), Duration::from_secs(1))]);
+        assert!(periodic_index_is_stale(None, 7), "an empty cache is always stale");
+        assert!(!periodic_index_is_stale(Some(&cached), 7));
+        assert!(periodic_index_is_stale(Some(&cached), 8));
+    }
+
+    #[tokio::test]
+    async fn db_generation_starts_at_zero_and_bumps() {
+        let state = test_state(mdel_ai_record("test_pv", 1.0, "0"));
+        assert_eq!(state.db_generation(), 0);
+        state.bump_db_generation();
+        state.bump_db_generation();
+        assert_eq!(state.db_generation(), 2);
+    }
+
+    const SCAN_SRC_DB: &str = r#"
+record(ai, "SRC") {
+    field(VAL, "0")
+}
+"#;
+
+    fn scan_db(p_scan: &str) -> String {
+        format!(
+            r#"{SCAN_SRC_DB}
+record(ai, "P") {{
+    field(SCAN, "{p_scan}")
+    field(INP, "SRC")
+}}
+"#
+        )
+    }
+
+    /// A `ServerState` built from a real .db text, with a live event channel.
+    fn scan_test_state(db: &str) -> (Arc<ServerState>, mpsc::Receiver<PostedEvent>) {
+        let store = spvirit_tools::spvirit_server::db::parse_db(db).expect("test db parses");
+        let (event_tx, event_rx) = mpsc::channel(16);
+        let state = Arc::new(ServerState::new(
+            store,
+            false,
+            event_tx,
+            PvListMode::Off,
+            1024,
+            None,
+            [0u8; 12],
+            5075,
+            None,
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        ));
+        (state, event_rx)
+    }
+
+    async fn scan_value(state: &Arc<ServerState>, name: &str) -> f64 {
+        let store = state.pv_store.read().await;
+        match store.get(name).expect("record exists").to_ntpayload() {
+            NtPayload::Scalar(nt) => scalar_as_f64(&nt.value).expect("numeric value"),
+            _ => panic!("{name} is not a scalar"),
+        }
+    }
+
+    async fn set_src(state: &Arc<ServerState>, v: f64) {
+        let mut store = state.pv_store.write().await;
+        store
+            .get_mut("SRC")
+            .expect("SRC exists")
+            .set_scalar_value(ScalarValue::F64(v), false);
+    }
+
+    /// Poll every 20 ms until `name == want`, failing after 3 s.
+    async fn wait_for_value(state: &Arc<ServerState>, name: &str, want: f64) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let got = scan_value(state, name).await;
+            if got == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name} never reached {want} within 3 s (last seen {got})"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The store swap + generation bump from `run_db_reload` (which itself
+    /// polls a file's mtime, so it is not driven directly here).
+    async fn simulate_reload(state: &Arc<ServerState>, db: &str) {
+        let new_store = spvirit_tools::spvirit_server::db::parse_db(db).expect("reload db parses");
+        let mut store = state.pv_store.write().await;
+        *store = new_store;
+        state.bump_db_generation();
+    }
+
+    // Real-time test (the bin's tests do not use a paused clock): positive
+    // checks poll with a 3 s deadline; negative windows can only false-pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_scheduler_scans_and_follows_db_reload() {
+        let periodic = scan_db("0.1 second");
+        let passive = scan_db("Passive");
+        let (state, _event_rx) = scan_test_state(&periodic);
+        let sched_state = state.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_scan_scheduler(sched_state).await.is_ok();
+        });
+
+        for i in 1..=3 {
+            set_src(&state, i as f64).await;
+            wait_for_value(&state, "P", i as f64).await;
+        }
+
+        // Reload to a DB where P is Passive: it must stop scanning. The
+        // reloaded P starts from its parsed VAL, so read that baseline.
+        simulate_reload(&state, &passive).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = scan_value(&state, "P").await;
+        set_src(&state, 42.0).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            scan_value(&state, "P").await,
+            before,
+            "a record made Passive by a reload must stop scanning"
+        );
+
+        // Reload back to the periodic DB: P must start scanning again.
+        simulate_reload(&state, &periodic).await;
+        set_src(&state, 7.0).await;
+        wait_for_value(&state, "P", 7.0).await;
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_worker_keeps_soft_and_io_events_apart() {
+        let db = format!(
+            r#"{SCAN_SRC_DB}
+record(ai, "E") {{
+    field(SCAN, "Event")
+    field(EVNT, "T")
+    field(INP, "SRC")
+}}
+record(ai, "I") {{
+    field(SCAN, "I/O Intr")
+    field(IOSCAN, "T")
+    field(INP, "SRC")
+}}
+"#
+        );
+        let (state, event_rx) = scan_test_state(&db);
+        set_src(&state, 5.0).await;
+        state
+            .event_tx
+            .send(PostedEvent::Event("T".to_string()))
+            .await
+            .unwrap();
+        state
+            .event_tx
+            .send(PostedEvent::Event("nope".to_string()))
+            .await
+            .unwrap();
+        let worker_state = state.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_event_worker(worker_state, event_rx).await.is_ok();
+        });
+
+        wait_for_value(&state, "E", 5.0).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            scan_value(&state, "I").await,
+            0.0,
+            "a soft event must not fire an I/O Intr record sharing its tag"
+        );
+
+        set_src(&state, 9.0).await;
+        state
+            .event_tx
+            .send(PostedEvent::IoEvent("T".to_string()))
+            .await
+            .unwrap();
+        wait_for_value(&state, "I", 9.0).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            scan_value(&state, "E").await,
+            5.0,
+            "an I/O event must not fire a soft-event record sharing its tag"
+        );
+
+        handle.abort();
     }
 
     // Regression test for finding tools-T1 (cross-client head-of-line
@@ -3307,6 +3950,53 @@ mod tests {
             .try_recv()
             .expect("healthy client should receive its monitor update");
         assert!(!got.is_empty(), "healthy client frame should be non-empty");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_delivered_sub_commits_exactly_once_across_many_subs() {
+        let record = mdel_ai_record("test_pv", 1.0, "0");
+        let payload = record.to_ntpayload();
+        let state = test_state(record);
+
+        // Keep the receivers alive for the whole test so every channel stays
+        // open (Ok, not Closed) and none of the 8-deep queues fills.
+        let mut rxs = Vec::new();
+        for conn_id in 0..64u64 {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+            state.conns.lock().await.insert(conn_id, tx);
+            rxs.push(rx);
+        }
+        {
+            let mut monitors = state.monitors.lock().await;
+            let list = monitors.entry("test_pv".to_string()).or_default();
+            for conn_id in 0..64u64 {
+                list.push(MonitorSub {
+                    conn_id,
+                    ioid: 100 + conn_id as u32,
+                    version: 2,
+                    is_be: false,
+                    running: true,
+                    pipeline_enabled: true,
+                    nfree: 4,
+                    filtered_desc: None,
+                    last_snapshot: None,
+                });
+            }
+        }
+
+        notify_monitors(&state, "test_pv", &payload).await;
+
+        let monitors = state.monitors.lock().await;
+        let list = monitors.get("test_pv").expect("subs");
+        assert_eq!(list.len(), 64);
+        for sub in list {
+            assert_eq!(
+                sub.nfree, 3,
+                "conn {} must spend exactly one credit",
+                sub.conn_id
+            );
+            assert!(sub.last_snapshot.is_some());
+        }
     }
 
     // Regression test for finding R2-H1 (premature commit): when a pipelined
@@ -3507,57 +4197,5 @@ mod tests {
             Some(&(2.0, 0)),
             "should_post_update must run on a value change so last_posted stays current"
         );
-    }
-}
-
-fn file_mtime(path: &str) -> Option<SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-fn validate_encoded_packet(conn_id: u64, label: &str, bytes: &[u8]) {
-    let mut pkt = PvaPacket::new(bytes);
-    let decoded = pkt.decode_payload();
-    match decoded {
-        Some(PvaPacketCommand::ConnectionValidation(payload)) => {
-            debug!(
-                "Conn {}: {} decoded as cmd=1 buffer_size={} qos={} authz={:?}",
-                conn_id, label, payload.buffer_size, payload.qos, payload.authz
-            );
-        }
-        Some(PvaPacketCommand::ConnectionValidated(_)) => {
-            debug!("Conn {}: {} decoded as cmd=9", conn_id, label);
-        }
-        Some(other) => {
-            debug!("Conn {}: {} decoded as {:?}", conn_id, label, other);
-        }
-        None => {
-            debug!("Conn {}: {} failed to decode", conn_id, label);
-        }
-    }
-}
-
-fn dump_hex_packet(conn_id: u64, dir: &str, label: &str, version: u8, is_be: bool, bytes: &[u8]) {
-    debug!(
-        "Conn {}: {} {} ver={} be={} len={}",
-        conn_id,
-        dir,
-        label,
-        version,
-        is_be,
-        bytes.len()
-    );
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let end = usize::min(offset + 16, bytes.len());
-        let chunk = &bytes[offset..end];
-        let mut line = String::new();
-        for (i, b) in chunk.iter().enumerate() {
-            if i > 0 {
-                line.push(' ');
-            }
-            line.push_str(&format!("{:02x}", b));
-        }
-        debug!("Conn {}: {:04x} {}", conn_id, offset, line);
-        offset += 16;
     }
 }

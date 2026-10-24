@@ -2,7 +2,7 @@
 name = "spvirit-codec"
 version.workspace = true
 edition = "2024"
-description = "PVAccess protocol encode/decode and connection state tracking."
+description = "PVAccess wire codec: PVA message and pvData encode/decode, monitor deltas, and segment reassembly."
 license = "BSD-3-Clause"
 repository = "https://github.com/ISISNeutronMuon/spvirit"
 readme = "../README.md"

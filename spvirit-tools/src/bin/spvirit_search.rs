@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -20,6 +20,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
 use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_tools::tui::{centered_rect, focus_block};
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -126,8 +127,6 @@ enum WorkerEvent {
 // ---------------------------------------------------------------------------
 
 const PVA_MULTICAST_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
-#[allow(dead_code)]
-const PVA_MULTICAST_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0x42, 1);
 
 fn bind_udp_reuse(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     let domain = if addr.is_ipv4() {
@@ -136,7 +135,9 @@ fn bind_udp_reuse(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
         Domain::IPV6
     };
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    #[cfg(unix)]
+    // SO_REUSEADDR on both platforms: this is a broadcast/multicast receiver on
+    // the well-known PVA port, which normally already has a local server bound
+    // to it. Windows' unicast-hijack caveat does not apply to that case.
     sock.set_reuse_address(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&addr.into())?;
@@ -149,11 +150,10 @@ fn join_multicast_v4(socket: &std::net::UdpSocket) {
         Err(_) => return,
     };
     for iface in &ifaces {
-        if let IfAddr::V4(v4) = &iface.addr {
-            if !v4.ip.is_loopback() {
+        if let IfAddr::V4(v4) = &iface.addr
+            && !v4.ip.is_loopback() {
                 let _ = socket.join_multicast_v4(&PVA_MULTICAST_V4, &v4.ip);
             }
-        }
     }
 }
 
@@ -644,38 +644,6 @@ fn format_ago(instant: Option<Instant>, now: Instant) -> String {
     }
 }
 
-fn focus_block(title: String, focused: bool) -> Block<'static> {
-    let border_style = if focused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    };
-    Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(border_style)
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
 fn draw(frame: &mut ratatui::Frame<'_>, app: &SearchApp) {
     let now = Instant::now();
 
@@ -959,8 +927,8 @@ fn run_ui(
         }
         app.rebuild_sorted_keys();
 
-        if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(tick_rate)?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -1030,7 +998,6 @@ fn run_ui(
                     _ => {}
                 }
             }
-        }
     }
     Ok(())
 }
@@ -1091,4 +1058,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     drop(worker_handle);
     ui_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_udp_reuse;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn bind_udp_reuse_sets_so_reuseaddr() {
+        let addr: SocketAddr = "0.0.0.0:0".parse().expect("addr");
+        let sock = bind_udp_reuse(addr).expect("bind");
+        assert!(sock.local_addr().expect("local addr").port() > 0);
+        assert!(
+            socket2::SockRef::from(&sock)
+                .reuse_address()
+                .expect("read SO_REUSEADDR"),
+            "SO_REUSEADDR must be set on every platform"
+        );
+    }
+
+    /// Windows-only: SO_REUSEADDR permits a second bind to the same addr:port.
+    /// On Unix that needs SO_REUSEPORT, so this is not asserted there.
+    #[cfg(windows)]
+    #[test]
+    fn two_binds_share_the_same_port_on_windows() {
+        let first = bind_udp_reuse("0.0.0.0:0".parse().expect("addr")).expect("first bind");
+        let port = first.local_addr().expect("local addr").port();
+        let second = bind_udp_reuse(format!("0.0.0.0:{port}").parse().expect("addr"));
+        assert!(second.is_ok(), "second bind to {port} failed: {:?}", second.err());
+    }
 }

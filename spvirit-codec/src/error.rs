@@ -31,6 +31,10 @@ pub enum DecodeError {
     UnresolvedTypeId(u16),
     /// A union selector outside the union's field list.
     UnknownUnionSelector { selector: usize, len: usize },
+    /// Introspection or value nesting exceeded `DecodeLimits::max_depth`.
+    /// Unbounded recursion here overflows the native stack, which kills the
+    /// process outright instead of unwinding.
+    DepthExceeded { depth: usize, limit: usize },
     /// Structurally invalid input that needs no parameters to explain.
     Malformed(&'static str),
 }
@@ -67,6 +71,9 @@ impl fmt::Display for DecodeError {
             }
             Self::UnknownUnionSelector { selector, len } => {
                 write!(f, "union selector {selector} out of range for {len} fields")
+            }
+            Self::DepthExceeded { depth, limit } => {
+                write!(f, "nesting depth {depth} exceeds the limit of {limit}")
             }
             Self::Malformed(what) => write!(f, "malformed: {what}"),
         }

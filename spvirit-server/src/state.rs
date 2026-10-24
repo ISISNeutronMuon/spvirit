@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use spvirit_codec::spvd_decode::StructureDesc;
@@ -23,6 +23,10 @@ pub struct ChannelTables {
     /// Monitor request id → the channel it was created on. Written at monitor
     /// INIT, where both numbers are already in hand.
     pub ioid_to_sid: HashMap<u32, u32>,
+    /// Reverse of `ioid_to_sid`. Without it, forgetting a channel means a
+    /// `retain` over every monitor binding on the whole connection — O(n) per
+    /// channel teardown on a connection with thousands of subscriptions.
+    pub sid_to_ioids: HashMap<u32, HashSet<u32>>,
 }
 
 impl ChannelTables {
@@ -41,7 +45,12 @@ impl ChannelTables {
         self.cid_to_sid.remove(&cid);
         self.sid_to_cid.remove(&sid);
         self.sid_to_pv.remove(&sid);
-        self.ioid_to_sid.retain(|_, s| *s != sid);
+        // O(k) in this channel's bindings, not O(n) in the connection's.
+        if let Some(ioids) = self.sid_to_ioids.remove(&sid) {
+            for ioid in ioids {
+                self.ioid_to_sid.remove(&ioid);
+            }
+        }
     }
 
     /// Forget destroyed channel `sid`, but leave `cid`'s row alone if that cid
@@ -72,14 +81,42 @@ impl ChannelTables {
         false
     }
 
-    /// Record that monitor `ioid` runs on channel `sid`.
+    /// Record that request `ioid` runs on channel `sid`.
+    ///
+    /// Despite the name, this binds every request ioid (GET/PUT/PUT_GET too,
+    /// not just MONITOR) so DESTROY_CHANNEL can purge them all; not renamed
+    /// because `spvirit-gateway` and `spvirit-server` tests call it.
     pub fn bind_monitor(&mut self, ioid: u32, sid: u32) {
-        self.ioid_to_sid.insert(ioid, sid);
+        if let Some(old) = self.ioid_to_sid.insert(ioid, sid)
+            && old != sid
+            && let Some(set) = self.sid_to_ioids.get_mut(&old)
+        {
+            set.remove(&ioid);
+            if set.is_empty() {
+                self.sid_to_ioids.remove(&old);
+            }
+        }
+        self.sid_to_ioids.entry(sid).or_default().insert(ioid);
     }
 
     /// Forget a monitor subscription's channel binding.
     pub fn unbind_monitor(&mut self, ioid: u32) {
-        self.ioid_to_sid.remove(&ioid);
+        if let Some(sid) = self.ioid_to_sid.remove(&ioid)
+            && let Some(set) = self.sid_to_ioids.get_mut(&sid)
+        {
+            set.remove(&ioid);
+            if set.is_empty() {
+                self.sid_to_ioids.remove(&sid);
+            }
+        }
+    }
+
+    /// Every monitor request id bound to channel `sid`.
+    pub fn ioids_for_sid(&self, sid: u32) -> Vec<u32> {
+        self.sid_to_ioids
+            .get(&sid)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// The client's channel id for one of our server ids, if the channel is
@@ -259,5 +296,80 @@ mod tests {
             weak.upgrade().is_none(),
             "a connection's channel tables must not outlive the connection"
         );
+    }
+
+    #[test]
+    fn ioids_for_sid_lists_only_that_channels_monitors() {
+        let mut t = ChannelTables::default();
+        t.insert_channel(1, 100, "A");
+        t.insert_channel(2, 200, "B");
+        t.bind_monitor(10, 100);
+        t.bind_monitor(11, 100);
+        t.bind_monitor(20, 200);
+
+        let mut a = t.ioids_for_sid(100);
+        a.sort();
+        assert_eq!(a, vec![10, 11]);
+        assert_eq!(t.ioids_for_sid(200), vec![20]);
+        assert!(t.ioids_for_sid(999).is_empty());
+    }
+
+    #[test]
+    fn removing_a_channel_drops_its_bindings_and_keeps_the_others() {
+        let mut t = ChannelTables::default();
+        t.insert_channel(1, 100, "A");
+        t.insert_channel(2, 200, "B");
+        t.bind_monitor(10, 100);
+        t.bind_monitor(20, 200);
+
+        t.remove_channel(1, 100);
+
+        assert!(
+            t.ioid_to_sid.get(&10).is_none(),
+            "the destroyed channel's binding must go"
+        );
+        assert!(
+            t.ioids_for_sid(100).is_empty(),
+            "and so must the reverse index row"
+        );
+        assert_eq!(
+            t.ioid_to_sid.get(&20),
+            Some(&200),
+            "another channel is untouched"
+        );
+        assert_eq!(t.ioids_for_sid(200), vec![20]);
+    }
+
+    #[test]
+    fn unbinding_a_monitor_clears_both_directions() {
+        let mut t = ChannelTables::default();
+        t.insert_channel(1, 100, "A");
+        t.bind_monitor(10, 100);
+        t.bind_monitor(11, 100);
+
+        t.unbind_monitor(10);
+
+        assert_eq!(
+            t.ioids_for_sid(100),
+            vec![11],
+            "the reverse index must not leak"
+        );
+        assert!(t.channel_for_monitor(10).is_none());
+        assert_eq!(t.channel_for_monitor(11), Some((100, 1)));
+    }
+
+    #[test]
+    fn rebinding_a_monitor_to_a_new_channel_moves_it() {
+        let mut t = ChannelTables::default();
+        t.insert_channel(1, 100, "A");
+        t.insert_channel(2, 200, "B");
+        t.bind_monitor(10, 100);
+        t.bind_monitor(10, 200);
+
+        assert!(
+            t.ioids_for_sid(100).is_empty(),
+            "the old channel must not keep a stale reverse-index entry"
+        );
+        assert_eq!(t.ioids_for_sid(200), vec![10]);
     }
 }

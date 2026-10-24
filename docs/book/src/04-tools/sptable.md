@@ -73,8 +73,9 @@ table  ->  id:i32=1,2,3 x:f64=0.5,1.5
 
 ## Patterns
 
-Any command that takes a name takes a **bash-style brace pattern**, and
-acts on every expansion:
+The commands `add`, `set`, `del`, `ro`/`rw`, `anim` and `stop` take a
+**bash-style brace pattern** and act on every expansion. `rename` takes
+exactly one name:
 
 ```text
 {1..8}   {8..1}   {0..100..10}   {01..12}   {A,B,C}
@@ -105,7 +106,7 @@ the global tick rate.
 | `noise` | `min=0 max=1` |
 | `walk` | `start=0 step=1 min=0 max=1` |
 | `count` | `start=0 step=1` |
-| `cycle` | `period=1` (enum only) |
+| `cycle` | `period=1`; index `floor(t/period)`. Required for enum rows; also usable on numeric rows. |
 
 ```text
 :anim RING:BPM{01..99} noise min=-1 max=1
@@ -118,7 +119,7 @@ per-generator frequency. Use `period` for the shape of one waveform.
 **Inapplicable parameters are an error, not a no-op.** `:anim X sine min=-2`
 is rejected, because sine's range comes from `amp`/`offset` and a silently
 ignored `min` would look like it worked
-(`spvirit-tools/src/bin/spvirit_table/anim.rs:138`).
+(`spvirit-tools/src/bin/spvirit_table/anim.rs:212`).
 
 ## Sessions
 
@@ -146,6 +147,9 @@ reports how many it skipped. Bulk-adding an overlapping pattern is safe.
 `:add`. Tables are a payload type, not a record with a value field; see
 [Tables and images](../03-progressive/tables-and-images.md).
 
-**Scalar values are coerced, not rejected.** Setting `3.7` on an `int32`
-row rounds and clamps to the type's range
-(`spvirit-tools/src/bin/spvirit_table/parse.rs:78`). The row's type wins.
+**Typed values are checked, not coerced.** `:set` and `:add` reject a value
+that does not parse as the row's type, so `:set X 3.7` on an `int32` row is
+an error. Animation output is different: each generator sample is rounded
+and clamped to the row's type (`coerce_scalar`,
+`spvirit-tools/src/bin/spvirit_table/parse.rs:79`). The row's type wins in
+both cases.

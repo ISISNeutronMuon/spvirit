@@ -20,7 +20,7 @@ Silicon), and Windows x86_64: those five platforms get prebuilt `abi3`
 wheels, so there is no compiler involved. Python 3.9 or newer.
 
 It also brings the command-line tools. `spvirit` depends on the
-`spvirit-tools` package, so the twelve binaries below land on your `PATH`
+`spvirit-tools` package, so the thirteen binaries below land on your `PATH`
 in the same step — no Rust toolchain, and inside the virtualenv rather than
 in `~/.cargo/bin`.
 
@@ -28,7 +28,7 @@ Check it:
 
 ```console
 $ python -c "from importlib.metadata import version; print(version('spvirit'))"
-0.1.19
+0.4.0
 ```
 
 (The module itself has no `__version__` attribute — ask the package
@@ -39,9 +39,12 @@ which needs a Rust toolchain.
 
 ## Command-line tools
 
-Twelve binaries: `spget`, `spput`, `spmonitor`, `spinfo`, `splist`,
-`spsearch`, `spexplore`, `sptable`, `spserver`, `spsine`, `spdodeca`, and
-`spget_compare`.
+Thirteen binaries: `spget`, `spput`, `spmonitor`, `spinfo`, `splist`,
+`spsearch`, `spexplore`, `sptable`, `spserver`, `spsine`, `spdodeca`,
+`spget_compare`, and `spgateway`. The packet-capture tools `spvirit-scry` and
+`spvirit-scry_influx_collector` need the non-default `scry` feature, and the
+internal load driver `spload` the non-default `load` feature; none of the
+three is in the wheel.
 
 ```bash
 pip install spvirit-tools
@@ -76,10 +79,10 @@ Add whichever crates you need. They are strictly layered, so asking for
 
 ```toml
 [dependencies]
-spvirit-client = "0.1"   # search, connect, get, put, monitor
-spvirit-server = "0.1"   # .db parsing, the Source trait, the PVA server
-spvirit-codec  = "0.1"   # low-level PVAccess encode/decode
-spvirit-types  = "0.1"   # the Normative Type data model
+spvirit-client = "0.4"   # search, connect, get, put, monitor
+spvirit-server = "0.4"   # .db parsing, the Source trait, the PVA server
+spvirit-codec  = "0.4"   # low-level PVAccess encode/decode
+spvirit-types  = "0.4"   # the Normative Type data model
 ```
 
 Most of this site uses `spvirit-client` and `spvirit-server`. You will also

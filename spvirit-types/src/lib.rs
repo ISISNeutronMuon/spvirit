@@ -268,6 +268,16 @@ impl NtScalar {
         self
     }
 
+    /// Recompute `alarm_severity` / `alarm_status` / `alarm_message` from the
+    /// current value and the HIHI/HIGH/LOW/LOLO limits.
+    ///
+    /// `alarm_status` is deliberately `1` for every tripped limit. In pvData
+    /// `alarm.status` is a coarse *source category*, not the condition; the
+    /// specific limit is reported in `alarm.message`, which this method sets to
+    /// `HIHI`, `HIGH`, `LOW` or `LOLO`. (Prior audit T6.) Changing the value is
+    /// visible to every connected client — it is a protocol decision, not a
+    /// refactor. Pinned by
+    /// `alarm_status_is_a_category_and_the_message_carries_the_limit`.
     pub fn update_alarm_from_value(&mut self) {
         let val = match self.value {
             ScalarValue::F64(v) => v,
@@ -291,35 +301,32 @@ impl NtScalar {
         let mut severity = 0;
         let mut message = String::new();
 
-        if let Some(hihi) = self.alarm_hihi {
-            if val >= hihi {
-                severity = 2;
-                message = "HIHI".to_string();
-            }
+        if let Some(hihi) = self.alarm_hihi
+            && val >= hihi
+        {
+            severity = 2;
+            message = "HIHI".to_string();
         }
-        if severity == 0 {
-            if let Some(high) = self.alarm_high {
-                if val >= high {
-                    severity = 1;
-                    message = "HIGH".to_string();
-                }
-            }
+        if severity == 0
+            && let Some(high) = self.alarm_high
+            && val >= high
+        {
+            severity = 1;
+            message = "HIGH".to_string();
         }
-        if severity == 0 {
-            if let Some(lolo) = self.alarm_lolo {
-                if val <= lolo {
-                    severity = 2;
-                    message = "LOLO".to_string();
-                }
-            }
+        if severity == 0
+            && let Some(lolo) = self.alarm_lolo
+            && val <= lolo
+        {
+            severity = 2;
+            message = "LOLO".to_string();
         }
-        if severity == 0 {
-            if let Some(low) = self.alarm_low {
-                if val <= low {
-                    severity = 1;
-                    message = "LOW".to_string();
-                }
-            }
+        if severity == 0
+            && let Some(low) = self.alarm_low
+            && val <= low
+        {
+            severity = 1;
+            message = "LOW".to_string();
         }
 
         if severity == 0 {
@@ -371,6 +378,13 @@ pub struct NtTable {
 }
 
 impl NtTable {
+    /// Check the invariants this type cannot enforce in its constructors.
+    ///
+    /// Returns `Result<(), String>` rather than a typed error on purpose:
+    /// `spvirit-types` has no dependencies and no error module, no caller
+    /// matches on the failure, and `spvirit-py` calls this across the FFI
+    /// boundary where the message is what surfaces. The codec's decode entry
+    /// points, which *are* matched on, use `DecodeError` instead.
     pub fn validate(&self) -> Result<(), String> {
         let mut expected_len: Option<usize> = None;
         for col in &self.columns {
@@ -457,6 +471,13 @@ impl NtNdArray {
         }
     }
 
+    /// Check the invariants this type cannot enforce in its constructors.
+    ///
+    /// Returns `Result<(), String>` rather than a typed error on purpose:
+    /// `spvirit-types` has no dependencies and no error module, no caller
+    /// matches on the failure, and `spvirit-py` calls this across the FFI
+    /// boundary where the message is what surfaces. The codec's decode entry
+    /// points, which *are* matched on, use `DecodeError` instead.
     pub fn validate(&self) -> Result<(), String> {
         if self
             .attribute
@@ -486,7 +507,12 @@ impl NtNdArray {
                 self.uncompressed_size, expected_uncompressed
             ));
         }
-        if self.compressed_size > 0 && self.compressed_size > self.uncompressed_size {
+        // Only meaningful when the producer actually set `uncompressed_size`;
+        // 0 is the "not supplied" sentinel, not "zero bytes". (Prior audit T5.)
+        if self.compressed_size > 0
+            && self.uncompressed_size > 0
+            && self.compressed_size > self.uncompressed_size
+        {
             return Err(format!(
                 "compressed_size {} cannot exceed uncompressed_size {}",
                 self.compressed_size, self.uncompressed_size
@@ -591,6 +617,60 @@ pub static STANDARD_FORM_CHOICES: [&str; 7] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressed_size_is_not_checked_against_an_unset_uncompressed_size() {
+        let mut nt = NtNdArray::empty();
+        nt.value = ScalarArrayValue::I32(vec![1, 2, 3, 4]);
+        nt.dimension = vec![NdDimension {
+            size: 4,
+            offset: 0,
+            full_size: 4,
+            binning: 1,
+            reverse: false,
+        }];
+        nt.compressed_size = 7;
+        nt.uncompressed_size = 0; // not set by the producer
+        assert_eq!(
+            nt.validate(),
+            Ok(()),
+            "an unset uncompressed_size must not fail the compressed_size check"
+        );
+
+        // The real inconsistency is still caught.
+        nt.uncompressed_size = 16;
+        nt.compressed_size = 32;
+        assert!(nt.validate().is_err());
+    }
+
+    #[test]
+    fn alarm_status_is_a_category_and_the_message_carries_the_limit() {
+        // There is no `NtScalar::new_i32`; `from_value` is the constructor.
+        let mut nt = NtScalar::from_value(ScalarValue::I32(0));
+        nt.alarm_hihi = Some(90.0);
+        nt.alarm_high = Some(70.0);
+        nt.alarm_low = Some(30.0);
+        nt.alarm_lolo = Some(10.0);
+        // `alarm_severity` and `alarm_status` are both `i32` (lib.rs:134-135), so
+        // the severity literals must be `i32`, not `u8`.
+        for (v, severity, message) in [
+            (95i32, 2i32, "HIHI"),
+            (75, 1, "HIGH"),
+            (50, 0, ""),
+            (25, 1, "LOW"),
+            (5, 2, "LOLO"),
+        ] {
+            nt.value = ScalarValue::I32(v);
+            nt.update_alarm_from_value();
+            assert_eq!(nt.alarm_severity, severity, "severity for {v}");
+            assert_eq!(nt.alarm_message, message, "message for {v}");
+            assert_eq!(
+                nt.alarm_status,
+                if severity == 0 { 0 } else { 1 },
+                "status is a category, not the specific limit ({v})"
+            );
+        }
+    }
 
     #[test]
     fn from_value_has_no_timestamp_by_default() {

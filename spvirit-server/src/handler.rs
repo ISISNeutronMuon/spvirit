@@ -37,15 +37,42 @@ use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue, Scalar
 
 use crate::conn_writer::ConnWriter;
 use crate::decode::decode_put_body;
+use crate::diag::ClientRegistry;
 use crate::monitor::MonitorRegistry;
 use crate::pvstore::{SourceRegistry, TryClaim};
-use crate::state::{ConnState, MonitorState, MonitorSub};
+use crate::state::{ChannelTables, ConnState, MonitorState, MonitorSub};
 
 /// Hard server-side ceiling on a pipelined monitor's outstanding-frame credit,
 /// regardless of the window a client requests or ACKs. Bounds worst-case memory
 /// on the (lossless) control lane so a stalled pipelined client cannot OOM the
 /// server (crate-audit review R1-H1).
 pub const MAX_PIPELINE_WINDOW: u32 = 4096;
+
+/// The largest payload the server will allocate for one inbound frame.
+///
+/// The PVA protocol puts no ceiling on `payload_length` beyond the u32 field
+/// itself. This is the same constant the codec uses to bound reassembled
+/// segmented messages and the client uses for its own frame reader, so one
+/// number governs the whole inbound byte budget.
+pub const MAX_INBOUND_PAYLOAD_BYTES: usize = spvirit_codec::DEFAULT_MAX_MESSAGE_BYTES;
+
+/// How many payload bytes to read for `header`, or `Err(declared)` when the
+/// wire-supplied length exceeds [`MAX_INBOUND_PAYLOAD_BYTES`].
+///
+/// A pure function so the cap is testable without allocating: the caller must
+/// refuse *before* `vec![0u8; n]`, because a failed `Vec` allocation calls
+/// `handle_alloc_error` and aborts the process rather than unwinding.
+pub(crate) fn inbound_payload_len(header: &PvaHeader) -> Result<usize, usize> {
+    if header.flags.is_control {
+        return Ok(0);
+    }
+    let declared = header.payload_length as usize;
+    if declared > MAX_INBOUND_PAYLOAD_BYTES {
+        Err(declared)
+    } else {
+        Ok(declared)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PvListMode — controls virtual PV listing behaviour
@@ -229,14 +256,37 @@ pub fn collect_visible_pv_names(
     allow_pattern: Option<&Regex>,
     max_items: usize,
 ) -> Vec<String> {
+    collect_visible_pv_names_iter(
+        all_names.iter().map(String::as_str),
+        mode,
+        allow_pattern,
+        max_items,
+    )
+}
+
+/// As [`collect_visible_pv_names`], but over any iterator of names.
+///
+/// Callers that hold a `HashMap` keyed by PV name (the `spserver` binary is
+/// one) would otherwise have to materialise a `Vec<String>` just to call the
+/// slice version, reintroducing the clone-everything cost this function
+/// exists to avoid.
+pub fn collect_visible_pv_names_iter<'a, I>(
+    all_names: I,
+    mode: PvListMode,
+    allow_pattern: Option<&Regex>,
+    max_items: usize,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     // Sort and truncate *references*, and clone only what survives. The
     // caller's `max_items` is typically a few hundred while `all_names` is
     // whatever every registered source put together — on a large gateway,
     // tens of thousands of strings — so cloning first and discarding after
     // meant a heap allocation per name for names that were then thrown away.
     // Reference-sized elements also make the sort itself cheaper to move.
-    let mut refs: Vec<&String> = all_names
-        .iter()
+    let mut refs: Vec<&str> = all_names
+        .into_iter()
         .filter(|name| {
             allow_pattern
                 .as_ref()
@@ -248,7 +298,7 @@ pub fn collect_visible_pv_names(
     if refs.len() > max_items {
         refs.truncate(max_items);
     }
-    let mut names: Vec<String> = refs.into_iter().cloned().collect();
+    let mut names: Vec<String> = refs.into_iter().map(str::to_string).collect();
     if mode == PvListMode::List && names.len() < max_items {
         names.push("__pvlist".to_string());
     }
@@ -474,7 +524,9 @@ where
     PatternDispatch::Deferred
 }
 
-fn build_pvlist_structure(names: &[String]) -> StructureDesc {
+/// Build the `epics:pva/pvlist:1.0` introspection structure that answers a
+/// pvlist GET_FIELD: one boolean field per visible PV name.
+pub fn build_pvlist_structure(names: &[String]) -> StructureDesc {
     use spvirit_codec::spvd_decode::{FieldDesc, FieldType, TypeCode};
     StructureDesc {
         struct_id: Some("epics:pva/pvlist:1.0".to_string()),
@@ -488,7 +540,10 @@ fn build_pvlist_structure(names: &[String]) -> StructureDesc {
     }
 }
 
-fn requested_pvlist_pattern(field_name: Option<&str>) -> Option<&str> {
+/// Interpret a pvlist GET_FIELD's requested field name as a wildcard pattern.
+/// Empty, `*`, `__pvlist` and `pvlist` all mean "everything"; anything else is
+/// returned only if it is actually a pattern.
+pub fn requested_pvlist_pattern(field_name: Option<&str>) -> Option<&str> {
     let raw = field_name.map(str::trim).unwrap_or("");
     if raw.is_empty() || raw == "*" || raw == "__pvlist" || raw.eq_ignore_ascii_case("pvlist") {
         return Some("*");
@@ -582,7 +637,16 @@ pub fn rand_guid() -> [u8; 12] {
 // ---------------------------------------------------------------------------
 
 pub fn validate_encoded_packet(conn_id: u64, label: &str, bytes: &[u8]) {
-    let mut pkt = PvaPacket::new(bytes);
+    // Re-decoding every outbound frame is only worth doing if we can report
+    // the result — and every report here is a `debug!`. Bail before the decode
+    // when DEBUG is off.
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let Some(mut pkt) = PvaPacket::try_new(bytes) else {
+        debug!("Conn {}: {} failed to decode", conn_id, label);
+        return;
+    };
     let decoded = pkt.decode_payload();
     match decoded {
         Some(PvaPacketCommand::ConnectionValidation(payload)) => {
@@ -611,6 +675,11 @@ pub fn dump_hex_packet(
     is_be: bool,
     bytes: &[u8],
 ) {
+    // A `format!` per byte, allocating a String per line, and then `debug!`
+    // discards all of it at the default level. Check first.
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     debug!(
         "Conn {}: {} {} ver={} be={} len={}",
         conn_id,
@@ -620,16 +689,19 @@ pub fn dump_hex_packet(
         is_be,
         bytes.len()
     );
+    use std::fmt::Write as _;
+    // 16 bytes as "xx " plus a trailing byte with no space.
+    let mut line = String::with_capacity(48);
     let mut offset = 0usize;
     while offset < bytes.len() {
         let end = usize::min(offset + 16, bytes.len());
-        let chunk = &bytes[offset..end];
-        let mut line = String::new();
-        for (i, b) in chunk.iter().enumerate() {
+        line.clear();
+        for (i, b) in bytes[offset..end].iter().enumerate() {
             if i > 0 {
                 line.push(' ');
             }
-            line.push_str(&format!("{:02x}", b));
+            // Writes into the existing buffer; no per-byte allocation.
+            let _ = write!(line, "{b:02x}");
         }
         debug!("Conn {}: {:04x} {}", conn_id, offset, line);
         offset += 16;
@@ -686,8 +758,185 @@ async fn notify_changed_records(state: &ServerState, changed: Vec<(String, NtPay
 }
 
 // ---------------------------------------------------------------------------
+// Replier: a connection's own reply channel
+// ---------------------------------------------------------------------------
+
+/// A connection's own reply channel.
+///
+/// `MonitorRegistry::send_msg` locks the process-global `conns` map on every
+/// call to find a writer that the connection task itself created and handed to
+/// the registry. Holding the `Arc` directly removes a global lock acquisition
+/// from every single one-shot reply, while reproducing `send_msg`'s tx
+/// accounting exactly.
+#[derive(Clone)]
+pub struct Replier {
+    cw: Arc<ConnWriter>,
+    conn_id: u64,
+    client_registry: Option<Arc<ClientRegistry>>,
+}
+
+impl Replier {
+    pub fn new(
+        cw: Arc<ConnWriter>,
+        conn_id: u64,
+        client_registry: Option<Arc<ClientRegistry>>,
+    ) -> Self {
+        Self {
+            cw,
+            conn_id,
+            client_registry,
+        }
+    }
+
+    /// Queue one complete frame on the connection's lossless control lane.
+    pub async fn send(&self, bytes: Vec<u8>) {
+        if let Some(cr) = &self.client_registry {
+            cr.add_tx(self.conn_id, bytes.len() as u64);
+        }
+        self.cw.send_control(bytes).await;
+    }
+
+    /// A weak handle for a reply that may outlive the connection.
+    ///
+    /// The spawned pattern-query-reply task (`spawn_pattern_query_reply`) can
+    /// run for as long as its enumeration timeout (up to 30s), well after the
+    /// client that asked for it may have disconnected. Cloning `Replier`
+    /// itself keeps a strong `Arc<ConnWriter>` alive for that whole window
+    /// even though nothing else references the connection any more — the
+    /// connection's cleanup guard (`ConnCleanupGuard`) has already run
+    /// `cleanup_connection`, which drops the registry's own strong reference,
+    /// but the spawned task's clone kept the writer (and its buffers)
+    /// resident regardless. A `WeakReplier` holds a `Weak<ConnWriter>`
+    /// instead, so once every strong owner is gone the writer is freed
+    /// immediately; the delayed reply is simply dropped (nobody is listening
+    /// on that socket any more).
+    pub(crate) fn downgrade(&self) -> WeakReplier {
+        WeakReplier {
+            cw: Arc::downgrade(&self.cw),
+            conn_id: self.conn_id,
+            client_registry: self.client_registry.clone(),
+        }
+    }
+}
+
+/// `Replier::downgrade`: a reply handle that does not keep the connection's
+/// writer alive.
+pub(crate) struct WeakReplier {
+    cw: std::sync::Weak<ConnWriter>,
+    conn_id: u64,
+    client_registry: Option<Arc<ClientRegistry>>,
+}
+
+impl WeakReplier {
+    /// Deliver the frame if the connection's writer is still alive; otherwise
+    /// drop it silently (at debug level) — the connection is gone, so there
+    /// is nothing to deliver to.
+    pub(crate) async fn send(&self, bytes: Vec<u8>) {
+        let Some(cw) = self.cw.upgrade() else {
+            debug!(
+                "Conn {}: dropping a delayed reply — connection already torn down",
+                self.conn_id
+            );
+            return;
+        };
+        if let Some(cr) = &self.client_registry {
+            cr.add_tx(self.conn_id, bytes.len() as u64);
+        }
+        cw.send_control(bytes).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operation-arm helpers shared by the GET/PUT/PUT_GET/MONITOR arms
+// ---------------------------------------------------------------------------
+
+/// The error reply that a dozen operation arms had copy-pasted.
+async fn reply_op_error(
+    replier: &Replier,
+    command: u8,
+    subcmd: u8,
+    ioid: u32,
+    msg: &str,
+    version: u8,
+    is_be: bool,
+) {
+    replier
+        .send(encode_op_error(command, subcmd, ioid, msg, version, is_be))
+        .await;
+}
+
+/// Resolve the descriptor to advertise for `pv_name`: the source registry's if
+/// it has one, else derived from a live snapshot. `None` means "PV not found",
+/// and the caller replies with [`reply_op_error`].
+///
+/// This preamble was duplicated in the GET, PUT, PUT_GET and MONITOR init arms.
+async fn init_full_desc(state: &ServerState, pv_name: &str) -> Option<StructureDesc> {
+    if let Some(desc) = state.sources.get_descriptor(pv_name).await {
+        return Some(desc);
+    }
+    get_nt_snapshot(state, pv_name).await.map(|nt| nt_payload_desc(&nt))
+}
+
+/// Project `full` onto the fields the client's pvRequest selects.
+///
+/// Returns the descriptor to advertise and whether a field filter was
+/// *actually* requested. That flag is what decides whether a monitor
+/// subscriber needs a `filtered_desc` at all: an empty pvRequest selects
+/// everything, and storing a projection for it forces the expensive
+/// double-encode path in `build_monitor_frame`.
+fn apply_pv_request_filter(full: StructureDesc, body: &[u8], is_be: bool) -> (StructureDesc, bool) {
+    match decode_pv_request_fields(body, is_be) {
+        Some(fields) => (filter_structure_desc(&full, &fields), true),
+        None => (full, false),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GET_FIELD handler
 // ---------------------------------------------------------------------------
+
+/// Work out which channel a GET_FIELD request is about.
+///
+/// Order, unchanged from the `or_else` chain this replaces:
+/// 1. the sid the client named, taken as-is (never validated here — an
+///    unknown one falls out as "PV not found" at the caller's `sid_to_pv`
+///    lookup);
+/// 2. the cid it named, resolved through `cid_to_sid`;
+/// 3. the cid field read as if it held a sid — some clients populate it that
+///    way;
+/// 4. only when the client sent `cid == 0` **and** exactly one channel is
+///    open on this connection, that channel.
+///
+/// Step 4 is a compatibility shim, not a rule: real clients do send GET_FIELD
+/// with cid 0, and refusing them breaks introspection. It is deliberately
+/// confined to the unambiguous case and logged, because it is a guess.
+pub fn resolve_get_field_sid(
+    tables: &ChannelTables,
+    sid: Option<u32>,
+    cid: u32,
+) -> Option<u32> {
+    if let Some(s) = sid {
+        return Some(s);
+    }
+    if let Some(s) = tables.cid_to_sid.get(&cid).copied() {
+        return Some(s);
+    }
+    if tables.sid_to_pv.contains_key(&cid) {
+        return Some(cid);
+    }
+    if cid == 0 && tables.sid_to_pv.len() == 1 {
+        let only = tables.sid_to_pv.keys().copied().next();
+        if let Some(s) = only {
+            warn!(
+                "GET_FIELD names no channel (no sid, cid=0); guessing the \
+                 connection's only open channel sid={}",
+                s
+            );
+        }
+        return only;
+    }
+    None
+}
 
 async fn handle_get_field_request(
     state: &ServerState,
@@ -696,6 +945,7 @@ async fn handle_get_field_request(
     payload: spvirit_codec::epics_decode::PvaGetFieldPayload,
     version: u8,
     is_be: bool,
+    replier: &Replier,
 ) {
     if payload.is_server {
         let resp = encode_get_field_error(
@@ -704,7 +954,7 @@ async fn handle_get_field_request(
             version,
             is_be,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
 
@@ -714,26 +964,28 @@ async fn handle_get_field_request(
     // release the tables before any `.await` below.
     let (sid, resolved_pv) = {
         let tables = conn_state.channels.lock().unwrap();
-        let sid = payload
-            .sid
-            .or_else(|| tables.cid_to_sid.get(&payload.cid).copied())
-            .or_else(|| {
-                tables
-                    .sid_to_pv
-                    .contains_key(&payload.cid)
-                    .then_some(payload.cid)
-            })
-            .or_else(|| {
-                (payload.cid == 0 && tables.sid_to_pv.len() == 1)
-                    .then(|| tables.sid_to_pv.keys().copied().next())
-                    .flatten()
-            });
+        let sid = resolve_get_field_sid(&tables, payload.sid, payload.cid);
         let pv = sid.and_then(|s| tables.sid_to_pv.get(&s).cloned());
         (sid, pv)
     };
 
-    if let Some(sid) = sid {
-        if let Some(pv_name) = resolved_pv.as_ref() {
+    // A request that explicitly names a channel this connection does not have
+    // is refused, with the same text GET/PUT use. Falling through to the
+    // listing below would hand the client the PV list as if it were that
+    // channel's introspection. Sid 0 is never allocated (sids start at 1) and
+    // is how a listing request names "no channel" — spvirit's own `pvlist`
+    // sends `encode_get_field_request(0, 0, ..)` — so it keeps listing.
+    if let Some(named) = payload.sid
+        && named != 0
+        && resolved_pv.is_none()
+    {
+        let resp = encode_get_field_error(request_id, "Unknown SID", version, is_be);
+        replier.send(resp).await;
+        return;
+    }
+
+    if let Some(sid) = sid
+        && let Some(pv_name) = resolved_pv.as_ref() {
             if let Some(nt) = get_nt_snapshot(state, pv_name).await {
                 let full_desc = nt_payload_desc(&nt);
                 let sub = payload.field_name.as_deref().filter(|s| !s.is_empty());
@@ -747,7 +999,7 @@ async fn handle_get_field_request(
                                 version,
                                 is_be,
                             );
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             return;
                         }
                     }
@@ -756,7 +1008,7 @@ async fn handle_get_field_request(
                 };
                 let resp = encode_get_field_response(request_id, &desc, version, is_be);
                 dump_hex_packet(conn_id, "tx", "cmd=17 get_field", version, is_be, &resp);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
                 debug!(
                     "Conn {}: get_field cid={} sid={:?} ioid={:?} resolved_sid={} pv='{}' field={:?}",
                     conn_id,
@@ -770,10 +1022,9 @@ async fn handle_get_field_request(
                 return;
             }
             let resp = encode_get_field_error(request_id, "PV not found", version, is_be);
-            state.registry.send_msg(conn_id, resp).await;
+            replier.send(resp).await;
             return;
         }
-    }
 
     if state.pvlist_mode != PvListMode::List {
         let resp = encode_get_field_error(
@@ -782,7 +1033,7 @@ async fn handle_get_field_request(
             version,
             is_be,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
 
@@ -793,7 +1044,7 @@ async fn handle_get_field_request(
             version,
             is_be,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     };
 
@@ -810,7 +1061,7 @@ async fn handle_get_field_request(
     if names.is_empty() {
         let resp =
             encode_get_field_error(request_id, "No PVs matched list request", version, is_be);
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
     let desc = build_pvlist_structure(&names);
@@ -823,7 +1074,7 @@ async fn handle_get_field_request(
         is_be,
         &resp,
     );
-    state.registry.send_msg(conn_id, resp).await;
+    replier.send(resp).await;
     debug!(
         "Conn {}: get_field list pattern='{}' returned {} entries",
         conn_id,
@@ -838,11 +1089,11 @@ async fn handle_get_field_request(
 
 async fn handle_server_rpc(
     state: &ServerState,
-    conn_id: u64,
     ioid: u32,
     subcmd: u8,
     version: u8,
     is_be: bool,
+    replier: &Replier,
 ) {
     if state.pvlist_mode != PvListMode::List {
         let resp = encode_op_status_error_response(
@@ -853,7 +1104,7 @@ async fn handle_server_rpc(
             version,
             is_be,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
 
@@ -869,19 +1120,19 @@ async fn handle_server_rpc(
     let is_init = (subcmd & 0x08) != 0;
     if is_init {
         let resp = encode_op_status_response(20, ioid, subcmd, version, is_be);
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
         return;
     }
 
     let resp = encode_op_rpc_data_response_payload(ioid, subcmd, &payload, version, is_be);
-    state.registry.send_msg(conn_id, resp).await;
+    replier.send(resp).await;
 }
 
 // ---------------------------------------------------------------------------
 // Control message handler (inside segmented stream)
 // ---------------------------------------------------------------------------
 
-async fn handle_control_message(state: &ServerState, conn_id: u64, header: &PvaHeader) {
+async fn handle_control_message(conn_id: u64, header: &PvaHeader, replier: &Replier) {
     debug!(
         "Conn {}: control (segmented) cmd={} data={}",
         conn_id, header.command, header.payload_length
@@ -894,7 +1145,7 @@ async fn handle_control_message(state: &ServerState, conn_id: u64, header: &PvaH
             4,
             header.payload_length,
         );
-        state.registry.send_msg(conn_id, resp).await;
+        replier.send(resp).await;
     }
 }
 
@@ -911,9 +1162,25 @@ pub async fn run_udp_search(
     advertise_ip: Option<IpAddr>,
     multicast_iface: Option<Ipv4Addr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let socket = bind_udp_search_socket(addr)?;
+    run_udp_search_on_socket(state, socket, tcp_port, guid, advertise_ip, multicast_iface).await
+}
+
+/// [`run_udp_search`] on a socket the caller has already bound (with
+/// [`bind_udp_search_socket`]), so the caller can learn its real address —
+/// e.g. the port the OS picked for a port-0 bind — before serving starts.
+pub(crate) async fn run_udp_search_on_socket(
+    state: Arc<ServerState>,
+    socket: UdpSocket,
+    tcp_port: u16,
+    guid: [u8; 12],
+    advertise_ip: Option<IpAddr>,
+    multicast_iface: Option<Ipv4Addr>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = socket.local_addr()?;
     // `Arc` so a pattern-query reply can be sent from the task that computed
     // it, without that computation ever running on this loop.
-    let socket = Arc::new(bind_udp_search_socket(addr)?);
+    let socket = Arc::new(socket);
     socket.set_broadcast(true)?;
     if let Some(iface) = multicast_iface {
         const PVA_MULTICAST: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 128);
@@ -946,167 +1213,164 @@ pub async fn run_udp_search(
         };
         let version = pkt.header.version;
         let is_be = pkt.header.flags.is_msb;
-        match cmd {
-            PvaPacketCommand::Search(payload) => {
-                debug!(
-                    "UDP search from {}: pv_count={} mask=0x{:02x}",
-                    peer,
-                    payload.pv_requests.len(),
-                    payload.mask
-                );
-                let accepts_tcp = payload.protocols.is_empty()
-                    || payload
-                        .protocols
-                        .iter()
-                        .any(|p| p.eq_ignore_ascii_case("tcp"));
-                if !accepts_tcp {
-                    debug!("UDP search: no compatible protocol (tcp not accepted)");
-                    continue;
-                }
-                let (cids, pattern_requests, req_ctx) = crate::request_ctx::scope(peer, async {
-                    let mut cids = Vec::new();
-                    let mut pattern_requests: Vec<(u32, String)> = Vec::new();
-                    for (cid, name) in &payload.pv_requests {
-                        if is_virtual_event_pv(name)
-                            || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
-                            || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
-                        {
+        if let PvaPacketCommand::Search(payload) = cmd {
+            debug!(
+                "UDP search from {}: pv_count={} mask=0x{:02x}",
+                peer,
+                payload.pv_requests.len(),
+                payload.mask
+            );
+            let accepts_tcp = payload.protocols.is_empty()
+                || payload
+                    .protocols
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case("tcp"));
+            if !accepts_tcp {
+                debug!("UDP search: no compatible protocol (tcp not accepted)");
+                continue;
+            }
+            let (cids, pattern_requests, req_ctx) = crate::request_ctx::scope(peer, async {
+                let mut cids = Vec::new();
+                let mut pattern_requests: Vec<(u32, String)> = Vec::new();
+                for (cid, name) in &payload.pv_requests {
+                    if is_virtual_event_pv(name)
+                        || (is_pvlist_virtual_pv(name) && state.pvlist_mode == PvListMode::List)
+                        || (is_server_rpc_pv(name) && state.pvlist_mode != PvListMode::Off)
+                    {
+                        cids.push(*cid);
+                        continue;
+                    }
+                    // `try_claim` never blocks. Anything it cannot decide
+                    // is resolved on a background task and answered on the
+                    // client's next search retry — awaiting resolution here
+                    // would stop this task reading datagrams for every
+                    // other client, which is the whole defect.
+                    let outcome = state.sources.try_claim(name);
+                    crate::search_resolve::note_try_claim(outcome);
+                    match outcome {
+                        TryClaim::Yes => {
                             cids.push(*cid);
                             continue;
                         }
-                        // `try_claim` never blocks. Anything it cannot decide
-                        // is resolved on a background task and answered on the
-                        // client's next search retry — awaiting resolution here
-                        // would stop this task reading datagrams for every
-                        // other client, which is the whole defect.
-                        let outcome = state.sources.try_claim(name);
-                        crate::search_resolve::note_try_claim(outcome);
-                        match outcome {
-                            TryClaim::Yes => {
-                                cids.push(*cid);
-                                continue;
+                        TryClaim::Unknown => {
+                            // A wildcard is answered from the visible-name
+                            // list below; resolving it upstream is
+                            // meaningless and would pollute the negative
+                            // cache with a name no server owns.
+                            if !is_pattern_query(name) {
+                                state.search_resolver.enqueue(name);
                             }
-                            TryClaim::Unknown => {
-                                // A wildcard is answered from the visible-name
-                                // list below; resolving it upstream is
-                                // meaningless and would pollute the negative
-                                // cache with a name no server owns.
-                                if !is_pattern_query(name) {
-                                    state.search_resolver.enqueue(name);
-                                }
-                            }
-                            TryClaim::No => {}
                         }
-                        // Answered off this task: matching needs the full
-                        // enumeration, which is unbounded third-party work.
-                        if state.pvlist_mode != PvListMode::Off && is_pattern_query(name) {
-                            pattern_requests.push((*cid, name.clone()));
-                        }
+                        TryClaim::No => {}
                     }
-                    // Captured *inside* the scope, on the task that holds the
-                    // request's task-local: the pattern enumeration is
-                    // spawned below, after this scope has already ended.
-                    //
-                    // Only when there is something to spawn. `current_request`
-                    // takes a mutex and clones up to two `String`s, and the
-                    // overwhelming majority of datagrams carry no pattern
-                    // query at all — for those `spawn_pattern_query_reply`
-                    // returns `PatternDispatch::None` without ever looking at
-                    // the context. This is the search read loop, the very path
-                    // this branch exists to keep clear.
-                    let req_ctx = if pattern_requests.is_empty() {
-                        None
-                    } else {
-                        crate::request_ctx::current_request()
-                    };
-                    (cids, pattern_requests, req_ctx)
-                })
-                .await;
-                let response_required = (payload.mask & 0x01) != 0;
-                let server_discovery_ping = payload.pv_requests.is_empty();
-                let found = server_discovery_ping || !cids.is_empty();
-                // `Some(0.0.0.0)` (all-interface bind, no explicit advertise IP)
-                // is treated as unset so we fall through to the bound socket
-                // address and finally to inferring the local IP toward this
-                // peer — never emitting a zero address a client cannot reach.
-                let resp_ip = effective_advertise_ip(advertise_ip)
-                    .or_else(|| effective_advertise_ip(Some(addr.ip())))
-                    .or_else(|| {
-                        let inferred = infer_udp_response_ip(peer);
-                        if let Some(ip) = inferred {
-                            debug!("UDP search: inferred response address {}", ip);
-                        }
-                        inferred
-                    })
-                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-                let addr_bytes = if resp_ip.is_unspecified() {
-                    debug!("UDP search: responding with zero address (unspecified listen)");
-                    [0u8; 16]
+                    // Answered off this task: matching needs the full
+                    // enumeration, which is unbounded third-party work.
+                    if state.pvlist_mode != PvListMode::Off && is_pattern_query(name) {
+                        pattern_requests.push((*cid, name.clone()));
+                    }
+                }
+                // Captured *inside* the scope, on the task that holds the
+                // request's task-local: the pattern enumeration is
+                // spawned below, after this scope has already ended.
+                //
+                // Only when there is something to spawn. `current_request`
+                // takes a mutex and clones up to two `String`s, and the
+                // overwhelming majority of datagrams carry no pattern
+                // query at all — for those `spawn_pattern_query_reply`
+                // returns `PatternDispatch::None` without ever looking at
+                // the context. This is the search read loop, the very path
+                // this branch exists to keep clear.
+                let req_ctx = if pattern_requests.is_empty() {
+                    None
                 } else {
-                    ip_to_bytes(resp_ip)
+                    crate::request_ctx::current_request()
                 };
-                let response = encode_search_response(
-                    guid,
-                    payload.seq,
-                    addr_bytes,
-                    tcp_port,
-                    "tcp",
-                    found,
-                    &cids,
-                    version,
-                    is_be,
-                );
-                let reply_target = search_reply_target(&payload.addr, payload.port, peer);
-                // Hand the pattern queries to their own task. If it takes
-                // them, it also inherits the duty to answer a
-                // `response_required` datagram this loop found nothing for —
-                // so a wildcard-only search still gets exactly one reply,
-                // carrying exactly the cids it used to carry.
-                let seq = payload.seq;
-                let answer_negative = response_required && !found;
-                let dispatch = {
-                    let socket = socket.clone();
-                    spawn_pattern_query_reply(&state, req_ctx, pattern_requests, move |pattern_cids| async move {
-                        if pattern_cids.is_empty() && !answer_negative {
-                            return;
-                        }
-                        let response = encode_search_response(
-                            guid,
-                            seq,
-                            addr_bytes,
-                            tcp_port,
-                            "tcp",
-                            !pattern_cids.is_empty(),
-                            &pattern_cids,
-                            version,
-                            is_be,
-                        );
-                        if let Err(e) = socket.send_to(&response, reply_target).await {
-                            debug!("UDP search: failed sending pattern reply to {reply_target}: {e}");
-                        }
-                    })
-                };
-                if !found && (dispatch.withholds_negative() || !response_required) {
-                    debug!("UDP search: no immediate matches (pattern dispatch={dispatch:?})");
-                    continue;
-                }
-                if let Err(e) = socket.send_to(&response, reply_target).await {
-                    debug!(
-                        "UDP search: failed sending {} matches to {}: {}",
-                        cids.len(),
-                        reply_target,
-                        e
+                (cids, pattern_requests, req_ctx)
+            })
+            .await;
+            let response_required = (payload.mask & 0x01) != 0;
+            let server_discovery_ping = payload.pv_requests.is_empty();
+            let found = server_discovery_ping || !cids.is_empty();
+            // `Some(0.0.0.0)` (all-interface bind, no explicit advertise IP)
+            // is treated as unset so we fall through to the bound socket
+            // address and finally to inferring the local IP toward this
+            // peer — never emitting a zero address a client cannot reach.
+            let resp_ip = effective_advertise_ip(advertise_ip)
+                .or_else(|| effective_advertise_ip(Some(addr.ip())))
+                .or_else(|| {
+                    let inferred = infer_udp_response_ip(peer);
+                    if let Some(ip) = inferred {
+                        debug!("UDP search: inferred response address {}", ip);
+                    }
+                    inferred
+                })
+                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            let addr_bytes = if resp_ip.is_unspecified() {
+                debug!("UDP search: responding with zero address (unspecified listen)");
+                [0u8; 16]
+            } else {
+                ip_to_bytes(resp_ip)
+            };
+            let response = encode_search_response(
+                guid,
+                payload.seq,
+                addr_bytes,
+                tcp_port,
+                "tcp",
+                found,
+                &cids,
+                version,
+                is_be,
+            );
+            let reply_target = search_reply_target(&payload.addr, payload.port, peer);
+            // Hand the pattern queries to their own task. If it takes
+            // them, it also inherits the duty to answer a
+            // `response_required` datagram this loop found nothing for —
+            // so a wildcard-only search still gets exactly one reply,
+            // carrying exactly the cids it used to carry.
+            let seq = payload.seq;
+            let answer_negative = response_required && !found;
+            let dispatch = {
+                let socket = socket.clone();
+                spawn_pattern_query_reply(&state, req_ctx, pattern_requests, move |pattern_cids| async move {
+                    if pattern_cids.is_empty() && !answer_negative {
+                        return;
+                    }
+                    let response = encode_search_response(
+                        guid,
+                        seq,
+                        addr_bytes,
+                        tcp_port,
+                        "tcp",
+                        !pattern_cids.is_empty(),
+                        &pattern_cids,
+                        version,
+                        is_be,
                     );
-                    continue;
-                }
-                debug!(
-                    "UDP search: responded found={} with {} matches to {}",
-                    found,
-                    cids.len(),
-                    reply_target
-                );
+                    if let Err(e) = socket.send_to(&response, reply_target).await {
+                        debug!("UDP search: failed sending pattern reply to {reply_target}: {e}");
+                    }
+                })
+            };
+            if !found && (dispatch.withholds_negative() || !response_required) {
+                debug!("UDP search: no immediate matches (pattern dispatch={dispatch:?})");
+                continue;
             }
-            _ => {}
+            if let Err(e) = socket.send_to(&response, reply_target).await {
+                debug!(
+                    "UDP search: failed sending {} matches to {}: {}",
+                    cids.len(),
+                    reply_target,
+                    e
+                );
+                continue;
+            }
+            debug!(
+                "UDP search: responded found={} with {} matches to {}",
+                found,
+                cids.len(),
+                reply_target
+            );
         }
     }
 }
@@ -1184,6 +1448,51 @@ pub async fn run_tcp_server(
 // Core TCP connection handler
 // ---------------------------------------------------------------------------
 
+/// Turn off Nagle's algorithm on an accepted connection.
+///
+/// PVA responses are typically far smaller than an MSS. With Nagle on, the
+/// kernel holds such a write until the previous segment is acknowledged, and
+/// the peer's delayed-ACK timer means that acknowledgement is itself deferred
+/// — a latency floor of roughly 40 ms on Linux and 200 ms on Windows under
+/// every single request/response round trip.
+///
+/// A failure here is not fatal: the connection still works, just slowly. Log
+/// it and carry on rather than dropping a client over a socket option.
+pub fn disable_nagle(stream: &TcpStream, conn_id: u64) {
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("Conn {}: could not set TCP_NODELAY: {}", conn_id, e);
+    }
+}
+
+/// Runs a connection's registry cleanup no matter how its task ends.
+///
+/// `cleanup_connection` used to be the last statement of `handle_connection`,
+/// so a panic anywhere in the read loop — including one caused by another
+/// task poisoning a shared `std::sync::Mutex` — unwound past it and leaked the
+/// connection's `ConnWriter`, its channel-tables registration, its
+/// `ClientRegistry` row and its `monitors[pv]` entries (which kept its pumps
+/// alive forever). Any early return added later is now safe by construction.
+/// `Drop` cannot `await`, so the work is spawned — the same shape as
+/// `conn_writer::FlushGuard`. With no runtime to spawn on (process shutting
+/// down) there is nothing left to leak into. If a runtime exists but is
+/// already shutting down, the spawned cleanup task may itself be cancelled
+/// before it runs — that is harmless too, since the `MonitorRegistry` it
+/// would have cleaned up is owned by (and dies with) that same runtime.
+struct ConnCleanupGuard {
+    registry: Arc<MonitorRegistry>,
+    conn_id: u64,
+}
+
+impl Drop for ConnCleanupGuard {
+    fn drop(&mut self) {
+        let registry = self.registry.clone();
+        let conn_id = self.conn_id;
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { registry.cleanup_connection(conn_id).await });
+        }
+    }
+}
+
 /// Handle a single PVA TCP connection.
 ///
 /// This is the main protocol loop: handshake, then dispatch each command
@@ -1200,12 +1509,19 @@ pub async fn handle_connection(
     // making it the ideal thing to advertise in a search reply when no explicit
     // advertise IP is configured.
     let conn_local_addr = stream.local_addr().ok();
+    disable_nagle(&stream, conn_id);
     let (mut reader, writer) = stream.into_split();
 
+    let cw = ConnWriter::new(writer);
     {
         let mut conns = state.registry.conns.lock().await;
-        conns.insert(conn_id, ConnWriter::new(writer));
+        conns.insert(conn_id, cw.clone());
     }
+    let _cleanup = ConnCleanupGuard {
+        registry: state.registry.clone(),
+        conn_id,
+    };
+    let replier = Replier::new(cw, conn_id, state.client_registry.clone());
 
     if let Some(cr) = &state.client_registry
         && let Some(ctx) = crate::request_ctx::current_request()
@@ -1230,7 +1546,7 @@ pub async fn handle_connection(
         false,
         &set_byte_order,
     );
-    state.registry.send_msg(conn_id, set_byte_order).await;
+    replier.send(set_byte_order).await;
 
     // Server sends Connection Validation (cmd=1) next.
     let server_validation =
@@ -1244,7 +1560,7 @@ pub async fn handle_connection(
         false,
         &server_validation,
     );
-    state.registry.send_msg(conn_id, server_validation).await;
+    replier.send(server_validation).await;
 
     let mut last_activity = Instant::now();
     // One reassembler for the whole connection: the segments of a message may
@@ -1269,10 +1585,16 @@ pub async fn handle_connection(
             }
         }
         let header_pkt = PvaPacket::new(&header);
-        let payload_len = if header_pkt.header.flags.is_control {
-            0usize
-        } else {
-            header_pkt.header.payload_length as usize
+        let payload_len = match inbound_payload_len(&header_pkt.header) {
+            Ok(len) => len,
+            Err(declared) => {
+                warn!(
+                    "Conn {}: peer declared a {}-byte payload, over the {}-byte \
+                     inbound limit; closing the connection",
+                    conn_id, declared, MAX_INBOUND_PAYLOAD_BYTES
+                );
+                break;
+            }
         };
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
@@ -1310,7 +1632,7 @@ pub async fn handle_connection(
             Ok(SegmentOutcome::Pending) => continue,
             Ok(SegmentOutcome::Control(msg)) => {
                 let ctrl = PvaPacket::new(&msg);
-                handle_control_message(&state, conn_id, &ctrl.header).await;
+                handle_control_message(conn_id, &ctrl.header, &replier).await;
                 continue;
             }
             Err(e) => {
@@ -1357,7 +1679,7 @@ pub async fn handle_connection(
                     is_be,
                     &resp,
                 );
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
                 continue;
             }
         }
@@ -1370,7 +1692,7 @@ pub async fn handle_connection(
                 debug!("Conn {}: control {}", conn_id, payload);
                 if payload.command == 3 {
                     let resp = encode_control_message(true, is_be, version, 4, payload.data);
-                    state.registry.send_msg(conn_id, resp).await;
+                    replier.send(resp).await;
                 }
                 continue;
             }
@@ -1395,14 +1717,14 @@ pub async fn handle_connection(
                             .unwrap()
                             .insert_channel(cid, sid, &pv_name);
                         let resp = encode_create_channel_response(cid, sid, version, is_be);
-                        state.registry.send_msg(conn_id, resp).await;
+                        replier.send(resp).await;
                         info!(
                             "Conn {}: channel '{}' cid={} sid={}",
                             conn_id, pv_name, cid, sid
                         );
                     } else {
                         let resp = encode_create_channel_error(cid, "PV not found", version, is_be);
-                        state.registry.send_msg(conn_id, resp).await;
+                        replier.send(resp).await;
                         info!(
                             "Conn {}: channel '{}' not found (cid={})",
                             conn_id, pv_name, cid
@@ -1433,20 +1755,16 @@ pub async fn handle_connection(
                     .get(&sid)
                     .cloned();
                 let Some(pv_name) = pv_lookup else {
-                    state
-                        .registry
-                        .send_msg(
-                            conn_id,
-                            encode_op_error(
-                                payload.command,
-                                payload.subcmd,
-                                ioid,
-                                "Unknown SID",
-                                version,
-                                is_be,
-                            ),
-                        )
-                        .await;
+                    reply_op_error(
+                        &replier,
+                        payload.command,
+                        payload.subcmd,
+                        ioid,
+                        "Unknown SID",
+                        version,
+                        is_be,
+                    )
+                    .await;
                     continue;
                 };
 
@@ -1471,35 +1789,27 @@ pub async fn handle_connection(
                         if is_init {
                             // Init only needs the type descriptor, not the data.
                             // Use get_descriptor first; fall back to snapshot.
-                            let full_desc =
-                                if let Some(desc) = state.sources.get_descriptor(&pv_name).await {
-                                    desc
-                                } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
-                                    nt_payload_desc(&nt)
-                                } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
-                                    continue;
-                                };
-                            let pv_req_fields = decode_pv_request_fields(&payload.body, is_be);
-                            let desc = match &pv_req_fields {
-                                Some(fields) => filter_structure_desc(&full_desc, fields),
-                                None => full_desc,
+                            let Some(full_desc) = init_full_desc(&state, &pv_name).await else {
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
+                                continue;
                             };
+                            let (desc, _) =
+                                apply_pv_request_filter(full_desc, &payload.body, is_be);
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
+                            // Bind the request to its channel so DESTROY_CHANNEL
+                            // can find and purge it. Previously only MONITOR
+                            // bound, so GET/PUT/PUT_GET rows leaked.
+                            conn_state.channels.lock().unwrap().bind_monitor(ioid, sid);
                             let resp = encode_op_init_response_desc(
                                 payload.command,
                                 ioid,
@@ -1508,24 +1818,20 @@ pub async fn handle_connection(
                                 version,
                                 is_be,
                             );
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             info!("Conn {}: get init pv='{}' ioid={}", conn_id, pv_name, ioid);
                         } else {
                             let Some(nt) = get_nt_snapshot(&state, &pv_name).await else {
-                                state
-                                    .registry
-                                    .send_msg(
-                                        conn_id,
-                                        encode_op_error(
-                                            payload.command,
-                                            payload.subcmd,
-                                            ioid,
-                                            "PV has no data yet",
-                                            version,
-                                            is_be,
-                                        ),
-                                    )
-                                    .await;
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV has no data yet",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
                                 continue;
                             };
                             let resp = if let Some(desc) = conn_state.ioid_to_desc.get(&ioid) {
@@ -1535,7 +1841,7 @@ pub async fn handle_connection(
                             } else {
                                 encode_op_get_data_response_payload(ioid, &nt, version, is_be)
                             };
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             debug!("Conn {}: get data pv='{}' ioid={}", conn_id, pv_name, ioid);
                         }
                     }
@@ -1545,28 +1851,20 @@ pub async fn handle_connection(
                             // Init only needs the type descriptor, not current data.
                             // Use get_descriptor first; fall back to snapshot so PUT
                             // can target PVs that do not yet have any data.
-                            let desc =
-                                if let Some(desc) = state.sources.get_descriptor(&pv_name).await {
-                                    desc
-                                } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
-                                    nt_payload_desc(&nt)
-                                } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
-                                    continue;
-                                };
+                            let Some(full_desc) = init_full_desc(&state, &pv_name).await else {
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
+                                continue;
+                            };
+                            let desc = full_desc;
                             if !is_virtual_event_pv(&pv_name)
                                 && !is_writable_pv(&state, &pv_name).await
                             {
@@ -1577,11 +1875,15 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                                 continue;
                             }
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
+                            // Bind the request to its channel so DESTROY_CHANNEL
+                            // can find and purge it. Previously only MONITOR
+                            // bound, so GET/PUT/PUT_GET rows leaked.
+                            conn_state.channels.lock().unwrap().bind_monitor(ioid, sid);
                             let resp = encode_op_init_response_desc(
                                 payload.command,
                                 ioid,
@@ -1590,7 +1892,7 @@ pub async fn handle_connection(
                                 version,
                                 is_be,
                             );
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             info!("Conn {}: put init pv='{}' ioid={}", conn_id, pv_name, ioid);
                         } else {
                             if (payload.subcmd & 0x40) != 0 {
@@ -1604,53 +1906,45 @@ pub async fn handle_connection(
                                         version,
                                         is_be,
                                     );
-                                    state.registry.send_msg(conn_id, resp).await;
+                                    replier.send(resp).await;
                                     continue;
                                 }
                                 if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     let resp = encode_op_put_getput_response_payload(
                                         ioid, &nt, version, is_be,
                                     );
-                                    state.registry.send_msg(conn_id, resp).await;
+                                    replier.send(resp).await;
                                     debug!(
                                         "Conn {}: put get-put pv='{}' ioid={}",
                                         conn_id, pv_name, ioid
                                     );
                                 } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
+                                    reply_op_error(
+                                        &replier,
+                                        payload.command,
+                                        payload.subcmd,
+                                        ioid,
+                                        "PV not found",
+                                        version,
+                                        is_be,
+                                    )
+                                    .await;
                                 }
                                 continue;
                             }
                             let desc = match conn_state.ioid_to_desc.get(&ioid) {
                                 Some(d) => d.clone(),
                                 None => {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PUT without init",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
+                                    reply_op_error(
+                                        &replier,
+                                        payload.command,
+                                        payload.subcmd,
+                                        ioid,
+                                        "PUT without init",
+                                        version,
+                                        is_be,
+                                    )
+                                    .await;
                                     continue;
                                 }
                             };
@@ -1668,7 +1962,7 @@ pub async fn handle_connection(
                                             version,
                                             is_be,
                                         );
-                                        state.registry.send_msg(conn_id, resp).await;
+                                        replier.send(resp).await;
                                         continue;
                                     }
                                 }
@@ -1686,11 +1980,11 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                                 continue;
                             }
                             let resp = encode_op_put_response(ioid, payload.subcmd, version, is_be);
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             debug!("Conn {}: put data pv='{}' ioid={}", conn_id, pv_name, ioid);
                         }
                     }
@@ -1700,28 +1994,20 @@ pub async fn handle_connection(
                             // Init only needs the type descriptor, not current data.
                             // Use get_descriptor first; fall back to snapshot so that
                             // clients can initiate PUT_GET before any data exists.
-                            let desc =
-                                if let Some(desc) = state.sources.get_descriptor(&pv_name).await {
-                                    desc
-                                } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
-                                    nt_payload_desc(&nt)
-                                } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
-                                    continue;
-                                };
+                            let Some(full_desc) = init_full_desc(&state, &pv_name).await else {
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
+                                continue;
+                            };
+                            let desc = full_desc;
                             if !is_virtual_event_pv(&pv_name)
                                 && !is_writable_pv(&state, &pv_name).await
                             {
@@ -1731,14 +2017,18 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                                 continue;
                             }
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
+                            // Bind the request to its channel so DESTROY_CHANNEL
+                            // can find and purge it. Previously only MONITOR
+                            // bound, so GET/PUT/PUT_GET rows leaked.
+                            conn_state.channels.lock().unwrap().bind_monitor(ioid, sid);
                             let resp =
                                 encode_op_put_get_init_response(ioid, &desc, &desc, version, is_be);
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             info!(
                                 "Conn {}: put_get init pv='{}' ioid={}",
                                 conn_id, pv_name, ioid
@@ -1747,20 +2037,16 @@ pub async fn handle_connection(
                             let desc = match conn_state.ioid_to_desc.get(&ioid) {
                                 Some(d) => d.clone(),
                                 None => {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PUT_GET without init",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
+                                    reply_op_error(
+                                        &replier,
+                                        payload.command,
+                                        payload.subcmd,
+                                        ioid,
+                                        "PUT_GET without init",
+                                        version,
+                                        is_be,
+                                    )
+                                    .await;
                                     continue;
                                 }
                             };
@@ -1774,7 +2060,7 @@ pub async fn handle_connection(
                                         let resp = encode_op_put_get_data_error_response(
                                             ioid, &msg, version, is_be,
                                         );
-                                        state.registry.send_msg(conn_id, resp).await;
+                                        replier.send(resp).await;
                                         continue;
                                     }
                                 }
@@ -1791,29 +2077,25 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                                 continue;
                             }
                             if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                 let resp = encode_op_put_get_data_response_payload(
                                     ioid, &nt, version, is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                             } else {
-                                state
-                                    .registry
-                                    .send_msg(
-                                        conn_id,
-                                        encode_op_error(
-                                            payload.command,
-                                            payload.subcmd,
-                                            ioid,
-                                            "PV not found",
-                                            version,
-                                            is_be,
-                                        ),
-                                    )
-                                    .await;
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
                             }
                             debug!(
                                 "Conn {}: put_get data pv='{}' ioid={}",
@@ -1831,33 +2113,21 @@ pub async fn handle_connection(
                             // updates are pushed once data arrives. Strict clients
                             // like p4p treat a MONITOR init error as fatal, so we
                             // must not error out when only the descriptor is known.
-                            let full_desc =
-                                if let Some(desc) = state.sources.get_descriptor(&pv_name).await {
-                                    desc
-                                } else if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
-                                    nt_payload_desc(&nt)
-                                } else {
-                                    state
-                                        .registry
-                                        .send_msg(
-                                            conn_id,
-                                            encode_op_error(
-                                                payload.command,
-                                                payload.subcmd,
-                                                ioid,
-                                                "PV not found",
-                                                version,
-                                                is_be,
-                                            ),
-                                        )
-                                        .await;
-                                    continue;
-                                };
-                            let pv_req_fields = decode_pv_request_fields(&payload.body, is_be);
-                            let desc = match &pv_req_fields {
-                                Some(fields) => filter_structure_desc(&full_desc, fields),
-                                None => full_desc,
+                            let Some(full_desc) = init_full_desc(&state, &pv_name).await else {
+                                reply_op_error(
+                                    &replier,
+                                    payload.command,
+                                    payload.subcmd,
+                                    ioid,
+                                    "PV not found",
+                                    version,
+                                    is_be,
+                                )
+                                .await;
+                                continue;
                             };
+                            let (desc, has_filter) =
+                                apply_pv_request_filter(full_desc, &payload.body, is_be);
                             conn_state.ioid_to_desc.insert(ioid, desc.clone());
                             conn_state.ioid_to_pv.insert(ioid, pv_name.clone());
                             let pipeline_enabled = (payload.subcmd & 0x80) != 0;
@@ -1893,7 +2163,7 @@ pub async fn handle_connection(
                                 version,
                                 is_be,
                             );
-                            state.registry.send_msg(conn_id, resp).await;
+                            replier.send(resp).await;
                             conn_state.ioid_to_monitor.insert(
                                 ioid,
                                 MonitorState {
@@ -1921,7 +2191,21 @@ pub async fn handle_connection(
                                         running: false,
                                         pipeline_enabled,
                                         nfree,
-                                        filtered_desc: conn_state.ioid_to_desc.get(&ioid).cloned(),
+                                        // Only a client that actually asked for
+                                        // a field filter needs a projection
+                                        // desc. Storing one unconditionally
+                                        // forces `build_monitor_frame` down the
+                                        // filtered branch, which encodes a
+                                        // throwaway delta as a change detector
+                                        // and then a full filtered frame — two
+                                        // full encodes per update for what is
+                                        // the identity projection. The bytes
+                                        // are unchanged either way:
+                                        // `encode_nt_payload_values_for_desc`
+                                        // short-circuits to
+                                        // `encode_nt_payload_full` when the
+                                        // desc equals the payload's own.
+                                        filtered_desc: has_filter.then(|| desc.clone()),
                                         last_snapshot: None,
                                     });
                             }
@@ -1947,7 +2231,7 @@ pub async fn handle_connection(
                                 let resp = encode_monitor_data_response_payload(
                                     ioid, 0x10, &nt, version, is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                             }
                             state
                                 .registry
@@ -2035,14 +2319,13 @@ pub async fn handle_connection(
                                 pipeline_ack,
                                 nfree
                             );
-                            if start {
-                                if let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
+                            if start
+                                && let Some(nt) = get_nt_snapshot(&state, &pv_name).await {
                                     state
                                         .registry
                                         .send_monitor_update_for(&pv_name, conn_id, ioid, &nt)
                                         .await;
                                 }
-                            }
                         }
                     }
                     20 => {
@@ -2050,11 +2333,11 @@ pub async fn handle_connection(
                         if is_server_rpc_pv(&pv_name) {
                             handle_server_rpc(
                                 &state,
-                                conn_id,
                                 ioid,
                                 payload.subcmd,
                                 version,
                                 is_be,
+                                &replier,
                             )
                             .await;
                         } else {
@@ -2068,7 +2351,7 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, resp).await;
+                                replier.send(resp).await;
                             } else {
                                 // RPC EXEC — decode self-describing PVD args and
                                 // delegate to the source registry
@@ -2098,7 +2381,7 @@ pub async fn handle_connection(
                                             version,
                                             is_be,
                                         );
-                                        state.registry.send_msg(conn_id, resp).await;
+                                        replier.send(resp).await;
                                     }
                                     Err(msg) => {
                                         let resp = encode_op_status_error_response(
@@ -2109,43 +2392,35 @@ pub async fn handle_connection(
                                             version,
                                             is_be,
                                         );
-                                        state.registry.send_msg(conn_id, resp).await;
+                                        replier.send(resp).await;
                                     }
                                 }
                             }
                         }
                     }
                     14 | 16 => {
-                        state
-                            .registry
-                            .send_msg(
-                                conn_id,
-                                encode_op_error(
-                                    payload.command,
-                                    payload.subcmd,
-                                    ioid,
-                                    "Operation not supported",
-                                    version,
-                                    is_be,
-                                ),
-                            )
-                            .await;
+                        reply_op_error(
+                            &replier,
+                            payload.command,
+                            payload.subcmd,
+                            ioid,
+                            "Operation not supported",
+                            version,
+                            is_be,
+                        )
+                        .await;
                     }
                     _ => {
-                        state
-                            .registry
-                            .send_msg(
-                                conn_id,
-                                encode_op_error(
-                                    payload.command,
-                                    payload.subcmd,
-                                    ioid,
-                                    "Operation not supported",
-                                    version,
-                                    is_be,
-                                ),
-                            )
-                            .await;
+                        reply_op_error(
+                            &replier,
+                            payload.command,
+                            payload.subcmd,
+                            ioid,
+                            "Operation not supported",
+                            version,
+                            is_be,
+                        )
+                        .await;
                     }
                 }
             }
@@ -2155,14 +2430,9 @@ pub async fn handle_connection(
                 // The client names the sid, so it may be stale: a client that
                 // re-created a channel on the same cid and only then echoes a
                 // DestroyChannel for the old sid must not strip the *new*
-                // channel's `cid_to_sid` row. Losing it makes
-                // `MonitorRegistry::destroy_subs` decline to send that client a
-                // DESTROY_CHANNEL on the next upstream death.
-                conn_state
-                    .channels
-                    .lock()
-                    .unwrap()
-                    .remove_channel_if_current(cid, sid);
+                // channel's `cid_to_sid` row (see remove_channel_if_current).
+                // Every request bound to the destroyed channel is also dead.
+                purge_channel_requests(&mut conn_state, cid, sid);
                 info!(
                     "Conn {}: channel destroyed sid={} cid={}",
                     conn_id, sid, cid
@@ -2188,36 +2458,44 @@ pub async fn handle_connection(
             PvaPacketCommand::AclChange(_) => {
                 let resp =
                     encode_message_error("ACL_CHANGE command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::GetField(payload) => {
-                handle_get_field_request(&state, &conn_state, conn_id, payload, version, is_be)
-                    .await;
+                handle_get_field_request(
+                    &state,
+                    &conn_state,
+                    conn_id,
+                    payload,
+                    version,
+                    is_be,
+                    &replier,
+                )
+                .await;
             }
             PvaPacketCommand::Echo(payload_bytes) => {
                 let mut resp =
                     encode_header(true, is_be, false, version, 2, payload_bytes.len() as u32);
                 resp.extend_from_slice(&payload_bytes);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::Message(_) => {
                 let resp = encode_message_error("MESSAGE command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::MultipleData(_) => {
                 let resp =
                     encode_message_error("MULTIPLE_DATA command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::CancelRequest(_) => {
                 let resp =
                     encode_message_error("CANCEL_REQUEST command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::OriginTag(_) => {
                 let resp =
                     encode_message_error("ORIGIN_TAG command is not supported", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::Search(payload) => {
                 debug!(
@@ -2299,7 +2577,8 @@ pub async fn handle_connection(
                     let seq = payload.seq;
                     let answer_negative = !found;
                     let dispatch = {
-                        let replier = state.clone();
+                        let state_for_task = state.clone();
+                        let replier_for_task = replier.downgrade();
                         // `handle_connection` runs inside `request_ctx::scope`
                         // and `set_credentials` has already installed the
                         // validated `ca` user, so this is the full identity the
@@ -2322,7 +2601,7 @@ pub async fn handle_connection(
                             req_ctx,
                             pattern_requests,
                             move |pattern_cids| async move {
-                                let state = replier;
+                                let state = state_for_task;
                                 if pattern_cids.is_empty() && !answer_negative {
                                     return;
                                 }
@@ -2337,12 +2616,12 @@ pub async fn handle_connection(
                                     version,
                                     is_be,
                                 );
-                                state.registry.send_msg(conn_id, response).await;
+                                replier_for_task.send(response).await;
                             },
                         )
                     };
                     if found || !dispatch.withholds_negative() {
-                        state.registry.send_msg(conn_id, response).await;
+                        replier.send(response).await;
                         debug!(
                             "Conn {}: TCP search responded found={} matches={}",
                             conn_id,
@@ -2357,7 +2636,7 @@ pub async fn handle_connection(
             PvaPacketCommand::SearchResponse(_) | PvaPacketCommand::Beacon(_) => {
                 let resp =
                     encode_message_error("Unexpected command for server endpoint", version, is_be);
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
             PvaPacketCommand::Unknown(payload) => {
                 let resp = encode_message_error(
@@ -2365,13 +2644,33 @@ pub async fn handle_connection(
                     version,
                     is_be,
                 );
-                state.registry.send_msg(conn_id, resp).await;
+                replier.send(resp).await;
             }
         }
     }
 
-    state.registry.cleanup_connection(conn_id).await;
     Ok(())
+}
+
+/// Forget every request that was running on a channel the client just
+/// destroyed.
+///
+/// A destroyed channel's request ids can never be referenced again, but
+/// `ConnState`'s three per-request maps kept their rows — and `ioid_to_desc`
+/// holds a whole `StructureDesc` each. A client that flaps channels on one
+/// long-lived connection grew all three without bound.
+fn purge_channel_requests(conn_state: &mut ConnState, cid: u32, sid: u32) {
+    let ioids = {
+        let mut t = conn_state.channels.lock().unwrap();
+        let ioids = t.ioids_for_sid(sid);
+        t.remove_channel_if_current(cid, sid);
+        ioids
+    };
+    for ioid in ioids {
+        conn_state.ioid_to_desc.remove(&ioid);
+        conn_state.ioid_to_pv.remove(&ioid);
+        conn_state.ioid_to_monitor.remove(&ioid);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2381,6 +2680,23 @@ pub async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both diagnostics must be total. With a DEBUG subscriber installed the
+    /// decode path actually runs, so a short frame must not reach a panicking
+    /// header constructor.
+    #[test]
+    fn packet_diagnostics_never_panic_on_short_frames() {
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            for bytes in [&[][..], &[0xca, 0x02, 0x00][..], &[0xca, 0x02, 0, 1, 0, 0, 0][..]] {
+                validate_encoded_packet(1, "short", bytes);
+                dump_hex_packet(1, "->", "short", 2, false, bytes);
+            }
+        });
+    }
     use crate::monitor::MonitorRegistry;
     use crate::pvstore::PvInfo;
     use crate::request_ctx::RequestContext;
@@ -2392,6 +2708,106 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket as TokioUdpSocket;
+
+    /// Site 1. `handle_connection` did `vec![0u8; header.payload_length]`
+    /// with no ceiling: eight bytes from any unauthenticated peer asked the
+    /// allocator for up to 4 GiB, and `vec![0u8; n]`'s failure path calls
+    /// `handle_alloc_error`, which aborts rather than unwinding.
+    ///
+    /// A pure function, so the cap is tested with no allocation whatsoever.
+    #[test]
+    fn an_oversized_declared_payload_is_refused_before_allocating() {
+        let mut raw = vec![0xCA, 0x02, 0x00, 0x00];
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        let header = PvaHeader::new(&raw);
+        assert_eq!(
+            inbound_payload_len(&header),
+            Err(u32::MAX as usize),
+            "a 4 GiB declaration must be refused, not reserved"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_declared_payload_is_accepted() {
+        let mut raw = vec![0xCA, 0x02, 0x00, 0x00];
+        raw.extend_from_slice(&64u32.to_le_bytes());
+        let header = PvaHeader::new(&raw);
+        assert_eq!(inbound_payload_len(&header), Ok(64));
+    }
+
+    /// Pins all four resolution steps, in order, exactly as the chain at
+    /// `handler.rs:715-733` implements them today. Step 1 in particular is
+    /// unvalidated: a client-named sid is returned whether or not the
+    /// connection has such a channel — the caller's later `sid_to_pv` lookup
+    /// is what turns an unknown one into "not found".
+    #[test]
+    fn get_field_resolves_by_sid_then_cid_then_cid_as_sid_then_the_arity_one_guess() {
+        let mut t = ChannelTables::default();
+        t.insert_channel(5, 500, "A");
+
+        assert_eq!(
+            resolve_get_field_sid(&t, Some(500), 0),
+            Some(500),
+            "a client-named sid wins outright"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, Some(999), 5),
+            Some(999),
+            "a client-named sid is taken as-is, even one this connection does \
+             not know: the chain never validated it and this is an extraction, \
+             not a fix"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 5),
+            Some(500),
+            "no sid named: fall back to the cid"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 500),
+            Some(500),
+            "a cid that is not a cid but IS a known sid is accepted as one"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 0),
+            Some(500),
+            "cid == 0 with exactly one channel is the compatibility guess real \
+             clients depend on"
+        );
+
+        // Two channels: the guess is ambiguous and must not fire.
+        t.insert_channel(6, 600, "B");
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 0),
+            None,
+            "with more than one channel open there is nothing to guess"
+        );
+        assert_eq!(
+            resolve_get_field_sid(&t, None, 7),
+            None,
+            "a non-zero cid that is neither a known cid nor a known sid is \
+             never guessed at"
+        );
+    }
+
+    /// A control frame carries no payload however the length field reads.
+    #[test]
+    fn a_control_frame_reads_no_payload_regardless_of_the_length_field() {
+        let mut raw = vec![0xCA, 0x02, 0x01, 0x02];
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        let header = PvaHeader::new(&raw);
+        assert!(header.flags.is_control);
+        assert_eq!(inbound_payload_len(&header), Ok(0));
+    }
+
+    /// The server and the client must share one inbound byte budget.
+    #[test]
+    fn the_inbound_payload_cap_is_the_workspace_message_limit() {
+        assert_eq!(
+            MAX_INBOUND_PAYLOAD_BYTES,
+            spvirit_codec::DEFAULT_MAX_MESSAGE_BYTES
+        );
+        assert_eq!(MAX_INBOUND_PAYLOAD_BYTES, 268_435_456);
+    }
 
     /// V6 LOW-1. The bound's *magnitude* was unpinned: `from_secs(30)` →
     /// `from_millis(30)`, the classic units slip, survived the whole suite.
@@ -2428,6 +2844,46 @@ mod tests {
         // The documented value, so a deliberate retune is a visible edit here
         // and not a silent one.
         assert_eq!(PATTERN_ENUM_TIMEOUT, StdDuration::from_secs(30));
+    }
+
+    #[test]
+    fn collect_visible_pv_names_iter_matches_the_slice_version() {
+        let names = vec!["C:PV".to_string(), "A:PV".to_string(), "B:PV".to_string()];
+        let from_slice = collect_visible_pv_names(&names, PvListMode::List, None, 10);
+        let from_iter = collect_visible_pv_names_iter(
+            names.iter().map(String::as_str),
+            PvListMode::List,
+            None,
+            10,
+        );
+        assert_eq!(from_slice, from_iter);
+        assert_eq!(from_iter, vec!["A:PV", "B:PV", "C:PV", "__pvlist"]);
+    }
+
+    #[test]
+    fn collect_visible_pv_names_iter_truncates_before_appending_pvlist() {
+        let names = ["A".to_string(), "B".to_string(), "C".to_string()];
+        let got = collect_visible_pv_names_iter(
+            names.iter().map(String::as_str),
+            PvListMode::List,
+            None,
+            2,
+        );
+        assert_eq!(got, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn pvlist_helpers_are_public_and_stable() {
+        let desc = build_pvlist_structure(&["A:PV".to_string(), "B:PV".to_string()]);
+        assert_eq!(desc.struct_id.as_deref(), Some("epics:pva/pvlist:1.0"));
+        assert_eq!(desc.fields.len(), 2);
+        assert_eq!(desc.fields[0].name, "A:PV");
+
+        assert_eq!(requested_pvlist_pattern(None), Some("*"));
+        assert_eq!(requested_pvlist_pattern(Some("  ")), Some("*"));
+        assert_eq!(requested_pvlist_pattern(Some("pvlist")), Some("*"));
+        assert_eq!(requested_pvlist_pattern(Some("A:*")), Some("A:*"));
+        assert_eq!(requested_pvlist_pattern(Some("A:PV")), None);
     }
 
     /// V6 MEDIUM-2. `collect_visible_pv_names` sorts and *then* truncates, so
@@ -3665,5 +4121,290 @@ mod tests {
             "background resolution never made the name findable; the \
              no-reply resolver design does not deliver"
         );
+    }
+
+    /// The hex dump allocated a String per byte via `format!` and only then
+    /// handed the line to `debug!`, which throws it away at the default level.
+    /// Both dump helpers must bail out before doing any work when their level
+    /// is disabled.
+    #[test]
+    fn packet_dump_helpers_check_the_level_before_formatting() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handler.rs"),
+        )
+        .expect("handler.rs must be readable");
+
+        // Both helpers log only at DEBUG (validate_encoded_packet's four log
+        // statements are all `debug!`), so DEBUG is the level both must gate on.
+        for (name, level) in [
+            ("pub fn dump_hex_packet(", "Level::DEBUG"),
+            ("pub fn validate_encoded_packet(", "Level::DEBUG"),
+        ] {
+            let start = src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let body = &src[start..start + 900.min(src.len() - start)];
+            assert!(
+                body.contains("tracing::enabled!") && body.contains(level),
+                "{name} must open with a tracing::enabled!({level}) guard so it \
+                 does no formatting or decoding when that level is off"
+            );
+        }
+
+        assert!(
+            !src[src.find("pub fn dump_hex_packet(").unwrap()
+                ..src.find("pub fn dump_hex_packet(").unwrap() + 900]
+                .contains("push_str(&format!"),
+            "dump_hex_packet must not allocate a String per byte; write into \
+             the line buffer with write! instead"
+        );
+    }
+
+    /// Gating must not change what is logged when the level IS on.
+    #[test]
+    fn hex_dump_still_emits_every_byte_when_debug_is_on() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(buf.clone())
+            .finish();
+        tracing::subscriber::with_default(sub, || {
+            dump_hex_packet(1, "->", "test", 2, false, &[0x00, 0xde, 0xad, 0xff]);
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).expect("utf8");
+        assert!(
+            out.contains("00 de ad ff"),
+            "the dump must still print every byte when DEBUG is enabled; got:\n{out}"
+        );
+    }
+
+    /// A Replier must reproduce send_msg's behaviour exactly: the bytes reach
+    /// the writer, and the connection's tx counter is credited.
+    #[tokio::test]
+    async fn replier_writes_the_frame_and_credits_tx() {
+        use crate::diag::ClientRegistry;
+
+        let (mut client, server_side) = tokio::io::duplex(1024);
+        let cr = Arc::new(ClientRegistry::new());
+        cr.connect(1, "127.0.0.1:9999".parse().unwrap());
+
+        let replier = Replier::new(ConnWriter::new(server_side), 1, Some(cr.clone()));
+        replier.send(vec![1, 2, 3, 4]).await;
+
+        let mut got = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut got),
+        )
+        .await
+        .expect("frame must arrive")
+        .expect("read");
+        assert_eq!(got, [1, 2, 3, 4]);
+
+        let entry = cr.snapshot().into_iter().next().expect("one connection");
+        assert_eq!(entry.tx, 4, "the reply's bytes must be credited to the conn");
+    }
+
+    /// A client that flaps channels on one connection must not grow the
+    /// connection's per-request maps. Every request bound to the destroyed
+    /// channel is dead the moment the channel is: its ioid can never be used
+    /// again.
+    #[test]
+    fn destroying_a_channel_purges_every_request_bound_to_it() {
+        let mut conn_state = ConnState::default();
+        {
+            let mut t = conn_state.channels.lock().unwrap();
+            t.insert_channel(1, 100, "A");
+            t.insert_channel(2, 200, "B");
+            // A monitor and a get on the doomed channel, and one on the other.
+            t.bind_monitor(10, 100);
+            t.bind_monitor(11, 100);
+            t.bind_monitor(20, 200);
+        }
+        // `ioid_to_desc` is the map that actually leaks memory (a whole
+        // StructureDesc, with an owned String per field), so it must be
+        // populated or the assertion on it below proves nothing.
+        let desc = nt_payload_desc(&NtPayload::Scalar(NtScalar::from_value(
+            ScalarValue::F64(1.0),
+        )));
+        for ioid in [10u32, 11, 20] {
+            conn_state
+                .ioid_to_pv
+                .insert(ioid, format!("PV{ioid}"));
+            conn_state.ioid_to_desc.insert(ioid, desc.clone());
+            conn_state.ioid_to_monitor.insert(
+                ioid,
+                MonitorState {
+                    running: true,
+                    pipeline_enabled: false,
+                    nfree: 0,
+                },
+            );
+        }
+
+        purge_channel_requests(&mut conn_state, 1, 100);
+
+        assert!(
+            conn_state.ioid_to_pv.get(&10).is_none()
+                && conn_state.ioid_to_pv.get(&11).is_none()
+                && conn_state.ioid_to_monitor.get(&10).is_none()
+                && conn_state.ioid_to_desc.get(&10).is_none(),
+            "every request on the destroyed channel must be forgotten"
+        );
+        assert!(
+            conn_state.ioid_to_pv.contains_key(&20)
+                && conn_state.ioid_to_monitor.contains_key(&20)
+                && conn_state.ioid_to_desc.contains_key(&20),
+            "requests on other channels must survive"
+        );
+        assert!(
+            conn_state.channels.lock().unwrap().ioids_for_sid(100).is_empty(),
+            "the channel's bindings must be gone from the tables too"
+        );
+    }
+
+    /// Cleanup is the last statement of handle_connection, so a panic or an
+    /// early return leaks the connection's writer, its channel tables and its
+    /// client-registry row. A drop guard cannot be skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conn_cleanup_guard_runs_even_when_the_task_unwinds() {
+        let registry = Arc::new(MonitorRegistry::new());
+        let (_client, server_side) = tokio::io::duplex(64);
+        registry
+            .conns
+            .lock()
+            .await
+            .insert(7, ConnWriter::new(server_side));
+        assert!(
+            registry.conns.lock().await.contains_key(&7),
+            "precondition: the connection is registered"
+        );
+
+        let reg = registry.clone();
+        let task = tokio::spawn(async move {
+            let _guard = ConnCleanupGuard {
+                registry: reg,
+                conn_id: 7,
+            };
+            panic!("connection task blew up");
+        });
+        assert!(task.await.is_err(), "the task must have panicked");
+
+        for _ in 0..50 {
+            if !registry.conns.lock().await.contains_key(&7) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the connection was leaked: cleanup did not run on unwind");
+    }
+
+    /// The spawned search-reply task used to hold a strong `Arc<ConnWriter>`
+    /// for as long as its enumeration window (up to 30s), keeping the
+    /// writer's buffers resident well after the connection that asked for it
+    /// was gone. A `WeakReplier` must let the writer be freed the moment
+    /// every other strong owner drops it, regardless of whether the delayed
+    /// reply itself has fired yet.
+    #[tokio::test]
+    async fn weak_replier_does_not_keep_the_writer_alive_after_teardown() {
+        use crate::diag::ClientRegistry;
+
+        let (_client, server_side) = tokio::io::duplex(64);
+        let cw = ConnWriter::new(server_side);
+        let cr = Arc::new(ClientRegistry::new());
+        let replier = Replier::new(cw.clone(), 1, Some(cr));
+        let weak_replier = replier.downgrade();
+
+        // Simulate every strong owner (the registry's `conns` map and the
+        // connection task's own `replier`) going away, exactly as happens
+        // once `ConnCleanupGuard` has run and `handle_connection` returns.
+        drop(replier);
+        drop(cw);
+
+        // The pending "search reply" fires after teardown: it must find the
+        // writer gone rather than resurrect it.
+        weak_replier.send(vec![9, 9, 9]).await;
+
+        assert!(
+            weak_replier.cw.upgrade().is_none(),
+            "the writer must already be freed once every strong owner is gone, \
+             proving the search-reply closure was not holding it alive"
+        );
+    }
+
+    #[test]
+    fn apply_pv_request_filter_reports_whether_a_filter_was_requested() {
+        use spvirit_codec::spvd_encode::{encode_pv_request, nt_payload_desc};
+
+        use spvirit_types::{NtPayload, NtScalar, ScalarValue};
+
+        let full = nt_payload_desc(&NtPayload::Scalar(NtScalar::from_value(
+            ScalarValue::F64(1.0),
+        )));
+
+        // A pvRequest with an empty `field(...)` selector: no filter.
+        // `decode_pv_request_fields` returns None for it
+        // (`spvirit-codec/src/spvd_encode.rs:1403-1405`).
+        let empty = encode_pv_request(&[], false);
+        let (desc, filtered) = apply_pv_request_filter(full.clone(), &empty, false);
+        assert!(!filtered, "an empty pvRequest is not a field filter");
+        assert_eq!(
+            desc.fields.len(),
+            full.fields.len(),
+            "with no filter the full descriptor is advertised unchanged"
+        );
+
+        // field(value): a real filter.
+        let req = encode_pv_request(&["value"], false);
+        let (desc, filtered) = apply_pv_request_filter(full.clone(), &req, false);
+        assert!(filtered, "field(value) IS a field filter");
+        let names: Vec<&str> = desc.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["value"]);
+    }
+
+    #[tokio::test]
+    async fn reply_op_error_sends_the_encoded_error_frame() {
+        use crate::diag::ClientRegistry;
+        use spvirit_codec::spvirit_encode::encode_op_error;
+
+        let (mut client, server_side) = tokio::io::duplex(4096);
+        let cr = Arc::new(ClientRegistry::new());
+        cr.connect(1, "127.0.0.1:9999".parse().unwrap());
+        let replier = Replier::new(ConnWriter::new(server_side), 1, Some(cr));
+
+        reply_op_error(&replier, 13, 0x08, 42, "PV not found", 2, false).await;
+
+        let want = encode_op_error(13, 0x08, 42, "PV not found", 2, false);
+        let mut got = vec![0u8; want.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut got),
+        )
+        .await
+        .expect("frame must arrive")
+        .expect("read");
+        assert_eq!(got, want, "the extracted helper must emit the same bytes");
     }
 }

@@ -6,7 +6,10 @@
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
 
-`spvirit-tools` ships thirteen binaries. They are named `sp*` rather than
+`spvirit-tools` ships sixteen binaries: the fifteen below plus `spload`, an
+internal load driver for the `loadtest/` harness that is not documented here.
+Thirteen are in the default build and the Python wheel; the two `scry` tools
+and `spload` are opt-in features. They are named `sp*` rather than
 `pv*` so they can sit alongside an EPICS Base installation without
 shadowing `pvget`, `pvput`, and friends.
 
@@ -20,20 +23,30 @@ shadowing `pvget`, `pvput`, and friends.
 | [`spexplore`](spexplore.md) | client, TUI | browse a server interactively |
 | [`spsearch`](spsearch.md) | client, TUI | passively watch PVA search traffic |
 | [`spsine`](spsine.md) | client | drive a PV with a sine wave |
-| [`spget_compare`](spget-compare.md) | offline | replay a captured GET frame |
+| [`spget_compare`](spget-compare.md) | offline | compare a captured GET exchange against spvirit's encoders |
 | [`spserver`](spserver.md) | server | serve a `.db` file |
 | [`sptable`](sptable.md) | server, TUI | an interactive spreadsheet IOC |
 | [`spdodeca`](spdodeca.md) | server | serve a rotating wireframe as an image |
 | [`spgateway`](spgateway.md) | client, server | p4p-compatible PVAccess gateway |
+| [`spvirit-scry`](spvirit-scry.md) | capture, TUI | passively capture and decode PVA traffic |
+| [`spvirit-scry_influx_collector`](spvirit-scry.md) | capture | the same capture, exported to InfluxDB and Loki |
+
+The last two need the `scry` feature and libpcap (Linux) or the Npcap SDK
+(Windows); they are not part of the Python wheel.
 
 ## Building them
 
-The binaries are gated behind Cargo features, so a plain
-`cargo build -p spvirit-tools` produces none of them:
+The binaries are gated behind Cargo features. A plain
+`cargo build -p spvirit-tools` uses the default features (`client`, `server`,
+`tui`) and builds the thirteen default tools; ask for everything with:
 
 ```bash
 cargo build -p spvirit-tools --all-features
 ```
+
+`--all-features` includes `scry`, so it needs libpcap or the Npcap SDK
+(see [spvirit-scry](spvirit-scry.md)). Without them, the default features
+build every tool except the `scry` pair and `spload`.
 
 | Feature | Tools it enables |
 |---|---|
@@ -42,20 +55,23 @@ cargo build -p spvirit-tools --all-features
 | `client` + `server` | `spgateway` |
 | `client` + `tui` | `spexplore`, `spsearch` |
 | `server` + `tui` | `sptable` |
+| `scry` (needs libpcap / Npcap SDK) | `spvirit-scry`, `spvirit-scry_influx_collector` |
+| `load` (not in the default build) | `spload` |
 
 ## Flags every client shares
 
-The seven `client` tools take the same connection options, because they
-share one argument-parser helper. Rather than repeat the table on each
-page, it is here:
+The client tools that query a server (`spget`, `spput`, `spmonitor`,
+`spinfo`, `splist`, `spsine`, `spexplore`, and `spload`) share one
+connection-option helper. (`spget_compare` reads a file and takes none of
+them.) Rather than repeat the table on each page, it is here:
 
 | Flag | Meaning |
 |---|---|
 | `-w`, `--timeout` | timeout in seconds |
 | `--server` | talk to `ip:port` directly, skipping search |
-| `--search-addr` | search target IP; defaults to `EPICS_PVA_ADDR_LIST` or broadcast |
+| `--search-addr` | search target IP. If set, it is the only search target. If not set, the targets are the `EPICS_PVA_ADDR_LIST` entries plus the auto-broadcast addresses (unless `EPICS_PVA_AUTO_ADDR_LIST=NO`). |
 | `--bind-addr` | local IP to bind the search socket to |
-| `--name-server` | PVA name server `host:port`; repeatable via `EPICS_PVA_NAME_SERVERS` |
+| `--name-server` | PVA name server `host:port`. One value on the command line; `EPICS_PVA_NAME_SERVERS` may hold several, and its entries are added to the flag value. |
 | `--udp-port` | search port (default 5076) |
 | `--tcp-port` | default server port (default 5075) |
 | `--no-broadcast` | disable UDP broadcast/multicast search; same as `EPICS_PVA_AUTO_ADDR_LIST=NO` |
@@ -71,7 +87,10 @@ only `--udp-port`, `--bind-addr`, and `--debug`.
 
 The standard EPICS PVAccess variables are honoured:
 `EPICS_PVA_ADDR_LIST`, `EPICS_PVA_AUTO_ADDR_LIST`,
-`EPICS_PVA_NAME_SERVERS`. Explicit flags win over the environment.
+`EPICS_PVA_NAME_SERVERS`. Explicit `--search-addr` and `--bind-addr`
+replace the environment value. `--name-server` is added to
+`EPICS_PVA_NAME_SERVERS`, not substituted. `--no-broadcast` can only disable
+broadcast.
 
 ## A server to try them against
 

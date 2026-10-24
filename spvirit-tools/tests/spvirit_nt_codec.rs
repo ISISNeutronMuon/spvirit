@@ -48,7 +48,9 @@ fn nt_scalar_array_roundtrip_all_scalar_types() {
         ScalarArrayValue::U32(vec![100, 200]),
         ScalarArrayValue::U64(vec![1000, 2000]),
         ScalarArrayValue::F32(vec![1.25, 2.5]),
-        ScalarArrayValue::F64(vec![3.1415, 2.7182]),
+        // Not PI/E approximations: clippy::approx_constant is deny-by-default
+        // and would fail the whole workspace clippy run.
+        ScalarArrayValue::F64(vec![3.25, -2.75]),
         ScalarArrayValue::Str(vec!["a".to_string(), "b".to_string()]),
     ];
 

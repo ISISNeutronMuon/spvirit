@@ -4,7 +4,7 @@ name: Release Python packages
 # a version:
 #
 #   spvirit        -- the PyO3 extension module, built from spvirit-py
-#   spvirit-tools  -- the twelve command-line tools, as wheel scripts
+#   spvirit-tools  -- the thirteen command-line tools, as wheel scripts
 #
 # `spvirit` depends on `spvirit-tools` by exact version, so `pip install
 # spvirit` puts the tools on PATH. That pin is enforced by
@@ -112,7 +112,7 @@ jobs:
           python-version: "3.12"
 
       # `bindings = "bin"` in spvirit-tools/pyproject.toml makes this package
-      # the twelve executables rather than an extension module.
+      # the thirteen executables rather than an extension module.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:

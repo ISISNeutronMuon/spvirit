@@ -96,6 +96,48 @@ async fn a_subscriber_receives_the_monitors_a_later_put_causes() {
     assert_eq!(scalar_of(&payload), 3.0);
 }
 
+/// The shape a real client's PUT arrives in: the server decodes the body into
+/// the channel's structure, so the source sees `{value, ..}` rather than a
+/// bare scalar. It must write exactly like the bare value; members other than
+/// `value` (here a client-sent alarm) are not client-writable and are ignored.
+#[tokio::test]
+async fn a_structure_put_writes_its_value_member_like_a_bare_put() {
+    let src = source();
+    let put = DecodedValue::Structure(vec![
+        ("value".to_string(), double(4.25)),
+        (
+            "alarm".to_string(),
+            DecodedValue::Structure(vec![("severity".to_string(), DecodedValue::Int32(2))]),
+        ),
+    ]);
+    let events = src.put("PV:SET", &put).await.expect("a structure put succeeds");
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["PV:SET", "PV:MID", "PV:OUT"]);
+    for (name, payload) in &events {
+        assert_eq!(scalar_of(payload), 4.25, "{name} must carry the written value");
+        match payload {
+            NtPayload::Scalar(s) => assert_eq!(s.alarm_severity, 0, "{name}: client alarm ignored"),
+            other => panic!("expected a scalar payload, got {other:?}"),
+        }
+    }
+}
+
+/// A structure PUT with no `value` member has nothing an IOC record accepts
+/// from a client; it is refused (not a silent success) and changes nothing.
+#[tokio::test]
+async fn a_structure_put_without_a_value_member_is_refused() {
+    let src = source();
+    src.put("PV:SET", &double(1.0)).await.expect("seed");
+    let put = DecodedValue::Structure(vec![(
+        "alarm".to_string(),
+        DecodedValue::Structure(vec![("severity".to_string(), DecodedValue::Int32(2))]),
+    )]);
+    let err = src.put("PV:SET", &put).await.expect_err("no value member: refused");
+    assert!(err.contains("PV:SET") && err.contains("value"), "got {err}");
+    let after = src.get("PV:SET").await.expect("gettable");
+    assert_eq!(scalar_of(&after), 1.0, "a refused put changes nothing");
+}
+
 #[tokio::test]
 async fn a_put_to_an_unknown_pv_is_an_error_naming_it() {
     let src = source();
@@ -154,6 +196,28 @@ async fn pini_definition_order_differs_from_lock_set_traversal_order() {
         vec!["PV:FIRST", "PV:SECOND", "PV:THIRD"],
         "PINI order must be .db definition order, not ascending lock-set traversal order \
          (which would yield PV:FIRST, PV:THIRD, PV:SECOND here)"
+    );
+}
+
+/// Base's `initialProcess` sweeps PINI records in scan-phase order; definition
+/// order is only the tie-break within a phase. `Scanner::process_pini` already
+/// did this; the public `IocSource::process_pini` used to ignore PHAS
+/// entirely, so the entry point the conformance tests call disagreed with the
+/// one a running server uses.
+#[tokio::test]
+async fn pini_phas_order_beats_definition_order() {
+    let src = IocSource::from_db_str(
+        "record(ai, \"PV:LATE\") {\n    field(PINI, \"YES\")\n    field(PHAS, \"2\")\n    field(INP, \"1\")\n}\n\
+         record(ai, \"PV:EARLY\") {\n    field(PINI, \"YES\")\n    field(PHAS, \"0\")\n    field(INP, \"2\")\n}\n\
+         record(ai, \"PV:MIDDLE\") {\n    field(PINI, \"YES\")\n    field(PHAS, \"1\")\n    field(INP, \"3\")\n}\n",
+    )
+    .expect("load");
+    let events = src.process_pini();
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["PV:EARLY", "PV:MIDDLE", "PV:LATE"],
+        "PINI order is PHAS ascending; .db definition order only breaks ties"
     );
 }
 

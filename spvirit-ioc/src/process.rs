@@ -686,11 +686,22 @@ pub enum AsyncOutcome {
 
 /// Device support that may take longer than a processing pass.
 ///
-/// This is now live machinery. A record is bound to an implementation through
-/// [`AsyncRegistry`](crate::scan::AsyncRegistry), which `record_body` reaches
-/// via `ProcCtx` (threaded like the clock). At the async hook point in
-/// `record_body` — before the synchronous body runs — a bound record's
-/// `start` is called.
+/// This is now live machinery, reachable for a [`Scanner`](crate::scan::Scanner)
+/// driven directly. A driver binds a record with
+/// [`Scanner::bind_async`](crate::scan::Scanner::bind_async); every scan pass
+/// carries the bindings, because `Scanner::process_ids` builds its context
+/// with [`ProcCtx::with_async`](crate::ctx::ProcCtx::with_async); and the
+/// driver reports the finished operation with
+/// [`Scanner::complete_async`](crate::scan::Scanner::complete_async), which is
+/// the Scanner's entry point for [`complete_async`] (`process`'s PACT brake
+/// returns early for an active record). `IocSource` does not yet expose a bind
+/// path, and its put and `PINI` paths still build `ProcCtx::new()` (no
+/// registry), so a record processed through them runs synchronously even when
+/// bound -- a known follow-up. A record is bound to an
+/// implementation through [`AsyncRegistry`](crate::scan::AsyncRegistry), which
+/// `record_body` reaches via `ProcCtx` (threaded like the clock). At the async
+/// hook point in `record_body` -- before the synchronous body runs -- a bound
+/// record's `start` is called.
 ///
 /// `pact` follows EPICS Base's `pact` local: it is the record's PACT flag as
 /// it stood *before* this pass raised it, so `pact == false` means "initiate
@@ -704,6 +715,23 @@ pub enum AsyncOutcome {
 /// - [`AsyncOutcome::Complete`]: the operation finished inside `start`;
 ///   `record_body` falls through to the ordinary synchronous body, exactly as
 ///   an unbound record does.
+///
+/// In the `pact == true` branch the support must confirm that *its own*
+/// operation has really finished, and return [`AsyncOutcome::Pending`]
+/// otherwise: the once-only guarantee holds per PACT cycle, not per operation,
+/// so an early or stray completion call must not be mistaken for the result.
+/// Base device support carries the same obligation.
+///
+/// **Contract.** `start` runs while the scan thread holds the record's
+/// lock-set mutex, which is not re-entrant. Therefore:
+/// - `start` must not block, and must not call back into the `Scanner` --
+///   no `complete_async`, `scan_once`, `fire_event` or `process_ids` for any
+///   record in the same lock set (that would deadlock on the held mutex).
+/// - An operation that finishes immediately must return
+///   [`AsyncOutcome::Complete`] rather than calling `complete_async`.
+/// - The driver must not call `Scanner::complete_async` while holding any
+///   driver lock that `start` also takes: `complete_async` acquires the
+///   lock-set mutex, and `start` runs under it, so that is a lock inversion.
 ///
 /// `start` is arbitrary bound code and may panic. `record_body` guards the
 /// call so a panic resets PACT rather than stranding the record braked

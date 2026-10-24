@@ -46,8 +46,9 @@ arguments, and `spvirit.Server(pvs=[...])` serves the handles.
 and it is why a PVAccess GUI can label an axis without being told to.
 
 **Alarm limits are four numbers in one call**, ordered outward-in:
-`alarm_limits(lolo, low, high, hihi)`. Crossing `low` or `high` is MINOR;
-crossing `lolo` or `hihi` is MAJOR. [Alarms](alarms.md) goes into this.
+`alarm_limits(lolo, low, high, hihi)`. Crossing `low` or `high` is MINOR,
+and crossing `lolo` or `hihi` is MAJOR, when the server runs with
+`compute_alarms` on (it is off by default); see [Alarms](alarms.md).
 
 **Drive limits are advertised, not enforced.** This one will catch you:
 
@@ -86,7 +87,7 @@ described in [EPICS in 10 minutes](../01-fundamentals/epics-in-10-minutes.md).
 ## Choosing the wire type
 
 `ai`/`ao`/`bi`/`bo`/`longin`/`longout`/`string_in`/`string_out` (Rust) and
-`ai`/`ao`/`bo`/`longin`/`longout`/`string_in`/`string_out` (Python) each
+`ai`/`ao`/`bi`/`bo`/`longin`/`longout`/`string_in`/`string_out` (Python) each
 fix the NTScalar wire type to one of `double`, `boolean`, `int` or
 `string`. PVAccess defines twelve NTScalar value types in total —
 `boolean`, `byte`, `short`, `int`, `long`, their unsigned variants

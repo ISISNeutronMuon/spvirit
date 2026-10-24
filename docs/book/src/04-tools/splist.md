@@ -43,9 +43,10 @@ useful when a server advertises an address you cannot route to directly.
 ## `__pvlist`
 
 That last entry is not one of your PVs. It is the server's introspection
-channel — the mechanism the second form uses. Every spvirit server exposes
-it unless started with `--pvlist-mode off`, and it appears in every
-listing.
+channel — the mechanism the second form uses. The server exposes
+`__pvlist` only with `--pvlist-mode list` (the default), and only while the
+listing is below `--pvlist-max`. With `discover` or `off` the name does not
+exist, which is why the listing fails in the example below.
 
 ## Gotchas
 
@@ -69,4 +70,7 @@ only part of a database. See [`spserver`](spserver.md).
 
 **Discovery is a UDP broadcast.** On a host with several interfaces the
 search may leave by the wrong one. `--search-addr` or
-`EPICS_PVA_ADDR_LIST` pins it; `--server` skips discovery entirely.
+`EPICS_PVA_ADDR_LIST` pins the discovery search. `splist` always runs
+discovery first, even when a target is given, and it ignores the shared
+`--server` flag. To list one server, pass its `ip:port` (or GUID) as the
+positional TARGET.

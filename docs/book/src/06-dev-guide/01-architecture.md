@@ -6,22 +6,23 @@ Spvirit is a from-scratch Rust implementation of the EPICS **PVAccess**
 protocol: wire codec, client, server (softIOC-like), CLI tools, and Python
 bindings. It interoperates with EPICS Base, p4p/pvxs, and PVAccessJava.
 
-If you are new to EPICS, read the "Key Concepts" section of the top-level
-`README.md` first — it explains PVs, records, `.db` files, and Normative
-Types (NT) with diagrams. This guide assumes that vocabulary.
+If you are new to EPICS, read
+[EPICS in 10 minutes](../01-fundamentals/epics-in-10-minutes.md) and
+[Normative Types](../01-fundamentals/normative-types.md) first. This guide
+assumes that vocabulary.
 
 ## Crate dependency graph
 
 ```
                  spvirit-types        (pure NT data model, zero deps)
                        │
-                 spvirit-codec        (PVA wire format + PVD codec + state tracker)
+                 spvirit-codec        (PVA wire format + PVD codec + segment reassembly)
                     ┌──┴──────────┐
              spvirit-client   spvirit-server
                     │              ├──────── spvirit-ioc   (scan/process; server-only)
                     └──────┬───────┘
                     ┌──────┴───────┐
-             spvirit-gateway   spvirit-py    (both consume client + server)
+             spvirit-gateway   spvirit-py    (both consume client + server; py also uses spvirit-ioc)
              (proxy engine)    (PyO3 bindings)
                     │
              spvirit-tools
@@ -33,10 +34,9 @@ apart), is the mermaid diagram on the [Crate map](../05-reference/crate-map.md).
 
 - **spvirit-types** — `ScalarValue`, `NtScalar`, `NtPayload`, etc. Everything
   the wire carries, as plain Rust data. Chapter 02.
-- **spvirit-codec** — encode/decode for both protocol layers: the PVA message
+- **spvirit-codec** — encode/decode for both protocol layers, the PVA message
   layer (headers, commands) and the PVD data layer (introspection
-  descriptors, values, bitsets). Also a passive connection-state tracker used
-  by the diagnostic tools. Chapter 02.
+  descriptors, values, bitsets), plus sans-io segment reassembly. Chapter 02.
 - **spvirit-client** — search/discovery, channel lifecycle, get/put/monitor/
   info. Chapter 04.
 - **spvirit-server** — the `Source` provider model, `SimplePvStore` record
@@ -48,9 +48,11 @@ apart), is the mermaid diagram on the [Crate map](../05-reference/crate-map.md).
 - **spvirit-gateway** — the PVAccess proxy engine behind the `spgateway`
   binary: it consumes both the client (to reach upstream servers) and the
   server (to face downstream clients). Chapter 04 (`spgateway`).
-- **spvirit-tools** — 13 CLI binaries (`spget`, `spput`, `spmonitor`,
-  `spexplore`, `spserver`, `spgateway`, …) plus the workspace's
-  integration/interop test suite. Depends on `spvirit-gateway` for the
+- **spvirit-tools** — 13 CLI binaries in a default build (`spget`, `spput`,
+  `spmonitor`, `spexplore`, `spserver`, `spgateway`, …), plus `spload` behind
+  the non-default `load` feature and `spvirit-scry` /
+  `spvirit-scry_influx_collector` behind the non-default `scry` feature (needs
+  Npcap/libpcap), and the workspace's integration/interop test suite. Depends on `spvirit-gateway` for the
   gateway binary. Chapter 04.
 - **spvirit-py** — PyO3 bindings mirroring the handle API in Python,
   plus Python-defined dynamic sources and a low-level channel/codec surface.
@@ -86,7 +88,8 @@ mapping.
                   SourceRegistry ──► SimplePvStore ──► MonitorRegistry
                   (priority list)    (records, MDEL,     (self-contained
                    builtin @0        validators, links,   frames, pipeline
-                   record-fields @10 on_put, timestamps)  credits)
+                   ioc @5 (if any)   on_put, timestamps)  credits)
+                   record-fields @10
                    user sources)           ▲
                                            │ set_value / set (internal writes)
                               scan tasks / Pv<T> handles / links
@@ -108,8 +111,8 @@ lossless FIFO lane.
 ## Two API levels, everywhere
 
 The project consistently offers an IOC-style record level and a raw-NT level
-(the README's "IOC-style records vs raw NT PVs" table is the user-facing
-version of this):
+(the [Records vs raw NT](../01-fundamentals/records-vs-raw-nt.md) page is the
+user-facing version of this):
 
 | | Record level | Raw NT level |
 |---|---|---|
@@ -122,9 +125,11 @@ should be sugar over the NT level, not a parallel implementation.
 
 ## Design invariants worth knowing before changing anything
 
-1. **Timestamps**: a missing (`None`/epoch-0) timestamp is stamped at
-   *encode* time, which breaks monitor deltas and Archiver Appliance
-   ingestion. All mutation paths stamp update time; keep it that way.
+1. **Timestamps**: an `NtScalar` with `time_stamp: None` is stamped with
+   `now()` at *encode* time, which breaks monitor deltas. A `None`
+   table/NDArray timestamp encodes as epoch 0, which the Archiver Appliance
+   rejects. The store stamps missing (`None`/epoch-0) timestamps on entry,
+   and every mutation path stamps update time; keep it that way.
 2. **The introspection registry is per-connection state** — decoders must be
    reused across a connection's packets (0xFE type refs). The same lifetime
    rule applies to `SegmentReassembler`: one per connection, because it holds
@@ -132,12 +137,15 @@ should be sugar over the NT level, not a parallel implementation.
 3. **First-claim-wins source priority** — `claim` must be cheap and
    idempotent because `get`/`put`/`subscribe` re-claim.
 4. **on_put (post-apply, can't reject) vs PUT validator (pre-apply, can
-   reject)** are different mechanisms; the Python `on_put` maps to the
-   validator.
+   reject)** are different mechanisms; the Python handle-level `Pv.on_put`
+   maps to the validator, and the builder-level `ServerBuilder.on_put(name,
+   cb)` maps to the post-apply callback and cannot reject.
 5. **Monitor bitset ordering is spec-exact by default** — changed bitset,
    data, overrun bitset — and every workspace call site uses it. The old
    try-every-layout scoring heuristic still exists behind
    `DecodeMode::Lenient` for mid-stream captures of implementations that
-   disagree; it has no in-workspace caller, so do not delete it as dead code.
+   disagree; the packet-capture tool `spvirit-scry` uses it
+   (`spvirit-tools/src/scry/utils/packet_processor.rs`), so do not delete it
+   as dead code.
 6. **Bool coercion trap**: `decoded_to_scalar_value` checks truthiness before
    numeric types; typed paths override `from_decoded` to avoid it.

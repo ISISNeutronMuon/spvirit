@@ -285,6 +285,82 @@ pub fn merge_monitor_delta(last_full: &mut DecodedValue, update: &MonitorUpdate)
     }
 }
 
+/// Applies the fields named by `update`'s changed bitset to an already-built
+/// `cached` payload, reading their (already merged) values out of `last_full`.
+///
+/// Returns `true` when the whole delta was applied in place, `false` when the
+/// caller must fall back to a full `nt_payload_from_decoded` rebuild — bit 0
+/// ("<whole structure>") is set, the delta named no field at all, the cached
+/// payload is not a `Generic` structure, or a changed path does not resolve in
+/// either the merged value or the cached payload.
+///
+/// On `false`, `cached` is unspecified and must be rebuilt by the caller: the
+/// fields named by bits before the failing one have already been written, so
+/// a refused payload is NOT the pre-call payload and must never be dispatched.
+///
+/// This exists because the rebuild it replaces re-converts every field of the
+/// structure (a fresh `String` key and a fresh `PvValue` per field) on every
+/// upstream tick, no matter how small the delta.
+pub fn patch_nt_payload(
+    cached: &mut NtPayload,
+    last_full: &DecodedValue,
+    update: &MonitorUpdate,
+) -> bool {
+    let NtPayload::Generic { fields, .. } = cached else {
+        return false;
+    };
+    if bit_is_set(&update.changed, 0) {
+        return false;
+    }
+
+    let mut patched_any = false;
+    for (bit, path) in update.paths.iter().enumerate().skip(1) {
+        if !bit_is_set(&update.changed, bit) {
+            continue;
+        }
+        let Some(merged) = get_at_path(last_full, path) else {
+            return false;
+        };
+        if !patch_fields(fields, path, decoded_to_pv_value(merged)) {
+            return false;
+        }
+        patched_any = true;
+    }
+    patched_any
+}
+
+/// Writes `value` at dotted `path` inside an `NtPayload::Generic`'s field
+/// list, descending through `PvValue::Structure` fields by name. Returns
+/// `false` if the path does not already exist — unlike `set_at_path` on the
+/// `DecodedValue` side this never creates intermediates, because a payload
+/// growing a field is exactly the case that needs a full rebuild.
+///
+/// Takes `&mut [_]`, not `&mut Vec<_>`: nothing here grows or shrinks the
+/// list, and clippy's `ptr_arg` (warn-by-default) would flag the `Vec` form —
+/// which this crate's zero-warning bar does not allow. Both call sites pass a
+/// `&mut Vec<..>` and deref-coerce.
+fn patch_fields(fields: &mut [(String, PvValue)], path: &str, value: PvValue) -> bool {
+    let (head, rest) = match path.split_once('.') {
+        Some((h, r)) => (h, Some(r)),
+        None => (path, None),
+    };
+    // `position` + index rather than `iter_mut().find()`: the recursive call
+    // below needs a fresh mutable borrow of the nested vector.
+    let Some(idx) = fields.iter().position(|(n, _)| n == head) else {
+        return false;
+    };
+    match rest {
+        None => {
+            fields[idx].1 = value;
+            true
+        }
+        Some(rest) => match &mut fields[idx].1 {
+            PvValue::Structure { fields: inner, .. } => patch_fields(inner, rest, value),
+            _ => false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,7 +435,7 @@ mod tests {
 
     /// Mirrors `bit_paths`' layout for the sample structure: bit 0 is the
     /// whole structure, then depth-first self-then-nested field order.
-    fn sample_paths() -> Vec<String> {
+    fn sample_paths() -> std::sync::Arc<[String]> {
         vec![
             "<whole structure>".to_string(),
             "value".to_string(),
@@ -367,6 +443,7 @@ mod tests {
             "alarm.severity".to_string(),
             "alarm.message".to_string(),
         ]
+        .into()
     }
 
     #[test]
@@ -473,5 +550,260 @@ mod tests {
         assert!(bit_is_set(&[0b0000_0010], 1));
         assert!(!bit_is_set(&[0b0000_0010], 0));
         assert!(!bit_is_set(&[0b0000_0010], 8)); // out of range byte
+    }
+
+    /// The whole point of the incremental patch is that it is
+    /// indistinguishable from the full rebuild it replaces.
+    #[test]
+    fn patching_a_cached_payload_matches_a_full_rebuild() {
+        let struct_id = "epics:nt/NTScalar:1.0".to_string();
+        let update = MonitorUpdate {
+            value: DecodedValue::Structure(vec![(
+                "alarm".to_string(),
+                DecodedValue::Structure(vec![("severity".to_string(), DecodedValue::Int32(2))]),
+            )]),
+            // bit 3 == sample_paths()[3] == "alarm.severity"
+            changed: vec![0b0000_1000],
+            overrun: vec![],
+            consumed: 0,
+            paths: sample_paths(),
+        };
+
+        let mut last_full = sample_last_full();
+        merge_monitor_delta(&mut last_full, &update);
+
+        let mut cached = nt_payload_from_decoded(&sample_last_full(), struct_id.clone());
+        assert!(
+            patch_nt_payload(&mut cached, &last_full, &update),
+            "a single-leaf delta must be applicable in place"
+        );
+
+        assert_eq!(
+            cached,
+            nt_payload_from_decoded(&last_full, struct_id),
+            "the patched payload must be identical to a full rebuild"
+        );
+    }
+
+    /// Bit 0 is "<whole structure>": there is nothing selective to patch, so
+    /// the caller must be told to rebuild rather than silently keeping a stale
+    /// payload.
+    #[test]
+    fn a_whole_structure_delta_refuses_to_patch() {
+        let update = MonitorUpdate {
+            value: sample_last_full(),
+            changed: vec![0b0000_0001],
+            overrun: vec![],
+            consumed: 0,
+            paths: sample_paths(),
+        };
+        let mut cached = nt_payload_from_decoded(&sample_last_full(), String::new());
+        assert!(!patch_nt_payload(&mut cached, &sample_last_full(), &update));
+    }
+
+    /// A path the cached payload does not contain cannot be patched into it;
+    /// refuse rather than drop the update on the floor.
+    #[test]
+    fn an_unknown_path_refuses_to_patch() {
+        let update = MonitorUpdate {
+            value: DecodedValue::Structure(vec![(
+                "nosuch".to_string(),
+                DecodedValue::Int32(1),
+            )]),
+            changed: vec![0b0000_0010],
+            overrun: vec![],
+            consumed: 0,
+            // `.into()` is an identity today (`paths: Vec<String>`) and a
+            // `Vec -> Arc<[String]>` conversion once the codec plan's Task 8
+            // lands, so this literal compiles against either field type.
+            paths: vec!["<whole structure>".to_string(), "nosuch".to_string()].into(),
+        };
+        let mut cached = nt_payload_from_decoded(&sample_last_full(), String::new());
+        assert!(!patch_nt_payload(&mut cached, &sample_last_full(), &update));
+    }
+
+    /// An NTScalarArray-shaped full value, closer to what a real IOC sends
+    /// than `sample_last_full()`: an array `value`, a three-field `alarm` and
+    /// a three-field `timeStamp`.
+    fn ntscalararray_last_full() -> DecodedValue {
+        DecodedValue::Structure(vec![
+            (
+                "value".to_string(),
+                DecodedValue::Array(vec![
+                    DecodedValue::Float64(1.0),
+                    DecodedValue::Float64(2.0),
+                    DecodedValue::Float64(3.0),
+                ]),
+            ),
+            (
+                "alarm".to_string(),
+                DecodedValue::Structure(vec![
+                    ("severity".to_string(), DecodedValue::Int32(0)),
+                    ("status".to_string(), DecodedValue::Int32(0)),
+                    ("message".to_string(), DecodedValue::String("NO_ALARM".to_string())),
+                ]),
+            ),
+            (
+                "timeStamp".to_string(),
+                DecodedValue::Structure(vec![
+                    ("secondsPastEpoch".to_string(), DecodedValue::Int64(1_000)),
+                    ("nanoseconds".to_string(), DecodedValue::Int32(500)),
+                    ("userTag".to_string(), DecodedValue::Int32(7)),
+                ]),
+            ),
+        ])
+    }
+
+    /// Bit layout matching `ntscalararray_last_full()`'s depth-first field
+    /// order, as the codec's introspection walk numbers them.
+    fn ntscalararray_paths() -> std::sync::Arc<[String]> {
+        vec![
+            "<whole structure>".to_string(),          // 0
+            "value".to_string(),                      // 1
+            "alarm".to_string(),                      // 2
+            "alarm.severity".to_string(),             // 3
+            "alarm.status".to_string(),               // 4
+            "alarm.message".to_string(),              // 5
+            "timeStamp".to_string(),                  // 6
+            "timeStamp.secondsPastEpoch".to_string(), // 7
+            "timeStamp.nanoseconds".to_string(),      // 8
+            "timeStamp.userTag".to_string(),          // 9
+        ]
+        .into()
+    }
+
+    /// A realistic multi-field tick: the array value changes length, and
+    /// alarm severity/status and both timestamp leaves move together, while
+    /// `alarm.message` and `timeStamp.userTag` stay as they were. Patching
+    /// must be indistinguishable from rebuilding the merged state, including
+    /// across a second consecutive tick patched onto the first one's result.
+    #[test]
+    fn patching_a_realistic_multi_field_delta_matches_a_full_rebuild() {
+        let struct_id = "epics:nt/NTScalarArray:1.0".to_string();
+        // bits 1, 3, 4, 7 (byte 0) and 8 (byte 1)
+        let changed = vec![0b1001_1010, 0b0000_0001];
+        let tick = |len: usize, sev: i32, secs: i64, nanos: i32| MonitorUpdate {
+            value: DecodedValue::Structure(vec![
+                (
+                    "value".to_string(),
+                    DecodedValue::Array(
+                        (0..len).map(|i| DecodedValue::Float64(i as f64 * 0.5)).collect(),
+                    ),
+                ),
+                (
+                    "alarm".to_string(),
+                    DecodedValue::Structure(vec![
+                        ("severity".to_string(), DecodedValue::Int32(sev)),
+                        ("status".to_string(), DecodedValue::Int32(sev + 1)),
+                    ]),
+                ),
+                (
+                    "timeStamp".to_string(),
+                    DecodedValue::Structure(vec![
+                        ("secondsPastEpoch".to_string(), DecodedValue::Int64(secs)),
+                        ("nanoseconds".to_string(), DecodedValue::Int32(nanos)),
+                    ]),
+                ),
+            ]),
+            changed: changed.clone(),
+            overrun: vec![],
+            consumed: 0,
+            paths: ntscalararray_paths(),
+        };
+
+        let mut last_full = ntscalararray_last_full();
+        let mut cached = nt_payload_from_decoded(&last_full, struct_id.clone());
+
+        // Grow the array 3 -> 5, then shrink it 5 -> 1.
+        for update in [tick(5, 2, 1_001, 250), tick(1, 1, 1_002, 999_999_999)] {
+            merge_monitor_delta(&mut last_full, &update);
+            assert!(
+                patch_nt_payload(&mut cached, &last_full, &update),
+                "a delta naming only existing leaves must be applicable in place"
+            );
+            assert_eq!(
+                cached,
+                nt_payload_from_decoded(&last_full, struct_id.clone()),
+                "the patched payload must be identical to a full rebuild"
+            );
+        }
+    }
+
+    /// Every way `patch_nt_payload` can refuse on a well-formed `Generic`
+    /// payload. Each refusal sends the caller to the full rebuild, so a
+    /// refusal that silently turned into `true` would ship a stale payload.
+    #[test]
+    fn every_refusal_branch_returns_false() {
+        let paths = || -> std::sync::Arc<[String]> {
+            vec![
+                "<whole structure>".to_string(),
+                "value".to_string(),
+                "alarm".to_string(),
+                "alarm.severity".to_string(),
+                "alarm.message".to_string(),
+                "alarm.nosuch".to_string(),
+            ]
+            .into()
+        };
+        let delta = |value: DecodedValue, changed: Vec<u8>| MonitorUpdate {
+            value,
+            changed,
+            overrun: vec![],
+            consumed: 0,
+            paths: paths(),
+        };
+        let empty = || DecodedValue::Structure(vec![]);
+        let new_alarm_field = || {
+            DecodedValue::Structure(vec![(
+                "alarm".to_string(),
+                DecodedValue::Structure(vec![("nosuch".to_string(), DecodedValue::Int32(3))]),
+            )])
+        };
+
+        // (name, update, merge it into last_full first?)
+        let cases: Vec<(&str, MonitorUpdate, bool)> = vec![
+            ("empty changed bitset", delta(empty(), vec![]), true),
+            ("all-zero changed bitset", delta(empty(), vec![0, 0]), true),
+            // bit 9: beyond the six named paths, so nothing is patchable
+            ("out-of-range bit only", delta(empty(), vec![0, 0b0000_0010]), true),
+            // bit 5 names `alarm.nosuch`, which the (unmerged) full value
+            // lacks: the `get_at_path` lookup fails
+            ("path missing in last_full", delta(empty(), vec![0b0010_0000]), false),
+            // merging creates `alarm.nosuch` in last_full, but the cached
+            // payload was built before it existed: the `patch_fields` lookup
+            // fails
+            (
+                "field present in last_full only through merge",
+                delta(new_alarm_field(), vec![0b0010_0000]),
+                true,
+            ),
+            // a valid leaf (bit 3) patched first, then the missing one: the
+            // earlier success must not turn the refusal into `true`
+            (
+                "valid bit followed by a missing path",
+                delta(new_alarm_field(), vec![0b0010_1000]),
+                true,
+            ),
+        ];
+
+        for (name, update, merge) in cases {
+            let mut last_full = sample_last_full();
+            if merge {
+                merge_monitor_delta(&mut last_full, &update);
+            }
+            let mut cached = nt_payload_from_decoded(&sample_last_full(), String::new());
+            assert!(
+                !patch_nt_payload(&mut cached, &last_full, &update),
+                "case `{name}` must refuse to patch"
+            );
+        }
+
+        // Guard the two lookup-failure cases against passing for the wrong
+        // reason: merge really does create the field in last_full, and the
+        // unmerged full value really does lack it.
+        let mut merged = sample_last_full();
+        merge_monitor_delta(&mut merged, &delta(new_alarm_field(), vec![0b0010_0000]));
+        assert!(get_at_path(&merged, "alarm.nosuch").is_some());
+        assert!(get_at_path(&sample_last_full(), "alarm.nosuch").is_none());
     }
 }

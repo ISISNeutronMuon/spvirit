@@ -21,7 +21,8 @@ cargo install spvirit-tools
 
 ## Tools
 
-Twelve binaries. They are named `sp*` rather than `pv*` so they can sit
+Thirteen binaries ship in the default build and the pip wheel (plus two
+packet-capture tools behind the `scry` feature, below). They are named `sp*` rather than `pv*` so they can sit
 alongside an EPICS Base installation without shadowing `pvget`, `pvput`, and
 friends.
 
@@ -35,12 +36,41 @@ friends.
 | `spexplore` | client, TUI | browse a server interactively |
 | `spsearch` | client, TUI | passively watch PVA search traffic |
 | `spsine` | client | drive a PV with a sine wave |
-| `spget_compare` | offline | replay a captured GET frame |
+| `spget_compare` | offline | compare a captured GET exchange against spvirit's encoders |
 | `spserver` | server | serve a `.db` file |
 | `sptable` | server, TUI | an interactive spreadsheet IOC |
 | `spdodeca` | server | serve a rotating wireframe as an image |
+| `spgateway` | client, server | p4p-compatible PVAccess gateway |
+
+`spload` is an internal load driver used by the `loadtest/` harness. It is
+not a user-facing tool and is not in the wheel or a default build
+(`--features load` builds it).
 
 Each accepts `--help`.
+
+### Packet capture: `spvirit-scry`
+
+Two more binaries, folded in from the former `spvirit-scry` crate, capture
+and decode live PVAccess traffic off a network interface:
+
+| Tool | Kind | What it does |
+| --- | --- | --- |
+| `spvirit-scry` | capture, TUI | passively capture and decode PVA traffic |
+| `spvirit-scry_influx_collector` | capture | the same capture, exported to InfluxDB and Loki |
+
+They are behind the optional `scry` feature and are **not** in the pip
+wheel or a default build, because they link against libpcap (Linux,
+`libpcap-dev`) or the Npcap SDK (Windows, found automatically or via
+`NPCAP_SDK`):
+
+```sh
+cargo install spvirit-tools --features scry
+```
+
+Capturing needs `sudo`/`CAP_NET_RAW` on Linux or administrator rights on
+Windows. The book's
+[spvirit-scry chapter](https://isisneutronmuon.github.io/spvirit/04-tools/spvirit-scry.html)
+covers flags, source fingerprinting and the collector's configuration.
 
 ## Documentation
 

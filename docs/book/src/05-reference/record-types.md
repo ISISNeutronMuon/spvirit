@@ -27,7 +27,7 @@ If you are not sure whether you want a record at all, read
 | `longout` | 32-bit integer out | `Pv::longout` | — | — | yes |
 | `stringin` | string in | `Pv::string_in` | `.string_in()` | `record(stringin, …)` | no |
 | `stringout` | string out | `Pv::string_out` | `.string_out()` | `record(stringout, …)` | yes |
-| `mbbi` | multi-bit binary in | `Pv::mbbi` | `.mbbi()` | parses, then refused² | yes³ |
+| `mbbi` | multi-bit binary in | `Pv::mbbi` | `.mbbi()` | parses, then refused² | no |
 | `mbbo` | multi-bit binary out | `Pv::mbbo` | `.mbbo()` | parses, then refused² | yes³ |
 | `waveform` | array | `PvArray::waveform` | `.waveform()` | `record(waveform, …)` | yes |
 | `aai` | array analog in | `PvArray::aai` | `.aai()` | `record(aai, …)` | no |
@@ -35,26 +35,29 @@ If you are not sure whether you want a record at all, read
 | `subArray` | window onto an array | — | `.sub_array()` | `record(subarray, …)` | no |
 | `NtTable` | table payload | — | `.nt_table()` | refused² | yes⁴ |
 | `NtNdArray` | image / detector frame | — | `.nt_ndarray()` | refused² | yes⁴ |
-| `Generic` | arbitrary structure | — | `.generic()` | refused² | yes |
+| `Generic` | arbitrary structure | — | `.generic()` | refused² | yes⁵ |
 
 ¹ An `ai` becomes writable when `SIMM` is set — the simulation-mode path
-(`spvirit-server/src/types.rs:308`).
+(`spvirit-server/src/types.rs:359`).
 
-² `RecordType::from_db_name` maps twelve `.db` spellings, including `mbbi`
-(also spelled `ntenum`) and `mbbo`. Those two then reach an arm in
-`spvirit-server/src/db.rs:550` that prints *"is not a standard EPICS Base
-record type and cannot be loaded from .db files"* (message at db.rs:558) and
-drops the record.
-`mbbi` and `mbbo` **are** standard EPICS Base record types; the message is
-wrong. See [Known gaps](known-gaps.md).
+² `RecordType::from_db_name` recognises thirteen `.db` spellings (twelve
+record types, with `mbbi` also accepted as `ntenum`), including `mbbi` and
+`mbbo`. The `.db` loader does not construct those
+two yet: loading a file that contains one fails with *"record '…' of type
+'mbbi' is not yet supported by the .db loader; create it through the host API
+instead"*. See [Known gaps](known-gaps.md).
 
-³ Writable in the sense that the record accepts write access. A wire PUT of
-an enum index is currently dropped — see [Known gaps](known-gaps.md).
+³ A wire PUT selects the choice by index (`{"value":{"index":2}}`); an
+out-of-range index is refused with a PUT error.
 
-⁴ Writable via a client PUT as well as `store.put_nt()`. The `NtTable`/
-`NtNdArray` arms of `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:629`) apply the wire fields and restamp the
-record.
+⁴ The `NtTable` arm of `RecordInstance::apply_put_fields`
+(`spvirit-server/src/apply.rs:675`) applies the wire fields, and `apply_put`
+restamps the record. An `NtNdArray` PUT applies the metadata fields, but the
+image `value` a client sends is not applied (see [Known gaps](known-gaps.md)).
+Both are writable through `store.put_nt()` too.
+
+⁵ Writable through `store.put_nt()` only. A client PUT to a generic record is
+refused with a PUT error — see [Known gaps](known-gaps.md).
 
 ## Reading the columns
 
@@ -66,14 +69,16 @@ This is the level most of [Part III](../03-progressive/scalars.md) works at.
 **Builder** — `PvaServer::builder().ai(…)` and friends
 (`spvirit-server/src/pva_server.rs`). Declares records inline; you reach them
 afterwards through the store rather than through a handle. The builder is
-the only route to `sub_array`, `nt_table`, `nt_ndarray` and `generic`.
+the only declare-up-front route to `nt_table`, `nt_ndarray` and `generic`
+(`subArray` also loads from `.db`, and `PvaServer::add_table` adds a table at
+runtime).
 
 **`.db`** — text database files, as EPICS Base uses them. See
 [Serving a .db file](../03-progressive/db-files.md) for the fields spvirit
 acts on.
 
 **Writable** — whether the server grants write access
-(`RecordInstance::writable`, `spvirit-server/src/types.rs:303`). Output
+(`RecordInstance::writable`, `spvirit-server/src/types.rs:354`). Output
 record types are always writable; a handful of input types are too, for the
 reasons in the footnotes. Everything else answers a PUT with
 `Write access denied`.
@@ -90,5 +95,5 @@ as a Rust closure. The builder spelling is `.link(output, inputs, compute)`.
 The Python module exposes the same handle-API set:
 `ai`, `ao`, `bi`, `bo`, `string_in`, `string_out`, `longin`, `longout`,
 `mbbi`, `mbbo`, `waveform`, `aai`, `aao`, `calc`, plus the generic `pv` and
-`scalar` constructors (`spvirit-py/src/lib.rs:54`). See
+`scalar` constructors (`spvirit-py/src/lib.rs:84`). See
 [Python API](python-api.md).

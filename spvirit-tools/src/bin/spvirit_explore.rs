@@ -8,7 +8,7 @@ use argparse::{ArgumentParser, Store};
 use chrono::Local;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, RenderDirection, Sparkline, Wrap};
@@ -26,6 +26,7 @@ use spvirit_tools::spvirit_client::search::{
     DiscoveredServer, SearchTarget, build_search_targets, discover_servers,
 };
 use spvirit_tools::spvirit_client::types::{PvGetOptions, PvGetResult};
+use spvirit_tools::tui::{centered_rect, focus_block};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FocusPane {
@@ -406,13 +407,13 @@ impl ExploreApp {
         if self.pv_index >= self.pvs.len() {
             self.pv_index = self.pvs.len().saturating_sub(1);
         }
-        if let Some(selected) = self.selected_pv.clone() {
-            if !self.pvs.contains(&selected) {
-                self.selected_pv = None;
-                self.last_snapshot = None;
-                self.snapshot_in_flight = false;
-                self.clear_chart_samples();
-            }
+        if let Some(selected) = self.selected_pv.clone()
+            && !self.pvs.contains(&selected)
+        {
+            self.selected_pv = None;
+            self.last_snapshot = None;
+            self.snapshot_in_flight = false;
+            self.clear_chart_samples();
         }
     }
 
@@ -687,17 +688,17 @@ impl ExploreApp {
                         if self.server_index >= self.servers.len() {
                             self.server_index = self.servers.len().saturating_sub(1);
                         }
-                        if let Some(prev) = self.selected_server {
-                            if !self.servers.contains(&prev) {
-                                self.selected_server = None;
-                                self.selected_pv = None;
-                                self.all_pvs.clear();
-                                self.pvs.clear();
-                                self.last_snapshot = None;
-                                self.clear_chart_samples();
-                                self.list_in_flight = false;
-                                self.snapshot_in_flight = false;
-                            }
+                        if let Some(prev) = self.selected_server
+                            && !self.servers.contains(&prev)
+                        {
+                            self.selected_server = None;
+                            self.selected_pv = None;
+                            self.all_pvs.clear();
+                            self.pvs.clear();
+                            self.last_snapshot = None;
+                            self.clear_chart_samples();
+                            self.list_in_flight = false;
+                            self.snapshot_in_flight = false;
                         }
                         self.push_status(format!("Discovered {} server(s)", self.servers.len()));
                     }
@@ -886,38 +887,6 @@ impl ExploreApp {
             FocusPane::Details => {}
         }
     }
-}
-
-fn focus_block(title: String, focused: bool) -> Block<'static> {
-    let border_style = if focused {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    };
-    Block::default()
-        .title(title.to_string())
-        .borders(Borders::ALL)
-        .border_style(border_style)
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
 }
 
 fn chart_sample_from_value(value: &DecodedValue) -> Option<f64> {
@@ -1280,85 +1249,85 @@ fn run_ui(
             app.handle_event(evt);
         }
 
-        if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if app.add_pv_editing {
-                    match key.code {
-                        KeyCode::Enter => app.apply_add_pv_input(&cmd_tx),
-                        KeyCode::Backspace => {
-                            app.add_pv_input.pop();
-                        }
-                        KeyCode::Esc => {
-                            app.add_pv_editing = false;
-                            app.add_pv_input.clear();
-                            app.push_status("Add PV input cancelled");
-                        }
-                        KeyCode::Char(c) => app.add_pv_input.push(c),
-                        _ => {}
-                    }
-                    continue;
-                }
-                if app.filter_editing {
-                    match key.code {
-                        KeyCode::Enter => app.apply_filter_input(),
-                        KeyCode::Backspace => {
-                            app.filter_input.pop();
-                        }
-                        KeyCode::Esc => {
-                            app.filter_editing = false;
-                            app.filter_input = app.pv_filter.clone();
-                            app.push_status("PV filter input cancelled");
-                        }
-                        KeyCode::Char(c) => app.filter_input.push(c),
-                        _ => {}
-                    }
-                    continue;
-                }
+        if event::poll(tick_rate)?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if app.add_pv_editing {
                 match key.code {
-                    KeyCode::Char('q') => break,
+                    KeyCode::Enter => app.apply_add_pv_input(&cmd_tx),
+                    KeyCode::Backspace => {
+                        app.add_pv_input.pop();
+                    }
                     KeyCode::Esc => {
-                        if app.show_help {
-                            app.show_help = false;
-                        } else {
-                            app.cancel_in_flight(&cmd_tx);
-                        }
+                        app.add_pv_editing = false;
+                        app.add_pv_input.clear();
+                        app.push_status("Add PV input cancelled");
                     }
-                    KeyCode::Char('h') => app.show_help = !app.show_help,
-                    KeyCode::Char('f') => app.start_filter_input(),
-                    KeyCode::Char('a') => app.start_add_pv_input(),
-                    KeyCode::Char('t') => app.toggle_details_view(),
-                    KeyCode::Tab => {
-                        app.focus = match app.focus {
-                            FocusPane::Servers => FocusPane::Pvs,
-                            FocusPane::Pvs => FocusPane::Details,
-                            FocusPane::Details => FocusPane::Servers,
-                        }
-                    }
-                    KeyCode::Char('r') => app.manual_refresh(&cmd_tx),
-                    KeyCode::Char('x') => app.cancel_in_flight(&cmd_tx),
-                    KeyCode::Char('p') => {
-                        app.poll_paused = !app.poll_paused;
-                        let message = if app.poll_paused {
-                            app.cancel_monitor(&cmd_tx);
-                            "Monitor paused"
-                        } else {
-                            if let (Some(server), Some(pv)) =
-                                (app.selected_server, app.selected_pv.clone())
-                            {
-                                app.issue_snapshot(&cmd_tx, server, &pv);
-                            }
-                            "Monitor resumed"
-                        };
-                        app.push_status(message);
-                    }
-                    KeyCode::Up => app.move_up(),
-                    KeyCode::Down => app.move_down(),
-                    KeyCode::Enter => app.activate_selection(&cmd_tx),
+                    KeyCode::Char(c) => app.add_pv_input.push(c),
                     _ => {}
                 }
+                continue;
+            }
+            if app.filter_editing {
+                match key.code {
+                    KeyCode::Enter => app.apply_filter_input(),
+                    KeyCode::Backspace => {
+                        app.filter_input.pop();
+                    }
+                    KeyCode::Esc => {
+                        app.filter_editing = false;
+                        app.filter_input = app.pv_filter.clone();
+                        app.push_status("PV filter input cancelled");
+                    }
+                    KeyCode::Char(c) => app.filter_input.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Esc => {
+                    if app.show_help {
+                        app.show_help = false;
+                    } else {
+                        app.cancel_in_flight(&cmd_tx);
+                    }
+                }
+                KeyCode::Char('h') => app.show_help = !app.show_help,
+                KeyCode::Char('f') => app.start_filter_input(),
+                KeyCode::Char('a') => app.start_add_pv_input(),
+                KeyCode::Char('t') => app.toggle_details_view(),
+                KeyCode::Tab => {
+                    app.focus = match app.focus {
+                        FocusPane::Servers => FocusPane::Pvs,
+                        FocusPane::Pvs => FocusPane::Details,
+                        FocusPane::Details => FocusPane::Servers,
+                    }
+                }
+                KeyCode::Char('r') => app.manual_refresh(&cmd_tx),
+                KeyCode::Char('x') => app.cancel_in_flight(&cmd_tx),
+                KeyCode::Char('p') => {
+                    app.poll_paused = !app.poll_paused;
+                    let message = if app.poll_paused {
+                        app.cancel_monitor(&cmd_tx);
+                        "Monitor paused"
+                    } else {
+                        if let (Some(server), Some(pv)) =
+                            (app.selected_server, app.selected_pv.clone())
+                        {
+                            app.issue_snapshot(&cmd_tx, server, &pv);
+                        }
+                        "Monitor resumed"
+                    };
+                    app.push_status(message);
+                }
+                KeyCode::Up => app.move_up(),
+                KeyCode::Down => app.move_down(),
+                KeyCode::Enter => app.activate_selection(&cmd_tx),
+                _ => {}
             }
         }
     }

@@ -76,7 +76,7 @@ people reach for `calc` to do.
 | `waveform` | `.waveform(name, data)` | Writable | Array | Spectra, traces |
 | `aai` | `.aai(name, data)` | Input (read-only) | Array | Read-only array data |
 | `aao` | `.aao(name, data)` | Output (writable) | Array | Writable array data |
-| `subArray` | `.sub_array(name, data)` | Writable | Array | View into part of an array |
+| `subArray` | `.sub_array(name, data, indx, nelm)` | Input (read-only) | Array | View into part of an array |
 | `mbbi` | `.mbbi(name, choices, idx)` | Input (read-only) | Enum | Multi-choice status |
 | `mbbo` | `.mbbo(name, choices, idx)` | Output (writable) | Enum | Multi-choice selector |
 
@@ -88,9 +88,9 @@ serve those structures directly under a PV name.
 
 | Construct | Rust builder | Normative Type | Typical use |
 |---|---|---|---|
-| `NtTable` | `.nt_table(name, table)` | NTTable | Tabular data |
-| `NtNdArray` | `.nt_ndarray(name, arr)` | NTNDArray | Image / detector data |
-| `generic` | `.generic(name, desc, payload)` | any | Custom structure |
+| `NtTable` | `.nt_table(name, columns)` | NTTable | Tabular data |
+| `NtNdArray` | `.nt_ndarray(name, data, dims)` | NTNDArray | Image / detector data |
+| `generic` | `.generic(name, struct_id, fields)` | any | Custom structure |
 
 The difference is not cosmetic. An `ai` record is a **processing entity**: it
 has `SCAN`, `PINI`, `FLNK`, alarm thresholds, and a deadband, and the server
@@ -131,7 +131,7 @@ four-letter uppercase names, inherited from EPICS Base.
 | `EGU` | Engineering units (`degC`, `mm`, `counts`) |
 | `PREC` | Display precision (decimal places) |
 | `HOPR` / `LOPR` | High / low operator display range |
-| `DRVH` / `DRVL` | Drive high / low limit — clamps writes |
+| `DRVH` / `DRVL` | Drive high / low limit; published as the NTScalar `control` limits. In Spvirit they are advisory and do **not** clamp writes. |
 | `HIHI` / `HIGH` / `LOW` / `LOLO` | Alarm thresholds |
 | `MDEL` / `ADEL` | Monitor / archive deadbands |
 | `ZNAM` / `ONAM` | Zero name / one name, for binary records |
@@ -209,9 +209,11 @@ record(bo, "SHUTTER:CTRL") {
 }
 ```
 
-When a client reads this PV the value is the integer index, 0 or 1, and
-`display.form.choices` carries `["Closed", "Open"]` so a UI can draw a
-dropdown. In Spvirit, `bi`/`bo` store the value as `ScalarValue::Bool` and the
+When a client reads this PV the value is a boolean (`spget` prints
+`false`/`true`). `ZNAM`/`ONAM` are kept on the record and are **not** put on
+the wire; Spvirit's `display.form.choices` carries the seven standard
+display-format names. If you need the labels on the wire, use `mbbi`/`mbbo`.
+In Spvirit, `bi`/`bo` store the value as `ScalarValue::Bool` and the
 labels in the `znam`/`onam` fields of `RecordData::Bi` / `RecordData::Bo`.
 
 For more than two choices, use `mbbi`/`mbbo`, which take an explicit list of
@@ -221,8 +223,10 @@ choices and map to NTEnum properly.
 
 You will see both names. **Channel Access (CA)** is the original EPICS
 protocol; **PVAccess (PVA)** is its successor, and it is what Spvirit
-implements. The visible difference is that CA sends bare values while PVA
-sends **structured payloads** — value plus alarm plus timestamp plus display
+implements. The visible difference is that CA returns a value in one of a
+fixed set of DBR types (plain, or with time/alarm or graphic/control metadata
+chosen per request), while PVA returns a **self-describing structure** whose
+shape the server defines — value plus alarm plus timestamp plus display
 metadata, in one message. That structure is the subject of the
 [next chapter](normative-types.md).
 

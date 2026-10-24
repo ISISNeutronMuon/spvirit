@@ -166,8 +166,11 @@ impl RecordFieldProvider for SimplePvStore {
     ) -> Pin<Box<dyn Future<Output = Option<ScalarValue>> + Send + '_>> {
         let (base, field) = (base.to_string(), field.to_string());
         Box::pin(async move {
-            let record = self.get_record(&base).await?;
-            crate::record_fields::field_value(&record, &field)
+            self.with_record(&base, |record| {
+                crate::record_fields::field_value(record, &field)
+            })
+            .await
+            .flatten()
         })
     }
 
@@ -188,11 +191,14 @@ impl RecordFieldProvider for SimplePvStore {
     ) -> Pin<Box<dyn Future<Output = Option<RecordFieldDesc>> + Send + '_>> {
         let (base, field) = (base.to_string(), field.to_string());
         Box::pin(async move {
-            let record = self.get_record(&base).await?;
-            let value = crate::record_fields::field_value(&record, &field)?;
-            Some(RecordFieldDesc {
-                kind: field_kind_of(&value),
+            self.with_record(&base, |record| {
+                let value = crate::record_fields::field_value(record, &field)?;
+                Some(RecordFieldDesc {
+                    kind: field_kind_of(&value),
+                })
             })
+            .await
+            .flatten()
         })
     }
 }

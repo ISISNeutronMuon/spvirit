@@ -16,8 +16,13 @@
 //!
 //! A test drives completion deterministically: advance the `ManualClock` past
 //! the recorded [`deadline`](DelaySupport::deadline), then call
-//! `complete_async` (or `Scanner::scan_once`). No real sleep, no timing
-//! tolerance — the clock is the only source of time.
+//! [`Scanner::complete_async`](crate::scan::Scanner::complete_async) -- or
+//! [`process::complete_async`](crate::process::complete_async) directly, with
+//! the record's lock set already held. `Scanner::scan_once` cannot do it: it
+//! routes through `process()`, whose PACT brake returns early for exactly the
+//! state a pending async record is in, so only the completion entry point
+//! reaches the second half. No real sleep, no timing tolerance -- the clock is
+//! the only source of time.
 //!
 //! This lives in a real module (not the `process` test module) so several test
 //! modules can bind it, per ruling R-T14-MODREG.

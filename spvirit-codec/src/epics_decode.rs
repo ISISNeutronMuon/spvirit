@@ -48,29 +48,6 @@ pub fn command_name(code: u8) -> &'static str {
         .unwrap_or("Unknown")
 }
 
-/// Look up a PVA command code by its name.  Returns 255 for unknown names.
-pub fn command_to_integer(command: &str) -> u8 {
-    PVA_COMMAND_NAMES
-        .iter()
-        .position(|&name| name == command)
-        .map(|i| i as u8)
-        .unwrap_or(255)
-}
-
-/// Convenience wrapper that matches the pre-existing `PvaCommands` API.
-/// Prefer calling [`command_name`] directly for new code.
-#[derive(Debug)]
-pub struct PvaCommands;
-
-impl PvaCommands {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn get_command(&self, code: u8) -> &'static str {
-        command_name(code)
-    }
-}
 #[derive(Debug)]
 pub struct PvaControlFlags {
     pub raw: u8,
@@ -135,6 +112,15 @@ pub struct PvaHeader {
 }
 
 impl PvaHeader {
+    /// Parse an 8-byte PVA header.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is shorter than 8 bytes. Only call this where the
+    /// length is already guaranteed -- typically bytes that came out of a
+    /// frame reader, or bytes this crate encoded itself. **On any path that
+    /// touches the network directly (a UDP datagram, a public function taking
+    /// a caller-supplied slice) use [`PvaHeader::try_new`] instead.**
     pub fn new(raw: &[u8]) -> Self {
         Self::try_new(raw).expect("PVA header requires at least 8 bytes")
     }
@@ -198,6 +184,14 @@ pub struct PvaPacket {
 }
 
 impl PvaPacket {
+    /// Parse a `PvaPacket` (header plus payload copy).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `raw` is shorter than the 8-byte PVA header. Only call this
+    /// where the length is already guaranteed. **On any path that touches
+    /// the network directly (a UDP datagram, a public function taking a
+    /// caller-supplied slice) use [`PvaPacket::try_new`] instead.**
     pub fn new(raw: &[u8]) -> Self {
         let header = PvaHeader::new(raw);
         let payload = raw.to_vec();
@@ -212,6 +206,18 @@ impl PvaPacket {
         let header = PvaHeader::try_new(raw)?;
         let payload = raw.to_vec();
         Some(Self { header, payload })
+    }
+    /// Take ownership of an already-owned frame instead of copying it.
+    ///
+    /// [`PvaPacket::try_new`] copies its `&[u8]` into a fresh `Vec`; when the
+    /// caller already owns the buffer that copy is pure waste. `payload` holds
+    /// the **whole frame including the 8-byte header**, matching `try_new`.
+    pub fn from_vec(raw: Vec<u8>) -> Option<PvaPacket> {
+        let header = PvaHeader::try_new(&raw)?;
+        Some(Self {
+            header,
+            payload: raw,
+        })
     }
     pub fn decode_payload(&mut self) -> Option<PvaPacketCommand> {
         let pva_header_size = 8;
@@ -370,15 +376,33 @@ pub fn decode_status(raw: &[u8], is_be: bool) -> (Option<PvaStatus>, usize) {
     )
 }
 
-pub fn decode_op_response_status(raw: &[u8], is_be: bool) -> Result<Option<PvaStatus>, String> {
-    let pkt = PvaPacket::new(raw);
-    let payload_len = pkt.header.payload_length as usize;
+/// Read the `PvaStatus` out of an operation response frame.
+///
+/// Reads the payload length straight out of the 8-byte header rather than
+/// building a `PvaPacket` — the old code copied the entire frame into an owned
+/// `Vec` to reach four bytes of it, then re-sliced `raw` anyway.
+pub fn decode_op_response_status(
+    raw: &[u8],
+    is_be: bool,
+) -> crate::error::DecodeResult<Option<PvaStatus>> {
+    use crate::error::DecodeError;
+    let header = PvaHeader::try_new(raw).ok_or(DecodeError::Truncated {
+        needed: 8,
+        available: raw.len(),
+    })?;
+    let payload_len = header.payload_length as usize;
     if raw.len() < 8 + payload_len {
-        return Err("op response truncated".to_string());
+        return Err(DecodeError::Truncated {
+            needed: 8 + payload_len,
+            available: raw.len(),
+        });
     }
     let payload = &raw[8..8 + payload_len];
     if payload.len() < 5 {
-        return Err("op response payload too short".to_string());
+        return Err(DecodeError::Truncated {
+            needed: 5,
+            available: payload.len(),
+        });
     }
     Ok(decode_status(&payload[5..], is_be).0)
 }
@@ -517,12 +541,18 @@ impl PvaConnectionValidationPayload {
                     offset += consumed;
                     let mut first_method = None;
                     for _ in 0..count {
-                        if let Some((s, c)) = decode_string(&raw[offset..], is_be) {
-                            if first_method.is_none() && !s.is_empty() {
-                                first_method = Some(s);
-                            }
-                            offset += c;
+                        // `count` is wire-supplied and unbounded. Without this
+                        // `else` the loop keeps going with `offset` frozen
+                        // once the strings run out, so a declared u32::MAX
+                        // spins ~4.3e9 times on an 11-byte frame. Same shape
+                        // as `PvaAuthNzPayload::new` below.
+                        let Some((s, c)) = decode_string(&raw[offset..], is_be) else {
+                            break;
+                        };
+                        if first_method.is_none() && !s.is_empty() {
+                            first_method = Some(s);
                         }
+                        offset += c;
                     }
                     first_method
                 } else {
@@ -1390,19 +1420,17 @@ pub fn extract_pv_names(raw: &[u8]) -> Vec<String> {
                 }
             }
             let len = i - start;
-            if len >= 3 && len <= 128 {
-                if let Ok(s) = std::str::from_utf8(&raw[start..start + len]) {
+            if (3..=128).contains(&len)
+                && let Ok(s) = std::str::from_utf8(&raw[start..start + len]) {
                     // validate candidate contains at least one alphabetic char
-                    if s.chars().any(|c| c.is_ascii_alphabetic()) {
-                        if !names.contains(&s.to_string()) {
+                    if s.chars().any(|c| c.is_ascii_alphabetic())
+                        && !names.contains(&s.to_string()) {
                             names.push(s.to_string());
                             if names.len() >= 8 {
                                 break;
                             }
                         }
-                    }
                 }
-            }
         } else {
             i += 1;
         }
@@ -1489,7 +1517,9 @@ impl PvaOpPayload {
         // NB: pv_names is NOT computed here. The heuristic `extract_pv_names`
         // scan is deferred to `Display` (only when there is no decoded value),
         // so it costs nothing on the normal op path.
-        let result = Some(Self {
+        
+
+        Some(Self {
             sid_or_cid,
             ioid,
             subcmd,
@@ -1499,9 +1529,7 @@ impl PvaOpPayload {
             status,
             introspection,
             decoded_value: None, // Will be set by packet processor with field_desc
-        });
-
-        result
+        })
     }
 
     /// Decode the body using provided field description.
@@ -1891,6 +1919,130 @@ mod tests {
     }
 
     #[test]
+    fn op_response_status_reports_truncation_as_a_typed_error() {
+        // 8-byte header claiming a 40-byte payload, with nothing after it.
+        let mut raw = crate::spvirit_encode::encode_header(true, false, false, 2, 11, 40);
+        assert_eq!(raw.len(), 8);
+        let err = decode_op_response_status(&raw, false).unwrap_err();
+        assert!(
+            matches!(err, crate::error::DecodeError::Truncated { .. }),
+            "expected Truncated, got {err:?}"
+        );
+
+        // Header plus a payload too short to hold the 5-byte op prefix.
+        raw = crate::spvirit_encode::encode_header(true, false, false, 2, 11, 3);
+        raw.extend_from_slice(&[0, 0, 0]);
+        let err = decode_op_response_status(&raw, false).unwrap_err();
+        assert!(
+            matches!(err, crate::error::DecodeError::Truncated { .. }),
+            "expected Truncated, got {err:?}"
+        );
+
+        // A header shorter than 8 bytes must be an error, not a panic.
+        let err = decode_op_response_status(&[0xCA, 2, 0x40], false).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::DecodeError::Truncated { .. }
+        ));
+    }
+
+    #[test]
+    fn packet_from_vec_takes_ownership_without_copying() {
+        let mut raw = crate::spvirit_encode::encode_header(true, false, false, 2, 11, 4);
+        raw.extend_from_slice(&[1, 2, 3, 4]);
+        let expected = raw.clone();
+        let pkt = PvaPacket::from_vec(raw).expect("well-formed header");
+        assert_eq!(pkt.payload, expected);
+        assert_eq!(pkt.header.payload_length, 4);
+    }
+
+    /// Site 9. `decode_op_response_status` is public and takes an arbitrary
+    /// slice, but built a `PvaPacket` from it unconditionally --
+    /// `PvaPacket::new` -> `PvaHeader::new` -> `expect`. A caller that hands
+    /// it a truncated frame gets a panic instead of the `Result` its
+    /// signature promises.
+    #[test]
+    fn decode_op_response_status_rejects_a_short_frame_without_panicking() {
+        let err = decode_op_response_status(&[0xCA, 0x02, 0x00, 0x0B], false)
+            .expect_err("a sub-header frame must be a typed error, not a panic");
+        assert!(matches!(err, crate::error::DecodeError::Truncated { .. }), "{err:?}");
+
+        // Empty is the degenerate case of the same thing.
+        assert!(decode_op_response_status(&[], false).is_err());
+    }
+
+    /// Site 7. The server-direction authz loop has no `else { break }`, so a
+    /// declared count of `u32::MAX` with no strings behind it iterates ~4.3e9
+    /// times on an 11-byte frame. Run it on a worker thread and harvest with
+    /// a timeout, so the pre-fix failure is a fast deterministic timeout
+    /// rather than an eight-second hang inside the test process.
+    #[test]
+    fn a_bogus_authz_count_does_not_spin_the_validation_decoder() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Server -> client body: buffer_size(u32) +
+        // introspection_registry_size(u16) + Size(count) + count x string.
+        // 254 introduces a 4-byte size, so the count is u32::MAX. Nothing
+        // follows it.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&4096u32.to_le_bytes());
+        raw.extend_from_slice(&16u16.to_le_bytes());
+        raw.push(254);
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(raw.len(), 11);
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let out = PvaConnectionValidationPayload::new(&raw, false, true);
+            let _ = tx.send(out.map(|p| p.authz));
+        });
+
+        let authz = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("decoding a bogus authz count did not terminate promptly");
+        assert_eq!(
+            authz,
+            Some(None),
+            "no strings followed the count, so no method can be found"
+        );
+    }
+
+    /// The fix must not change the ordinary case: a real server sends one or
+    /// more authz method names and the first non-empty one is picked.
+    #[test]
+    fn a_well_formed_authz_list_still_yields_the_first_method() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&4096u32.to_le_bytes());
+        raw.extend_from_slice(&16u16.to_le_bytes());
+        raw.push(2); // two methods
+        raw.push(2);
+        raw.extend_from_slice(b"ca");
+        raw.push(9);
+        raw.extend_from_slice(b"anonymous");
+
+        let p = PvaConnectionValidationPayload::new(&raw, false, true)
+            .expect("well-formed validation decodes");
+        assert_eq!(p.authz.as_deref(), Some("ca"));
+    }
+
+    /// The fix must not change the happy path: a well-formed op response
+    /// still yields its status.
+    #[test]
+    fn decode_op_response_status_still_reads_a_well_formed_frame() {
+        // header: magic, version 2, flags 0 (LE, app), command 11 (PUT),
+        // payload_length 6. Payload: ioid(4) + subcmd(1) + status code 0xFF
+        // ("no status"), which decodes to None.
+        let mut raw = vec![0xCA, 0x02, 0x00, 0x0B];
+        raw.extend_from_slice(&6u32.to_le_bytes());
+        raw.extend_from_slice(&1u32.to_le_bytes());
+        raw.push(0x00);
+        raw.push(0xFF);
+        let status = decode_op_response_status(&raw, false).expect("well-formed frame decodes");
+        assert!(status.is_none(), "0xFF is the no-status marker");
+    }
+
+    #[test]
     fn destroy_request_decodes_spec_and_legacy_forms() {
         // Spec form (pvxs/pvAccessCPP): serverChannelID then requestID.
         let mut spec = Vec::new();
@@ -1907,10 +2059,11 @@ mod tests {
         assert!(PvaDestroyRequestPayload::new(&[0u8; 3], false).is_none());
     }
     use crate::spvd_encode::{
-        encode_nt_payload_bitset_parts, encode_nt_scalar_bitset_parts, encode_size_pvd,
+        encode_nt_payload_bitset_parts, encode_nt_scalar_bitset_parts,
         nt_payload_desc, nt_scalar_desc,
     };
     use crate::spvirit_encode::encode_header;
+    use crate::spvirit_encode::encode_size_pva;
     use spvirit_types::{NtPayload, NtScalar, NtScalarArray, ScalarArrayValue, ScalarValue};
 
     #[test]
@@ -1972,7 +2125,7 @@ mod tests {
         let mut body_spec = Vec::new();
         body_spec.extend_from_slice(&changed_bitset);
         body_spec.extend_from_slice(&values);
-        body_spec.extend_from_slice(&encode_size_pvd(0, false));
+        body_spec.extend_from_slice(&encode_size_pva(0, false));
 
         let pkt = build_monitor_packet(1, 0x00, &body_spec);
         let mut pva = PvaPacket::new(&pkt);
@@ -2008,7 +2161,7 @@ mod tests {
         // changed bitset, overrun bitset, data.
         let mut body_overrun = Vec::new();
         body_overrun.extend_from_slice(&changed_bitset);
-        body_overrun.extend_from_slice(&encode_size_pvd(0, false));
+        body_overrun.extend_from_slice(&encode_size_pva(0, false));
         body_overrun.extend_from_slice(&values);
 
         let (update, layout) = decoder
@@ -2047,7 +2200,7 @@ mod tests {
         let mut body_spec = Vec::new();
         body_spec.extend_from_slice(&changed_bitset);
         body_spec.extend_from_slice(&values);
-        body_spec.extend_from_slice(&encode_size_pvd(0, false));
+        body_spec.extend_from_slice(&encode_size_pva(0, false));
 
         let pkt = build_monitor_packet(11, 0x00, &body_spec);
         let mut pva = PvaPacket::new(&pkt);

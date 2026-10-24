@@ -66,12 +66,14 @@ valueAlarm: structure
 client library refuses a PV, this tells you whether the server is really
 sending `epics:nt/NTScalar:1.0` or something else.
 
-**Seeing metadata that is published but unused.** The `valueAlarm` block
-above exists because the record was built with `.alarm_limits(...)`. The
-limits are on the wire, and `spinfo` proves it — but the server never
-compares the value against them. That distinction is the subject of
-[Alarms](../03-progressive/alarms.md), and `spinfo` is how you tell the
-two cases apart.
+**Seeing the alarm limits.** The `valueAlarm` block above exists because
+the record was built with `.alarm_limits(...)`. The limits are on the wire,
+and `spinfo` proves it. Whether the server also *evaluates* them depends on
+`compute_alarms`: when it is on (`spserver --compute-alarms` or
+`.compute_alarms(true)`), every write is compared against these same limits
+and drives the severity; it is off by default, and then the limits are only
+published. `spinfo` shows the limits either way, which is how you tell
+metadata from computed severity. See [Alarms](../03-progressive/alarms.md).
 
 **Working out what `-F` can ask for.** The dotted paths in `spget -F` and
 `spmonitor -F` are exactly the paths in this tree.

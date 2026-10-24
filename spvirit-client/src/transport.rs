@@ -9,6 +9,26 @@ use crate::types::PvGetError;
 use spvirit_codec::epics_decode::{PvaHeader, PvaPacket, PvaPacketCommand};
 use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 
+/// The largest payload this reader will allocate for one inbound frame.
+///
+/// The PVA protocol puts no ceiling on `payload_length` beyond the u32 field
+/// itself, so there is no protocol number to adopt. Reuse the workspace
+/// constant that already bounds *reassembled* messages, so one number governs
+/// the whole inbound byte budget instead of two that can drift apart.
+pub const MAX_INBOUND_PAYLOAD_BYTES: usize = spvirit_codec::DEFAULT_MAX_MESSAGE_BYTES;
+
+/// The largest buffer capacity [`FrameBuf::recycle`] will keep across frames.
+///
+/// Recycling exists to save the per-frame allocation for the common case,
+/// and the common monitor update is small: an NTScalar is a few hundred
+/// bytes, and 64 KiB still covers an 8 K-element `double` waveform. Anything
+/// bigger is a one-off worth freeing — a gateway holds one `FrameBuf` per
+/// upstream monitor, so retaining a single 200 MiB frame per connection
+/// (anything up to `max_payload` would otherwise be kept) multiplies by the
+/// monitor count and can be forced by one hostile frame. At 64 KiB the
+/// worst-case pinned memory is 64 KiB per monitor connection.
+const RECYCLE_RETAIN_MAX: usize = 64 * 1024;
+
 /// Persistent partial-read state for one connection, used by
 /// [`read_frame_resumable`].
 ///
@@ -22,9 +42,9 @@ use spvirit_codec::{SegmentOutcome, SegmentReassembler};
 /// consumes nothing), so the only state that has to survive a drop is this
 /// cursor.
 ///
-/// The `payload` allocation is also reused as the fill buffer across resumed
-/// reads of a single frame.
-#[derive(Default)]
+/// The `payload` allocation is reused as the fill buffer across resumed reads
+/// of a single frame, and across frames when the caller donates the finished
+/// message back with [`FrameBuf::recycle`].
 pub struct FrameBuf {
     /// The 8-byte header being filled.
     header: [u8; 8],
@@ -38,6 +58,22 @@ pub struct FrameBuf {
     payload_filled: usize,
     /// Expected payload length for the current frame (0 for control frames).
     payload_need: usize,
+    /// Largest `payload_length` this buffer will honour.
+    max_payload: usize,
+}
+
+impl Default for FrameBuf {
+    fn default() -> Self {
+        Self {
+            header: [0u8; 8],
+            header_filled: 0,
+            header_done: false,
+            payload: Vec::new(),
+            payload_filled: 0,
+            payload_need: 0,
+            max_payload: MAX_INBOUND_PAYLOAD_BYTES,
+        }
+    }
 }
 
 impl FrameBuf {
@@ -46,12 +82,76 @@ impl FrameBuf {
         Self::default()
     }
 
-    /// Reset to await a new frame (keeps the `payload` allocation for reuse).
+    /// A buffer with a non-default payload ceiling.
+    ///
+    /// Exists so the cap can be exercised without a large allocation, and so
+    /// an embedder with a tighter byte budget can impose one.
+    pub fn with_max_payload_bytes(max: usize) -> Self {
+        Self {
+            max_payload: max,
+            ..Self::default()
+        }
+    }
+
+    /// Reset to await a new frame. Note that `read_frame_into` takes the
+    /// payload buffer out before calling this, so there is nothing left to
+    /// keep unless the caller donates one back via [`FrameBuf::recycle`].
     fn reset(&mut self) {
         self.header_filled = 0;
         self.header_done = false;
         self.payload_filled = 0;
         self.payload_need = 0;
+    }
+
+    /// Donate a finished message buffer back for the next frame's payload.
+    ///
+    /// `read_frame_into` moves the payload allocation out into the message it
+    /// returns, so without this the next frame allocates from scratch. A
+    /// caller that is done with a message (the monitor loop, at the end of an
+    /// iteration) hands it back here.
+    ///
+    /// Ignored when a frame is partially read — replacing the buffer then
+    /// would discard bytes already taken off the socket, which would break
+    /// the cancel-safety invariant (prior audit item C1) — ignored when the
+    /// donation is no larger than what is already held, and dropped (freed)
+    /// when its capacity exceeds [`RECYCLE_RETAIN_MAX`] or this buffer's own
+    /// `max_payload` (plus the 8-byte header), so one large frame cannot pin
+    /// its allocation for the connection's lifetime.
+    pub fn recycle(&mut self, buf: Vec<u8>) {
+        if self.header_filled != 0 || self.header_done || self.payload_filled != 0 {
+            return;
+        }
+        // A donated message is header + payload, hence the `+ 8`.
+        if buf.capacity() > RECYCLE_RETAIN_MAX.min(self.max_payload.saturating_add(8)) {
+            return;
+        }
+        if buf.capacity() <= self.payload.capacity() {
+            return;
+        }
+        let mut buf = buf;
+        buf.clear();
+        self.payload = buf;
+    }
+
+    #[cfg(test)]
+    fn payload_capacity(&self) -> usize {
+        self.payload.capacity()
+    }
+
+    #[cfg(test)]
+    fn payload_ptr(&self) -> *const u8 {
+        self.payload.as_ptr()
+    }
+
+    /// Test hook: put the buffer into the "header parsed, payload partly
+    /// read" state that `recycle` must refuse to disturb.
+    #[cfg(test)]
+    fn begin_for_test(&mut self, need: usize, filled: usize) {
+        self.header_done = true;
+        self.payload_need = need;
+        self.payload.clear();
+        self.payload.resize(need, 0);
+        self.payload_filled = filled;
     }
 }
 
@@ -190,11 +290,22 @@ where
                 Fill::Done => {}
             }
             let parsed = PvaHeader::new(&fb.header);
-            fb.payload_need = if parsed.flags.is_control {
+            let declared = if parsed.flags.is_control {
                 0
             } else {
                 parsed.payload_length as usize
             };
+            // `declared` is a raw u32 off the wire. Refuse before the resize:
+            // eight bytes of header must not be able to make this process ask
+            // the allocator for gigabytes.
+            if declared > fb.max_payload {
+                return Err(PvGetError::Protocol(format!(
+                    "inbound frame declares {declared} payload bytes, over the \
+                     {} byte limit",
+                    fb.max_payload
+                )));
+            }
+            fb.payload_need = declared;
             fb.payload.clear();
             fb.payload.resize(fb.payload_need, 0);
             fb.payload_filled = 0;
@@ -322,10 +433,10 @@ where
         let remaining = deadline - now;
         let bytes = read_frame_into(stream, remaining, reassembler, &mut fb, true).await?;
         let mut pkt = PvaPacket::new(&bytes);
-        if let Some(cmd) = pkt.decode_payload() {
-            if predicate(&cmd) {
-                return Ok(bytes);
-            }
+        if let Some(cmd) = pkt.decode_payload()
+            && predicate(&cmd)
+        {
+            return Ok(bytes);
         }
     }
 }
@@ -335,6 +446,260 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::time::sleep;
+
+    #[test]
+    fn recycle_reuses_the_donated_allocation_for_the_next_frame() {
+        let mut fb = FrameBuf::new();
+        let mut donated = Vec::with_capacity(4096);
+        donated.extend_from_slice(&[0u8; 16]);
+        let want = donated.as_ptr();
+
+        fb.recycle(donated);
+        assert_eq!(fb.payload_capacity(), 4096);
+        assert_eq!(fb.payload_ptr(), want, "the same allocation must be kept");
+    }
+
+    #[test]
+    fn recycle_is_ignored_while_a_partial_read_is_in_progress() {
+        let mut fb = FrameBuf::new();
+        // Simulate a frame whose header is parsed and whose payload is
+        // half-filled: donating here would drop bytes already read.
+        fb.begin_for_test(64, 10);
+        let before = fb.payload_capacity();
+
+        fb.recycle(Vec::with_capacity(4096));
+        assert_eq!(
+            fb.payload_capacity(),
+            before,
+            "an in-progress frame must not have its buffer replaced"
+        );
+    }
+
+    #[test]
+    fn recycle_keeps_the_larger_of_the_two_buffers() {
+        let mut fb = FrameBuf::new();
+        fb.recycle(Vec::with_capacity(8192));
+        fb.recycle(Vec::with_capacity(64));
+        assert_eq!(
+            fb.payload_capacity(),
+            8192,
+            "a smaller donation must not shrink the buffer"
+        );
+    }
+
+    /// One large frame must not pin its allocation for the connection's
+    /// lifetime: a donation above the retention ceiling is dropped.
+    #[test]
+    fn recycle_drops_a_donation_above_the_retention_ceiling() {
+        let mut fb = FrameBuf::new();
+        fb.recycle(Vec::with_capacity(RECYCLE_RETAIN_MAX + 1));
+        assert_eq!(
+            fb.payload_capacity(),
+            0,
+            "an oversized donation must be freed, not retained"
+        );
+
+        // A donation at the ceiling is still kept.
+        fb.recycle(Vec::with_capacity(RECYCLE_RETAIN_MAX));
+        assert_eq!(fb.payload_capacity(), RECYCLE_RETAIN_MAX);
+    }
+
+    /// The ceiling is also bounded by the buffer's own payload cap: nothing
+    /// larger than the largest frame it will honour is worth keeping.
+    #[test]
+    fn recycle_drops_a_donation_above_the_payload_cap() {
+        let mut fb = FrameBuf::with_max_payload_bytes(1024);
+        fb.recycle(Vec::with_capacity(4096));
+        assert_eq!(
+            fb.payload_capacity(),
+            0,
+            "a donation above max_payload must be freed, not retained"
+        );
+    }
+
+    /// An application frame (server, LE, MONITOR) carrying `payload`.
+    fn frame_with_payload(payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0xCA, 0x02, 0x40, 0x0D];
+        f.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Recycling on the real read path: read frame A, donate it back, then a
+    /// smaller and a larger frame. Each must come back byte-exact at its own
+    /// length — no stale tail from the recycled allocation, no truncation.
+    #[tokio::test]
+    async fn recycled_buffer_yields_exact_frames_on_the_real_read_path() {
+        let a = frame_with_payload(&[0xAA; 32]);
+        let smaller = frame_with_payload(b"HELLO");
+        let larger = frame_with_payload(&(0..100u8).collect::<Vec<_>>());
+        let mut wire = a.clone();
+        wire.extend_from_slice(&smaller);
+        wire.extend_from_slice(&larger);
+
+        let mut reader = &wire[..];
+        let mut reassembler = SegmentReassembler::new();
+        let mut fb = FrameBuf::new();
+        let t = Duration::from_millis(200);
+
+        let msg_a = read_frame_resumable(&mut reader, t, &mut reassembler, &mut fb)
+            .await
+            .expect("frame A");
+        assert_eq!(msg_a, a);
+        fb.recycle(msg_a);
+        assert!(fb.payload_capacity() >= a.len(), "frame A's buffer is kept");
+
+        let msg_s = read_frame_resumable(&mut reader, t, &mut reassembler, &mut fb)
+            .await
+            .expect("smaller frame");
+        assert_eq!(msg_s.len(), smaller.len());
+        assert_eq!(msg_s, smaller);
+        fb.recycle(msg_s);
+
+        let msg_l = read_frame_resumable(&mut reader, t, &mut reassembler, &mut fb)
+            .await
+            .expect("larger frame");
+        assert_eq!(msg_l.len(), larger.len());
+        assert_eq!(msg_l, larger);
+    }
+
+    /// The retention ceiling on the real read path: a frame larger than
+    /// `RECYCLE_RETAIN_MAX`, read through `read_frame_resumable` and then
+    /// donated, is freed rather than kept — and the next frame still reads
+    /// byte-exact into a fresh allocation.
+    #[tokio::test]
+    async fn a_large_frame_read_and_donated_is_not_retained() {
+        let large = frame_with_payload(&vec![0x5A; RECYCLE_RETAIN_MAX + 1]);
+        let small = frame_with_payload(b"HELLO");
+        let mut wire = large.clone();
+        wire.extend_from_slice(&small);
+
+        let mut reader = &wire[..];
+        let mut reassembler = SegmentReassembler::new();
+        let mut fb = FrameBuf::new();
+        let t = Duration::from_millis(200);
+
+        let msg_large = read_frame_resumable(&mut reader, t, &mut reassembler, &mut fb)
+            .await
+            .expect("large frame");
+        assert_eq!(msg_large, large);
+        assert!(msg_large.capacity() > RECYCLE_RETAIN_MAX);
+        fb.recycle(msg_large);
+        assert_eq!(
+            fb.payload_capacity(),
+            0,
+            "a frame above the retention ceiling must be freed, not retained"
+        );
+
+        let msg_small = read_frame_resumable(&mut reader, t, &mut reassembler, &mut fb)
+            .await
+            .expect("small frame");
+        assert_eq!(msg_small, small);
+    }
+
+    /// The partial-state guard also covers a half-read header
+    /// (`header_filled != 0`, `header_done` still false), produced here by
+    /// genuinely dropping a read future mid-header.
+    #[tokio::test]
+    async fn recycle_is_ignored_while_a_header_is_half_read() {
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let frame = sample_frame();
+        let mut reass = SegmentReassembler::new();
+        let mut fb = FrameBuf::new();
+
+        server.write_all(&frame[..3]).await.unwrap();
+        server.flush().await.unwrap();
+        tokio::select! {
+            _ = read_frame_resumable(&mut client, Duration::from_secs(30), &mut reass, &mut fb) => {
+                panic!("frame is incomplete; read must not resolve yet");
+            }
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
+        assert_eq!(fb.header_filled, 3);
+        assert!(!fb.header_done);
+        let before = fb.payload_capacity();
+
+        fb.recycle(Vec::with_capacity(4096));
+        assert_eq!(
+            fb.payload_capacity(),
+            before,
+            "a half-read header must not have its buffer replaced"
+        );
+
+        server.write_all(&frame[3..]).await.unwrap();
+        server.flush().await.unwrap();
+        let got = read_frame_resumable(&mut client, Duration::from_secs(5), &mut reass, &mut fb)
+            .await
+            .expect("the frame resumes intact");
+        assert_eq!(got, frame);
+    }
+
+    /// Site 2. `read_frame_into` resized straight to the peer-declared u32.
+    /// Eight bytes of header from an upstream server made the gateway ask for
+    /// up to 4 GiB. The cap is checked against a *configured* small ceiling
+    /// here so the test itself never allocates anything large.
+    #[tokio::test]
+    async fn a_frame_declaring_more_than_the_cap_is_rejected() {
+        // magic, version 2, flags 0 (client, LE, application), command 0,
+        // payload_length = 1024. No payload bytes follow at all.
+        let mut frame = vec![0xCA, 0x02, 0x00, 0x00];
+        frame.extend_from_slice(&1024u32.to_le_bytes());
+
+        let mut reader = &frame[..];
+        let mut reassembler = SegmentReassembler::new();
+        let mut fb = FrameBuf::with_max_payload_bytes(16);
+
+        let err = read_frame_resumable(
+            &mut reader,
+            Duration::from_millis(200),
+            &mut reassembler,
+            &mut fb,
+        )
+        .await
+        .expect_err("a frame over the cap must be rejected");
+
+        match err {
+            PvGetError::Protocol(msg) => assert!(
+                msg.contains("1024") && msg.contains("16"),
+                "the error should name both the declared length and the cap: {msg}"
+            ),
+            other => panic!("expected Protocol, got {other:?}"),
+        }
+    }
+
+    /// The default ceiling is the workspace's single inbound byte budget, the
+    /// same constant that already bounds segmented reassembly. One number,
+    /// not two.
+    #[test]
+    fn the_default_payload_cap_is_the_workspace_message_limit() {
+        assert_eq!(
+            MAX_INBOUND_PAYLOAD_BYTES,
+            spvirit_codec::DEFAULT_MAX_MESSAGE_BYTES
+        );
+        assert_eq!(MAX_INBOUND_PAYLOAD_BYTES, 268_435_456);
+    }
+
+    /// An ordinary frame is unaffected.
+    #[tokio::test]
+    async fn a_frame_within_the_cap_still_reads() {
+        let mut frame = vec![0xCA, 0x02, 0x00, 0x00];
+        frame.extend_from_slice(&4u32.to_le_bytes());
+        frame.extend_from_slice(&[1, 2, 3, 4]);
+
+        let mut reader = &frame[..];
+        let mut reassembler = SegmentReassembler::new();
+        let mut fb = FrameBuf::new();
+
+        let msg = read_frame_resumable(
+            &mut reader,
+            Duration::from_millis(200),
+            &mut reassembler,
+            &mut fb,
+        )
+        .await
+        .expect("a 4-byte payload is well inside the cap");
+        assert_eq!(msg.len(), 12);
+    }
 
     /// A complete, unsegmented, little-endian PVA app frame: 8-byte header
     /// (magic, version, flags=0x40 server-dir, command=13) followed by a

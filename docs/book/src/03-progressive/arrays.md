@@ -127,6 +127,9 @@ display: structure
   description: string
   units: string
   precision: int
+  form: structure
+    index: int
+    choices: string[]
 control: structure
   limitLow: double
   limitHigh: double

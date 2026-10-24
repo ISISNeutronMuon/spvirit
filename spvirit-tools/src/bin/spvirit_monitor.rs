@@ -149,42 +149,39 @@ async fn pvmonitor_raw(
                     Some(c) => c,
                     None => continue,
                 };
-                match cmd {
-                    PvaPacketCommand::Op(mut op) => {
-                        if op.command != 13 || (op.subcmd != 0x00 && op.subcmd != 0x10) {
-                            continue;
+                if let PvaPacketCommand::Op(mut op) = cmd {
+                    if op.command != 13 || (op.subcmd != 0x00 && op.subcmd != 0x10) {
+                        continue;
+                    }
+                    // A decode failure leaves decoded_value None; skip the update.
+                    let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
+                    if let Some(full) = op.decoded_value {
+                        let mut render_opts = RenderOptions::default();
+                        if json {
+                            render_opts.format = OutputFormat::Json;
                         }
-                        // A decode failure leaves decoded_value None; skip the update.
-                        let _ = op.decode_with_field_desc(&desc, is_be, DecodeMode::Strict);
-                        if let Some(full) = op.decoded_value {
-                            let mut render_opts = RenderOptions::default();
-                            if json {
-                                render_opts.format = OutputFormat::Json;
-                            }
-                            println!("{}", format_output(&opts.pv_name, &full, &render_opts));
-                            println!("raw_pva: {}", hex_encode(&bytes));
-                            println!("raw_pvd: {}", hex_encode(&op.body));
-                        }
-                        if pipeline.is_some() && op.subcmd == 0x00 {
-                            consumed_since_ack = consumed_since_ack.saturating_add(1);
-                            if consumed_since_ack >= ack_threshold {
-                                let ack_bytes = if is_be {
-                                    consumed_since_ack.to_be_bytes()
-                                } else {
-                                    consumed_since_ack.to_le_bytes()
-                                };
-                                let ack = encode_monitor_request(
-                                    sid, ioid, 0x80, &ack_bytes, version, is_be,
-                                );
-                                let _ = stream.write_all(&ack).await;
-                                consumed_since_ack = 0;
-                            }
-                        }
-                        if op.subcmd == 0x10 {
-                            return Ok(());
+                        println!("{}", format_output(&opts.pv_name, &full, &render_opts));
+                        println!("raw_pva: {}", hex_encode(&bytes));
+                        println!("raw_pvd: {}", hex_encode(&op.body));
+                    }
+                    if pipeline.is_some() && op.subcmd == 0x00 {
+                        consumed_since_ack = consumed_since_ack.saturating_add(1);
+                        if consumed_since_ack >= ack_threshold {
+                            let ack_bytes = if is_be {
+                                consumed_since_ack.to_be_bytes()
+                            } else {
+                                consumed_since_ack.to_le_bytes()
+                            };
+                            let ack = encode_monitor_request(
+                                sid, ioid, 0x80, &ack_bytes, version, is_be,
+                            );
+                            let _ = stream.write_all(&ack).await;
+                            consumed_since_ack = 0;
                         }
                     }
-                    _ => {}
+                    if op.subcmd == 0x10 {
+                        return Ok(());
+                    }
                 }
             }
         }

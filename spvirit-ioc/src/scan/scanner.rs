@@ -15,11 +15,99 @@ use std::time::Duration;
 /// reference it as `super::SCAN_ONCE_CAPACITY`.
 pub(crate) const SCAN_ONCE_CAPACITY: usize = 1024;
 
+/// The most distinct periodic scan periods one `Scanner` will run at once.
+///
+/// Every distinct period owns a dedicated OS thread, and `SCAN` is
+/// client-writable with any period in
+/// [`MIN_SCAN_PERIOD_SECS`](crate::scan::MIN_SCAN_PERIOD_SECS)..=
+/// [`MAX_SCAN_PERIOD_SECS`](crate::scan::MAX_SCAN_PERIOD_SECS), so without a
+/// cap a client writing "1.000001 second", "1.000002 second", ... could create
+/// threads until the OS refuses. Real EPICS runs the seven menu periods (plus a
+/// handful of site additions); 64 leaves ample room for that. Records sharing a
+/// period share its thread, so the cap limits distinct periods, never records:
+/// joining a period that already exists is always allowed. A registration that
+/// would add a 65th period is refused with
+/// [`ScanRegisterError::TooManyPeriods`]. A period whose last record leaves is
+/// removed and its thread exits, which frees its slot.
+pub const MAX_PERIODIC_THREADS: usize = 64;
+
+/// Why a periodic scan registration was refused.
+///
+/// The scan grid is whole nanoseconds in a `u64` (`PeriodKey`), so a period
+/// outside that range cannot be scheduled at all. Refusing is deliberate: a
+/// SCAN value this engine accepts must actually scan (real EPICS only accepts
+/// menu periods, every one of which has a thread), so anything it cannot
+/// schedule is an error the client sees, not a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanRegisterError {
+    /// The period is zero, or rounds to zero whole nanoseconds. A zero grid
+    /// step makes every deadline equal to the anchor, and `periodic_loop`'s
+    /// overrun catch-up (`while deadline_for(n) <= now`) would then walk `n`
+    /// to `u64::MAX` on the first tick -- a livelock pegging a core forever.
+    ZeroPeriod,
+    /// The period does not fit `u64` nanoseconds (about 584 years).
+    PeriodTooLong,
+    /// The period is not already scanned and would exceed
+    /// [`MAX_PERIODIC_THREADS`] distinct periods (each one is an OS thread).
+    TooManyPeriods,
+}
+
+impl std::fmt::Display for ScanRegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroPeriod => write!(f, "scan period must be greater than zero"),
+            Self::PeriodTooLong => {
+                write!(f, "scan period is too long to schedule (limit is about 584 years)")
+            }
+            Self::TooManyPeriods => write!(
+                f,
+                "too many distinct scan periods (limit is {MAX_PERIODIC_THREADS}); \
+                 use a period that is already scanned"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ScanRegisterError {}
+
+/// Why an async completion pass did not finish cleanly.
+///
+/// [`Scanner::complete_async`] is called from device code, often on a driver's
+/// own callback thread, so it contains a panic the way a scan pass does rather
+/// than unwinding into the driver -- but it must still tell the caller that
+/// something went wrong, which is why the panic gets a variant of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsyncCompleteError {
+    /// The completion pass returned a processing error (see [`ProcError`]).
+    Proc(ProcError),
+    /// The completion pass panicked inside the processing body. It was caught
+    /// here, and any monitors the pass had already accumulated are lost with
+    /// the context. A panic in the bound `start` has PACT reset by
+    /// `record_body`'s guard; a panic elsewhere in the body may leave the
+    /// record braked with PACT set (the same residual hazard `process_ids`
+    /// documents for a panicking scan pass, R-T6-PACT). Only the body is
+    /// contained: the `sink.flush` and deferred `process_ids` that follow a
+    /// successful body run outside `catch_unwind`, as in `process_ids`, so a
+    /// panic there unwinds into the caller rather than becoming this variant.
+    Panicked,
+}
+
+impl std::fmt::Display for AsyncCompleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Proc(e) => write!(f, "async completion failed: {e}"),
+            Self::Panicked => write!(f, "async completion panicked"),
+        }
+    }
+}
+
+impl std::error::Error for AsyncCompleteError {}
+
 use crate::clock::Clock;
-use crate::ctx::ProcCtx;
+use crate::ctx::{ProcCtx, ProcError};
 use crate::lockset::{RecordDb, RecordId};
-use crate::process::process;
-use crate::scan::{ScanList, ScanSpec, parse_scan};
+use crate::process::{AsyncSupport, process};
+use crate::scan::{AsyncRegistry, ScanList, ScanSpec, parse_scan};
 use spvirit_server::events::EventSink;
 use spvirit_types::NtPayload;
 
@@ -37,6 +125,12 @@ pub struct Scanner {
     db: Arc<RecordDb>,
     clock: Arc<dyn Clock>,
     sink: Arc<dyn ProcSink>,
+    /// Record → async device-support bindings, handed to every pass through
+    /// `ProcCtx::with_async` (see `process_ids`). Empty by default, so an
+    /// unbound record -- which is every record until a driver calls
+    /// [`Self::bind_async`] -- processes exactly as it did before async
+    /// support was wired.
+    async_registry: AsyncRegistry,
     periodic: Mutex<HashMap<PeriodKey, ScanList>>,
     /// Event-driven scan lists, keyed by the record's `EVNT` string. Fired
     /// synchronously (on the caller's thread) by [`Self::fire_event`], never
@@ -60,6 +154,20 @@ pub struct Scanner {
     io_intr: Mutex<HashMap<String, ScanList>>,
     stop: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// A weak handle to `self`, published by `start()`. `ensure_periodic_thread_at`
+    /// needs a `Weak<Scanner>` to hand each thread, and it is reachable from
+    /// `&self` methods (`add_periodic`) that have no `Arc<Self>` to downgrade.
+    /// `None` until `start()` runs, which is exactly the "not scanning yet"
+    /// state: `load_from_db()` registers every `.db` period before `start()`,
+    /// and `start()` spawns for all of them at once.
+    self_weak: Mutex<Option<Weak<Scanner>>>,
+    /// Period keys that already own a thread, so a second registration on a
+    /// running period joins the existing thread instead of spawning a rival
+    /// one (two threads on one key would double-process every member). Each
+    /// maps to that thread's retire flag: `remove_periodic` sets it (and
+    /// drops the entry) when the period's last member leaves, and the thread
+    /// exits on its next wake.
+    thread_keys: Mutex<HashMap<PeriodKey, Arc<AtomicBool>>>,
     /// Sender end of the bounded `scan_once` queue. `None` once `shutdown()`
     /// has closed it (dropping the sender is what makes the drain thread's
     /// blocked `recv()` return `Err` and exit).
@@ -83,11 +191,14 @@ impl Scanner {
             db,
             clock,
             sink,
+            async_registry: AsyncRegistry::new(),
             periodic: Mutex::new(HashMap::new()),
             events: Mutex::new(HashMap::new()),
             io_intr: Mutex::new(HashMap::new()),
             stop: Arc::new(AtomicBool::new(false)),
             threads: Mutex::new(Vec::new()),
+            self_weak: Mutex::new(None),
+            thread_keys: Mutex::new(HashMap::new()),
             scan_once_tx: Mutex::new(Some(tx)),
             scan_once_rx: Mutex::new(Some(rx)),
             scan_once_dropped: AtomicU64::new(0),
@@ -139,28 +250,11 @@ impl Scanner {
     /// ordering, per-record panic isolation, and deferred-recursion handling
     /// uniform with every other caller of `process_ids` (R-T8-FLUSH).
     ///
-    /// This is a NEW, PHAS-ordered sweep distinct from the pre-existing
-    /// `IocSource::process_pini` (`source.rs`), which sweeps in `.db`
-    /// definition order only; that older path is left untouched (R-T8-DUP).
+    /// This sweep and the pre-existing `IocSource::process_pini`
+    /// (`source.rs`) now share one ordering via `RecordDb::pini_order`, so
+    /// the two can no longer disagree about processing order (R-T8-DUP).
     pub fn process_pini(&self) {
-        let mut sweep: Vec<(i32, usize, RecordId)> = self
-            .db
-            .order()
-            .iter()
-            .enumerate()
-            .filter_map(|(order_index, &id)| {
-                let (pini, phas) = self
-                    .db
-                    .with_set(id.set, |set| {
-                        let common = &set.get(id).common;
-                        (common.pini, common.phas)
-                    });
-                pini.then_some((phas, order_index, id))
-            })
-            .collect();
-        sweep.sort_by_key(|&(phas, order_index, _)| (phas, order_index));
-        let ids: Vec<RecordId> = sweep.into_iter().map(|(_, _, id)| id).collect();
-        self.process_ids(&ids);
+        self.process_ids(&self.db.pini_order());
     }
 
     /// Populate every scan list from the loaded database.
@@ -195,45 +289,129 @@ impl Scanner {
                 }
             };
             match spec {
-                ScanSpec::Periodic(period) => self.add_periodic(id, phas, period),
+                ScanSpec::Periodic(period) => {
+                    if let Err(e) = self.add_periodic(id, phas, period) {
+                        tracing::warn!(
+                            "load_from_db: {:?} has an unschedulable SCAN period ({e}); \
+                             leaving it off every scan list",
+                            id
+                        );
+                    }
+                }
                 ScanSpec::Event => self.add_event(id, phas, evnt),
                 ScanSpec::IoIntr | ScanSpec::Passive => {}
             }
         }
     }
 
+    /// The scan-grid key for `period`, or why it cannot be scheduled.
+    fn period_key(period: Duration) -> Result<PeriodKey, ScanRegisterError> {
+        let key =
+            PeriodKey::try_from(period.as_nanos()).map_err(|_| ScanRegisterError::PeriodTooLong)?;
+        if key == 0 {
+            return Err(ScanRegisterError::ZeroPeriod);
+        }
+        Ok(key)
+    }
+
+    /// Could `id` be moved onto the periodic list for `period`? Callers that
+    /// must validate *before* mutating anything (the SCAN put path, whose
+    /// contract is that a rejected put leaves membership and `scan_raw`
+    /// untouched) call this first; `add_periodic` re-checks, so this is an
+    /// early-out, not a precondition anyone can skip.
+    ///
+    /// The [`MAX_PERIODIC_THREADS`] check credits `id`'s own move: a record
+    /// that is the only member of its current period frees that period when
+    /// it leaves, so moving it never needs a net new slot. The answer is a
+    /// snapshot; a concurrent registration can still fill the last slot
+    /// before the caller's `add_periodic`, which then refuses.
+    pub fn check_period(&self, id: RecordId, period: Duration) -> Result<(), ScanRegisterError> {
+        let key = Self::period_key(period)?;
+        let periodic = self.periodic.lock().unwrap();
+        if periodic.contains_key(&key) {
+            return Ok(());
+        }
+        let freed = periodic.values().any(|list| list.len() == 1 && list.snapshot() == [id]);
+        if periodic.len() - usize::from(freed) >= MAX_PERIODIC_THREADS {
+            return Err(ScanRegisterError::TooManyPeriods);
+        }
+        Ok(())
+    }
+
     /// Add `id` (with scan priority `phas`) to the periodic scan list for
     /// `period`. Lists are created lazily; `start()` spawns one thread per
     /// non-empty list.
     ///
-    /// A zero period is refused (warned once, not registered): `periodic_loop`
-    /// computes deadlines as `start + n*period`, so a zero period makes every
-    /// deadline equal to `start`, and the overrun catch-up loop
+    /// A period that cannot be scheduled -- zero, or rounding to zero whole
+    /// nanoseconds, or too long to fit `u64` nanoseconds -- is refused with
+    /// `ScanRegisterError` rather than registered: `periodic_loop` computes
+    /// deadlines as `start + n*period`, so a zero period makes every deadline
+    /// equal to `start`, and the overrun catch-up loop
     /// (`while deadline_for(n) <= now`) would then spin `n` all the way to
     /// `u64::MAX` on the very first tick instead of ever sleeping again --
     /// a livelock that pegs a CPU core forever.
-    pub fn add_periodic(&self, id: RecordId, phas: i32, period: Duration) {
-        if period.is_zero() {
-            tracing::warn!(
-                "add_periodic: ignoring zero-period scan request for {:?} (would livelock)",
-                id
-            );
-            return;
+    ///
+    /// A period not already registered is refused with
+    /// [`ScanRegisterError::TooManyPeriods`] once [`MAX_PERIODIC_THREADS`]
+    /// distinct periods exist; joining an existing period always succeeds.
+    pub fn add_periodic(
+        &self,
+        id: RecordId,
+        phas: i32,
+        period: Duration,
+    ) -> Result<(), ScanRegisterError> {
+        let key = Self::period_key(period)?;
+        let anchor = self.clock.now();
+        // Held across the spawn below (lock order `periodic` -> `threads` ->
+        // `thread_keys`), so `remove_periodic` cannot empty and retire this
+        // key between the insert and the spawn -- that would leave a thread
+        // running for a period nobody is on, never to be retired.
+        let mut periodic = self.periodic.lock().unwrap();
+        if !periodic.contains_key(&key) && periodic.len() >= MAX_PERIODIC_THREADS {
+            return Err(ScanRegisterError::TooManyPeriods);
         }
-        let key = period.as_nanos() as u64;
-        self.periodic
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .insert(id, phas);
+        periodic.entry(key).or_default().insert(id, phas);
+        // A period first seen after `start()` has no thread yet: give it one.
+        // Before `start()` this is a no-op and `start()` does the spawning.
+        self.ensure_periodic_thread_at(key, anchor);
+        Ok(())
     }
 
-    /// Remove `id` from every periodic scan list it belongs to.
+    /// Remove `id` from every periodic scan list it belongs to. A list left
+    /// empty is removed and its thread retired: the thread exits on its next
+    /// wake, which this call triggers immediately rather than leaving it to
+    /// sleep out its period (up to `MAX_SCAN_PERIOD_SECS`).
     pub fn remove_periodic(&self, id: RecordId) {
-        let mut periodic = self.periodic.lock().unwrap();
-        for list in periodic.values_mut() {
-            list.remove(id);
+        let mut retired_any = false;
+        {
+            let mut periodic = self.periodic.lock().unwrap();
+            let mut emptied = Vec::new();
+            for (key, list) in periodic.iter_mut() {
+                if list.remove(id) && list.is_empty() {
+                    emptied.push(*key);
+                }
+            }
+            if emptied.is_empty() {
+                return;
+            }
+            // Retire under the `periodic` lock, so a concurrent
+            // `add_periodic` of the same period either lands first (the list
+            // is not empty, nothing is retired) or after (it finds no thread
+            // and spawns a fresh one).
+            let mut thread_keys = self.thread_keys.lock().unwrap();
+            for key in emptied {
+                periodic.remove(&key);
+                if let Some(retired) = thread_keys.remove(&key) {
+                    retired.store(true, Ordering::SeqCst);
+                    retired_any = true;
+                }
+            }
+        }
+        if retired_any {
+            // After the flag stores: `sleep_until_or` checks the flag under
+            // the clock's own lock, so this wake cannot be lost. Other scan
+            // threads wake too; see the early-wake check in `periodic_loop`.
+            self.clock.wake_all();
         }
     }
 
@@ -311,6 +489,89 @@ impl Scanner {
         self.process_ids(&ids);
     }
 
+    /// Spawn the periodic thread for `key` if it does not already have one.
+    ///
+    /// Idempotent per key, and a deliberate no-op in two states: before
+    /// `start()` (no `self_weak` published yet -- `start()` will spawn for
+    /// every registered key in one go) and after `shutdown()` (`stop` set --
+    /// spawning then would resurrect a scanner the owner has torn down).
+    ///
+    /// `anchor` is captured on the *calling* thread rather than inside the
+    /// thread body, for the same reason `start()` does it: a caller that
+    /// advances a `ManualClock` immediately afterwards must not race the
+    /// spawned thread into computing deadlines from an already-advanced
+    /// origin. It is captured *now* rather than reusing `start()`'s anchor
+    /// because `periodic_loop`'s catch-up loop walks `n` forward one tick at
+    /// a time from the anchor -- a period registered long after `start()`
+    /// would otherwise spin through every tick since then before its first
+    /// sleep.
+    ///
+    /// The caller holds the `periodic` lock (see `add_periodic`, `start`).
+    fn ensure_periodic_thread_at(&self, key: PeriodKey, anchor: std::time::Instant) {
+        // `weak` (not a strong clone) so the thread never keeps `Scanner`
+        // alive: if it did, `Scanner::drop` could never run while any thread
+        // was alive (a strong-ref cycle), leaking the thread whenever a
+        // caller drops its handle without calling `shutdown()` explicitly.
+        // `clock` and `stop` are independent `Arc`s (not `Arc<Self>`), so
+        // cloning them does not re-create that cycle -- they let the thread
+        // sleep and observe shutdown without ever needing to upgrade `weak`
+        // for that.
+        let Some(weak) = self.self_weak.lock().unwrap().clone() else {
+            return;
+        };
+        let clock = self.clock.clone();
+        let stop = self.stop.clone();
+        let period = Duration::from_nanos(key);
+        // Take `threads` FIRST, then decide. `shutdown()` stores `stop`
+        // BEFORE it locks `threads` to take the handles, so either we push
+        // first (and shutdown joins us) or we observe `stop == true` here and
+        // never spawn: there is no window in which a thread is spawned but
+        // missed by the join. `thread_keys` is claimed only once the spawn is
+        // certain -- claiming it earlier and then returning on `stop` would
+        // leave a key permanently marked as owning a thread it never got.
+        // Lock order is `periodic` -> `threads` -> `thread_keys`
+        // (`remove_periodic` takes `periodic` -> `thread_keys`), so there is
+        // no cycle.
+        let mut threads = self.threads.lock().unwrap();
+        if self.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let retired = {
+            let mut thread_keys = self.thread_keys.lock().unwrap();
+            if thread_keys.contains_key(&key) {
+                return;
+            }
+            let retired = Arc::new(AtomicBool::new(false));
+            thread_keys.insert(key, retired.clone());
+            retired
+        };
+        // Drop the handles of reaped threads that have already exited, so a
+        // client cycling SCAN periods cannot grow this vec without bound.
+        threads.retain(|h| !h.is_finished());
+        // `Builder::spawn` (not `thread::spawn`) so an OS failure to create
+        // the thread (e.g. resource exhaustion) returns `Err` instead of
+        // panicking here, under the `threads` lock -- a panic here would
+        // poison the mutex, and every later `lock().unwrap()` on it
+        // (including the one in `Drop::drop` -> `shutdown()`) would then
+        // itself panic, aborting the process instead of degrading. On `Err`
+        // the key is un-claimed so a later retry (another `add_periodic` on
+        // the same period, or a future `start()`) is not permanently blocked
+        // by a thread that never came into existence.
+        match std::thread::Builder::new()
+            .name(format!("spvirit-scan-{key}"))
+            .spawn(move || Self::periodic_loop(weak, clock, stop, retired, key, period, anchor))
+        {
+            Ok(handle) => threads.push(handle),
+            Err(e) => {
+                self.thread_keys.lock().unwrap().remove(&key);
+                tracing::error!(
+                    "failed to spawn periodic scan thread for period {:?}: {e}",
+                    period
+                );
+            }
+        }
+    }
+
     /// Spawn one thread per non-empty periodic scan list. Call once; `self`
     /// must be held in an `Arc` so each thread can hold a strong reference.
     pub fn start(self: &Arc<Self>) {
@@ -318,14 +579,15 @@ impl Scanner {
         // (spec §PINI): startup-time initialization must finish first, not
         // race the first periodic pass.
         self.process_pini();
-        let keys: Vec<PeriodKey> = {
-            let periodic = self.periodic.lock().unwrap();
-            periodic
-                .iter()
-                .filter(|(_, list)| !list.is_empty())
-                .map(|(key, _)| *key)
-                .collect()
-        };
+        // Publish the weak handle BEFORE the key snapshot below (not just
+        // before spawning): an `add_periodic` that lands between the
+        // snapshot and the publish would otherwise see a `None` weak (its
+        // own `ensure_periodic_thread_at` would no-op) while also being missed
+        // by this loop's snapshot, since it started before the put arrived.
+        // Publishing first closes that window; `thread_keys` dedupes the
+        // remaining, harmless overlap where both this loop and a racing
+        // `add_periodic` observe the same key.
+        *self.self_weak.lock().unwrap() = Some(Arc::downgrade(self));
         // Anchor every thread's schedule to `now` at the moment `start()` is
         // called, not to whenever the OS happens to actually run the spawned
         // thread body. Capturing `self.clock.now()` lazily inside the thread
@@ -333,23 +595,22 @@ impl Scanner {
         // `start()` returns (the thread could see an already-advanced clock
         // and silently compute deadlines from the wrong origin).
         let anchor = self.clock.now();
-        let mut threads = self.threads.lock().unwrap();
-        for key in keys {
-            // `weak` (not a strong clone) so the thread never keeps `Scanner`
-            // alive: if it did, `Scanner::drop` could never run while any
-            // thread was alive (a strong-ref cycle), leaking the thread
-            // whenever a caller drops its handle without calling
-            // `shutdown()` explicitly. `clock` and `stop` are independent
-            // `Arc`s (not `Arc<Self>`), so cloning them does not re-create
-            // that cycle -- they let the thread sleep and observe shutdown
-            // without ever needing to upgrade `weak` for that.
-            let weak = Arc::downgrade(self);
-            let clock = self.clock.clone();
-            let stop = self.stop.clone();
-            let period = Duration::from_nanos(key);
-            threads.push(std::thread::spawn(move || {
-                Self::periodic_loop(weak, clock, stop, key, period, anchor)
-            }));
+        {
+            // Held across the spawns, as in `add_periodic`: a racing
+            // `remove_periodic` must not retire a key between this loop
+            // reading it and its thread being spawned.
+            let periodic = self.periodic.lock().unwrap();
+            let keys: Vec<PeriodKey> = periodic
+                .iter()
+                .filter(|(_, list)| !list.is_empty())
+                .map(|(key, _)| *key)
+                .collect();
+            for key in keys {
+                // Every thread in this batch shares one anchor, so a caller
+                // that advances the clock right after `start()` returns sees
+                // one coherent grid across all of them.
+                self.ensure_periodic_thread_at(key, anchor);
+            }
         }
         // The `scan_once` drain/callback thread: drains the bounded queue and
         // processes each request via `process_ids`. Like the periodic threads
@@ -399,10 +660,14 @@ impl Scanner {
     /// (falls out of scope) before the next `sleep_until` -- so this thread
     /// never holds a strong `Arc<Scanner>` while parked, which is exactly
     /// what lets an owner's `drop()` reclaim it.
+    ///
+    /// `retired` is set by `remove_periodic` when this period's last member
+    /// leaves; the thread then exits, exactly as on `stop`.
     fn periodic_loop(
         weak: Weak<Self>,
         clock: Arc<dyn Clock>,
         stop: Arc<AtomicBool>,
+        retired: Arc<AtomicBool>,
         key: PeriodKey,
         period: Duration,
         start: std::time::Instant,
@@ -414,12 +679,18 @@ impl Scanner {
         // schedule anchored to `start` (an absolute grid) instead of
         // `now + period` (which would drift under a slow pass).
         let deadline_for = |n: u64| start + Duration::from_nanos(Self::deadline_nanos(key, n));
+        let done = || stop.load(Ordering::Relaxed) || retired.load(Ordering::SeqCst);
         let mut n: u64 = 1;
-        while !stop.load(Ordering::Relaxed) {
+        while !done() {
             let deadline = deadline_for(n);
-            clock.sleep_until(deadline);
-            if stop.load(Ordering::Relaxed) {
+            clock.sleep_until_or(deadline, &done);
+            if done() {
                 break;
+            }
+            // `wake_all` also fires when *another* period is retired, so a
+            // wake short of the deadline is not a tick: sleep again.
+            if clock.now() < deadline {
+                continue;
             }
             // `Scanner` may already be gone (owner dropped their last handle
             // without calling `shutdown()`): in that case there is nothing
@@ -501,9 +772,14 @@ impl Scanner {
     /// the batch continues.
     pub fn process_ids(&self, ids: &[RecordId]) {
         for &id in ids {
-            let clock = self.clock.clone();
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut ctx = ProcCtx::with_clock(clock.as_ref());
+                // Borrowed, not cloned: the closure already captures `&self`,
+                // so an `Arc` clone per record per tick buys nothing. The
+                // registry rides along the same way the clock does -- this is
+                // what makes a bound record's `AsyncSupport::start` reachable
+                // for a `Scanner` driven directly. (`IocSource`'s put and PINI
+                // paths still build `ProcCtx::new()`; a known follow-up.)
+                let mut ctx = ProcCtx::with_async(self.clock.as_ref(), &self.async_registry);
                 let res = self.db.with_set(id.set, |set| process(set, id, &mut ctx));
                 (
                     res,
@@ -530,15 +806,100 @@ impl Scanner {
             }
         }
     }
+
+    /// Bind `id` to the device support that drives it. A later bind for the
+    /// same record replaces the earlier one.
+    ///
+    /// This is the production counterpart to `.db` device support in Base,
+    /// which has no equivalent here (see the `io_intr` field's divergence
+    /// note): there is no `DTYP`-driven device layer, so a driver registers
+    /// itself in Rust, exactly as it does for I/O-Intr scanning.
+    pub fn bind_async(&self, id: RecordId, support: Arc<dyn AsyncSupport>) {
+        self.async_registry.bind(id, support);
+    }
+
+    /// Finish a record whose bound support reported its operation outstanding:
+    /// the device's callback calls this when the operation completes.
+    ///
+    /// Mirrors one iteration of [`Self::process_ids`] deliberately -- same
+    /// `catch_unwind` isolation of the processing body (and, as there, the
+    /// `sink.flush` and deferred drain run outside it), same context, same
+    /// `sink.flush` after the lock is dropped -- so a completion-driven update
+    /// is indistinguishable downstream from a scan-driven one. The difference
+    /// is only the pass it runs: [`crate::process::complete_async`] rather
+    /// than `process`, because `process`'s PACT brake returns early for
+    /// exactly the state a pending async record is in.
+    ///
+    /// Idempotent by construction: `crate::process::complete_async` returns
+    /// `Ok(())` without processing if PACT is already clear, so a duplicate
+    /// callback is a no-op rather than a second pass. That guarantee is per PACT
+    /// cycle, not per operation: in its `pact == true` branch the support must
+    /// confirm its own operation has finished and return
+    /// [`AsyncOutcome::Pending`](crate::process::AsyncOutcome::Pending)
+    /// otherwise, exactly as Base device support must.
+    ///
+    /// **Contract.** The bound support's `start` runs while this pass holds the
+    /// record's lock-set mutex, which is not re-entrant. `start` must not
+    /// block, and must not call back into the `Scanner` (no `complete_async`,
+    /// `scan_once`, `fire_event` or `process_ids` for any record in the same
+    /// lock set); an operation that finishes immediately must return
+    /// [`AsyncOutcome::Complete`](crate::process::AsyncOutcome::Complete)
+    /// rather than calling this. Do not call this while holding any driver
+    /// lock that `start` also takes: this acquires the lock-set mutex, and
+    /// `start` runs under it, so that is a lock inversion.
+    pub fn complete_async(&self, id: RecordId) -> Result<(), AsyncCompleteError> {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut ctx = ProcCtx::with_async(self.clock.as_ref(), &self.async_registry);
+            let res = self
+                .db
+                .with_set(id.set, |set| crate::process::complete_async(set, id, &mut ctx));
+            (
+                res,
+                ctx.take_events(),
+                std::mem::take(&mut ctx.trace),
+                std::mem::take(&mut ctx.deferred),
+            )
+        }));
+        match outcome {
+            Ok((res, events, trace, deferred)) => {
+                // Flush before reporting the error: a pass that failed part
+                // way still produced the monitors it produced, exactly as
+                // `process_ids` treats a `ProcError`.
+                self.sink.flush(events, trace);
+                if !deferred.is_empty() {
+                    self.process_ids(&deferred);
+                }
+                res.map_err(AsyncCompleteError::Proc)
+            }
+            Err(_) => {
+                tracing::warn!("async completion for {:?} panicked; contained", id);
+                Err(AsyncCompleteError::Panicked)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 impl Scanner {
+    /// How many periodic scan threads are still running (spawned and not yet
+    /// finished). The `scan_once` drain thread is not counted: it lives in
+    /// `drain_thread`, not `threads`.
+    pub fn periodic_thread_count(&self) -> usize {
+        self.threads.lock().unwrap().iter().filter(|h| !h.is_finished()).count()
+    }
+
     /// The processing order of the periodic list for `period`, or empty if
     /// there is no such list. Test-only observability for Task 12's put
     /// routing, which drives membership but cannot read it back from `Common`.
     pub fn periodic_members(&self, period: Duration) -> Vec<RecordId> {
-        let key = period.as_nanos() as u64;
+        let Ok(key) = Self::period_key(period) else {
+            // A period that cannot be scheduled is on no list by
+            // construction; going through the same key derivation as
+            // `add_periodic` (rather than a raw `as u64`, which would wrap an
+            // out-of-range period into an arbitrary key) is what makes that
+            // guarantee checkable.
+            return Vec::new();
+        };
         self.periodic
             .lock()
             .unwrap()
@@ -665,6 +1026,91 @@ mod tests {
     }
 
     #[test]
+    fn a_period_first_seen_after_start_gets_its_own_scan_thread() {
+        // The headline bug: SCAN puts arrive after start(), so a period that
+        // nobody had registered when start() enumerated the map used to get a
+        // scan list with no thread behind it -- the record silently never
+        // scanned. Both records are TPRO'd so `passes()` counts every pass.
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:OLD\") {\n field(INP, \"1\")\n field(TPRO, \"1\")\n}\n\
+             record(ai, \"PV:NEW\") {\n field(INP, \"2\")\n field(TPRO, \"1\")\n}\n",
+        ));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let old = db.lookup("PV:OLD").unwrap();
+        let new = db.lookup("PV:NEW").unwrap();
+
+        // Only the 100ms period exists when start() runs.
+        scanner.add_periodic(old, 0, Duration::from_millis(100)).expect("period is schedulable");
+        scanner.start();
+
+        // ...and now a period start() never saw, exactly as a SCAN put does.
+        scanner.add_periodic(new, 0, Duration::from_millis(250)).expect("period is schedulable");
+
+        manual.advance(Duration::from_millis(250));
+        wait_until(|| sink.passes("PV:NEW") >= 1);
+        assert!(
+            sink.passes("PV:NEW") >= 1,
+            "a period registered after start() must still be scanned"
+        );
+
+        scanner.shutdown();
+    }
+
+    #[test]
+    fn a_second_record_on_a_running_period_does_not_spawn_a_second_thread() {
+        // Guard on the fix above: ensure_periodic_thread must be idempotent
+        // per period key. Two threads on one key would each snapshot the same
+        // list every tick, so every member would process twice per tick.
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:A\") {\n field(INP, \"1\")\n field(TPRO, \"1\")\n}\n\
+             record(ai, \"PV:B\") {\n field(INP, \"2\")\n field(TPRO, \"1\")\n}\n",
+        ));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let a = db.lookup("PV:A").unwrap();
+        let b = db.lookup("PV:B").unwrap();
+
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
+        scanner.start();
+        // Same period, registered after start(): joins the existing thread.
+        scanner.add_periodic(b, 1, Duration::from_millis(100)).expect("period is schedulable");
+
+        // Structural guard, not just behavioural: a double-spawn bug could
+        // still pass the pass-count assertions below if both threads happened
+        // to run in lockstep (each processing the list once per tick would
+        // look identical to a single thread doing so). Assert directly on
+        // `thread_keys` (exactly one key claimed) and `threads` (exactly one
+        // periodic thread -- the drain thread lives in the separate
+        // `drain_thread` field, not in `threads`) so a rival second thread on
+        // the same key is caught even if its timing happened to coincide.
+        assert_eq!(
+            scanner.thread_keys.lock().unwrap().len(),
+            1,
+            "exactly one period key must be claimed"
+        );
+        assert_eq!(
+            scanner.threads.lock().unwrap().len(),
+            1,
+            "exactly one periodic thread must exist for the shared period"
+        );
+
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| sink.passes("PV:B") >= 1);
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| sink.passes("PV:B") >= 2);
+
+        assert_eq!(sink.passes("PV:B"), 2, "exactly one pass per tick, not two");
+        assert_eq!(sink.passes("PV:A"), 2, "exactly one pass per tick, not two");
+
+        scanner.shutdown();
+    }
+
+    #[test]
     fn process_ids_processes_each_record_and_flushes_monitors() {
         let (scanner, sink, db) = scanner_over(
             "record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n\
@@ -700,8 +1146,8 @@ mod tests {
         fn now(&self) -> std::time::Instant {
             self.inner.now()
         }
-        fn sleep_until(&self, deadline: std::time::Instant) {
-            self.inner.sleep_until(deadline)
+        fn sleep_until_or(&self, deadline: std::time::Instant, cancelled: &dyn Fn() -> bool) {
+            self.inner.sleep_until_or(deadline, cancelled)
         }
         fn unix_nanos(&self) -> u64 {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -739,8 +1185,8 @@ mod tests {
         let b = db.lookup("PV:B").unwrap();
         // PHAS order puts A first, so A's process() (and the injected panic)
         // runs before B's on pass 1.
-        scanner.add_periodic(a, 0, Duration::from_millis(100));
-        scanner.add_periodic(b, 1, Duration::from_millis(100));
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
+        scanner.add_periodic(b, 1, Duration::from_millis(100)).expect("period is schedulable");
         scanner.start();
 
         manual.advance(Duration::from_millis(100));
@@ -768,7 +1214,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(100)); // 10 Hz
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable"); // 10 Hz
         scanner.start();
 
         // Advance one simulated second in 100ms steps; yield so the thread runs.
@@ -794,8 +1240,8 @@ mod tests {
         let a = db.lookup("PV:A").unwrap();
         let b = db.lookup("PV:B").unwrap();
         // Both at 1 Hz; PV:B (PHAS 0) must be posted before PV:A (PHAS 1).
-        scanner.add_periodic(a, 1, Duration::from_secs(1));
-        scanner.add_periodic(b, 0, Duration::from_secs(1));
+        scanner.add_periodic(a, 1, Duration::from_secs(1)).expect("period is schedulable");
+        scanner.add_periodic(b, 0, Duration::from_secs(1)).expect("period is schedulable");
         scanner.start();
 
         clock.advance(Duration::from_secs(1));
@@ -849,7 +1295,7 @@ mod tests {
         });
         let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(100));
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
         scanner.start();
 
         // Cross the first deadline (t=100ms); the pass itself then advances
@@ -902,7 +1348,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(50));
+        scanner.add_periodic(a, 0, Duration::from_millis(50)).expect("period is schedulable");
         scanner.start();
         assert_eq!(scanner.threads.lock().unwrap().len(), 1);
         // shutdown() must return (i.e. actually join) even though the thread
@@ -923,7 +1369,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(100));
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
         scanner.start();
 
         clock.advance(Duration::from_millis(100));
@@ -932,9 +1378,9 @@ mod tests {
 
         // `remove_periodic` must actually drop the id from the scan list
         // (not be a no-op stub): once removed, further deadlines on the same
-        // thread must snapshot an empty id set and post nothing further, even
-        // though the periodic thread itself keeps running (it is not torn
-        // down just because its list became empty).
+        // period must post nothing further. (Since F3 the emptied period is
+        // also reaped and its thread exits; that is pinned separately by
+        // `an_emptied_period_is_reaped_and_its_thread_exits`.)
         scanner.remove_periodic(a);
         for _ in 0..3 {
             clock.advance(Duration::from_millis(100));
@@ -955,6 +1401,132 @@ mod tests {
     }
 
     #[test]
+    fn an_emptied_period_is_reaped_and_its_thread_exits() {
+        // F3: every distinct period owns an OS thread. When the last member
+        // leaves a period, the key must go and the thread must exit; otherwise
+        // a client cycling one record through distinct SCAN periods leaks one
+        // thread per period.
+        let (scanner, _sink, db) = scanner_over("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n");
+        let scanner = Arc::new(scanner);
+        let a = db.lookup("PV:A").unwrap();
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
+        scanner.start();
+        assert_eq!(scanner.periodic_thread_count(), 1);
+
+        scanner.remove_periodic(a);
+        assert!(
+            scanner.periodic.lock().unwrap().is_empty(),
+            "an emptied period's key must be removed"
+        );
+        // No clock advance: the thread is parked on a deadline that never
+        // arrives, so only the reap itself can make it exit.
+        wait_until(|| scanner.periodic_thread_count() == 0);
+        assert!(scanner.thread_keys.lock().unwrap().is_empty());
+        scanner.shutdown();
+    }
+
+    #[test]
+    fn a_record_moving_to_another_period_and_back_keeps_scanning_on_one_thread() {
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:A\") {\n field(INP, \"1\")\n field(TPRO, \"1\")\n}\n",
+        ));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let a = db.lookup("PV:A").unwrap();
+        let (p_a, p_b) = (Duration::from_millis(100), Duration::from_millis(250));
+
+        scanner.add_periodic(a, 0, p_a).expect("period is schedulable");
+        scanner.start();
+        manual.advance(p_a);
+        wait_until(|| sink.passes("PV:A") >= 1);
+
+        // A -> B, the way `put_scan` moves a record.
+        scanner.remove_periodic(a);
+        scanner.add_periodic(a, 0, p_b).expect("period is schedulable");
+        wait_until(|| scanner.periodic_thread_count() == 1);
+        assert_eq!(scanner.periodic_members(p_b), vec![a]);
+        manual.advance(p_b);
+        wait_until(|| sink.passes("PV:A") >= 2);
+
+        // ...and back to A, whose old thread has been reaped: a fresh one
+        // must pick the period up again.
+        scanner.remove_periodic(a);
+        scanner.add_periodic(a, 0, p_a).expect("period is schedulable");
+        wait_until(|| scanner.periodic_thread_count() == 1);
+        assert_eq!(scanner.periodic_members(p_a), vec![a]);
+        manual.advance(p_a);
+        wait_until(|| sink.passes("PV:A") >= 3);
+        assert_eq!(scanner.thread_keys.lock().unwrap().len(), 1);
+
+        scanner.shutdown();
+    }
+
+    #[test]
+    fn reaping_one_period_does_not_make_another_fire_early() {
+        // A reap wakes sleeping scan threads so the orphaned one can exit. A
+        // thread whose period is still live must treat that wake as spurious
+        // and go back to sleep, not run an extra pass.
+        let db = Arc::new(build_db(
+            "record(ai, \"PV:A\") {\n field(INP, \"1\")\n field(TPRO, \"1\")\n}\n\
+             record(ai, \"PV:B\") {\n field(INP, \"2\")\n}\n",
+        ));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let a = db.lookup("PV:A").unwrap();
+        let b = db.lookup("PV:B").unwrap();
+        scanner.add_periodic(a, 0, Duration::from_millis(100)).expect("period is schedulable");
+        scanner.add_periodic(b, 0, Duration::from_millis(250)).expect("period is schedulable");
+        scanner.start();
+
+        scanner.remove_periodic(b);
+        wait_until(|| scanner.periodic_thread_count() == 1);
+        // Give a wrongly-woken A thread the chance to have fired.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(sink.passes("PV:A"), 0, "no deadline has passed; A must not fire");
+
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| sink.passes("PV:A") >= 1);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(sink.passes("PV:A"), 1, "exactly one deadline has passed");
+        scanner.shutdown();
+    }
+
+    #[test]
+    fn a_new_period_beyond_the_cap_is_refused_but_existing_periods_still_join() {
+        // F3: each distinct period is an OS thread, so the number of distinct
+        // periods is capped. Many records sharing a few periods (every real
+        // configuration) are unaffected.
+        let mut src = String::new();
+        for i in 0..70 {
+            src.push_str(&format!("record(ai, \"PV:{i}\") {{\n field(INP, \"1\")\n}}\n"));
+        }
+        let (scanner, _sink, db) = scanner_over(&src);
+        let scanner = Arc::new(scanner);
+        scanner.start();
+        let id = |i: usize| db.lookup(&format!("PV:{i}")).unwrap();
+        let period = |i: usize| Duration::from_millis(1000 + i as u64);
+
+        for i in 0..64 {
+            scanner.add_periodic(id(i), 0, period(i)).expect("within the cap");
+        }
+        let refused = scanner.add_periodic(id(64), 0, period(64));
+        assert!(refused.is_err(), "a 65th distinct period must be refused, got {refused:?}");
+        assert!(scanner.periodic_members(period(64)).is_empty());
+        assert_eq!(scanner.periodic_thread_count(), 64);
+        // Joining an existing period needs no new thread, so it is allowed.
+        for i in 64..70 {
+            scanner.add_periodic(id(i), 0, period(0)).expect("joining an existing period");
+        }
+        assert_eq!(scanner.periodic_members(period(0)).len(), 7);
+        assert_eq!(scanner.periodic_thread_count(), 64);
+        scanner.shutdown();
+    }
+
+    #[test]
     fn drop_without_explicit_shutdown_reclaims_the_thread() {
         // Fix 1: the periodic thread holds only a `Weak<Scanner>` (see
         // `periodic_loop`'s doc comment), never a strong `Arc<Scanner>`, so
@@ -970,7 +1542,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::from_millis(50));
+        scanner.add_periodic(a, 0, Duration::from_millis(50)).expect("period is schedulable");
         scanner.start();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -995,7 +1567,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
         let a = db.lookup("PV:A").unwrap();
-        scanner.add_periodic(a, 0, Duration::ZERO);
+        assert_eq!(scanner.add_periodic(a, 0, Duration::ZERO), Err(ScanRegisterError::ZeroPeriod));
         assert!(
             scanner.periodic.lock().unwrap().is_empty(),
             "a zero-period request must not be registered"
@@ -1007,6 +1579,33 @@ mod tests {
             "no thread should be spawned for a period with nothing registered"
         );
         scanner.shutdown();
+    }
+
+    #[test]
+    fn an_unschedulable_period_is_refused_rather_than_truncated() {
+        let (scanner, _sink, db) = scanner_over("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n");
+        let a = db.lookup("PV:A").unwrap();
+
+        // Sub-nanosecond: rounds to a zero-nanosecond grid step, which would
+        // livelock `periodic_loop`'s catch-up.
+        assert_eq!(
+            scanner.add_periodic(a, 0, Duration::from_nanos(0)),
+            Err(ScanRegisterError::ZeroPeriod)
+        );
+        // Past the u64-nanosecond grid: `as u64` used to wrap this into some
+        // unrelated short period and scan the record at the wrong rate.
+        let too_long = Duration::new(u64::MAX, 0);
+        assert_eq!(
+            scanner.add_periodic(a, 0, too_long),
+            Err(ScanRegisterError::PeriodTooLong)
+        );
+        assert!(
+            scanner.periodic_members(too_long).is_empty(),
+            "a refused period must leave the record off every list"
+        );
+        // The good case still registers.
+        assert_eq!(scanner.add_periodic(a, 0, Duration::from_secs(1)), Ok(()));
+        assert_eq!(scanner.periodic_members(Duration::from_secs(1)), vec![a]);
     }
 
     #[test]
@@ -1265,5 +1864,188 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("shutdown() did not return within 5s: self-join likely deadlocked");
+    }
+
+    /// Counts `start` calls and always reports the operation outstanding, so a
+    /// test can prove the engine reached a bound support at all.
+    struct RecordingSupport(std::sync::atomic::AtomicUsize);
+    impl crate::process::AsyncSupport for RecordingSupport {
+        fn start(
+            &self,
+            _record: &str,
+            _pact: bool,
+            _ctx: &mut ProcCtx,
+        ) -> crate::process::AsyncOutcome {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            crate::process::AsyncOutcome::Pending
+        }
+    }
+
+    #[test]
+    fn process_ids_reaches_a_bound_async_support() {
+        // `process_ids` is the only place the scan path builds a pass context.
+        // It used to call `ProcCtx::with_clock`, which hard-codes
+        // `async_registry: None` (`ctx.rs:90`), so a bound record processed
+        // synchronously and its support was never called. This pins the
+        // constructor: a regression to `with_clock` would silently make every
+        // bound record synchronous again.
+        let (scanner, sink, db) =
+            scanner_over("record(ai, \"PV:A\") {\n field(INP, \"1\")\n}\n");
+        let a = db.lookup("PV:A").unwrap();
+        let support = Arc::new(RecordingSupport(std::sync::atomic::AtomicUsize::new(0)));
+        scanner.bind_async(a, support.clone());
+
+        scanner.process_ids(&[a]);
+
+        assert_eq!(
+            support.0.load(Ordering::SeqCst),
+            1,
+            "a bound record's support must be consulted exactly once per pass"
+        );
+        assert_eq!(
+            sink.count("PV:A"),
+            0,
+            "an outstanding (Pending) operation posts nothing until it completes"
+        );
+    }
+
+    #[test]
+    fn a_bound_async_record_initiates_on_a_tick_and_completes_on_the_callback() {
+        // The end-to-end wiring: a periodic tick initiates the operation
+        // (DelaySupport reports Pending, so `record_body` returns with PACT
+        // set and posts nothing), and the device's own callback --
+        // `Scanner::complete_async` -- runs the second half, which posts the
+        // monitor and clears PACT. Entirely on the ManualClock: the only
+        // waiting is `wait_until`, which watches for the scan thread to react
+        // to an advance, never for wall-clock time to pass.
+        let db = Arc::new(build_db("record(ai, \"PV:SLOW\") {\n field(INP, \"7\")\n}\n"));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock.clone(), sink.clone()));
+        let slow = db.lookup("PV:SLOW").unwrap();
+
+        // The support reads the same clock the pass does, so its recorded
+        // deadline is on the timeline this test advances.
+        let support = Arc::new(crate::scan::delay::DelaySupport::new(
+            clock.clone(),
+            Duration::from_millis(50),
+        ));
+        scanner.bind_async(slow, support.clone());
+        scanner
+            .add_periodic(slow, 0, Duration::from_millis(100))
+            .expect("period is schedulable");
+        scanner.start();
+
+        // Tick 1 at t=100ms initiates.
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| support.deadline().is_some());
+        assert!(
+            !support.is_completed(),
+            "the initiating pass leaves the operation outstanding"
+        );
+        assert_eq!(
+            sink.count("PV:SLOW"),
+            0,
+            "an outstanding record posts nothing: record_body returns before \
+             the value/limits/monitor half"
+        );
+
+        // t=150ms: past the recorded deadline, and short of tick 2 at t=200ms,
+        // so nothing re-initiates underneath the completion.
+        manual.advance(Duration::from_millis(50));
+        assert!(
+            manual.now() >= support.deadline().expect("initiated above"),
+            "the operation is due before the driver calls back"
+        );
+        scanner.complete_async(slow).expect("the completion pass succeeds");
+
+        assert!(
+            support.is_completed(),
+            "the completion pass hands the support pact == true, so it collects"
+        );
+        assert_eq!(
+            sink.count("PV:SLOW"),
+            1,
+            "the completion pass runs the second half and posts the monitor"
+        );
+
+        // Once-only: a duplicate callback finds PACT clear and does nothing.
+        let deadline_before = support.deadline();
+        scanner.complete_async(slow).expect("a duplicate completion is Ok");
+        assert_eq!(sink.count("PV:SLOW"), 1, "a duplicate completion must not post again");
+        assert!(
+            !db.with_set(slow.set, |set| set.get(slow).common.pact),
+            "PACT is clear after the completion and the duplicate"
+        );
+        assert_eq!(
+            support.deadline(),
+            deadline_before,
+            "a duplicate completion must not re-initiate the operation (a \
+             re-initiation at t=150ms would record a new deadline)"
+        );
+
+        scanner.shutdown();
+    }
+
+    /// Initiates normally (counting initiations) and panics on the completion
+    /// pass, so a test can prove a panicking completion is contained and does
+    /// not strand the record.
+    struct PanicOnCompleteSupport(std::sync::atomic::AtomicUsize);
+    impl crate::process::AsyncSupport for PanicOnCompleteSupport {
+        fn start(
+            &self,
+            _record: &str,
+            pact: bool,
+            _ctx: &mut ProcCtx,
+        ) -> crate::process::AsyncOutcome {
+            if pact {
+                panic!("device completion failed");
+            }
+            self.0.fetch_add(1, Ordering::SeqCst);
+            crate::process::AsyncOutcome::Pending
+        }
+    }
+
+    #[test]
+    fn a_panicking_completion_is_reported_and_the_next_tick_re_initiates() {
+        // A driver's completion panics inside `start`. `complete_async` must
+        // contain it and say so (not unwind into the driver's callback
+        // thread), `record_body`'s PactResetGuard must leave PACT clear, and
+        // the record must therefore not be braked: the next tick re-initiates.
+        let db = Arc::new(build_db("record(ai, \"PV:BAD\") {\n field(INP, \"7\")\n}\n"));
+        let manual = ManualClock::new();
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(manual.clone());
+        let sink = Arc::new(RecordingSink::default());
+        let scanner = Arc::new(Scanner::new(db.clone(), clock, sink.clone()));
+        let bad = db.lookup("PV:BAD").unwrap();
+        let support = Arc::new(PanicOnCompleteSupport(std::sync::atomic::AtomicUsize::new(0)));
+        scanner.bind_async(bad, support.clone());
+        scanner
+            .add_periodic(bad, 0, Duration::from_millis(100))
+            .expect("period is schedulable");
+        scanner.start();
+
+        // Tick 1 at t=100ms initiates and leaves PACT set.
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| support.0.load(Ordering::SeqCst) == 1);
+        assert!(
+            db.with_set(bad.set, |set| set.get(bad).common.pact),
+            "the initiating pass leaves PACT set"
+        );
+
+        // The completion callback panics inside `start`: contained, reported.
+        assert_eq!(scanner.complete_async(bad), Err(AsyncCompleteError::Panicked));
+        assert!(
+            !db.with_set(bad.set, |set| set.get(bad).common.pact),
+            "a panicking completion must not strand the record with PACT set"
+        );
+        assert_eq!(sink.count("PV:BAD"), 0, "a panicked completion posts nothing");
+
+        // Tick 2 at t=200ms is not braked: it re-initiates.
+        manual.advance(Duration::from_millis(100));
+        wait_until(|| support.0.load(Ordering::SeqCst) == 2);
+
+        scanner.shutdown();
     }
 }

@@ -33,10 +33,13 @@ also lets the builder check at construction time that the engine's records
 and the builtin store's do not overlap — see
 [Two stores, one server](#two-stores-one-server) below.
 
-Registering through `.ioc()` rather than `.source()` is what makes
-`<record>.<FIELD>` resolve for engine records and what enables the
-disjointness check. A `.source()` registration still works and is the right
-call for anything that is not a record store.
+Registering through `.ioc()` rather than `.source()` is what wires the
+engine into the server lifecycle: it gets the monitor registry (so host-side
+`set_value` reaches clients), its scan threads are started, its scanner
+receives named events, `<record>.<FIELD>` resolves for engine records, and the
+builder checks that its records do not overlap the builtin store's. A
+`.source()` registration gets none of these, so it is wrong for an engine but
+right for anything that is not a record store.
 
 ## Driving the engine from host code
 
@@ -68,7 +71,7 @@ handler, so `put` alone would process correctly and notify nobody.
 Two things the engine will not do:
 
 - **Records cannot be added after the engine is built.** `RecordId` is
-  `{set, index}`, assigned by partitioning the link graph into lock sets; a
+  `{set, slot}`, assigned by partitioning the link graph into lock sets; a
   late record can join two sets and invalidate every outstanding id. Base has
   the same restriction — `dbLoadRecords` after `iocInit` is unsupported.
 - **There is no `on_put`.** A callback would run arbitrary code inside
@@ -97,8 +100,8 @@ other sources interact:
   shadow.
 - **Field PVs follow the winning store.** `<record>.<FIELD>` resolves
   through whichever store claims `<record>`, so a client cannot tell which
-  store served a PV except by the differences documented in the A2 spec's
-  "Deviations" section.
+  store served a PV except by small differences in field coverage (each
+  store has its own field table).
 
 Registration order is builtin at 0, the engine (if any) at 5, and the
 `record-fields` tier-2 (`SimplePvStore`) field source at 10.
@@ -134,7 +137,19 @@ updated. `ioc.graph().lock_sets` shows the partitioning.
 
 ## Not yet implemented
 
-Scanning is sub-project B: `SCAN = 1 second` parses and appears in the
-diagnostics, but nothing drives it yet. `PINI` records process when you call
-`process_pini()`. Channel-access links (`CA`, `CP`, `CPP`) are sub-project C,
-and every other record type is sub-project D.
+Channel-access links (`CA`, `CP`, `CPP`) are sub-project C, and every other
+record type is sub-project D.
+
+## Scanning
+
+Scanning (sub-project B) is driven once the engine is registered with
+`.ioc()`: when the server starts, `PINI` records process (in `PHAS` order)
+and then one OS thread per distinct `SCAN` period starts; records sharing a
+period share its thread. At most 64 distinct periods run at once
+(`MAX_PERIODIC_THREADS`); a `.db` with more leaves the extra records off every
+scan list with a warning. `SCAN = Event` records process on
+`post_event`, through the engine's scanner registered as an event sink.
+Server shutdown stops the scan threads, waking any that are sleeping out a
+long period. Over the wire only `SCAN`, `EVNT` and `PHAS` are writable on
+this tier; a `SCAN` write that would need a 65th period is refused. An engine
+used without a server is not scanned; call `process_pini()` yourself.
