@@ -886,11 +886,14 @@ mod tests {
     /// the dispatcher task is mid-poll at the moment it is called.
     /// `JoinHandle::abort()` alone only takes effect at the task's next
     /// yield, and `rx.recv()` on a non-empty queue does not yield — so a
-    /// handler posted while the poll is still running would run after
-    /// `abort_dispatcher()` returned. Made deterministic by blocking the
-    /// dispatcher's worker thread inside the first handler (a synchronous
-    /// wait, so the poll stays in flight) while the test aborts and posts
-    /// again, then releasing it.
+    /// handler already queued while the poll is still running would run
+    /// after `abort_dispatcher()` returned. Made deterministic by blocking
+    /// the dispatcher's worker thread inside the first handler (a
+    /// synchronous wait, so the poll stays in flight), posting the second
+    /// event while it is blocked (so it is queued, past `post()`'s
+    /// `stopped` gate), then aborting and releasing it. Only the
+    /// dispatcher-side `stopped` check after `recv()` can stop that queued
+    /// handler.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_stops_handlers_even_while_the_dispatcher_is_mid_poll() {
         let events = Events::new();
@@ -923,18 +926,51 @@ mod tests {
         events.post("GO").await;
         entered_rx.await.expect("first handler entered");
 
-        // The dispatcher's poll is in flight on the other worker.
-        events.abort_dispatcher();
+        // The dispatcher's poll is in flight on the other worker. Queue the
+        // second handler while it is still blocked, then abort.
         events.post("GO").await;
+        events.abort_dispatcher();
         release_tx.send(()).unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(
             ran.load(Ordering::SeqCst),
             1,
-            "a handler posted after abort_dispatcher() ran"
+            "a handler queued before abort_dispatcher() ran after it returned"
         );
         // drain() after a stop must return promptly, not hang to its deadline.
+        tokio::time::timeout(std::time::Duration::from_secs(1), events.drain())
+            .await
+            .expect("drain() after abort_dispatcher() must not hang");
+    }
+
+    /// `post()` after `abort_dispatcher()` must not queue anything: the
+    /// `stopped` gate in `post()` rejects it, so the handler never runs and
+    /// `drain()` returns promptly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn post_after_abort_dispatcher_queues_nothing() {
+        let events = Events::new();
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = ran.clone();
+        events.add_handler(
+            "GO",
+            Arc::new(move |_s, _e| {
+                let r = r.clone();
+                Box::pin(async move {
+                    r.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        events.start_dispatcher(test_store());
+        events.abort_dispatcher();
+        events.post("GO").await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "a handler posted after abort_dispatcher() ran"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(1), events.drain())
             .await
             .expect("drain() after abort_dispatcher() must not hang");
