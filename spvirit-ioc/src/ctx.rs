@@ -57,7 +57,7 @@ pub struct ProcCtx<'a> {
     async_registry: Option<&'a crate::scan::AsyncRegistry>,
 }
 
-const SYSTEM_CLOCK: crate::clock::SystemClock = crate::clock::SystemClock;
+static SYSTEM_CLOCK: crate::clock::SystemClock = crate::clock::SystemClock::new();
 
 impl ProcCtx<'static> {
     pub fn new() -> ProcCtx<'static> {

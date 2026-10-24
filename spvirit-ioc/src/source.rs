@@ -229,7 +229,7 @@ impl IocSource {
             notify_tx: OnceLock::new(),
             notify_dropped: AtomicU64::new(0),
         });
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
         let sink: Arc<dyn ProcSink> = egress.clone();
         let scanner = Arc::new(Scanner::new(db.clone(), clock, sink));
         let source = IocSource {
@@ -462,7 +462,7 @@ impl IocSource {
         // well formed; only the Scanner knows whether the resulting period
         // fits its grid.
         if let ScanSpec::Periodic(period) = spec {
-            Scanner::check_period(period).map_err(|e| e.to_string())?;
+            self.scanner.check_period(id, period).map_err(|e| e.to_string())?;
         }
         // Take the lock only to read PHAS/EVNT and update scan_raw, then drop
         // it before any Scanner call — the Scanner takes its own list locks and
@@ -476,8 +476,11 @@ impl IocSource {
         self.scanner.remove_event(id);
         self.scanner.unregister_io_intr(id);
         match spec {
-            // Pre-validated above, so this cannot fail; propagate rather than
-            // ignore so a future edit that drops the pre-check is loud.
+            // Pre-validated above. The period checks cannot fail here; the
+            // MAX_PERIODIC_THREADS check can, if a concurrent put took the
+            // last free period slot since `check_period` -- then the client
+            // still gets the refusal, though this record has already left its
+            // old list. Propagate rather than ignore either way.
             ScanSpec::Periodic(period) => {
                 self.scanner.add_periodic(id, phas, period).map_err(|e| e.to_string())?
             }
@@ -1257,6 +1260,84 @@ mod tests {
             Some(ScalarValue::Str("eight".into())),
             "EVNT must reflect the written value"
         );
+    }
+
+    /// F3: a SCAN put of a distinct period spawns a scan thread. 100 records
+    /// written to 100 distinct periods must not create 100 threads: puts that
+    /// would exceed the cap are refused (the client sees the error) and change
+    /// nothing.
+    #[tokio::test]
+    async fn distinct_period_scan_puts_beyond_the_cap_are_refused() {
+        let raws = (0..100)
+            .map(|i| raw_with_field(&format!("PV:{i}"), "ai", "EGU", "C"))
+            .collect();
+        let source = IocSource::from_raw(raws).expect("build");
+        source.scanner_for_test().start();
+
+        let mut refused = 0;
+        for i in 0..100 {
+            let name = format!("PV:{i}.SCAN");
+            let value = format!("1.{:06} second", i + 1);
+            match Source::put(&source, &name, &s(&value)).await {
+                Ok(_) => {}
+                Err(err) => {
+                    refused += 1;
+                    assert!(err.contains("too many"), "refusal must say why, got: {err}");
+                    assert_eq!(
+                        source.field_value(&format!("PV:{i}"), "SCAN").await,
+                        Some(ScalarValue::Str("Passive".into())),
+                        "a refused SCAN put must not alter scan_raw"
+                    );
+                }
+            }
+        }
+        let threads = source.scanner_for_test().periodic_thread_count();
+        assert!(threads <= 64, "thread count must stay within the cap, got {threads}");
+        assert_eq!(refused, 100 - 64, "every put past the cap must be refused");
+    }
+
+    /// F3: one record cycled through many distinct periods leaves at most one
+    /// scan thread behind, because each move empties (and reaps) the old
+    /// period. Under the cap, these moves are never refused.
+    #[tokio::test]
+    async fn cycling_one_record_through_many_periods_leaves_one_thread() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        source.scanner_for_test().start();
+        for i in 0..100 {
+            let value = format!("1.{:06} second", i + 1);
+            Source::put(&source, "PV:A.SCAN", &s(&value))
+                .await
+                .expect("moving one record never exceeds the cap");
+        }
+        let scanner = source.scanner_for_test();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while scanner.periodic_thread_count() > 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(scanner.periodic_thread_count(), 1, "emptied periods must be reaped");
+    }
+
+    /// F3: a `SCAN = "1e9 second"` put leaves a scan thread sleeping for ~31
+    /// years. Shutdown must still return promptly.
+    #[tokio::test]
+    async fn shutdown_after_a_very_long_period_returns_promptly() {
+        let source =
+            IocSource::from_raw(vec![raw_with_field("PV:A", "ai", "EGU", "C")]).expect("build");
+        source.scanner_for_test().start();
+        Source::put(&source, "PV:A.SCAN", &s("1e9 second")).await.expect("put");
+        // Let the scan thread actually park in its sleep.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            drop(source); // `IocSource::drop` -> `Scanner::shutdown`
+            let _ = tx.send(start.elapsed());
+        });
+        let took = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown did not return within 1 s of a 1e9-second SCAN put");
+        assert!(took < Duration::from_secs(1), "shutdown took {took:?}");
     }
 
     #[tokio::test]
