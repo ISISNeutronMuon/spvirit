@@ -31,8 +31,10 @@ covers the internals.
   import so `from spvirit.ioc import ao` works).
 - **No `.pyi` type stubs** — a known gap for a binding whose selling point is
   a typed API.
-- `.venv/` is gitignored (the build/test commands assume it exists locally);
-  any `dist/` wheels/sdists on disk are gitignored build output, not committed.
+- `.venv/` is not committed (venv tools write a self-ignoring `.gitignore`
+  into it, but the repo `.gitignore` does not list it; the build/test commands
+  assume it exists locally). `dist/` wheels/sdists are gitignored build
+  output.
 
 Dev loop:
 
@@ -71,7 +73,7 @@ Three design comments are the real documentation — read them first:
    worker (uses `block_in_place`), so a Python callback running inside the
    runtime can call `pv.set()`/client ops without deadlock. Covered by
    `test_on_put_can_set_other_pvs` and `test_client_usable_inside_callbacks`.
-2. **`pv.rs:370–382`** — scan closures run synchronously inside the async
+2. **`pv.rs:435–443`** — scan closures run synchronously inside the async
    scan task and therefore **cannot** block-on other PV reads; `None`/raised
    exception falls back to the closure's cached last value.
 3. **`source.rs:324–331`** — `async def` source methods are submitted to a
@@ -99,7 +101,7 @@ Server/Client ops remain blocking. Reconcile the comments when convenient.
   all twelve NTScalar wire types, backing `spvirit.scalar()` and any
   `long`/unsigned handle minted by `server.pv()`.
 - **Factories**: `ai/ao/bi/bo/string_in/string_out/longin/longout` generated
-  by the `pv_ctor!` macro (pv.rs:604), each with keyword-only
+  by the `pv_ctor!` macro (pv.rs:597), each with keyword-only
   `units/prec/desc/adel/mdel/drive_limits/alarm_limits`; `mbbi`/`mbbo`
   hand-written; `waveform/aai/aao` build `PvKind::Array` and accept a
   keyword-only `type=` for the element type; `scalar(name, initial, *, type,
@@ -121,8 +123,10 @@ Server/Client ops remain blocking. Reconcile the comments when convenient.
   `spvirit.Ioc` (tier 3); `db_file=`/`db_string=` load `.db` text as ordinary
   tier-2 records (deliberately *not* routed through the IOC engine, so an
   existing user's records are not silently upgraded to a self-processing IOC).
-  `run()` blocks, `start()` spawns a `std::thread` running
-  `RUNTIME.block_on(server.run())`. `server.pv(name)` sniffs the stored NT
+  `run()` blocks. `start()` (= `start_background()`, which also returns the
+  `Store`) first runs every `on_start` hook synchronously, so a raising hook
+  surfaces as `RuntimeError`, then starts the event dispatcher and spawns a
+  `std::thread` running `RUNTIME.block_on(server.serve_after_start_hooks())`. `server.pv(name)` sniffs the stored NT
   payload to mint a typed handle — it attaches to **any** served record,
   including `long`/unsigned/`float`-distinct ones, which now mint a
   dynamically typed `PvKind::Typed` handle (server.rs:840); it still raises
@@ -205,9 +209,11 @@ Server/Client ops remain blocking. Reconcile the comments when convenient.
   the test-only feature: `cargo test -p spvirit-py --no-default-features
   --features test-embed`. The rest of the handle-plumbing tests live in
   `spvirit-server` (`cargo test -p spvirit-server pv::`).
-- **Python tests** (`tests/`, ~1,500 LOC total) — **plain-assert scripts, not
-  pytest**; functions named `test_*` collected by a `main()` loop, run directly
-  with the venv's python after `maturin develop`:
+- **Python tests** (`tests/`, ~1,500 LOC total). Five of the six files are
+  plain-assert scripts with a `__main__` loop that calls every `test_*`
+  function, run directly with the venv's python after `maturin develop`. The
+  exception is `test_ioc_host_api.py`, which uses `pytest.raises` and must be
+  run with `python -m pytest tests/test_ioc_host_api.py`:
   - `test_pv_handles.py` (422 LOC) — typed handles.
   - `test_value_types.py` (341 LOC) — the typed-conversion layer:
     `NtScalar`/`NtScalarArray`/`NtTable`/`NtNdArray` `type=`/`types=`,
@@ -220,7 +226,8 @@ Server/Client ops remain blocking. Reconcile the comments when convenient.
   - `test_source_fields.py` (160 LOC) — dynamic-source field tiers.
 
   Each server test uses a unique port pair from a reserved range (e.g.
-  `test_pv_handles.py`: 15075–15206; `test_value_types.py`: 16060–16099).
+  `test_pv_handles.py`: 15075–15246; `test_value_types.py`: 16060–16083,
+  within its reserved 16060–16099 range).
 - **Examples**: ~38 scripts under `spvirit-py/examples/` — start with
   `demo_pv_handles.py` (typed handles), `demo_server.py`, the
   `demo_source_*.py` family (dynamic sources), `demo_channel*.py`

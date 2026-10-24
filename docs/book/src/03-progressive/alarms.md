@@ -29,7 +29,7 @@ the value itself is inside the deadband.
 **Alarm transitions always post.** The MDEL deadband gates value changes
 only — a severity change reaches every subscriber regardless of how small
 the value moved (`should_post_update`,
-`spvirit-server/src/simple_store.rs:571`).
+`spvirit-server/src/simple_store.rs:644`).
 
 ## Two ways to get a severity
 
@@ -98,8 +98,8 @@ argument rather than a builder call:
 **`.alarm_limits()` is published and evaluated.** Calling
 `.alarm_limits(lolo, low, high, hihi)` on a `Pv` handle — or passing
 `alarm_limits=(...)` in Python — fills in the `valueAlarm` structure that
-clients read back with `spinfo`, and the same limits the `.db` loader sets
-for `LOLO`/`LOW`/`HIGH`/`HIHI`. With `.compute_alarms(true)` every write is
+clients read back with `spinfo`, and also sets the limits the evaluator
+reads, the same ones the `.db` loader sets for `LOLO`/`LOW`/`HIGH`/`HIHI`. With `.compute_alarms(true)` every write is
 evaluated, whether it is a client `spput` or a host-side `pv.set(...)`:
 
 ```console
@@ -163,9 +163,9 @@ spmonitor SIM:PRESSURE                      # terminal 2
 ```console
 SIM:PRESSURE 2026-08-06 09:26:17.437  50
 SIM:PRESSURE 2026-08-06 09:26:18.438  95
-SIM:PRESSURE {alarm={severity=1, status=4, message="HIGH"}} MINOR HIGH
+SIM:PRESSURE {alarm={severity=1, status=1, message="HIGH"}} MINOR READ HIGH
 SIM:PRESSURE 2026-08-06 09:26:19.439 120
-SIM:PRESSURE {alarm={severity=2, status=4, message="HIHI"}} MAJOR HIGH HIHI
+SIM:PRESSURE {alarm={severity=2, status=1, message="HIHI"}} MAJOR READ HIHI
 ```
 
 Two things worth pausing on. The value and the alarm arrive as **separate

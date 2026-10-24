@@ -67,8 +67,7 @@ The Python builder is the compact form of the same thing:
 
 ## Driving both
 
-Neither type accepts a client PUT, so the server updates them with
-`store.put_nt(...)` — the raw-NT level from
+The server updates both with `store.put_nt(...)`, the raw-NT level from
 [Records vs raw NT](../01-fundamentals/records-vs-raw-nt.md):
 
 ```python
@@ -76,25 +75,28 @@ Neither type accepts a client PUT, so the server updates them with
 ```
 
 Watch the dimension argument, which is the one place the two APIs disagree:
-the *builder* takes `(size, full_size)` tuples, while the `NtNdArray`
-*constructor* takes a flat list of sizes and sets `full_size` equal to each
-`size`. Offset, binning and reversal are not reachable from the Python
-constructor at all; build the payload in Rust if you need a region of
-interest.
+the *builder* takes `(size, offset)` tuples (`full_size` is set equal to
+`size`, binning 1, not reversed), while the `NtNdArray` *constructor* takes a
+flat list of sizes (offset 0). Binning, reversal and a `full_size` different
+from `size` are not reachable from Python; build the payload in Rust if you
+need them.
 
 ## What to notice
 
-**Both types accept a wire PUT.** `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:629`) dispatches `NtTable` and `NtNdArray` PUTs
-to `apply_table_put`/`apply_ndarray_put`, so a client write updates the
-record and restamps it like any other. The examples above still use
-`store.put_nt(...)` because that is the natural way to drive a
-server-to-client payload from Rust or Python code, not because a client PUT
-is refused.
+**NTTable accepts a wire PUT; NTNDArray only partly does.**
+`RecordInstance::apply_put` (`spvirit-server/src/apply.rs:569`) dispatches
+`NtTable` and `NtNdArray` PUTs to `apply_table_put`/`apply_ndarray_put`. A
+table PUT updates the record and restamps it. An NTNDArray PUT applies the
+metadata fields (`codec`, sizes, `uniqueId`, `dimension`, …), but the
+union-shaped image `value` a client sends is **not applied** (see
+[Known gaps](../05-reference/known-gaps.md)). The examples use
+`store.put_nt(...)`, which is the natural way to drive both from server
+code.
 
 **No deadband, no alarm computation, no scanning.** All of that lives in
-the record layer, which these types are not part of. Every `put_nt` posts
-to every subscriber.
+the record layer, which these types are not part of. There is no MDEL
+deadband on `put_nt`: any payload that differs from the current one is
+posted. An identical payload is dropped.
 
 **`spget` prints them structurally.**
 

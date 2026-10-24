@@ -5,25 +5,28 @@
 | Layer | Where | Run with |
 |---|---|---|
 | Rust unit tests | inline `#[cfg(test)]` modules in every crate's `src/` | `cargo test --all` |
-| In-process protocol/integration tests | `spvirit-tools/tests/` (19 test files + shared harnesses, ~33 test fns) | `cargo test -p spvirit-tools` |
+| In-process protocol/integration tests | `spvirit-tools/tests/` (30 test files + shared harnesses, ~100 test fns), plus per-crate `tests/` integration suites in spvirit-client, -server, -ioc, -gateway and -calc | `cargo test -p spvirit-tools` (or `-p <crate>`) |
 | Cross-implementation interop tests | `spvirit-tools/tests/interop_*.rs` + `tests/interop/` | env-gated; see below |
-| Python tests | `spvirit-py/tests/test_pv_handles.py` + `test_value_types.py` | run the file directly with the venv python |
+| Python tests | `spvirit-py/tests/test_*.py` (6 files) | run each file directly with the venv python (`test_ioc_host_api.py`: `python -m pytest`) |
+| spvirit-py embedded-interpreter unit tests | `spvirit-py/src/` | `cargo test -p spvirit-py --no-default-features --features test-embed` |
 
-There are **no benchmarks** (no `benches/`, no criterion) and **no
-golden-file/packet-capture fixtures** — codec tests are inline-bytes and
-round-trip based. Both are worth adding.
+There are **no benchmarks** (no `benches/`, no criterion). There is a small
+set of golden spec vectors (`spvirit-tools/tests/protocol/spec_vectors/*.bin`,
+9 files, decoded by `golden_spec_vectors_decode`), but **no corpus of packet
+captures from real servers**. Most codec tests are inline-bytes and
+round-trip based.
 
 ## Rust unit tests
 
 Every crate keeps tests at the bottom of each source file. Notable suites:
 
-- `spvirit-codec`: spvd_encode (18), spvirit_encode (20), epics_decode (9),
-  spvd_decode (7).
+- `spvirit-codec`: spvd_encode (39), spvd_decode (38), spvirit_encode (25),
+  epics_decode (19), monitor (12), segment (11), error (6).
 - `spvirit-server`: simple_store (MDEL, timestamps, all 12 array element
   types, put_nt, validator rejection), pv (constructors, attach guards),
   pva_server (builder wiring, links), monitor (delta-frame semantics), db,
   record_fields, group.
-- `spvirit-client`: ~39 tests (search target math, parsing, round-trips).
+- `spvirit-client`: ~130 tests (search target math, parsing, cache/pool and retry behaviour, round-trips).
 
 ## In-process protocol tests (`spvirit-tools/tests/`)
 
@@ -34,12 +37,14 @@ Two harnesses under `tests/protocol/`:
 - `scenario_harness.rs` — `ScenarioSession`: higher-level
   connect/handshake/get/put helpers.
 
-Used by `spvirit_protocol_*` (codec, lifecycle, unsupported-command
-handling), `spvirit_pvlist`, `spvirit_nt_codec`/`spvirit_nt_lifecycle`,
-`spvirit_record_array`, `spvirit_monitor_fields` (nested pvRequest
-selection), `spvirit_monitor_pipeline` (flow control), `ioc_fields`
-(`PV.FIELD`/`FIELD$`), `pv_handle_api`, `spvirit_search_resilience`,
-`spvirit_get` (incl. read-only/simulation PUT authorization).
+Used by `spvirit_protocol_*` (codec, lifecycle, matrix, unsupported-command
+handling), `spvirit_pvlist`, `spvirit_monitor_fields` (nested pvRequest
+selection), `spvirit_monitor_pipeline` (flow control), `spvirit_put_timestamp`,
+`spvirit_server_startup` and `spvirit_explore_client`. Other integration files
+(`ioc_fields`, `pv_handle_api`, `spvirit_nt_lifecycle`,
+`spvirit_record_array`, `spvirit_search_resilience`, `spvirit_get` incl.
+read-only/simulation PUT authorization) start their own server process and
+drive it through the client library.
 
 ## Interop tests (against real EPICS implementations)
 
@@ -65,11 +70,13 @@ PVA_TEST_P4P=1 P4P_PROVIDER_CMD="python spvirit-tools/tests/interop/p4p_server.p
 
 ## Python tests
 
-Plain-assert style, deliberately not pytest: `test_*` functions collected by
-a `main()` loop at the bottom of the file. Conventions:
+Five of the six files are plain-assert scripts with a `__main__` loop that
+calls every `test_*` function, run directly with the venv's python. The
+exception is `test_ioc_host_api.py`, which uses `pytest.raises` and must be
+run with `python -m pytest tests/test_ioc_host_api.py`. Conventions:
 
 - Every test that starts a `Server` uses its **own unique port pair**
-  (`test_pv_handles.py`: 15075–15206; `test_value_types.py`: 16060–16081,
+  (`test_pv_handles.py`: 15075–15246; `test_value_types.py`: 16060–16083,
   within its reserved 16060–16099 range). Pick unused ranges for new files.
 - Build first: `.\.venv\Scripts\maturin.exe develop` (debug is fine).
 - Run: `.\.venv\Scripts\python.exe tests\test_pv_handles.py` → expect `ALL OK`.

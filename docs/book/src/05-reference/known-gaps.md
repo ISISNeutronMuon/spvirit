@@ -73,17 +73,20 @@ hardware poke — doubles up on exactly the writes you were trying to refuse.
 ## 3. `ADEL` is parsed and exposed but not applied
 
 `MDEL` gates monitor posts (`should_post_update`,
-`spvirit-server/src/simple_store.rs:571`).
+`spvirit-server/src/simple_store.rs:644`).
 `ADEL` — the archive deadband — is read out of the `.db` file and readable
 as a field, and no posting logic consults it. A `.db` that relies on `ADEL`
 behaves as though it were absent.
 
 ## 4. Wire PUT is refused for generic structures
 
-The `Generic` arm of `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs`) has no wire PUT path, so a client PUT to a
-generic record is answered with a PUT error and the record is left as it
-was. `NtTable`, `NtNdArray` and `NtEnum` are wired. Write a generic record
+The `Generic` arm of `RecordInstance::apply_put_fields`
+(`spvirit-server/src/apply.rs:710`) has no wire PUT path, so a client PUT to
+a generic record is answered with a PUT error (`no wire PUT path for this
+record type`) and the record is left as it was. `NtTable` and `NtEnum` are
+wired. `NtNdArray` is wired for its metadata fields (`codec`, sizes,
+`uniqueId`, `dimension`, …), but the union-shaped image `value` a client
+sends is not applied. Write a generic record, or an NTNDArray image,
 server-side with `store.put_nt()`.
 
 ## 5. The builder has no `longin`/`longout`
@@ -98,7 +101,7 @@ routes that cannot produce a `longin`. The matrix is on
 
 The server answers PVA command `CANCEL_REQUEST` with
 `"CANCEL_REQUEST command is not supported"`
-(`spvirit-server/src/handler.rs:1795`). `ACL_CHANGE`, `MESSAGE`,
+(`spvirit-server/src/handler.rs:2492`). `ACL_CHANGE`, `MESSAGE`,
 `MULTIPLE_DATA`, `ORIGIN_TAG` and commands 14 and 16 likewise return errors.
 Clients that cancel a request rather than destroying the channel will see the
 error; the common clients do not.
@@ -108,7 +111,8 @@ error; the common clients do not.
 spvirit reassembles segmented messages it receives — `SegmentReassembler` in
 `spvirit-codec/src/segment.rs:34`, driven by the client transport and the
 server handler — but it never emits them. `encode_header`
-(`spvirit-codec/src/spvirit_encode.rs:66`) never sets the segmentation bits,
+(`spvirit-codec/src/spvirit_encode.rs:98`; the flag bits are written in
+`push_header`, `:71-89`) never sets the segmentation bits,
 and no encode path splits a payload, so a 4 MB NTNDArray goes out as a single
 PVA frame with a four-byte payload length where EPICS Base would split it.
 Clients that accept large unsegmented frames — pvxs, p4p, PVAJava — read it
@@ -120,8 +124,8 @@ roadmap item 6 in
 
 `spgateway` in M1 is a *passthrough* gateway — it resolves, reads, writes, and
 monitors PVs across networks, with `readOnly`/`pvlist`/ACF access control
-enforced, but the observability layers (metrics, audit, hot reload) are not
-yet wired. The divergences below are deliberate for this milestone and are
+enforced and a Prometheus `/metrics` endpoint (`x-spvirit.metrics` or
+`--metrics`); audit, hot reload and rate limiting are not yet wired. The divergences below are deliberate for this milestone and are
 documented in full on the [`spgateway`](../04-tools/spgateway.md) page.
 
 **Representation.** The proxy round-trips through spvirit's decoded value model,
@@ -141,16 +145,18 @@ erroring.
 
 **Control plane.** `names()` (what a downstream `pvlist` sees) reports only the
 names this gateway has already claimed, not a true fan-out of each upstream's
-`pvlist` — the gateway resolves names dynamically and caches no upstream
-`SocketAddr` in M1. `rpc` forwarding is not implemented: there is no general
+`pvlist`. Upstream servers are found by per-name search (the client
+resolution cache remembers each PV's server address), and there is no
+per-client list of upstream server addresses to enumerate. `rpc` forwarding is not implemented: there is no general
 client RPC entry point yet, so an RPC to the gateway returns
 `"gateway RPC forwarding is not implemented in M1"`.
 
 **Access control and ops.** `readOnly`, `pvlist`, and `.acf` access control
 *are* enforced (see the [`spgateway`](../04-tools/spgateway.md) page) — this
 is no longer a passthrough-only gap. What remains unwired: the `x-spvirit`
-metrics, audit, hot-reload, and rate-limit blocks are parsed and validated
-but not consumed, and RPC forwarding to upstream servers is not implemented.
+audit, hot-reload and rate-limit blocks are parsed and validated but not
+consumed (the `metrics` block and the per-server `negativeCache` block *are*
+consumed), and RPC forwarding to upstream servers is not implemented.
 The per-client `acf-client` field is likewise parsed and referentially
 validated against the `clients[]` list but never consulted at runtime.
 Ctrl-C shutdown is immediate: outstanding requests are hard-cancelled rather
@@ -159,8 +165,9 @@ than drained gracefully.
 ## What is *not* on this list
 
 Behaviour that is deliberate and merely surprising lives in the chapters, not
-here — `mbbi` refusing client writes (an input record, read-only over the
-wire as in EPICS; drive it with `pv.set(index)`), `spget` accepting exactly
+here — `mbbi` refusing client writes (deliberately read-only over the wire
+in spvirit; EPICS Base allows VAL writes to input records; drive it with
+`pv.set(index)`), `spget` accepting exactly
 one PV name, `spsine` printing nothing on success, `discover` and `off` suppressing enumeration but not discovery,
 `spget`'s value column being a display rendering rather than the wire value.
 Each is a gotcha in its own tool page.

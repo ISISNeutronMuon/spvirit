@@ -2,25 +2,27 @@
 
 ## spvirit-client
 
-Library-only crate (~5,300 LOC). Deps: `spvirit-types`, `spvirit-codec`,
+Library-only crate (~9,800 LOC). Deps: `spvirit-types`, `spvirit-codec`,
 `tokio`, `serde_json`, `dns-lookup`, `get_if_addrs`, `socket2`, `chrono`.
 **No TLS crate — TLS is the biggest known gap.**
 
 | File | ~LOC | Purpose |
 |---|---|---|
-| `pva_client.rs` | 1091 | High-level API: `PvaClient`, `PvaClientBuilder`, `PvaChannel` (streaming PUT), monitor loop, pvinfo |
-| `search.rs` | 1290 | UDP broadcast/multicast search + discovery, TCP name-server search, `resolve_pv_server`, EPICS env vars |
-| `pvlist.rs` | 771 | PV-name listing with 4 fallback strategies (`__pvlist`, GET_FIELD, server RPC, server GET) |
+| `pva_client.rs` | 3093 | High-level API: `PvaClient`, `PvaClientBuilder`, `PvaChannel` (streaming PUT), monitor loop, `MonitorHandle` (`pvmonitor_spawn`, `cancel`, `join`), pvinfo |
+| `search.rs` | 1566 | UDP broadcast/multicast search + discovery, TCP name-server search, `resolve_pv_server`, EPICS env vars |
+| `pvlist.rs` | 769 | PV-name listing with 4 fallback strategies (`__pvlist`, GET_FIELD, server RPC, server GET) |
 | `put_encode.rs` | 633 | JSON→PVD PUT payload encoder (bitset partial encoding, scalars/arrays/unions/variants) |
-| `client.rs` | 358 | Low-level channel lifecycle: `establish_channel`, `pvget`/`pvget_fields` |
-| `format.rs` | 521 | Output rendering (text/JSON), NT metadata extraction, NTTable formatting |
-| `types.rs` | 97 | `PvOptions`, `PvGetResult`, `PvGetError` |
-| `transport.rs` | 532 | Framed-packet readers: `read_frame` (blocks through mid-frame stalls), `read_frame_resumable` (persistent `FrameBuf`, deadline-bounded, resumes after a dropped read), `read_until`, `read_packet` |
-| `auth.rs` | 25 | AuthNZ user/host resolution (options → env → "unknown") |
+| `client.rs` | 540 | Channel lifecycle: `connect_and_validate`, `create_channel_on`, `run_get_on`, plus the one-shot `establish_channel`/`pvget`/`pvget_fields` |
+| `cache.rs` | 1571 | Resolution cache (bounded at 16,384 names) + per-address connection pool behind `PvaClient` (`CacheConfig`, `CacheStats`, `PooledConn` cid/ioid allocation) |
+| `byte_sink.rs` | 23 | `ByteSink` trait: per-PV/per-host tx/rx byte accounting hook (used by the gateway) |
+| `format.rs` | 518 | Output rendering (text/JSON), NT metadata extraction, NTTable formatting |
+| `types.rs` | 96 | `PvOptions`, `PvGetResult`, `PvGetError` |
+| `transport.rs` | 897 | Framed-packet readers: `read_frame` (blocks through mid-frame stalls), `read_frame_resumable` (persistent `FrameBuf`, deadline-bounded, resumes after a dropped read), `read_until`, `read_packet` |
+| `auth.rs` | 60 | AuthNZ user/host resolution (options → env → "unknown") |
 
 ### Discovery and search (`search.rs`)
 
-`resolve_pv_server` (search.rs:872) is the entry point: an explicit
+`resolve_pv_server` (search.rs:937) is the entry point: an explicit
 `server_addr` short-circuits; otherwise all strategies run concurrently in a
 `JoinSet` (one TCP name-server search per configured server + one UDP search),
 first success wins, rest aborted.
@@ -30,18 +32,22 @@ first success wins, rest aborted.
   directed broadcast + IPv4 multicast `224.0.0.128` + IPv6 `ff02::42:1` —
   multicast added because Docker overlay networks may block broadcast).
 - Retransmit schedule: 100/500/1000/2000 ms within the overall timeout.
-- **Ephemeral source port is intentional** (search.rs:400): binding the client
+- **Ephemeral source port is intentional** (search.rs:414): binding the client
   to 5076 with SO_REUSEPORT loops packets back to the sender on Linux. Do not
   "fix" this.
-- **SO_REUSEADDR is Unix-only** (search.rs:323): deliberately skipped on
+- **SO_REUSEADDR is Unix-only** (search.rs:350): deliberately skipped on
   Windows where the semantics are unsafe. Also do not "fix".
 
 ### Operations
 
-- **Channel setup** (`establish_channel`, client.rs:121): TCP connect → learn
-  version + byte order from the first packets → client validation (authnz
-  "ca") → wait for ConnectionValidated → CREATE_CHANNEL (**cid hardcoded to
-  1** — fine for one-shot connections, a hazard if you ever multiplex).
+- **Channel setup** (`connect_and_validate`, client.rs:167, then
+  `create_channel_on`, client.rs:200): TCP connect → learn version + byte
+  order from the first packets → client validation (authnz "ca") → wait for
+  ConnectionValidated → CREATE_CHANNEL. `create_channel_on` takes the cid
+  from its caller: `PvaClient` operations run over a pooled connection whose
+  `PooledConn` allocates a fresh cid/ioid per channel, while the one-shot
+  `establish_channel` (client.rs:245) still uses cid 1 on its own
+  connection.
 - **GET**: GET INIT (subcmd 0x08, fixed 6-byte "all fields" pvRequest or
   `encode_pv_request(fields)`) → introspection from INIT → GET DATA →
   `decode_with_field_desc`. Result carries `value: DecodedValue` plus raw PVA
@@ -64,7 +70,7 @@ first success wins, rest aborted.
   INIT body *and* sets bit 0x80 on the INIT subcmd; ACKs at queueSize/2, and the
   ACK-credit accounting runs on *every* consumed update (decode success or
   failure) so a decode error can never leak a credit and stall the stream.
-  **Critical invariant** (pva_client.rs:553–556): never set 0x80 on the START
+  **Critical invariant** (pva_client.rs:1102–1107): never set 0x80 on the START
   message — on non-INIT monitor messages 0x80 means "ACK with u32 body", and
   getting this wrong makes pvxs/Java drop the TCP connection.
 - **INFO**: GET_FIELD (cmd 0x11) → `StructureDesc`.
@@ -85,21 +91,26 @@ read by the client — ports come from builder/CLI defaults (5075/5076).
 
 ### Client gotchas
 
-- **Epoch disambiguation heuristic** (format.rs:98): `secondsPastEpoch` is
+- **Epoch disambiguation heuristic** (format.rs:96): `secondsPastEpoch` is
   interpreted as UNIX or EPICS-1990 epoch by picking whichever is closer to
   "now" — fragile for historical or far-future timestamps.
 - pvlist's server-GET strategy scrapes ASCII candidates from raw bytes with a
   denylist filter — heuristic, can false-positive.
 - `spinfo` works around servers that crash on an empty GET_FIELD field name
   by retrying without the wire field, then falling back to pvget.
-- No automatic reconnect anywhere; a single `timeout` (default 5 s) applies
-  to connect and every read.
+- There is no reconnect for monitors or `PvaChannel`. Short `PvaClient`
+  operations (get/put/info) run over a pooled connection and retry once on a
+  freshly dialled connection if a *reused* connection turns out to be dead or
+  its sid stale, as long as the failure came before the operation committed
+  (`is_reuse_failure`, pva_client.rs:161). A single `timeout` (default 5 s)
+  applies to connect and every read.
 
 ## spvirit-tools
 
 Binaries + a thin lib re-exporting the client and server crates. Features:
-`default = ["client", "server", "tui"]`; `tui` pulls ratatui 0.29 +
-color-eyre. Source files are named `spvirit_*.rs` but the installed binaries
+`default = ["client", "server", "tui"]`, plus the opt-in `scry` (packet
+capture, pcap; adds `spvirit-scry` and `spvirit-scry_influx_collector`) and
+`load` (adds `spload`); `tui` pulls ratatui 0.29 + color-eyre. Source files are named `spvirit_*.rs` but the installed binaries
 are the `sp*` names (see the `[[bin]]` table in Cargo.toml).
 
 All client tools share `CommonClientArgs` (src/spvirit_client/cli.rs:25) —
@@ -108,18 +119,21 @@ the `argparse` crate, and `block_on` a manually built tokio runtime.
 
 | Binary | LOC | What it is / what it exercises |
 |---|---|---|
-| `spget` | 56 | One-shot GET; `format_output`, `--raw` hex dumps |
-| `spput` | 338 | PUT; default "EPICS-base-style" full flow (GET → PUT INIT → get-put probe → PUT → DESTROY_REQUEST → GET), auto-fallback to simple flow; `PV=VALUE` syntax for negative numbers |
-| `spmonitor` | 289 | Multi-PV monitor (JoinSet); `--raw`, `--json`, `--pipeline N` |
+| `spget` | 57 | One-shot GET; `format_output`, `--raw` hex dumps |
+| `spput` | 345 | PUT; default "EPICS-base-style" full flow (GET → PUT INIT → get-put probe → PUT → DESTROY_REQUEST → GET), auto-fallback to simple flow; `PV=VALUE` syntax for negative numbers |
+| `spmonitor` | 286 | Multi-PV monitor (JoinSet); `--raw`, `--json`, `--pipeline N` |
 | `spinfo` | 193 | Introspection with the 3-level fallback chain |
 | `splist` | 112 | Server discovery (GUID + addr) or PV listing via `pvlist_with_fallback` |
-| `spsine` | 102 | Streaming-PUT sine generator (`open_put_channel` showcase) |
-| `spget_compare` | 324 | Offline diagnostic: byte-compares captured frames against local encoder output; no network |
-| `spexplore` | 1414 | ratatui TUI: servers→PVs→details panes, chart view, background worker thread over `std::sync::mpsc` |
-| `spsearch` | 1094 | ratatui TUI: **passive** search-traffic sniffer; decodes frames directly with `PvaPacket` |
-| `spserver` | 3490 | Full PVA server binary: `.db` loading, hot-reload, beacons, MDEL, `__pvlist`/discovery modes; record logic comes from the spvirit-server crate |
-| `spdodeca` | 1165 | Self-contained single-PV server streaming a rotating dodecahedron as NTNDArray (does *not* use spvirit-server) |
-| `sptable` | ~1300 | ratatui TUI spreadsheet IOC. Rows are dynamically added PVs: 12 scalar types, arrays, **NTEnum**, **NTTable**. Modal `a` wizard **plus a vim-style `:` command line** (`:add/:set/:del/:mv/:ro/:rw/:anim/:stop/:source`, shorthands, `:help`). Bash-style **pattern expansion** (`RING:BPM{01..99}`, products) for bulk ops. **Animation** generators (sine/ramp/triangle/square/noise/walk/count, enum `cycle`) driven by a server-side tick (`--rate`, default 10 Hz). |
+| `spsine` | 108 | Streaming-PUT sine generator (`open_put_channel` showcase) |
+| `spget_compare` | 272 | Offline diagnostic: byte-compares captured frames against local encoder output; no network |
+| `spexplore` | 1383 | ratatui TUI: servers→PVs→details panes, chart view, background worker thread over `std::sync::mpsc` |
+| `spsearch` | 1091 | ratatui TUI: **passive** search-traffic sniffer; decodes frames directly with `PvaPacket` |
+| `spserver` | 4201 | Full PVA server binary: `.db` loading, hot-reload, beacons, MDEL, `__pvlist`/discovery modes; record logic comes from the spvirit-server crate |
+| `spdodeca` | 1163 | Self-contained single-PV server streaming a rotating dodecahedron as NTNDArray. It has its own accept/search loop and does not use `PvaServer` or the record store, but it borrows `ConnWriter` and the search-reply helpers from spvirit-server. |
+| `sptable` | 1324 (2266 with anim/parse/pattern) | ratatui TUI spreadsheet IOC. Rows are dynamically added PVs: 12 scalar types, arrays, **NTEnum**, **NTTable**. Modal `a` wizard **plus a vim-style `:` command line** (`:add/:set/:del/:mv/:ro/:rw/:anim/:stop/:source`, shorthands, `:help`). Bash-style **pattern expansion** (`RING:BPM{01..99}`, products) for bulk ops. **Animation** generators (sine/ramp/triangle/square/noise/walk/count, enum `cycle`) driven by a server-side tick (`--rate`, default 10 Hz). |
+| `spgateway` | 436 | PVAccess gateway binary over spvirit-gateway (p4p-compatible JSON config, `--metrics`) |
+| `spload` | 493 | Gateway load/benchmark driver: `spload drive` (PUT counters at a rate) / `spload watch` (M×N monitors, coalescing/latency); only with `--features load` |
+| `spvirit-scry`, `spvirit-scry_influx_collector` | 368 / 302 | Packet-capture PVA analyser + InfluxDB collector; only with `--features scry` (pcap) |
 
 #### sptable command reference
 
@@ -163,18 +177,26 @@ Value forms: enum accepts a choice name or index (`OFF`, `ON`, `TRIP`, or
 
 Known spserver limitations: ACL_CHANGE/MESSAGE/MULTIPLE_DATA/CANCEL_REQUEST/
 ORIGIN_TAG return "not supported"; NtTable/NtNdArray DOL output links are
-"no-op for now" (spvirit_server.rs:2700, 2730).
+"no-op for now" (spvirit_server.rs:2963, 2988).
 
 ## Tests
 
-- **spvirit-client**: ~39 inline unit tests (search target math, addr-list
-  parsing, encode/decode round-trips, builder defaults, put_encode bitsets).
-  No integration dir — integration coverage lives in spvirit-tools.
-- **spvirit-tools `tests/`**: ~33 test functions in two harness styles:
+- **spvirit-client**: ~130 inline unit tests (search target math, addr-list
+  parsing, cache/pool and retry behaviour, pipelining credits, encode/decode
+  round-trips, put_encode bitsets) plus `tests/` (handshake stall, public
+  surface, refused PUT, enum/generic PUT, handle alarm limits, segment
+  reassembly).
+- **spvirit-tools `tests/`**: 30 test files, ~100 test functions, in two
+  harness styles:
   - `tests/protocol/` — in-process wire testing (`frame_harness.rs` spawns
     workspace binaries; `scenario_harness.rs` gives connect/handshake/get/put
-    helpers). Used by `spvirit_protocol_*`, `spvirit_pvlist`, `spvirit_nt_*`,
-    `spvirit_monitor_*`, `ioc_fields`, `pv_handle_api`.
+    helpers). Used by `spvirit_protocol_*` (codec, lifecycle, matrix,
+    unsupported-command handling), `spvirit_pvlist`, `spvirit_monitor_fields`,
+    `spvirit_monitor_pipeline`, `spvirit_put_timestamp`,
+    `spvirit_server_startup` and `spvirit_explore_client`. Other integration
+    files (`ioc_fields`, `pv_handle_api`, `spvirit_nt_lifecycle`,
+    `spvirit_record_array`, `spvirit_search_resilience`, `spvirit_get`) start
+    their own server process and drive it through the client library.
   - `tests/interop/` — external implementations (p4p/pvxs, EPICS Base,
     PVAccessJava), env-gated so they skip unless e.g. `PVA_TEST_P4P=1` and the
     external server is installed. See chapter 06.

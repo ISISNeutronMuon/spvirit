@@ -2316,7 +2316,8 @@ mod tests {
             other => panic!("expected enum, got {other:?}"),
         }
 
-        // read-only enum -> mbbi, refused over the wire like an EPICS input
+        // read-only enum -> mbbi, deliberately refused over the wire in
+        // spvirit (EPICS Base allows VAL writes to input records)
         server
             .add_enum("RT:ENUM_RO", vec!["A".into(), "B".into()], 0, false)
             .await;

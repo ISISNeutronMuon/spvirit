@@ -33,11 +33,14 @@ fun project with a moderately useful outcome.
 | Crate | What it is |
 |---|---|
 | `spvirit-types` | Shared data model for PVAccess Normative Types (NT). |
-| `spvirit-codec` | PVAccess protocol encode/decode and connection state tracking. |
+| `spvirit-codec` | PVAccess protocol encode/decode (PVA message layer + pvData) and segment reassembly. |
 | `spvirit-client` | Client library — search, connect, get, put, monitor. |
 | `spvirit-server` | Server library — `.db` parsing, `Source` trait, PVAccess server runtime. |
 | `spvirit-tools` | The `sp*` command-line tools. |
 | `spvirit-py` | Python bindings via PyO3 — client and server APIs from Python. |
+| `spvirit-ioc` | Synchronous EPICS record-processing engine (scan lists, links, lock sets). |
+| `spvirit-gateway` | p4p-compatible PVAccess gateway library. |
+| `spvirit-calc` | CALC expression evaluator. |
 
 `spvirit-client` and `spvirit-server` do not depend on each other. The full
 layering, versions and feature flags are in the
@@ -86,14 +89,14 @@ cargo install spvirit-tools     # same tools, via a Rust toolchain
 ```
 
 `spvirit` depends on `spvirit-tools`, so the first line gets you both: the
-importable module and the twelve binaries on your `PATH`, no compiler needed.
+importable module and the thirteen `sp*` binaries on your `PATH`, no compiler needed.
 
 To use the libraries from your own Rust project, add the layer you need:
 
 ```toml
 [dependencies]
-spvirit-client = "0.1"
-spvirit-server = "0.1"
+spvirit-client = "0.4"
+spvirit-server = "0.4"
 ```
 
 Building from source, and the feature flags that gate the binaries, are covered
@@ -114,8 +117,12 @@ in [Installation](https://isisneutronmuon.github.io/spvirit/02-getting-started/i
 | `spexplore` | | Interactive TUI to browse servers, select PVs, and monitor values |
 | `spsearch` | | TUI showing PV search network traffic for diagnostics |
 | `spsine` | | Continuously write a sine wave to a PV (demo/testing) |
-| `spget_compare` | | Compare `pvget` results between spvirit and EPICS Base |
+| `spget_compare` | | Compare a captured GET exchange against spvirit's own encoders (offline) |
 | `spdodeca` | | Server publishing a rotating 3D dodecahedron as an NTNDArray PV |
+
+`spload`, an internal load driver for the `loadtest/` harness, is not a
+user-facing tool: it is not in the default build or the wheel, and builds
+only with `--features load`.
 
 A page per tool, with real captured output, is at
 [Command-line tools](https://isisneutronmuon.github.io/spvirit/04-tools/index.html).
@@ -150,7 +157,10 @@ Known divergences from EPICS Base behaviour are collected in
 
 ## Related Projects
 
-- [spvirit-scry](https://crates.io/crates/spvirit-scry) — A Rust tool for capturing and analyzing pvAccess EPICS packets.
+- `spvirit-scry`: packet capture and analysis for PVAccess, now built into
+  `spvirit-tools` behind the non-default `scry` feature:
+  `cargo install spvirit-tools --features scry` (needs libpcap on Linux or the
+  Npcap SDK on Windows; not in the Python wheel).
 
 ## References
 

@@ -42,6 +42,7 @@ graph TD
     tools --> types
     py --> client
     py --> server
+    py --> ioc
     py --> codec
     py --> types
 ```
@@ -61,7 +62,7 @@ the codec and the type vocabulary underneath it.
 | `spvirit-ioc` | codec + server | You want the higher-level IOC layer built on the server (scan/process infrastructure). | [docs.rs](https://docs.rs/spvirit-ioc/latest/spvirit_ioc/) |
 | `spvirit-gateway` | client + server | You are building a PVAccess gateway — the proxy engine behind `spgateway`. | [docs.rs](https://docs.rs/spvirit-gateway/latest/spvirit_gateway/) |
 | `spvirit-tools` | client + server + gateway | You want the `sp*` command-line programs. Also usable as a library, but it exists mainly to ship binaries. | [docs.rs](https://docs.rs/spvirit-tools/latest/spvirit_tools/) |
-| `spvirit-py` | client + server | The `spvirit` Python module. A PyO3 extension, not a pure-Python package. | [Python API](python-api.md) |
+| `spvirit-py` | client + server + ioc | The `spvirit` Python module. A PyO3 extension, not a pure-Python package. | [Python API](python-api.md) |
 
 The remaining crate, `spvirit-calc`
 ([docs.rs](https://docs.rs/spvirit-calc/latest/spvirit_calc/)), implements
@@ -76,26 +77,31 @@ each release, so `latest` always matches the newest published version.
 ## Versions
 
 All are released together from the workspace, so their version numbers
-move in step. `spvirit-py` is published to PyPI rather than crates.io and
-carries its own version.
+move in step. `spvirit-py` is published to PyPI (as `spvirit`) rather than
+crates.io, but it shares the workspace version. The command-line tools also
+ship on PyPI as `spvirit-tools`, and `spvirit` pins them by exact version.
 
 ## Feature flags
 
-Only `spvirit-tools` is feature-gated:
+`spvirit-tools` is the only library crate with user-facing features:
 
 | Feature | Default | Gates |
 |---|---|---|
 | `client` | yes | `spget`, `spput`, `spmonitor`, `spinfo`, `splist`, `spsine`, `spget_compare` |
 | `server` | yes | `spserver`, `spdodeca`; also required (with `client`) by `spgateway` |
 | `tui` | yes | `spexplore`, `spsearch`; also required (with `server`) by `sptable` |
+| `scry` | no | `spvirit-scry`, `spvirit-scry_influx_collector` (packet capture; needs the Npcap SDK on Windows or libpcap on Linux; not in the pip wheel) |
+| `load` | no | `spload`, the internal load driver for the `loadtest/` harness (not in the pip wheel) |
 
-All three are on by default. A build with `--no-default-features` produces
+The first three are on by default. A build with `--no-default-features` produces
 **no binaries at all** — a fact worth knowing before you spend ten minutes
 wondering where they went. See
 [Installation](../02-getting-started/install.md).
 
 `spvirit-types`, `spvirit-codec`, `spvirit-client`, `spvirit-server`,
 `spvirit-ioc`, `spvirit-gateway` and `spvirit-calc` declare no features.
+`spvirit-py` has build-only features (`extension-module`, default;
+`test-embed` for the embedded-interpreter unit tests).
 
 ## Where to read further
 

@@ -70,10 +70,10 @@ Wheels are published for Linux (x86_64, aarch64), Windows (x86_64), and macOS
 (x86_64, arm64) for Python 3.9+ (one abi3 wheel per platform). No EPICS base,
 no compiler needed.
 
-This also installs the `spvirit-tools` package, which puts the twelve
-command-line tools — `spget`, `spput`, `spmonitor`, `splist`, `spinfo`,
+This also installs the `spvirit-tools` package, which puts the thirteen
+command-line tools (`spget`, `spput`, `spmonitor`, `splist`, `spinfo`,
 `spexplore`, `spsearch`, `spsine`, `spserver`, `sptable`, `spdodeca`,
-`spget_compare` — on your `PATH` inside the same environment. They are native
+`spget_compare` and `spgateway`) on your `PATH` inside the same environment. They are native
 binaries, not Python wrappers, and each takes `--help`.
 
 To build from source instead, see [Building from source](#building-from-source).
@@ -118,8 +118,11 @@ yourself: [`NtScalar` and friends](#normative-type-classes) written with
 `store.put_nt(...)`, published with `notifier.notify(...)`, or served from a
 [dynamic source's](#dynamic-sources) `get`/`put`. You control — and must
 supply — the alarm, timestamp, display, and control metadata on each
-payload; no deadbands or alarm computation are applied for you (an explicit
-timestamp is honored; a zeroed one is stamped by the server).
+payload; no deadbands or alarm computation are applied for you. (`NtScalar`
+payloads are always stamped by the server, since the constructor has no
+timestamp argument. For array payloads, `store.put_nt` stamps a zeroed
+timestamp, but one served from a source's `get` or `notifier.notify` goes out
+as-is, so a zero there reads as 1970.)
 
 |  | IOC-style records | Raw NT payloads |
 |---|---|---|
@@ -216,14 +219,11 @@ A dynamically typed handle's `set()`/`get()` still uses plain Python `int`
 values, coerced with the same strict rules as above (an out-of-range write
 raises `OverflowError`).
 
-**Widened `int` handles are not range-checked.** A `byte`/`short`/`int`
-record maps onto the plain Python `int` handle kind above, which is *not*
-the same code path as `spvirit.scalar()`'s typed handles or
-`store.set_value` — writes through it use the core's C-style narrowing cast
-instead of strict coercion, so an out-of-range write silently wraps (e.g.
-`300` written to a `byte` record stores `44`) rather than raising
-`OverflowError`. Use `spvirit.scalar(name, initial, type="byte", ...)` or
-`store.set_value` when you need strict range enforcement on these types.
+**Widened `int` handles are range-checked.** A `byte`/`short`/`int`
+record maps onto the plain Python `int` handle kind above. Writes through a
+widened `byte`/`short` handle are range-checked: a value the record's type
+cannot represent (e.g. `300` written to a `byte` record) is refused, the
+record is left unchanged, and the write raises `TypeError`.
 
 Array element types: `waveform`/`aai`/`aao` infer the element type from the
 data when `type=` is omitted — `bytes` becomes an unsigned-byte (`ubyte[]`)
@@ -240,9 +240,12 @@ mode = spvirit.mbbi("SIM:MODE", ["Off", "Standby", "Running"], 0)
 cmd  = spvirit.mbbo("SIM:CMD",  ["Stop", "Start", "Reset"],   0, desc="Command")
 ```
 
-`mbbi` is read-only over the wire (a client PUT is refused, as for an EPICS
-input record; update it from Python with `set()`), `mbbo` is writable. Writes
-with an out-of-range index are refused with an error. Only the `desc` option applies to enums.
+`mbbi` is deliberately read-only over the wire in spvirit (a client PUT is
+refused; EPICS Base allows VAL writes to input records); update it from
+Python with `set()`. `mbbo` is writable: a client PUT selects the choice by
+index. A wire PUT with an out-of-range index is refused with an error; a
+`set()` with an out-of-range index leaves the value unchanged and raises
+nothing. Only the `desc` option applies to enums.
 
 Array records (served as NTScalarArray):
 
@@ -401,7 +404,7 @@ total = spvirit.calc("SIM:SUM", [a, b], lambda vals: vals[0] + vals[1])
 Set a record's alarm state explicitly, independent of its value:
 
 ```python
-temp.set_alarm(2, 3, "sensor unplugged")   # severity=MAJOR, status=STATE
+temp.set_alarm(2, 3, "sensor unplugged")   # severity=MAJOR, status=3 (spget shows HIHI)
 temp.set_alarm(0, 0)                       # clear (message defaults to "")
 ```
 
@@ -534,10 +537,12 @@ v = server.pv("DEMO:VOLTAGE")   # typed handle onto a .db-loaded record
 v.set(5.2)
 ```
 
-Supported record types include `ai`, `ao`, `bi`, `bo`, `stringin`,
-`stringout`, `mbbi`, `mbbo`, `waveform`, `aai`, `aao`, and common fields
-(`VAL`, `DESC`, `EGU`, `PREC`, `HIHI`/`HIGH`/`LOW`/`LOLO`, `DRVH`/`DRVL`,
-`ADEL`, `MDEL`, …).
+Supported record types are `ai`, `ao`, `bi`, `bo`, `stringin`, `stringout`,
+`waveform`, `aai`, `aao` and `subarray`, with common fields (`VAL`, `DESC`,
+`EGU`, `PREC`, `HIHI`/`HIGH`/`LOW`/`LOLO`, `DRVH`/`DRVL`, `ADEL`, `MDEL`, …).
+`mbbi`/`mbbo` (and `longin`/`longout`) are not yet built by the `.db` loader:
+loading one fails with *record '…' of type 'mbbi' is not yet supported by the
+.db loader* (create enums with `spvirit.mbbi`/`mbbo` instead).
 
 ---
 
@@ -580,9 +585,11 @@ server.start()
 
 The full method set: record definitions `ai`, `ao`, `bi`, `bo`, `string_in`,
 `string_out`, `mbbi`, `mbbo`, `waveform`, `aai`, `aao`, `sub_array`,
-`nt_table`, `nt_ndarray`, `generic` (no `longin`/`longout` — 32-bit integer
-records exist only in the handle API); loading `db_file`, `db_string`;
-callbacks `on_put`, `scan`; configuration `port`, `udp_port`, `listen_ip`,
+`nt_table`, `nt_ndarray`, `generic` (no `longin`/`longout`: use the handle
+factories `spvirit.longin`/`longout`, or tier 3's `spvirit.ioc.longin`/
+`longout`); loading `db_file`, `db_string`; callbacks `on_put`, `scan`;
+lifecycle `on_start`, `on_event` (see Lifecycle hooks and events);
+configuration `port`, `udp_port`, `listen_ip`,
 `advertise_ip`, `compute_alarms`, `beacon_period` (whole seconds),
 `add_source`; and `build()`.
 
@@ -617,7 +624,7 @@ store = server.store()
 
 store.pv_names()                      # -> list[str], all served PVs
 store.get_value("DEMO:TEMP")          # -> scalar value or None
-store.set_value("DEMO:TEMP", 22.0)    # -> True if the PV exists
+store.set_value("DEMO:TEMP", 22.0)    # -> True if the value changed (False if unchanged or the PV is not served)
 store.set_array_value("DEMO:WF", [1.0, 2.0, 3.0])
 store.get_nt("DEMO:TEMP")             # -> full NT payload (NtScalar, ...)
 store.put_nt("DEMO:TEMP", nt)         # write a full NT payload
@@ -635,7 +642,8 @@ follows the same never-retype rule for `NtScalar`/`NtScalarArray` payloads;
 for `NtTable`/`NtNdArray` payloads, `put_nt` replaces the record's stored
 payload wholesale — columns, element types, and all — since the whole
 structure comes from the payload you supply. Writing to a name that isn't
-served returns `False` (or, for `get_value`, `None`) rather than raising.
+served returns `False` (and `get_value` returns `None`) rather than raising;
+a write that leaves the value unchanged also returns `False`.
 
 ---
 
@@ -804,8 +812,9 @@ delays every other event's handlers behind it.
 The record half of that guarantee is real, not aspirational: `post_event`
 blocks the calling Python thread until every registered record consumer has
 finished, releasing the GIL for the duration, so a consumer that itself
-needs the GIL cannot deadlock against the poster. (Nothing registers such a
-consumer yet; the seam exists for the scan-list work.)
+needs the GIL cannot deadlock against the poster. (When a tier-3 `Ioc` is
+hosted, its event-scan list is such a consumer: records with `SCAN="Event"`
+process before `post_event` returns.)
 
 A handler that raises is logged and skipped; the next handler still runs
 (unlike a raising `on_start`, which aborts startup — see above). The queue
@@ -899,7 +908,7 @@ client.get("SIM:TEMP", fields=["value", "alarm.severity"])   # partial pvRequest
 client.get("SIM:TEMP", fields="value")          # single field: plain str is fine too
 
 client.put("SIM:SP", 21.0)                      # blocking put (fields default: ["value"])
-client.put("SIM:MODE", 2, fields=["value.index"])
+client.put("SIM:MODE", 2, fields=["value.index"])  # NTEnum: selects choice 2 of an mbbo
 
 def on_update(update):                          # a MonitorUpdate, not a bare value
     print(update.value)
@@ -986,7 +995,7 @@ client = (
 Server discovery (UDP beacons):
 
 ```python
-for srv in spvirit.discover_servers(timeout=2.0):
+for srv in spvirit.py_discover_servers(timeout=2.0):
     print(srv.guid.hex(), srv.tcp_addr)
 ```
 
@@ -1150,7 +1159,7 @@ Client, channel, discovery, and codec operations raise this hierarchy
 | `spvirit.ProtocolError` | unexpected/invalid protocol state |
 | `spvirit.DecodeError` | malformed wire data |
 | `spvirit.IoError` | socket/OS-level failure (also subclasses builtin `OSError`) |
-| `spvirit.PutRejectedError` | a put was rejected by an `on_put` validator |
+| `spvirit.PutRejectedError` | reserved; not currently raised. A put that the server refuses (an `on_put` validator, `Write access denied`, a value not representable in the record's type) raises `spvirit.ProtocolError` with the server's message. |
 
 `spvirit.TimeoutError` and `spvirit.IoError` deliberately dual-inherit, so
 idiomatic `except TimeoutError:` and `except OSError:` catch them alongside

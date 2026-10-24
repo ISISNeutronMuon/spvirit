@@ -13,15 +13,18 @@ installed to build or run.
 
 */ˈspɪrɪt/ of the Machine*
 
-## The six crates
+## The crates
 
-The project is a Cargo workspace, strictly layered. Each crate depends only on
-the ones above it.
+The project is a Cargo workspace of nine crates, strictly layered. Each crate
+depends only on the ones above it. The six below form the core stack;
+`spvirit-ioc` (synchronous record-processing engine), `spvirit-gateway`
+(p4p-compatible gateway) and `spvirit-calc` (CALC expression evaluator) are
+described in the [crate map](../05-reference/crate-map.md).
 
 | Crate | What it is |
 |---|---|
 | `spvirit-types` | Shared data model for PVAccess Normative Types. Pure data, no I/O. |
-| `spvirit-codec` | Protocol encoding/decoding and connection state tracking. |
+| `spvirit-codec` | Protocol encoding/decoding (PVA message layer + pvData) and segment reassembly. |
 | `spvirit-client` | Search, connect, get, put, monitor. |
 | `spvirit-server` | `.db` parsing, the `Source` trait, the PVAccess server runtime. |
 | `spvirit-tools` | The command-line tools, and the integration test suites. |
@@ -32,10 +35,15 @@ flowchart LR
     T["spvirit-types"] --> C["spvirit-codec"]
     C --> CL["spvirit-client"]
     C --> SV["spvirit-server"]
+    SV --> IOC["spvirit-ioc"]
+    CL --> GW["spvirit-gateway"]
+    SV --> GW
     CL --> TO["spvirit-tools"]
     SV --> TO
+    GW --> TO
     CL --> PY["spvirit-py"]
     SV --> PY
+    IOC --> PY
 ```
 
 If you only want to read and write PVs from Rust, you need `spvirit-client`.
@@ -64,6 +72,11 @@ links — but it is not EPICS Base. It does not implement the full record
 processing model, database links with all their link types, or the
 sequencing guarantees a real IOC gives you. If you are running a beamline,
 run an IOC.
+
+`spvirit-server`'s record store is simulation-grade. The separate
+`spvirit-ioc` crate adds a real record-processing engine (scan lists, link
+graph, lock sets) for `ai`/`ao`/`bi`/`bo`/`longin`/`longout`; it is still not
+a full EPICS Base (no `calc`/`calcout`/`seq`/`fanout` records).
 
 Development is also ongoing rather than finished. The near-term work is
 expanding the server's softIOC behaviours and record processing, and adding

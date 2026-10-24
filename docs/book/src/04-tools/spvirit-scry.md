@@ -85,15 +85,18 @@ spvirit-scry --device eth0 --tui
 
 Options:
 - `--device` / `-i`: network interface to capture from.
-- `--integration-time` / `-t`: stats integration period in seconds.
+- `--integration-time SECS` (default 1): stats integration period in seconds. There is no short form; `-t` is `--tui`.
 - `--buffer-size` / `-b`: capture buffer size (100–50000).
 - `--resolve` / `-r`: resolve IP addresses.
-- `--tui`: enable TUI.
+- `--tui` / `-t`: enable TUI.
+- `--tui-tick-ms`: TUI refresh tick in milliseconds (default 100).
+- `--quiet` / `-q`: be quiet.
+- `--show-payload` / `-p`: show packet payloads.
 - `--debug` / `-d`: debug logging.
 - `--version` / `-v`: print version and exit.
 - `--exclude-cmds` / `-x`: comma-separated PVA commands to exclude (e.g. `PUT,MONITOR`).
 - `--pva-ttl`: PVA channel state TTL in seconds (default 86400).
-- `--pva-max-memory-mb`: ceiling on PVA tracker state in MiB, `0` to disable (default 1024).
+- `--pva-max-memory-mb`: ceiling on PVA tracker state in MiB, `0` to disable (default 1024; otherwise at least 16).
 - `--pva-max-channels`: max PVA channels to track per connection (default 40000).
 - `--tracked-only`: only show packets for tracked connections.
 - `--pva-max-update-rate`: max update timestamps kept per channel for rate calculation (default 10000).
@@ -114,12 +117,14 @@ spvirit-scry_influx_collector --device eth0 --config-file influxdb_config.toml
 
 Options:
 - `--device` / `-i`: network interface to capture from.
-- `--integration-time` / `-t`: stats integration period in seconds.
+- `--integration-time SECS` (default 1): stats integration period in seconds. There is no short form; `-t` is `--tui`.
 - `--buffer-size` / `-b`: capture buffer size (100–50000).
 - `--resolve` / `-r`: resolve IP addresses.
+- `--tui` / `-t`: show the TUI.
+- `--show-payload` / `-p`: show packet payloads.
 - `--debug` / `-d`: debug logging.
 - `--version` / `-v`: print version and exit.
-- `--config-file` / `-c`: path to InfluxDB config file.
+- `--config-file` / `-c`: path to InfluxDB config file (default `influxdb_config.toml`).
 - `--fingerprint`: enable passive source fingerprinting (off by default).
 - `--fp-window`: fingerprint window in seconds (default 900).
 - `--fp-min-samples`: minimum samples before a fingerprint is emitted (default 30).
@@ -146,8 +151,10 @@ or directory service claims:
 - **Arrival minus stamp** — available only to a wire observer, and the best
   single signal for telling bridge-sourced from device-sourced data.
 
-A fingerprint accumulates per `(channel, server address)` over a rolling window
-(default 15 minutes) and is emitted once at least 30 samples are in. Results
+A fingerprint accumulates per `(channel, server address)` over a fixed window
+(default 15 minutes). When a window closes, the fingerprint is emitted if the
+channel has at least 30 samples; otherwise the channel is reported as
+insufficient (`pending n/m` in the TUI). Results
 appear on the TUI's **Fingerprints** page (key `5`; `v` cycles list, clusters
 and the discontinuity log), as a badge column in the Connections detail table,
 and from the collector as InfluxDB measurements plus Loki events.

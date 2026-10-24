@@ -74,8 +74,10 @@ $ spget SIM:MODE
 SIM:MODE {index=2, choices=["Standby", "Acquire", "Calibrate"]}
 ```
 
-An `mbbi` is an input record and, as in EPICS, refuses client writes with
-`Write access denied`. Drive it server-side with `pv.set(index)`.
+An `mbbi` is an input record and refuses client writes with
+`Write access denied`. That is deliberate: it is read-only over the wire in
+spvirit, although EPICS Base allows VAL writes to input records. Drive it
+server-side with `pv.set(index)`.
 
 **Out-of-range indices are refused, not clamped.** A PUT whose index is
 outside `choices` (or whose `value` carries no integer index) is answered

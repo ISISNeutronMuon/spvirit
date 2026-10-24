@@ -52,10 +52,11 @@ cargo clippy --all-targets
 
 Three conventions specific to this repository:
 
-1. **Chapters cite code; they do not copy it.** Every code block in this book
-   is an `{{#include}}` pointing at a real file under `spvirit-*/examples/`,
-   anchored with `// ANCHOR: name` / `// ANCHOR_END: name`. If you add a
-   snippet, add the example file and the anchor, not a copy of the source.
+1. **Chapters cite code; they do not copy it.** Every `{{#include}}` points
+   at a real example file under `spvirit-*/examples/`, anchored with
+   `// ANCHOR: name` / `// ANCHOR_END: name`; console output and small
+   fragments are inline. If you add a snippet, add the example file and the
+   anchor, not a copy of the source.
 
 2. **`docs/book/verify.toml` is the manifest.** Each chapter declares the
    example files, anchors, and CLI tools it cites.
@@ -74,9 +75,8 @@ Three conventions specific to this repository:
    UPDATE_DOCS=1 cargo test -p spvirit-tools --test docs_verify
    ```
 
-3. **Every example has a Python counterpart, and vice versa.** Part III is
-   dual-language throughout; a new Rust example wants a matching
-   `spvirit-py/examples/demo_*.py`.
+3. **Part III is dual-language where the API exists in both.** A new Rust
+   example usually wants a matching `spvirit-py/examples/demo_*.py`.
 
 Every page of this book has an **edit** link in its top-right corner that
 opens the source file directly on GitHub — the fastest route for a typo or a

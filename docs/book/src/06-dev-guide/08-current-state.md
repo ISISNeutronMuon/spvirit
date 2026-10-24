@@ -1,21 +1,20 @@
 # Current State, In-Flight Work, and Roadmap
 
-> Snapshot taken **2026-07-16**, revised **2026-07-17** after Effort B
-> landed. Reconcile against `git log`/`git status` before acting on anything
-> here — this chapter goes stale fastest.
+> Revised for the **0.4.0** release (2026-10-24). This chapter goes stale
+> fastest; reconcile against `git log` before acting on anything here.
 
-## Repository state at handover
+## What 0.4.0 adds
 
-- Branch `main`, **15 commits ahead of `origin/main`** (unpushed, as of this
-  revision) — the design spec/plan for Python NT value-type selection, the
-  NTTable-metadata/timestamp fix, and the full Effort B implementation
-  (`7c5bc9b` through `d85473b`, latest `fix(py): final-review fixes —
-  strict types= key validation, doc accuracy`).
-- **Working tree is clean** — the three files that were mid-edit at the
-  2026-07-16 snapshot (`spvirit-codec/src/spvd_encode.rs`,
-  `spvirit-server/src/simple_store.rs`, `spvirit-server/src/types.rs`) have
-  since been committed as part of Effort A below. There are no uncommitted
-  changes to reconcile.
+A client resolution cache (bounded at 16,384 names) and connection pool with
+retry-once for get/put/info, `MonitorHandle` cancellation, gateway
+idle-monitor teardown and upstream-disconnect propagation, an error (not
+success) for refused PUTs (an unrepresentable value, an out-of-range enum
+index, a Generic record), working enum wire PUTs, evaluated handle alarm
+limits, a codec introspection node budget (16 nodes per input byte, at most
+1,048,576 per decode), IOC scan threads that are capped at 64 distinct
+periods, reaped and woken at shutdown, IOC client writes that accept real
+PVA clients' PUTs, `spload` moved out of the pip wheel, and
+`RunningServer::local_addrs` for port-0 servers.
 
 ### Effort A — NTTable metadata + store-entry timestamps (committed: `0ac87d5`)
 
@@ -51,7 +50,7 @@ Errors: `ValueError` (unknown type string), `OverflowError` (out of range),
 user-facing doc.
 
 **Status**: all 10 tasks are committed (`git log` `0819a18`..`d85473b`).
-`spvirit-py/tests/test_value_types.py` (324 LOC, ports 16060–16081) now
+`spvirit-py/tests/test_value_types.py` (341 LOC, ports 16060–16083) now
 exists and exercises the full surface: `NtScalar`/`NtScalarArray`
 `type=`/`.value_type`, `NtTable`/`NtNdArray` constructors, `spvirit.scalar()`,
 `server.pv()` on `long`/unsigned records (no more `KeyError`), `waveform`/
@@ -65,8 +64,7 @@ exists and exercises the full surface: `NtScalar`/`NtScalarArray`
 
 Cross-referenced from the per-crate chapters.
 
-> **Crate audit + remediation, 2026-08-29 (landed on branch
-> `audit-remediation-2026-08-29`, not yet on `main`).** A workspace-wide
+> **Crate audit + remediation, 2026-08-29 (landed; in 0.4.0).** A workspace-wide
 > adversarial audit — one pass per crate — produced fixes across the high and
 > medium tiers, since committed on that branch. Load-bearing landings: the
 > server monitor writer is now the two-lane flat-combining `ConnWriter`
@@ -78,8 +76,7 @@ Cross-referenced from the per-crate chapters.
 > input (server `handler.rs` and `monitor.rs`, and the `spserver` binary);
 > Python `Notifier.notify` delivers monitor updates in order rather than via
 > fire-and-forget spawns; `spvirit-calc` uses `wrapping_rem` to avoid an
-> `i32::MIN % -1` panic; and the IOC layer prunes dead `field_subs`. Reconcile
-> against `git log` before relying on any of this.
+> `i32::MIN % -1` panic; and the IOC layer prunes dead `field_subs`.
 
 > **Codec-gaps effort, 2026-08-07 (landed).** Three of the protocol/codec
 > entries below are struck through: segmentation reassembly, the heuristic
@@ -104,7 +101,7 @@ Cross-referenced from the per-crate chapters.
   scoring)~~ — fixed: `decode_monitor_update` is spec-exact (changed bitset,
   data, overrun bitset) and is what every workspace call site uses. The
   scoring heuristic survives only behind `DecodeMode::Lenient`, for
-  out-of-tree packet-capture consumers.
+  packet-capture consumers (`spvirit-scry` uses it).
 - No packet-capture regression corpus; four duplicated size codecs.
 - ~~Array decode caps silently truncate; string/struct truncation can
   desync~~ — fixed: over-limit counts are `DecodeError::ArrayTooLarge` and
@@ -131,7 +128,9 @@ Cross-referenced from the per-crate chapters.
   capable than the high-level API exposes).
 - Epoch disambiguation heuristic in `format.rs` (UNIX vs 1990 epoch by
   closeness to now).
-- Hardcoded cid=1/ioid=1 in single-shot paths — hazard if ever multiplexed.
+- The one-shot `establish_channel`/`pvget` path still uses cid 1 on its own
+  connection; `PvaClient` operations allocate cids/ioids per pooled
+  connection (`PooledConn`).
 - spserver: NtTable/NtNdArray DOL links are no-ops; `demo/docker_compose.yml`
   is an empty placeholder.
 
@@ -143,11 +142,9 @@ Cross-referenced from the per-crate chapters.
 - ~~The type-collapsing limitation~~ — fixed by Effort B: all twelve
   NTScalar wire types are now selectable from Python via `type=`/`types=`
   and `spvirit.scalar()`, with strict coercion. Remaining Python-side gaps:
-  `on_put`/`scan` still unsupported on array PVs; widened `byte`/`short`/
-  `int` handles (the plain `int` `PvKind`) are not range-checked on write —
-  only `spvirit.scalar(type=...)`/`store.set_value` enforce strict range
-  checks on those types (see the README's "Widened `int` handles are not
-  range-checked" caveat).
+  `on_put`/`scan` are still unsupported on array PVs. Writes through a
+  widened `byte`/`short` handle are now refused rather than wrapped: an
+  unrepresentable value raises `TypeError`.
 
 **Process**
 - No clippy/rustfmt CI gate; no MSRV; no CONTRIBUTING.md; crates.io releases

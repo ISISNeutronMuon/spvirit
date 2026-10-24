@@ -1,4 +1,4 @@
-"""Enum records: mbbi (read-only) and mbbo (writable).
+"""Enum records: mbbi (read-only over the wire) and mbbo (writable).
 
 Run:
     python spvirit-py/examples/demo_enums.py
@@ -7,8 +7,11 @@ Then:
     spget SIM:STATE
     spget SIM:MODE
 
-Note: writing to an mbbo over the wire is a known gap - see the Enums
-chapter. Drive enum records server-side with `pv.set(index)`.
+A client can write the mbbo by index:
+    spput SIM:MODE --json '{"value":{"index":2}}'
+An out-of-range index is refused with a PUT error. The mbbi is
+deliberately read-only over the wire in spvirit (EPICS Base allows VAL
+writes to input records); drive it server-side with `pv.set(index)`.
 """
 
 import time

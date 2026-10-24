@@ -21,7 +21,8 @@ cargo install spvirit-tools
 
 ## Tools
 
-Twelve binaries. They are named `sp*` rather than `pv*` so they can sit
+Thirteen binaries ship in the default build and the pip wheel (plus two
+packet-capture tools behind the `scry` feature, below). They are named `sp*` rather than `pv*` so they can sit
 alongside an EPICS Base installation without shadowing `pvget`, `pvput`, and
 friends.
 
@@ -35,10 +36,15 @@ friends.
 | `spexplore` | client, TUI | browse a server interactively |
 | `spsearch` | client, TUI | passively watch PVA search traffic |
 | `spsine` | client | drive a PV with a sine wave |
-| `spget_compare` | offline | replay a captured GET frame |
+| `spget_compare` | offline | compare a captured GET exchange against spvirit's encoders |
 | `spserver` | server | serve a `.db` file |
 | `sptable` | server, TUI | an interactive spreadsheet IOC |
 | `spdodeca` | server | serve a rotating wireframe as an image |
+| `spgateway` | client, server | p4p-compatible PVAccess gateway |
+
+`spload` is an internal load driver used by the `loadtest/` harness. It is
+not a user-facing tool and is not in the wheel or a default build
+(`--features load` builds it).
 
 Each accepts `--help`.
 

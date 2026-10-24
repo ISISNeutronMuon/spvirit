@@ -16,7 +16,7 @@ Error: Timeout("search response")
 ```
 
 `PvGetError::Timeout` carries the stage it gave up at
-(`spvirit-client/src/types.rs:64`), and the stage tells you where to look.
+(`spvirit-client/src/types.rs:63`), and the stage tells you where to look.
 
 **`"search response"`** — nothing answered the UDP broadcast. Either no
 server is running, or the search never reached it. Check, in this order:
@@ -25,21 +25,28 @@ server is running, or the search never reached it. Check, in this order:
    server that answers.
 2. Same subnet? PVA searches go out on UDP **5076** by broadcast. Across a
    router, set `EPICS_PVA_ADDR_LIST` to the server's address, or pass
-   `--server host:port` to skip the search entirely.
+   `--server ip:port` (an IP literal; a hostname is not resolved) to skip the
+   search. For a hostname, put it in `EPICS_PVA_ADDR_LIST` or
+   `--name-server`. (`splist` ignores `--server`; give it the address as its
+   positional target.)
 3. Firewall? Windows blocks inbound UDP on a new binary the first time it
    binds. The server starts fine and answers nothing.
 4. Multi-homed host? The search leaves on one interface. `spsearch` shows
    what is actually arriving — if it shows nothing, you are on the wrong NIC.
 
 **`"read header"`, `"name server connect"`, `"name server handshake"`** —
-something answered, and then the TCP leg failed. The commonest cause is a
-stale `EPICS_PVA_NAME_SERVERS` pointing at a name server that is gone: the
-client goes straight to TCP, skips the broadcast, and waits. Unset it and
-retry before blaming the server.
+something answered, and then the TCP leg failed. A stale
+`EPICS_PVA_NAME_SERVERS` entry is tried in parallel with the UDP broadcast,
+so it only bites when broadcast is disabled (`--no-broadcast`,
+`EPICS_PVA_AUTO_ADDR_LIST=NO`) or the server is not reachable by broadcast;
+the error you see is the last strategy to fail. Unset it, or pass
+`--server ip:port`, to rule it out.
 
-The client reads five environment variables:
-`EPICS_PVA_ADDR_LIST`, `EPICS_PVA_AUTO_ADDR_LIST`, `EPICS_PVA_NAME_SERVERS`,
-`EPICS_PVA_CONN_TMO`, and `EPICS_PVA_ENABLE_GET_FIELD_FALLBACK`.
+The client reads four environment variables: `EPICS_PVA_ADDR_LIST`,
+`EPICS_PVA_AUTO_ADDR_LIST`, `EPICS_PVA_NAME_SERVERS`, and
+`EPICS_PVA_ENABLE_GET_FIELD_FALLBACK` (the last only affects `splist`'s
+GET_FIELD fallback, off by default). `spserver` also reads
+`EPICS_PVA_CONN_TMO` for its idle-connection timeout.
 
 ## The server is found but the PV is not
 
@@ -65,7 +72,7 @@ matrix is on [Record types](record-types.md).
 
 If you meant it to be writable, you wanted `ao` rather than `ai`. If you
 want a simulated readback you can also poke, set `SIMM` — an `ai` in
-simulation mode is writable (`spvirit-server/src/types.rs:308`).
+simulation mode is writable (`spvirit-server/src/types.rs:359`).
 
 ## The write is accepted and nothing changes
 
@@ -79,7 +86,7 @@ success without a change. [Known gaps](known-gaps.md).
 ## A monitor looks frozen
 
 The value is moving but no updates arrive. Almost always the deadband:
-`should_post_update` (`spvirit-server/src/simple_store.rs:545`) suppresses
+`should_post_update` (`spvirit-server/src/simple_store.rs:644`) suppresses
 the *post*, not the store, when the record is a numeric scalar, `MDEL` is
 greater than zero, the severity has not changed, and the delta is under
 `MDEL`.
@@ -93,25 +100,25 @@ posting logic.
 
 ## Python: `on_put` never fires
 
-You attached it after `Server.start()`. Handles are unbound until the server
-starts and bound afterwards; `on_put`, `scan` and `calc` must be registered
-while the handle is still unbound. There is no error — the callback simply
-sits there.
+You attached it after the PV was handed to `Server(...)`. A handle is
+unbound until `Server(...)` is constructed, and bound after it; `on_put`,
+`scan` and `calc` must be registered before that. Nothing is raised to
+Python; the core only logs a warning.
 
 Register everything before you start:
 
 ```python
 temp = spvirit.ao("DEMO:SETPOINT", 20.0)
-temp.on_put(lambda pv, v: print("set to", v))   # before
-server = spvirit.Server([temp])
-server.start()                                   # not after
+temp.on_put(lambda pv, v: print("set to", v))   # before Server(...)
+server = spvirit.Server(pvs=[temp])               # binds the handle
+server.start()
 ```
 
 ## `on_put` fires twice for one write
 
 Only for a *rejected* write, and only from `spput`. When the full PUT flow
 fails, `spput` silently retries with the simple flow
-(`spvirit-tools/src/bin/spvirit_put.rs:214`), so the server sees the write
+(`spvirit-tools/src/bin/spvirit_put.rs:240-249`), so the server sees the write
 twice. Pass `--no-flow-fallback` to suppress the retry — and write `on_put`
 callbacks to be idempotent regardless.
 
@@ -119,7 +126,7 @@ callbacks to be idempotent regardless.
 
 Limits — from `Pv::alarm_limits` or a `.db` file — are only evaluated when
 the server-level `compute_alarms` flag is on, and it is off by default
-(`spvirit-server/src/server.rs:55`) — `spserver --compute-alarms`, or
+(`spvirit-server/src/server.rs:64`) — `spserver --compute-alarms`, or
 `.compute_alarms(true)` on the builder. The limits are not applied to the
 initial value: severity changes on the first write. See
 [Alarms and severity](../03-progressive/alarms.md).
@@ -133,4 +140,6 @@ initial value: severity changes on the first write. See
 ## `spget` prints `0` for a value that is not zero
 
 That column is a display rendering, not the wire value: `5e-7` prints as
-`0`. Use `spget -F value` to see the field as decoded.
+`0`. Neither `-F value` nor `--json` shows the full-precision double (they
+use the same formatter). Use `spget --raw` for the payload bytes, or read the
+PV from a client library.

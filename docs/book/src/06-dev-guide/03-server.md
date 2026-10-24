@@ -10,83 +10,99 @@ All paths under `spvirit-server/src/`.
 
 | File | ~Lines | Purpose |
 |---|---|---|
-| `pva_server.rs` | 2335 | `PvaServer` + `PvaServerBuilder` (classic API), `ServeBuilder`/`RunningServer` (handle API), shared record-construction helpers `make_scalar_record`/`make_output_record`/`make_array_record` |
-| `handler.rs` | 2066 | **The core.** TCP connection processor (`handle_connection`), UDP search responder (`run_udp_search`), TCP accept loop, `ServerState`, wildcard matching, GUID generation, `MAX_PIPELINE_WINDOW` |
-| `simple_store.rs` | 1586 | `SimplePvStore`: in-memory `Source` backed by `RecordInstance`s — value/NT writes, subscribers, MDEL gate, link evaluation, PUT application, NTScalar descriptor builders |
-| `pv.rs` | 1498 | Typed handle layer: `Pv<T>`, `PvArray`, `AnyPv`, `PvScalar` trait, pending/bound state machine, builder methods, `attach` |
-| `group.rs` | 1161 | QSRV-style group PVs: `info(Q:group)` JSON parsing → `GroupPvDef`, and `GroupSource` composing members into `NtPayload::Generic` |
-| `types.rs` | 1104 | Record model: `RecordType`, `ScanMode`, `LinkExpr`, `DbCommonState`, `RecordData`, `RecordInstance` + value-mutation methods |
-| `apply.rs` | 1104 | Pure functions applying a decoded PUT to NT payloads (`apply_value_update`, `apply_table_put`, `apply_ndarray_put`, …) |
-| `db.rs` | 1090 | EPICS `.db` file parser (regex, line-oriented) |
-| `events.rs` | 736 | `Events`: server-wide `on_start` hooks, named `on_event` handlers, the `EventSink` trait, and the single-task dispatcher behind `post_event` |
-| `monitor.rs` | 724 | `MonitorRegistry`: per-PV subscriber lists, the per-connection `ConnWriter` map, `build_monitor_frame` (pure, self-contained frames), pipeline credit accounting, subscribe-only pump management |
-| `record_fields.rs` | 687 | QSRV-style field access: serves `<pv>.<FIELD>` and `<pv>.<FIELD>$` as read-only channels; dbCommon defaults table |
-| `pvstore.rs` | 572 | The **`Source` trait** + `PvInfo` + `SourceRegistry` |
-| `conn_writer.rs` | 484 | `ConnWriter`: the per-connection two-lane flat-combining writer (coalescing monitor lane + FIFO lossless control lane) that replaced the old mpsc-plus-writer-task tail |
-| `field_provider.rs` | 308 | `RecordFieldProvider`: the value-level field-access seam shared by `SimplePvStore` and `spvirit-ioc` (`field_descriptor` resolves type without a read) |
-| `convert.rs` | 276 | `DecodedValue` → `ScalarValue`/`ScalarArrayValue` conversions |
-| `server.rs` | 186 | Orchestration: `run_pva_server_with_registry` binds TCP/UDP/beacon and joins the tasks |
-| `request_ctx.rs` | 116 | Task-local per-connection request context (peer address now; `ca` user/host reserved for M2), visible to `Source` impls |
-| `decode.rs` | 110 | PUT-body decoding with fallback strategies + segmented-message reassembly |
+| `pva_server.rs` | 2943 | `PvaServer` + `PvaServerBuilder` (classic API), `ServeBuilder`/`RunningServer` (handle API), shared record-construction helpers `make_scalar_record`/`make_output_record`/`make_array_record` |
+| `handler.rs` | 4410 | **The core.** TCP connection processor (`handle_connection`), UDP search responder (`run_udp_search`), TCP accept loop, `ServerState`, wildcard matching, GUID generation, `MAX_PIPELINE_WINDOW` |
+| `simple_store.rs` | 1738 | `SimplePvStore`: in-memory `Source` backed by `RecordInstance`s — value/NT writes, subscribers, MDEL gate, link evaluation, PUT application, `descriptor_for_payload` |
+| `pv.rs` | 1646 | Typed handle layer: `Pv<T>`, `PvArray`, `AnyPv`, `PvScalar` trait, pending/bound state machine, builder methods, `attach` |
+| `group.rs` | 1436 | QSRV-style group PVs: `info(Q:group)` JSON parsing → `GroupPvDef`, and `GroupSource` composing members into `NtPayload::Generic` |
+| `types.rs` | 1709 | Record model: `RecordType`, `ScanMode`, `LinkExpr`, `DbCommonState`, `RecordData`, `RecordInstance` + value-mutation methods |
+| `apply.rs` | 1527 | Pure functions applying a decoded PUT to NT payloads (`apply_value_update`, `apply_table_put`, `apply_ndarray_put`, …) |
+| `db.rs` | 1183 | EPICS `.db` file parser (regex, line-oriented) |
+| `events.rs` | 994 | `Events`: server-wide `on_start` hooks, named `on_event` handlers, the `EventSink` trait, and the single-task dispatcher behind `post_event` |
+| `monitor.rs` | 2893 | `MonitorRegistry`: per-PV subscriber lists, the per-connection `ConnWriter` map, `build_monitor_frame` (pure, self-contained frames), pipeline credit accounting, subscribe-only pump management |
+| `record_fields.rs` | 731 | QSRV-style field access: serves `<pv>.<FIELD>` and `<pv>.<FIELD>$` as read-only channels; dbCommon defaults table |
+| `pvstore.rs` | 1414 | The **`Source` trait** + `StoreSource` + `PvInfo` + `SourceRegistry` |
+| `conn_writer.rs` | 512 | `ConnWriter`: the per-connection two-lane flat-combining writer (coalescing monitor lane + FIFO lossless control lane) that replaced the old mpsc-plus-writer-task tail |
+| `field_provider.rs` | 372 | `RecordFieldProvider`: the value-level field-access seam shared by `SimplePvStore` and `spvirit-ioc` (`field_descriptor` resolves type without a read) |
+| `convert.rs` | 437 | `DecodedValue` → `ScalarValue`/`ScalarArrayValue` conversions |
+| `server.rs` | 418 | Orchestration: `run_pva_server_with_registry` binds TCP/UDP/beacon and joins the tasks |
+| `search_resolve.rs` | 729 | `SearchResolver`: background resolution of names `Source::try_claim` could not answer, with a hard concurrency cap |
+| `diag.rs` | 399 | Live downstream-client registry and per-PV/per-host byte counters (gateway diagnostic PVs) |
+| `request_ctx.rs` | 175 | Task-local per-connection request context (peer address, plus the `ca` user/host decoded from CONNECTION_VALIDATION), visible to `Source` impls |
+| `decode.rs` | 110 | PUT-body decoding with fallback strategies (segment reassembly is the codec's `SegmentReassembler`, driven from `handler.rs`) |
 | `beacon.rs` | 67 | Periodic UDP beacon sender |
-| `state.rs` | 37 | Per-connection state: `ConnState`, `MonitorSub`, `MonitorState` |
+| `state.rs` | 375 | Per-connection state: `ConnState`, `MonitorSub`, `MonitorState`, and `ChannelTables` (shared with `MonitorRegistry` so upstream-death teardown can forget a destroyed channel) |
 
 ## The provider model: `Source` and `SourceRegistry`
 
-`Source` (pvstore.rs:55) is the object-safe provider abstraction (modeled on
+`Source` (pvstore.rs:111) is the object-safe provider abstraction (modeled on
 pvxs's provider registry). Methods return boxed futures: `claim` (returns
-`PvInfo{descriptor, writable}` or `None`), `get`, `put` (returns
-`Vec<(name, payload)>` of *everything that changed* — this is how forward-link
-fan-out reaches monitors), `subscribe` (returns `mpsc::Receiver<NtPayload>`),
-`rpc` (default `Err`), `names`.
+`PvInfo{descriptor, writable}` or `None`), `get`, `put` (returns the
+`(name, payload)` pairs the handler should publish. `IocSource` returns every
+record its pass changed; `SimplePvStore` returns only the target and notifies
+link outputs itself), `subscribe` (returns `mpsc::Receiver<NtPayload>`),
+`rpc` (default `Err`), `names`, plus `try_claim` (the non-blocking
+search-path answer, default `Unknown`) and `pushes_own_updates` (default
+`false`). `StoreSource` (pvstore.rs:237) extends `Source` for fixed record
+stores (`record_names`, `set_monitor_registry`, `start_scanning`, …).
 
-`SourceRegistry` (pvstore.rs:125) is a priority-ordered list — the **first
+`SourceRegistry` (pvstore.rs:323) is a priority-ordered list — the **first
 source to claim a name wins**. Note that `get`/`put`/`subscribe` each call
 `claim` again before dispatching, so `claim` must be cheap and idempotent.
 
-Registration in `PvaServer::run` (pva_server.rs:672–690):
+Registration in `PvaServer::serve_after_start_hooks` (pva_server.rs:1121–1222),
+which `run()` calls after the start hooks. `builtin` and `ioc` are registered
+with `add_store`:
 
 | Order | Label | Source | Claims |
 |---|---|---|---|
 | 0 | `builtin` | `SimplePvStore` | exact record names |
+| 5 | `ioc` | the `.ioc()` engine (`StoreSource`), if any | its record names and their `<name>.<FIELD>` refs |
 | 10 | `record-fields` | `RecordFieldSource` | `<name>.<FIELD>` refs |
 | user | … | `.source()` extras | whatever they claim |
 
 ## SimplePvStore
 
-`simple_store.rs:55`. Holds `RwLock<HashMap<String, PvEntry>>` where `PvEntry`
+`simple_store.rs:64`. Holds `RwLock<HashMap<String, PvEntry>>` where `PvEntry`
 = record + in-process subscriber senders + `last_posted` (the MDEL reference
 value). Key paths:
 
 - **Public writers** `set_value` / `set_array_value` / `put_nt` bypass
   on_put/validators; each calls an `_inner` writer then `evaluate_links`.
-- **`Source::put`** (simple_store.rs:410) — the wire PUT path: run the PUT
+- **`Source::put`** (simple_store.rs:479) — the wire PUT path: run the PUT
   validator (cloned out of the lock first, so user callbacks can't hold the
   lock across `.await`), apply via `RecordInstance::apply_put`
-  (apply.rs:546), which always restamps the record and reports whether the
-  value changed, MDEL-gate the post (or force it when the PUT was
+  (apply.rs:569). It refuses a value the record's type cannot represent (and
+  an out-of-range enum index, or any Generic PUT) with `Err` naming the
+  reason (record untouched, not restamped; the client gets an error status
+  and `on_put` does not run). Otherwise it restamps and reports
+  `value_changed` / `client_stamped`, then MDEL-gate the post (or force it when the PUT was
   client-stamped and the value did not change), spawn the `on_put` callback
   as a detached task, evaluate links.
-- **Links/calc**: `evaluate_links` (simple_store.rs:349) is a BFS over
+- **Links/calc**: `evaluate_links` (simple_store.rs:391) is a BFS over
   `LinkDef`s whose inputs include the changed PV, with a `visited` set for
   cycle detection; uses `set_value_inner` to avoid re-triggering.
-- **Descriptor builders** for NTScalar/NTScalarArray live here
-  (simple_store.rs:645–903); Table/NdArray/Enum/Generic delegate to
-  `spvirit_codec::spvd_encode::nt_payload_desc`.
+- **Descriptors**: `descriptor_for_payload` / `descriptor_for_record`
+  (simple_store.rs:680/690) delegate every payload shape, NTScalar included,
+  to `spvirit_codec::spvd_encode::nt_payload_desc`. A local copy used to
+  drift from the codec and broke string PUTs.
 
 ## Protocol runtime
 
-`run_pva_server_with_registry` (server.rs:112) binds TCP **first** (eager
+`run_pva_server_with_registry` (server.rs:183) binds TCP **first** (eager
 `EADDRINUSE` so a failed start doesn't ghost-beacon), then spawns UDP-search,
 TCP-accept and beacon tasks and joins them.
 
-- **UDP search** (handler.rs:620): binds 5076 with SO_REUSEADDR/SO_REUSEPORT
-  (so a co-located p4p can share the port); answers Search packets whose names
-  the registry claims. Response IP: advertise_ip → non-unspecified listen_ip →
+- **UDP search** (handler.rs:1157): binds 5076 with SO_REUSEADDR/SO_REUSEPORT
+  (so a co-located p4p can share the port); answers Search packets from the
+  non-blocking `SourceRegistry::try_claim`. Names no source can decide from
+  memory are handed to `SearchResolver` (search_resolve.rs) and answered on
+  the client's retry, so a slow proxying `claim` never stalls the search
+  task. Response IP: advertise_ip → non-unspecified listen_ip →
   `infer_udp_response_ip` (connect-a-socket trick) → zeros.
-- **TCP connection** (`handle_connection`, handler.rs:838): a per-connection
+- **TCP connection** (`handle_connection`, handler.rs:1501): a per-connection
   reader whose write half is wrapped in a [`ConnWriter`](#monitor-delivery-the-connwriter)
-  (handler.rs:848) — the flat-combining two-lane writer that replaced the old
+  (handler.rs:1515) — the flat-combining two-lane writer that replaced the old
   dedicated writer task draining an `mpsc::channel<Vec<u8>>(128)`. Handshake:
   SET_BYTE_ORDER → CONNECTION_VALIDATION → client's validation →
   CONNECTION_VALIDATED. Then the command dispatch (CreateChannel; Op 10 GET /
@@ -100,14 +116,16 @@ TCP-accept and beacon tasks and joins them.
 ### Data flow: external PUT → monitor update
 
 1. Handler decodes the PUT and calls `state.sources.put(name, value)`
-   (handler.rs:1258).
+   (handler.rs:1953, :2055).
 2. `SimplePvStore::put`: validator → apply under write lock → MDEL gate →
-   in-process subscriber sends → returns changed `(name, payload)` list;
-   `on_put` spawned; links evaluated (may append more changes).
-3. Handler's `notify_changed_records` (handler.rs:410) bumps the beacon
+   in-process subscriber sends → returns the target's `(name, payload)` (or
+   nothing if the post was gated). `on_put` is spawned, and links are
+   evaluated if the value changed. Link outputs are notified from inside the
+   store via `set_value_inner`; they are not added to the returned list.
+3. Handler's `notify_changed_records` (handler.rs:753) bumps the beacon
    counter and calls `registry.notify_monitors` per change.
-4. `MonitorRegistry::notify_monitors` (monitor.rs:221) builds one frame per
-   subscriber via the pure `build_monitor_frame` (monitor.rs:149) — first
+4. `MonitorRegistry::notify_monitors` (monitor.rs:594) builds one frame per
+   subscriber via the pure `build_monitor_frame` (monitor.rs:477) — first
    frame full (possibly field-filtered); a **filtered** subscriber's later
    frames are self-contained *full filtered* frames (not sparse deltas, so a
    coalesced drop cannot corrupt the client's value), no-op-suppressed when the
@@ -115,7 +133,7 @@ TCP-accept and beacon tasks and joins them.
    suppressed (suppressed when unchanged). Pipeline credit (`nfree`, capped at
    `MAX_PIPELINE_WINDOW`) gates delivery. Each frame is then handed to the
    subscriber's `ConnWriter` on the correct lane (`route_monitor_frame`,
-   monitor.rs:286).
+   monitor.rs:679).
 5. The `ConnWriter` delivers it: a **non-pipelined** monitor goes on the
    coalescing monitor lane (latest-per-ioid, lossy under load); a **pipelined**
    monitor goes on the FIFO lossless control lane so no charged credit is ever
@@ -127,7 +145,10 @@ TCP-accept and beacon tasks and joins them.
 `store.set_value` and notify monitors *from inside the store* (the store holds
 the registry via `set_registry`). So there are two notification origins:
 protocol PUTs notify from the handler, internal writes from the store. Note
-the beacon change counter is only bumped on the protocol-PUT path.
+the beacon change counter is only bumped on the protocol-PUT path. With an
+`.ioc()` engine there is another origin: scan-thread passes publish through
+the engine's notify-drain task (`IocSource::start_scanning`) into the same
+`notify_monitors`.
 
 **Subscribe-only sources** (gateway proxies, group PVs, async backends) have a
 third origin. Their values change upstream, never through a local PUT or store
@@ -148,7 +169,9 @@ nothing.
 Tokio tasks: UDP-search loop, TCP-accept loop, beacon loop, one per
 connection, one per `.scan()`, detached `on_put` tasks, one per
 group-subscription fan-in, one monitor pump per subscribe-only PV under
-monitor. Note there is **no** dedicated per-connection writer task any more:
+monitor, and, with an `.ioc()` engine, its notify-drain task. The engine's
+scan lists run on OS threads, one per distinct `SCAN` period (at most 64),
+stopped and joined at server shutdown. Note there is **no** dedicated per-connection writer task any more:
 the `ConnWriter` flat-combines, so socket writes happen inline on whichever
 task deposited the frame and won the flusher election. Locks: store `pvs`
 (`RwLock`), monitor registry (`Mutex`), source registry (`RwLock`); each
@@ -192,7 +215,7 @@ safety: if the flusher future is dropped mid-`write_all` (its task cancelled),
 the guard hands the election to a spawned continuation so pending bytes are
 never stranded and no depositor is wedged behind a stale `flushing == true`.
 
-**Frame building is pure.** `MonitorRegistry::build_monitor_frame` (monitor.rs:149)
+**Frame building is pure.** `MonitorRegistry::build_monitor_frame` (monitor.rs:477)
 takes only a `MonitorSub` and an `NtPayload` and returns `Option<Vec<u8>>`:
 `Some(bytes)` when there is something to send, `None` for a no-op (a duplicate
 under the subscriber's field view). A `None` **does not consume pipeline
@@ -204,11 +227,11 @@ harmless, whereas a dropped delta would silently corrupt the client's value.
 **Pipelined flow control is lossless.** A `MonitorSub` (state.rs) carries per-sub
 `nfree`, `last_snapshot`, `filtered_desc` and `pipeline_enabled`. Pipelined
 subscribers do credit-based flow control, so every charged frame must arrive;
-`route_monitor_frame` (monitor.rs:286) sends their frames on the lossless
+`route_monitor_frame` (monitor.rs:679) sends their frames on the lossless
 **control** lane, never the coalescing monitor lane — coalescing one away would
 spend a credit the client never receives and drift its window until it stalls.
 The client-supplied window is capped server-side at `MAX_PIPELINE_WINDOW = 4096`
-(handler.rs:48) at three points: monitor init, ACK refill, and the registry's
+(handler.rs:49) at three points: monitor init, ACK refill, and the registry's
 `update_monitor_subscription` gate — so a stalled pipelined client cannot grow
 the lossless lane without bound.
 
@@ -218,9 +241,10 @@ aborting a pump could drop its future mid-`write_all` inside a shared
 lets any in-flight `notify_monitors` finish first.
 
 > The standalone [`spserver`](../04-tools/spserver.md) binary is a separate
-> implementation and does **not** use `ConnWriter`; it keeps the older
-> per-connection `mpsc(128)` plus a writer task, borrowing only the pure
-> `build_monitor_frame`. It has no `MAX_PIPELINE_WINDOW` cap.
+> implementation and does **not** use `ConnWriter`. It keeps the older
+> per-connection `mpsc(128)` plus a writer task and borrows only the pure
+> `build_monitor_frame`. It applies the same `MAX_PIPELINE_WINDOW = 4096` cap
+> (`spvirit-tools/src/bin/spvirit_server.rs:1145`).
 
 ## Record model and .db parsing
 
@@ -229,35 +253,40 @@ lets any in-flight `notify_monitors` finish first.
   an input, is read-only over the wire).
 - `RecordData` (types.rs:128): one variant per record family carrying the NT
   payload + record-specific fields (INP/OUT/DOL/DRVL/DRVH/SIML/…).
-  **`nt()`/`nt_mut()` panic** on non-scalar variants (types.rs:244, 256) —
-  use `nt_scalar_mut()` (fallible) in generic code.
-- `RecordInstance` (types.rs:294) adds `raw_fields: HashMap<String,String>`
+  **`nt_mut()` panics** on non-scalar variants (types.rs:285, 423). Use
+  `nt_scalar()` (pub, fallible, types.rs:301) or the crate-internal
+  `nt_scalar_mut()` in generic code.
+- `RecordInstance` (types.rs:345) adds `raw_fields: HashMap<String,String>`
   (verbatim `.db` fields — used by the record-fields source and MDEL lookup).
-  `set_scalar_value` (types.rs:430) does exhaustive cross-type numeric
+  `set_scalar_value` (types.rs:528) does exhaustive cross-type numeric
   coercion and timestamp stamping.
-- `parse_db` (db.rs:579) is **line-oriented** (one statement per line). A
-  packed one-liner `record(...){field(...)}` silently drops its fields.
+- `parse_db` (db.rs:836) is **line-oriented** (one statement per logical
+  line; a quoted value may span lines). A packed one-liner
+  `record(...){field(...)}` is rejected with an `unrecognised line` error.
 - `.db` **cannot** load longin/longout/mbbi/mbbo/table/ndarray/generic — the
   two `TODO(follow-up)` markers in the codebase (types.rs:45, db.rs:562).
-  Those record types exist only via the builder/handle APIs.
+  Those record types exist in the builtin store only via the builder/handle
+  APIs, and a `.db` file naming one is a load error that names the record.
+  (`spvirit-ioc`'s engine does load `longin`/`longout` from `.db`; see
+  chapter 09.)
 
 ## Typed handle layer (`pv.rs`)
 
-`PvScalar` (pv.rs:85) is implemented for `f64`/`bool`/`i32`/`String` and
+`PvScalar` (pv.rs:88) is implemented for `f64`/`bool`/`i32`/`String` and
 (added by the value-types work, commit `0819a18`) `ScalarValue`. Each impl overrides `from_decoded` to dodge the
-truthy-first bug in `convert::decoded_to_scalar_value` (convert.rs:122 checks
+truthy-first bug in `convert::decoded_to_scalar_value` (convert.rs:140 checks
 bool before numerics, so any nonzero numeric becomes `Bool` — documented at
-pv.rs:92–103).
+pv.rs:94–102).
 
 A handle is `Arc<PvShared{name, Mutex<PvState>}>` where `PvState` is
 `Pending(record + validator + scan + calc)` or `Bound(Arc<SimplePvStore>)`.
 Builder methods mutate the pending record and **warn + no-op if already
 bound** — this is the "attach before serving" rule surfaced in the Python API
-docs. `ServeBuilder::build` (pva_server.rs:788) drains each handle's parts
+docs. `ServeBuilder::build` (pva_server.rs:1335) drains each handle's parts
 into the classic builder, builds, then flips handles to `Bound`.
 `Pv::attach`/`RunningServer::pv` mint handles to existing records and refuse
-payload shapes that don't match the requested type (regression test at
-pv.rs:1154).
+payload shapes that don't match the requested type (regression test
+`scalar_attach_rejects_array_backed_record`, pv.rs:1236).
 
 ### Callbacks
 
@@ -288,26 +317,27 @@ RwLock<HashMap<String, Vec<EventHandler>>>`, an `mpsc::channel` of capacity
   `Handle::block_on` panics, `block_in_place` panics, and
   `futures::executor::block_on` deadlocks on the store's tokio `RwLock` — so
   a sync signature could not be honoured by any sink that touches a record.
-  The returned future borrows `&self`, not `event`. This is the seam a future
-  EPICS-`EVNT`-scan-list consumer implements; nothing in this repo registers
-  a sink today.
+  The returned future borrows `&self`, not `event`. This is the seam the
+  `spvirit-ioc` scanner uses for EPICS `EVNT` scan lists: when an engine is
+  registered with `.ioc()`, `serve_after_start_hooks` adds the engine's
+  `Scanner` as a sink (pva_server.rs:1156).
 - **`EventHandler`** (events.rs:50) is the deferred counterpart:
   `Arc<dyn Fn(Arc<SimplePvStore>, String) -> Pin<Box<dyn Future<Output = ()> +
-  Send>> + Send + Sync>`. `Events::post` (events.rs:170) awaits the sinks —
+  Send>> + Send + Sync>`. `Events::post` (events.rs:222) awaits the sinks —
   each wrapped in `catch_unwind(AssertUnwindSafe(..))`, so a panicking sink
   is logged, counted in `failed_count`, and neither truncates the fan-out nor
   stops handlers being queued — then increments `inflight` for the whole
   batch *before* enqueueing any of it (so a concurrent `drain()` can never
   observe `inflight == 0` mid-batch), and `try_send`s each handler — a full
   queue drops and counts rather than blocking the poster.
-- **`start_dispatcher`** (events.rs:133) spawns the single task that drains
+- **`start_dispatcher`** (events.rs:149) spawns the single task that drains
   the channel and awaits each handler wrapped in
   `futures::FutureExt::catch_unwind(AssertUnwindSafe(fut))`: a panicking
   handler is logged, counted in `failed_count`, and the loop continues —
   handlers never abort the dispatcher. Handlers therefore run strictly one
   at a time, in the order they were enqueued across *all* events, so a slow
   handler for one event delays every other event's handlers behind it.
-- **`drain()`** (events.rs:232) is test-only: it polls `inflight` down to
+- **`drain()`** (events.rs:297) is test-only: it polls `inflight` down to
   zero with a 10 s timeout that panics by name rather than hanging CI if the
   dispatcher-invariant (`catch_unwind` always present, `inflight` always
   decremented) is ever broken by a regression. It first checks the
@@ -317,10 +347,10 @@ RwLock<HashMap<String, Vec<EventHandler>>>`, an `mpsc::channel` of capacity
   the dispatcher.
 
 **Startup hooks** (`StartHook`, events.rs:57) are not part of `Events` —
-they are a plain `Vec` on `PvaServer` (`start_hooks`, pva_server.rs:692),
-run by `run_start_hooks()` (pva_server.rs:735) to completion, in order,
+they are a plain `Vec` on `PvaServer` (`start_hooks`, pva_server.rs:868),
+run by `run_start_hooks()` (pva_server.rs:940) to completion, in order,
 *before* `serve_after_start_hooks()` builds the source registry, spawns
-scan tasks, starts the event dispatcher, and binds (pva_server.rs:823–905:
+scan tasks, starts the event dispatcher, and binds (pva_server.rs:1051–1222:
 `run()` is exactly `run_start_hooks().await?` then
 `serve_after_start_hooks().await`). A panicking hook returns
 `Err(format!("on_start hook #{i} panicked; aborting startup: {cause}"))` —
@@ -350,7 +380,7 @@ path, so this is not observable by a client — but a handler must not assume
 a source is registered. What both orders share is the part that matters: no
 hook runs late, and nothing binds before every hook has returned.
 `run_start_hooks` also installs the `MonitorRegistry` onto the store before
-the first hook runs (pva_server.rs:736), so a hook that writes the store
+the first hook runs (pva_server.rs:942), so a hook that writes the store
 reaches any monitor subscribed later, and a hook that reads the registry
 never sees `None`.
 
@@ -366,8 +396,9 @@ sources](../03-progressive/sources.md).
 ## Alarms and deadbands
 
 - **Alarm computation** is `NtScalar::update_alarm_from_value`
-  (spvirit-types/src/lib.rs:285), invoked only when `compute_alarms` is true —
-  and **`compute_alarms` defaults to `false`** (server.rs:55).
+  (spvirit-types/src/lib.rs:281), invoked only when `compute_alarms` is true —
+  and **`compute_alarms` defaults to `false`** (server.rs:64; also
+  pva_server.rs:95).
 - **Dual alarm-limit fields**: `NtScalar` has `alarm_low/high/lolo/hihi`
   (`Option<f64>` — what the alarm engine reads) *and*
   `value_alarm_*_limit` (`f64` — the NT wire metadata). Both the `.db`
@@ -375,7 +406,7 @@ sources](../03-progressive/sources.md).
   `NtScalar::with_alarm_limits(low, high, lolo, hihi)` (note the order differs
   from `Pv::alarm_limits(lolo, low, high, hihi)`). Neither evaluates the
   initial value; severity is computed on the next write.
-- **MDEL** (monitor deadband): `should_post_update` (simple_store.rs:545)
+- **MDEL** (monitor deadband): `should_post_update` (simple_store.rs:644)
   suppresses the *post* (not the store) when the record is a numeric scalar,
   MDEL > 0, severity unchanged, and the delta is under MDEL. **ADEL is parsed
   and exposed via field access but not wired into any posting logic**
@@ -383,27 +414,31 @@ sources](../03-progressive/sources.md).
 
 ## Known gaps / gotchas (beyond those above)
 
-1. **Timestamps are load-bearing.** Missing/epoch-0 timestamps get stamped at
-   encode time, which breaks monitor deltas and is rejected by the EPICS
-   Archiver Appliance. Mutation paths stamp timestamps (`set_scalar_value`
-   types.rs:430–448, `set_array_value`/`set_nt_payload` types.rs:848–960);
-   `stamp_missing_timestamps` (types.rs:387) is called on store insert
-   (simple_store.rs:74, 109) so static/`.db`-loaded records are stamped too
+1. **Timestamps are load-bearing.** An `NtScalar` with `time_stamp: None` is
+   stamped with `now()` at encode time, which breaks monitor deltas; a `None`
+   table/NDArray timestamp encodes as epoch 0, which the EPICS Archiver
+   Appliance rejects. Mutation paths stamp timestamps (`set_scalar_value`
+   types.rs:528, `set_array_value`/`set_nt_payload` types.rs:593/628);
+   `stamp_missing_timestamps` (types.rs:457) is called on store insert
+   (simple_store.rs:83, 118) so static/`.db`-loaded records are stamped too
    (see chapter 08).
 2. **PUT to `Generic` is refused.** `RecordInstance::apply_put` has no
-   wire path for `Generic` and answers a client PUT with an error.
-   `NtTable`/`NtNdArray` dispatch to `apply_table_put`/`apply_ndarray_put`
-   and `NtEnum` unwraps `value.index`, so all three are writable over the
-   wire; `Generic` is writable only via `put_nt`.
+   wire path for `Generic` (apply.rs:710) and answers a client PUT with an
+   error. `NtTable`/`NtNdArray` dispatch to `apply_table_put`/
+   `apply_ndarray_put` (apply.rs:675/678) and `NtEnum` unwraps
+   `value.index`. A table and an enum are fully writable over the wire; an
+   NDArray PUT applies its metadata, but not the union-shaped image `value`.
+   `Generic` is writable only via `put_nt`.
 3. **CANCEL_REQUEST is unimplemented** (returns an error message); some
    clients use it. ACL_CHANGE/MESSAGE/MULTIPLE_DATA/ORIGIN_TAG and Op 14/16
    likewise return errors.
-4. `group.rs::race_all` (group.rs:575) polls members in vec order — first
-   ready wins, lower indexes favoured; not starvation-proof.
+4. `group.rs::poll_any_member` (group.rs:575) races member receivers with
+   `select_all` and rotates the list after each win, so a chatty low-index
+   member cannot starve the others.
 5. Default `conn_timeout` is ~64000 s (~17.8 h); the doc comment rounds it to
-   18 h (pva_server.rs:513).
+   18 h (pva_server.rs:672).
 6. The beacon change counter only increments on protocol PUTs, not internal
-   scan/set writes (handler.rs:108, 404).
+   scan/set writes (handler.rs:115, 755).
 
 ## Tests and examples
 
@@ -413,7 +448,7 @@ rejection), `pv.rs` (constructors, attach guards, ScalarValue preservation) and
 `pva_server.rs` (builder wiring, db_string, links, serve/bind). Run:
 `cargo test -p spvirit-server`.
 
-19 runnable examples under `spvirit-server/examples/` — from
+24 runnable examples under `spvirit-server/examples/` — from
 `simple_server.rs` up to `snake.rs` (a Snake game over PVAccess). The
 `custom_pvstore` / `multi_source` / `wildcard_source` / `json_source` /
 `aggregate_source` / `passthrough_source` / `rpc_source` set demonstrates the

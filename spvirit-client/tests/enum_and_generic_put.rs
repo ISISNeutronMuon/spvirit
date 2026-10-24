@@ -3,8 +3,9 @@
 //!
 //! A real NTEnum PUT carries `value` as the sub-structure `{index, choices}`;
 //! the server must unwrap `index`. An out-of-range index is refused with the
-//! record left untouched (not even restamped). `mbbi`, like an EPICS input
-//! record, is read-only over the wire; `mbbo`/`bo` stay writable. A `Generic`
+//! record left untouched (not even restamped). `mbbi` is deliberately
+//! read-only over the wire in spvirit (EPICS Base allows VAL writes to input
+//! records); `mbbo`/`bo` stay writable. A `Generic`
 //! record has no wire PUT path, so a PUT to it is refused rather than silently
 //! dropped. Checked end to end: a real `PvaClient` against a real `PvaServer`.
 

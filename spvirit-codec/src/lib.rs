@@ -1,7 +1,8 @@
-//! PVAccess protocol encode/decode and connection state tracking.
+//! PVAccess protocol encode/decode and segment reassembly.
 //!
 //! This crate provides the low-level PVA wire-format codec (encode + decode),
-//! PVD (pvData) structure codec, and PVA connection state tracking.
+//! the PVD (pvData) structure codec, monitor delta encoding, and sans-io
+//! segment reassembly. It keeps no connection state.
 //!
 //! Commonly used types are re-exported at the crate root for convenience.
 //! The full module paths remain available for less common items.
