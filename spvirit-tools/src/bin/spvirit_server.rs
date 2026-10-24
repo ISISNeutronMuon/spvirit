@@ -2355,7 +2355,7 @@ async fn apply_put_and_process(
     }
     let mut changed_names: HashSet<String> = HashSet::new();
     let mut force_post: HashSet<String> = HashSet::new();
-    let outcome = record.apply_put(value, state.compute_alarms);
+    let outcome = record.apply_put(value, state.compute_alarms)?;
     if outcome.value_changed {
         // A value change is always judged by the deadband (should_post_update
         // must run so the MDEL reference point stays current); it is never

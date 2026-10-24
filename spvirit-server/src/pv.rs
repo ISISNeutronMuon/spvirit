@@ -44,7 +44,7 @@ use spvirit_codec::spvd_decode::DecodedValue;
 use spvirit_types::{NtPayload, ScalarArrayValue, ScalarValue};
 
 use crate::pva_server::{make_array_record, make_output_record, make_scalar_record};
-use crate::simple_store::SimplePvStore;
+use crate::simple_store::{SetOutcome, SimplePvStore};
 use crate::types::{RecordInstance, RecordType};
 
 /// Errors from typed PV handle operations.
@@ -604,22 +604,29 @@ impl<T: PvScalar> Pv<T> {
 
     /// Write a value through the full posting pipeline (timestamp, alarms,
     /// MDEL gating, monitors, links).
+    ///
+    /// Re-setting the current value is a no-op and `Ok(())`. A value the
+    /// record's type cannot represent (for example 300 into a `byte` record,
+    /// or a non-finite float into an integer one) is refused, leaves the
+    /// record untouched and returns [`PvError::TypeMismatch`].
     pub async fn set(&self, value: T) -> Result<(), PvError> {
         let store = self.store()?;
-        if store
-            .set_value(&self.shared.name, value.into_scalar())
+        match store
+            .set_value_checked(&self.shared.name, value.into_scalar())
             .await
         {
-            Ok(())
-        } else if store.get_value(&self.shared.name).await.is_some() {
-            // Record exists — the write was a no-op (value unchanged). Records
-            // CAN now be removed at runtime (`SimplePvStore::remove`), so this
-            // is a genuine (benign) TOCTOU: if the record were removed between
-            // the failed set and this check we would fall through to the
-            // `NotFound` arm, which is the correct outcome.
-            Ok(())
-        } else {
-            Err(PvError::NotFound(self.shared.name.clone()))
+            SetOutcome::Changed | SetOutcome::Unchanged => Ok(()),
+            SetOutcome::Refused => {
+                // Read back only on the refusal path, so a successful set
+                // pays nothing for the error text.
+                let current = store.get_value(&self.shared.name).await;
+                Err(PvError::TypeMismatch {
+                    expected: current.as_ref().map_or("a representable value", fits_label),
+                    actual: current
+                        .map_or_else(|| "a removed record".to_string(), |c| format!("{c:?}")),
+                })
+            }
+            SetOutcome::NotFound => Err(PvError::NotFound(self.shared.name.clone())),
         }
     }
 
@@ -700,6 +707,25 @@ impl<T: PvScalar> Pv<T> {
             }),
             _marker: PhantomData,
         })
+    }
+}
+
+/// `expected` text for a `PvError::TypeMismatch` raised by a refused
+/// `Pv::set`, named after the record's current scalar type.
+fn fits_label(current: &ScalarValue) -> &'static str {
+    match current {
+        ScalarValue::Bool(_) => "a value that fits boolean",
+        ScalarValue::I8(_) => "a value that fits byte",
+        ScalarValue::I16(_) => "a value that fits short",
+        ScalarValue::I32(_) => "a value that fits int",
+        ScalarValue::I64(_) => "a value that fits long",
+        ScalarValue::U8(_) => "a value that fits ubyte",
+        ScalarValue::U16(_) => "a value that fits ushort",
+        ScalarValue::U32(_) => "a value that fits uint",
+        ScalarValue::U64(_) => "a value that fits ulong",
+        ScalarValue::F32(_) => "a value that fits float",
+        ScalarValue::F64(_) => "a value that fits double",
+        ScalarValue::Str(_) => "a value that fits string",
     }
 }
 
@@ -1203,6 +1229,55 @@ mod tests {
             Vec::new(),
             false,
         ))
+    }
+
+    /// A `byte` record behind a widened `Pv<i32>` handle: the Python `int`
+    /// handle path. 300 does not fit, so the set is refused and must say so.
+    #[tokio::test]
+    async fn set_of_an_unrepresentable_value_is_an_error() {
+        let store = empty_store();
+        store
+            .insert(
+                "S:BYTE".into(),
+                make_output_record("S:BYTE", RecordType::LongOut, ScalarValue::I8(7)),
+            )
+            .await;
+        let pv = Pv::<i32>::attach(&store, "S:BYTE").await.unwrap();
+
+        match pv.set(300).await {
+            Err(PvError::TypeMismatch { .. }) => {}
+            other => panic!("expected a TypeMismatch refusal, got {other:?}"),
+        }
+        assert_eq!(store.get_value("S:BYTE").await, Some(ScalarValue::I8(7)));
+
+        let dynamic = Pv::<ScalarValue>::attach(&store, "S:BYTE").await.unwrap();
+        assert!(matches!(
+            dynamic.set(ScalarValue::F64(f64::NAN)).await,
+            Err(PvError::TypeMismatch { .. })
+        ));
+        assert_eq!(store.get_value("S:BYTE").await, Some(ScalarValue::I8(7)));
+    }
+
+    #[tokio::test]
+    async fn set_of_the_current_value_is_still_ok() {
+        let store = empty_store();
+        store
+            .insert(
+                "S:BYTE2".into(),
+                make_output_record("S:BYTE2", RecordType::LongOut, ScalarValue::I8(7)),
+            )
+            .await;
+        let pv = Pv::<i32>::attach(&store, "S:BYTE2").await.unwrap();
+        assert_eq!(
+            pv.set(7).await,
+            Ok(()),
+            "an unchanged set is a no-op, not a refusal"
+        );
+        assert_eq!(pv.set(-100).await, Ok(()));
+        assert_eq!(
+            store.get_value("S:BYTE2").await,
+            Some(ScalarValue::I8(-100))
+        );
     }
 
     #[tokio::test]

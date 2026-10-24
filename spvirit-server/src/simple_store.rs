@@ -47,6 +47,19 @@ struct PvEntry {
     last_posted: Option<f64>,
 }
 
+/// How a host-side scalar write ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetOutcome {
+    /// The value changed.
+    Changed,
+    /// The record exists and the write was a no-op (value unchanged).
+    Unchanged,
+    /// The record exists and the value is not representable in its type.
+    Refused,
+    /// No record with this name.
+    NotFound,
+}
+
 /// A simple in-memory PV store.
 pub struct SimplePvStore {
     pvs: RwLock<HashMap<String, PvEntry>>,
@@ -162,12 +175,18 @@ impl SimplePvStore {
 
     /// Write a [`ScalarValue`] to a PV (bypasses on_put).
     pub async fn set_value(&self, name: &str, value: ScalarValue) -> bool {
-        if self.set_value_inner(name, value).await {
+        self.set_value_checked(name, value).await == SetOutcome::Changed
+    }
+
+    /// [`set_value`](Self::set_value), but telling apart the ways a write can
+    /// end, so `Pv::set` can report a refused value as an error rather than
+    /// as an unchanged no-op.
+    pub(crate) async fn set_value_checked(&self, name: &str, value: ScalarValue) -> SetOutcome {
+        let outcome = self.set_value_outcome(name, value).await;
+        if outcome == SetOutcome::Changed {
             self.evaluate_links(name).await;
-            true
-        } else {
-            false
         }
+        outcome
     }
 
     /// Write a [`ScalarArrayValue`] to an array PV (bypasses on_put).
@@ -253,17 +272,28 @@ impl SimplePvStore {
     /// Core write logic — updates the value, notifies subscribers and monitors,
     /// but does **not** trigger link evaluation (to avoid recursion).
     async fn set_value_inner(&self, name: &str, value: ScalarValue) -> bool {
+        self.set_value_outcome(name, value).await == SetOutcome::Changed
+    }
+
+    /// [`set_value_inner`](Self::set_value_inner), reporting which way the
+    /// write ended.
+    async fn set_value_outcome(&self, name: &str, value: ScalarValue) -> SetOutcome {
         let payload = {
             let mut pvs = self.pvs.write().await;
             if let Some(entry) = pvs.get_mut(name) {
                 let prev_severity = entry.record.to_ntscalar().alarm_severity;
-                let changed = entry.record.set_scalar_value(value, self.compute_alarms);
+                let Some(changed) = entry
+                    .record
+                    .try_set_scalar_value(value, self.compute_alarms)
+                else {
+                    return SetOutcome::Refused;
+                };
                 if changed {
                     if !should_post_update(entry, prev_severity) {
                         // Changed, but within the MDEL monitor deadband:
                         // the record holds the new value (GETs see it), just
                         // no update is posted to subscribers/monitors.
-                        return true;
+                        return SetOutcome::Changed;
                     }
                     let payload = entry.record.to_ntpayload();
                     entry
@@ -274,7 +304,7 @@ impl SimplePvStore {
                     None
                 }
             } else {
-                return false;
+                return SetOutcome::NotFound;
             }
         };
 
@@ -284,9 +314,9 @@ impl SimplePvStore {
             if let Some(registry) = reg.as_ref() {
                 registry.notify_monitors(name, &payload).await;
             }
-            true
+            SetOutcome::Changed
         } else {
-            false
+            SetOutcome::Unchanged
         }
     }
 
@@ -477,7 +507,11 @@ impl Source for SimplePvStore {
                 }
 
                 let prev_severity = entry.record.to_ntscalar().alarm_severity;
-                let outcome = entry.record.apply_put(&value, self.compute_alarms);
+                // A refused PUT (value not representable in the record's
+                // type) returns here: before the post, before on_put, and
+                // with the record untouched — so the handler answers the
+                // client with an error status, not a success.
+                let outcome = entry.record.apply_put(&value, self.compute_alarms)?;
 
                 // A client-supplied timeStamp is new information even when the
                 // value is identical, so it posts. A server-generated stamp on

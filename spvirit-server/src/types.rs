@@ -523,25 +523,39 @@ impl RecordInstance {
     }
 
     pub fn set_scalar_value(&mut self, value: ScalarValue, compute_alarms: bool) -> bool {
+        self.try_set_scalar_value(value, compute_alarms)
+            .unwrap_or(false)
+    }
+
+    /// [`set_scalar_value`](Self::set_scalar_value), but telling a refusal
+    /// apart from a no-op: `None` means `coerce_into` refused the value as
+    /// not representable in the record's scalar type (nothing was modified);
+    /// `Some(changed)` otherwise. An out-of-range `NtEnum` index keeps its
+    /// existing no-op behaviour and is `Some(false)`, not a refusal.
+    pub(crate) fn try_set_scalar_value(
+        &mut self,
+        value: ScalarValue,
+        compute_alarms: bool,
+    ) -> Option<bool> {
         if let RecordData::NtEnum { nt, .. } = &mut self.data {
             let idx = match &value {
                 ScalarValue::I32(i) => *i,
                 ScalarValue::I16(i) => *i as i32,
                 ScalarValue::I8(i) => *i as i32,
                 ScalarValue::I64(i) => *i as i32,
-                _ => return false,
+                _ => return Some(false),
             };
             if idx < 0 || (idx as usize) >= nt.choices.len() {
-                return false; // out-of-range index — reject, keep value
+                return Some(false); // out-of-range index — reject, keep value
             }
             if nt.index == idx {
-                return false;
+                return Some(false);
             }
             nt.index = idx;
             // NtEnum encodes its stored time_stamp verbatim — stamp the
             // update time or clients see epoch 0 forever.
             nt.time_stamp = now_nt_timestamp();
-            return true;
+            return Some(true);
         }
 
         let nt = match &mut self.data {
@@ -551,14 +565,13 @@ impl RecordInstance {
             | RecordData::Bo { nt, .. }
             | RecordData::StringIn { nt, .. }
             | RecordData::StringOut { nt, .. } => nt,
-            _ => return false,
+            _ => return Some(false),
         };
 
-        let Some(next) = coerce_into(&nt.value, value) else {
-            return false; // not representable in the target type
-        };
+        // Not representable in the target type: refused.
+        let next = coerce_into(&nt.value, value)?;
         if nt.value == next {
-            return false;
+            return Some(false);
         }
         nt.value = next;
         // A `None` time_stamp makes the encoder stamp now() at *encode*
@@ -571,7 +584,7 @@ impl RecordInstance {
         if compute_alarms {
             nt.update_alarm_from_value();
         }
-        true
+        Some(true)
     }
 
     pub fn set_array_value(&mut self, value: ScalarArrayValue) -> bool {
