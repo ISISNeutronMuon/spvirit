@@ -126,35 +126,153 @@ struct Slot {
     entry: tokio::sync::Mutex<Option<Entry>>,
 }
 
+/// Below this many names the slot map is never swept. Above it, a sweep runs
+/// whenever the map has doubled since the last one (see [`SlotMap::get_or_insert`]).
+const PRUNE_MIN_SLOTS: usize = 1_024;
+
+/// Hard cap on the number of names the resolution cache tracks. Each slot is
+/// roughly a `String` plus ~100 bytes, so this bounds the map at a few MiB
+/// even when every name is live. A name that arrives while the map is full
+/// of live or in-use slots is still resolved, just not cached (and not
+/// single-flighted). A gateway serving more than 16,384 distinct live PVs
+/// within one TTL should raise this.
+const MAX_SLOTS: usize = 16_384;
+
+/// At the cap, a sweep that freed nothing is not retried for this long, so a
+/// burst of new names against a full map of live entries costs at most one
+/// O(n) sweep per interval rather than one per name.
+const PRUNE_AT_CAP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The name -> slot map plus the bookkeeping that keeps it bounded.
+#[derive(Debug)]
+struct SlotMap {
+    map: HashMap<String, Arc<Slot>>,
+    /// Sweep when `map.len()` reaches this. Doubling it after each sweep
+    /// makes sweeping O(1) amortised per inserted name.
+    next_prune: usize,
+    /// When the last sweep at the cap ran, for [`PRUNE_AT_CAP_INTERVAL`].
+    last_prune_at_cap: Option<Instant>,
+}
+
+impl SlotMap {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            next_prune: PRUNE_MIN_SLOTS,
+            last_prune_at_cap: None,
+        }
+    }
+
+    /// The slot for `pv_name`, creating it if needed. Only called under the
+    /// map lock, which is also the only place slots are cloned, so
+    /// `Arc::strong_count == 1` means "held by the map alone".
+    fn get_or_insert(&mut self, pv_name: &str, ttl: Duration) -> Arc<Slot> {
+        if let Some(slot) = self.map.get(pv_name) {
+            return Arc::clone(slot);
+        }
+        if self.map.len() >= self.next_prune {
+            self.prune(ttl);
+        }
+        if self.map.len() >= MAX_SLOTS {
+            // Full of live or in-use slots: resolve without caching.
+            return Arc::new(Slot::default());
+        }
+        let slot = Arc::new(Slot::default());
+        self.map.insert(pv_name.to_string(), Arc::clone(&slot));
+        slot
+    }
+
+    /// Drop every slot nobody holds whose entry is absent, expired, or from
+    /// an older generation. A slot that is in use keeps its key whatever its
+    /// entry says, so an in-flight resolve stays single-flight across an
+    /// `invalidate`.
+    fn prune(&mut self, ttl: Duration) {
+        if self.map.len() >= MAX_SLOTS {
+            let now = Instant::now();
+            if self
+                .last_prune_at_cap
+                .is_some_and(|t| now.duration_since(t) < PRUNE_AT_CAP_INTERVAL)
+            {
+                return;
+            }
+            self.last_prune_at_cap = Some(now);
+        }
+        self.map.retain(|_, slot| {
+            if Arc::strong_count(slot) > 1 {
+                return true;
+            }
+            let generation = slot.generation.load(Ordering::SeqCst);
+            // Nobody else holds the Arc, so nobody holds the guard either.
+            slot.entry.try_lock().is_ok_and(|guard| {
+                guard.is_some_and(|e| e.generation == generation && e.stored_at.elapsed() < ttl)
+            })
+        });
+        self.next_prune = (self.map.len() * 2).clamp(PRUNE_MIN_SLOTS, MAX_SLOTS);
+    }
+}
+
 /// PV name -> [`Resolved`], with a TTL and single-flight.
 ///
 /// The outer `std::sync::Mutex` guards only the map and is never held across
 /// an `.await`; the per-PV `tokio::sync::Mutex` is what serialises racers so
 /// that N concurrent lookups of one uncached PV perform exactly one search.
+///
+/// The map is bounded: a failed resolve removes its name once no other caller
+/// holds the slot, expired and unused slots are swept as the map grows, and
+/// [`MAX_SLOTS`] caps it outright.
 #[derive(Debug)]
 pub(crate) struct ResolutionCache {
     ttl: Option<Duration>,
-    slots: std::sync::Mutex<HashMap<String, Arc<Slot>>>,
+    slots: std::sync::Mutex<SlotMap>,
 }
 
 impl ResolutionCache {
     pub(crate) fn new(ttl: Option<Duration>) -> Self {
         Self {
             ttl,
-            slots: std::sync::Mutex::new(HashMap::new()),
+            slots: std::sync::Mutex::new(SlotMap::new()),
         }
     }
 
-    fn slot(&self, pv_name: &str) -> Arc<Slot> {
+    fn slot(&self, pv_name: &str, ttl: Duration) -> Arc<Slot> {
         let mut slots = self.slots.lock().expect("resolution cache mutex poisoned");
-        Arc::clone(slots.entry(pv_name.to_string()).or_default())
+        slots.get_or_insert(pv_name, ttl)
+    }
+
+    /// After a failed resolve: remove `pv_name` if `slot` is still its map
+    /// entry and nobody else holds it (the map plus this caller). Waiters
+    /// queued on the slot keep it, so single-flight holds for them; the last
+    /// of them to fail removes it. `slot` is dropped while the map lock is
+    /// held so two callers finishing together cannot each see the other's
+    /// reference and both keep the key.
+    fn forget_failed(&self, pv_name: &str, slot: Arc<Slot>) {
+        let mut slots = self.slots.lock().expect("resolution cache mutex poisoned");
+        if slots
+            .map
+            .get(pv_name)
+            .is_some_and(|s| Arc::ptr_eq(s, &slot))
+            && Arc::strong_count(&slot) == 2
+        {
+            slots.map.remove(pv_name);
+        }
+        drop(slot);
     }
 
     pub(crate) fn invalidate(&self, pv_name: &str) {
         let slots = self.slots.lock().expect("resolution cache mutex poisoned");
-        if let Some(slot) = slots.get(pv_name) {
+        if let Some(slot) = slots.map.get(pv_name) {
             slot.generation.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Test hook: how many names currently hold a slot in the map.
+    #[cfg(test)]
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots
+            .lock()
+            .expect("resolution cache mutex poisoned")
+            .map
+            .len()
     }
 
     /// Test hook: the cached address for `pv_name`, without touching the TTL
@@ -162,7 +280,7 @@ impl ResolutionCache {
     #[cfg(test)]
     pub(crate) fn peek_addr(&self, pv_name: &str) -> Option<SocketAddr> {
         let slots = self.slots.lock().expect("resolution cache mutex poisoned");
-        let slot = slots.get(pv_name)?.clone();
+        let slot = slots.map.get(pv_name)?.clone();
         drop(slots);
         let guard = slot.entry.try_lock().ok()?;
         guard.map(|e| e.resolved.addr)
@@ -186,7 +304,7 @@ impl ResolutionCache {
             return resolve().await;
         };
 
-        let slot = self.slot(pv_name);
+        let slot = self.slot(pv_name, ttl);
         let mut guard = slot.entry.lock().await;
         let generation = slot.generation.load(Ordering::SeqCst);
 
@@ -199,9 +317,17 @@ impl ResolutionCache {
         }
 
         bump(&counters.resolve_misses);
-        // A failure leaves the slot as it was (or empty), so the next caller
-        // retries rather than inheriting a poisoned entry.
-        let resolved = resolve().await?;
+        // A failure caches nothing, so the next caller retries rather than
+        // inheriting a poisoned entry, and the name is dropped from the map
+        // unless someone is queued on it.
+        let resolved = match resolve().await {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                drop(guard);
+                self.forget_failed(pv_name, slot);
+                return Err(e);
+            }
+        };
         *guard = Some(Entry {
             resolved,
             stored_at: Instant::now(),
@@ -969,6 +1095,142 @@ mod tests {
             .unwrap();
         assert_eq!(got, resolved(5075));
         assert_eq!(fake.calls(), 2, "the follower resolves for itself");
+    }
+
+    /// Review F4: a failed resolve must not leave its name behind. The
+    /// gateway resolves whatever names downstream clients search for, so a
+    /// slot per never-resolving name is unbounded heap growth.
+    #[tokio::test]
+    async fn failed_resolves_of_distinct_names_leave_no_slots_behind() {
+        let cache = ResolutionCache::new(Some(Duration::from_secs(300)));
+        let counters = CacheCounters::default();
+
+        for i in 0..1_000 {
+            let err = cache
+                .get_or_resolve(&format!("NOPE:{i}"), &counters, || async {
+                    Err(PvGetError::Search("no responder"))
+                })
+                .await;
+            assert!(err.is_err());
+        }
+
+        assert_eq!(cache.slot_count(), 0, "every failed name must be removed");
+    }
+
+    /// Review F4: expired entries must be reaped too, or a scan over many
+    /// distinct valid names grows the map without bound.
+    #[tokio::test(start_paused = true)]
+    async fn expired_entries_of_distinct_names_do_not_accumulate() {
+        let cache = ResolutionCache::new(Some(Duration::from_secs(300)));
+        let counters = CacheCounters::default();
+
+        for i in 0..(4 * PRUNE_MIN_SLOTS) {
+            cache
+                .get_or_resolve(&format!("SCAN:{i}"), &counters, || async {
+                    Ok(resolved(5075))
+                })
+                .await
+                .unwrap();
+            // Every entry so far is past its TTL before the next name.
+            tokio::time::advance(Duration::from_secs(301)).await;
+        }
+
+        assert!(
+            cache.slot_count() <= PRUNE_MIN_SLOTS,
+            "expired slots must be pruned: {} slots held",
+            cache.slot_count()
+        );
+    }
+
+    /// Review F4: live (unexpired) entries are bounded by a hard cap. A name
+    /// past the cap still resolves, it is just not cached.
+    #[tokio::test]
+    async fn live_entries_never_exceed_the_hard_cap() {
+        let cache = ResolutionCache::new(Some(Duration::from_secs(300)));
+        let counters = CacheCounters::default();
+
+        for i in 0..(MAX_SLOTS + 100) {
+            let got = cache
+                .get_or_resolve(&format!("LIVE:{i}"), &counters, || async {
+                    Ok(resolved(5075))
+                })
+                .await
+                .unwrap();
+            assert_eq!(got, resolved(5075));
+        }
+
+        assert!(
+            cache.slot_count() <= MAX_SLOTS,
+            "the slot map must respect its cap: {} slots held",
+            cache.slot_count()
+        );
+    }
+
+    /// Review F4: removing a failed name must not break single-flight.
+    /// Callers that queued behind a failing leader keep the slot alive, never
+    /// resolve concurrently with it, and each gets an error; the name is gone
+    /// once the last of them is done.
+    #[tokio::test]
+    async fn concurrent_callers_of_a_failing_name_stay_serialised_and_all_fail() {
+        let cache = Arc::new(ResolutionCache::new(Some(Duration::from_secs(300))));
+        let counters = Arc::new(CacheCounters::default());
+        let fake = Arc::new(CountingResolver::default());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        let spawn_caller = |gated: bool| {
+            let (cache, counters, fake, in_flight, max_in_flight, gate) = (
+                cache.clone(),
+                counters.clone(),
+                fake.clone(),
+                in_flight.clone(),
+                max_in_flight.clone(),
+                gate.clone(),
+            );
+            tokio::spawn(async move {
+                cache
+                    .get_or_resolve("NOPE:PV", &counters, || async {
+                        fake.calls.fetch_add(1, Ordering::SeqCst);
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_in_flight.fetch_max(now, Ordering::SeqCst);
+                        if gated {
+                            gate.notified().await;
+                        }
+                        tokio::task::yield_now().await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        Err(PvGetError::Search("no responder"))
+                    })
+                    .await
+            })
+        };
+
+        let leader = spawn_caller(true);
+        while fake.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let followers: Vec<_> = (0..4).map(|_| spawn_caller(false)).collect();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            fake.calls(),
+            1,
+            "followers must queue behind the in-flight leader"
+        );
+
+        gate.notify_one();
+        assert!(leader.await.unwrap().is_err());
+        for f in followers {
+            assert!(f.await.unwrap().is_err(), "every caller gets the error");
+        }
+
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 1, "never concurrent");
+        assert_eq!(
+            cache.slot_count(),
+            0,
+            "the failed name is removed at the end"
+        );
     }
 
     use tokio::net::{TcpListener, TcpStream};
