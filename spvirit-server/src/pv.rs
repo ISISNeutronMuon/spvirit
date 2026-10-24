@@ -54,7 +54,10 @@ pub enum PvError {
     Unbound,
     /// No record with this name exists in the store.
     NotFound(String),
-    /// The record's value type does not match the handle's `T`.
+    /// The record's value type does not match the handle's `T`, or the value
+    /// being written is not representable in the record's type (for example
+    /// 300 into a `ubyte` record); in the latter case `expected` names the
+    /// type the value had to fit and the record is left untouched.
     TypeMismatch {
         expected: &'static str,
         actual: String,

@@ -120,6 +120,11 @@ struct Entry {
 /// second, concurrent resolve. Instead `invalidate` bumps `generation`
 /// (synchronously, without waiting for an in-flight resolver to release
 /// `entry`), and any entry from an older generation is treated as absent.
+///
+/// Slots are cloned only under the map lock, which is what lets a sweep read
+/// `Arc::strong_count == 1` as "held by the map alone". A waiter or leader
+/// whose future is cancelled drops its clone without filling the entry, so
+/// it leaves an empty key behind; that key is reclaimed by the next sweep.
 #[derive(Debug, Default)]
 struct Slot {
     generation: AtomicU64,
@@ -146,6 +151,8 @@ const PRUNE_AT_CAP_INTERVAL: Duration = Duration::from_secs(1);
 /// The name -> slot map plus the bookkeeping that keeps it bounded.
 #[derive(Debug)]
 struct SlotMap {
+    /// Slots are cloned only under the map lock (see [`Slot`]). A cancelled
+    /// waiter or leader leaves an empty key here until the next sweep.
     map: HashMap<String, Arc<Slot>>,
     /// Sweep when `map.len()` reaches this. Doubling it after each sweep
     /// makes sweeping O(1) amortised per inserted name.
@@ -1231,6 +1238,136 @@ mod tests {
             0,
             "the failed name is removed at the end"
         );
+    }
+
+    /// A sweep must keep a slot that is in use (an in-flight resolve) and a
+    /// live entry, while dropping the expired ones around them: the in-flight
+    /// name still resolves exactly once, and the live name is still a hit.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_keeps_an_in_flight_slot_and_a_live_entry() {
+        let cache = Arc::new(ResolutionCache::new(Some(Duration::from_secs(300))));
+        let counters = Arc::new(CacheCounters::default());
+
+        // Fill the map to one below the sweep threshold with entries that
+        // will be expired by the time the sweep runs.
+        for i in 0..(PRUNE_MIN_SLOTS - 2) {
+            cache
+                .get_or_resolve(&format!("OLD:{i}"), &counters, || async {
+                    Ok(resolved(5075))
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::advance(Duration::from_secs(301)).await;
+
+        let live = CountingResolver::default();
+        cache
+            .get_or_resolve("LIVE", &counters, || async {
+                live.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(resolved(6000))
+            })
+            .await
+            .unwrap();
+
+        // An in-flight resolve, parked on a gate, holds its slot.
+        let in_flight = Arc::new(CountingResolver::default());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let spawn_in_flight = || {
+            let (cache, counters, in_flight, gate) = (
+                cache.clone(),
+                counters.clone(),
+                in_flight.clone(),
+                gate.clone(),
+            );
+            tokio::spawn(async move {
+                cache
+                    .get_or_resolve("INFLIGHT", &counters, || async {
+                        in_flight.calls.fetch_add(1, Ordering::SeqCst);
+                        gate.notified().await;
+                        Ok(resolved(7000))
+                    })
+                    .await
+            })
+        };
+        let leader = spawn_in_flight();
+        while in_flight.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(cache.slot_count(), PRUNE_MIN_SLOTS);
+
+        // The next new name reaches the threshold and sweeps.
+        cache
+            .get_or_resolve("TRIGGER", &counters, || async { Ok(resolved(8000)) })
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.slot_count(),
+            3,
+            "only LIVE, INFLIGHT and TRIGGER survive the sweep"
+        );
+
+        // A caller arriving after the sweep still queues on the same slot.
+        let follower = spawn_in_flight();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        gate.notify_one();
+        assert_eq!(leader.await.unwrap().unwrap(), resolved(7000));
+        assert_eq!(follower.await.unwrap().unwrap(), resolved(7000));
+        assert_eq!(
+            in_flight.calls(),
+            1,
+            "the in-flight name resolves once across the sweep"
+        );
+
+        let got = cache
+            .get_or_resolve("LIVE", &counters, || async {
+                live.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(resolved(6001))
+            })
+            .await
+            .unwrap();
+        assert_eq!(got, resolved(6000), "the live entry is still a hit");
+        assert_eq!(live.calls(), 1);
+    }
+
+    /// At the cap, a sweep that freed nothing is not retried within
+    /// [`PRUNE_AT_CAP_INTERVAL`], even once entries have expired; the first
+    /// new name after the interval sweeps them.
+    #[tokio::test(start_paused = true)]
+    async fn the_at_cap_sweep_is_throttled() {
+        let cache = ResolutionCache::new(Some(Duration::from_secs(300)));
+        let counters = CacheCounters::default();
+        let resolve = || async { Ok(resolved(5075)) };
+
+        for i in 0..MAX_SLOTS {
+            cache
+                .get_or_resolve(&format!("LIVE:{i}"), &counters, resolve)
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.slot_count(), MAX_SLOTS);
+
+        // Still live: the at-cap sweep runs, frees nothing, and starts the
+        // throttle interval. The new name is resolved but not cached.
+        tokio::time::advance(Duration::from_millis(299_500)).await;
+        cache.get_or_resolve("A", &counters, resolve).await.unwrap();
+        assert_eq!(cache.slot_count(), MAX_SLOTS);
+
+        // Every entry has now expired, but the interval has not elapsed:
+        // no sweep.
+        tokio::time::advance(Duration::from_millis(600)).await;
+        cache.get_or_resolve("B", &counters, resolve).await.unwrap();
+        assert_eq!(
+            cache.slot_count(),
+            MAX_SLOTS,
+            "a sweep inside the throttle interval must not run"
+        );
+
+        // Past the interval: the sweep runs and reclaims the expired slots.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        cache.get_or_resolve("C", &counters, resolve).await.unwrap();
+        assert_eq!(cache.slot_count(), 1, "only C remains after the sweep");
     }
 
     use tokio::net::{TcpListener, TcpStream};

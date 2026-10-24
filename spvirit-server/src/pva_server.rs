@@ -1201,11 +1201,21 @@ impl PvaServer {
         // 3. Start the event dispatcher.
         self.events.start_dispatcher(self.store.clone());
 
+        // Logged before the bind: with `.port(0)` the real port is not known
+        // yet, so say so rather than print "port 0". The bound address is
+        // logged by `run_pva_server_reporting` ("TCP listener bound on ...").
         let pv_count = self.store.pv_names().await.len();
-        info!(
-            "PvaServer starting: {} PVs on port {}",
-            pv_count, self.config.tcp_port
-        );
+        if self.config.tcp_port == 0 {
+            info!(
+                "PvaServer starting: {} PVs on an OS-assigned port",
+                pv_count
+            );
+        } else {
+            info!(
+                "PvaServer starting: {} PVs on port {}",
+                pv_count, self.config.tcp_port
+            );
+        }
 
         // 4. Bind and accept.
         run_pva_server_reporting(sources, self.config, registry, self.bound_tx).await
@@ -1392,6 +1402,13 @@ impl RunningServer {
     /// / `.udp_port(0)` it is how a caller learns the ports the OS picked —
     /// the race-free alternative to probing a free port and handing its
     /// number to the builder.
+    ///
+    /// These are the *bound* addresses, not necessarily connectable ones:
+    /// with the default `listen_ip` (unspecified, `0.0.0.0`) the TCP address
+    /// is `0.0.0.0:<port>`, and with discovery parity on the UDP address is
+    /// `0.0.0.0:<port>` too. A local caller connects to `127.0.0.1:<port>`
+    /// (substitute loopback for an unspecified IP); only the port is
+    /// meaningful in that case.
     ///
     /// Returns `Err` instead of hanging if either bind fails (e.g. the port
     /// is taken), or if the server task ends — panics, or is stopped with

@@ -946,7 +946,10 @@ mod tests {
 
     /// `post()` after `abort_dispatcher()` must not queue anything: the
     /// `stopped` gate in `post()` rejects it, so the handler never runs and
-    /// `drain()` returns promptly.
+    /// `drain()` returns promptly. The aborted dispatcher would never run a
+    /// queued item either, so "the handler did not run" alone cannot tell
+    /// the gate apart from no gate; `inflight` and `dropped_count` both
+    /// staying 0 is what proves no enqueue was attempted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn post_after_abort_dispatcher_queues_nothing() {
         let events = Events::new();
@@ -964,6 +967,19 @@ mod tests {
         events.start_dispatcher(test_store());
         events.abort_dispatcher();
         events.post("GO").await;
+        // Without the gate the item is either still queued (`inflight` 1,
+        // if the aborted task has not dropped its receiver yet) or refused
+        // by the closed channel (`dropped_count` 1). The gate leaves both 0.
+        assert_eq!(
+            events.inflight.load(Ordering::SeqCst),
+            0,
+            "post() after abort_dispatcher() queued a handler"
+        );
+        assert_eq!(
+            events.dropped_count(),
+            0,
+            "post() after abort_dispatcher() tried to queue a handler"
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(

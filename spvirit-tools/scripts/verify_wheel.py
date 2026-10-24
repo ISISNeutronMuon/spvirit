@@ -38,6 +38,15 @@ EXPECTED = {
     "spgateway",
 }
 
+# Binaries that must NOT be in the wheel: the internal load generator
+# (feature `load`) and the opt-in `scry` tools (feature `scry`). A wheel that
+# ships any of them was built with the wrong feature set.
+FORBIDDEN = {
+    "spload",
+    "spvirit-scry",
+    "spvirit-scry_influx_collector",
+}
+
 
 def scripts_in(wheel: Path) -> set[str]:
     """Names of the executables a wheel installs onto PATH."""
@@ -72,6 +81,16 @@ def main() -> int:
             print(
                 f"{wheel.name}: missing {len(missing)} of {len(EXPECTED)} tools: "
                 f"{', '.join(sorted(missing))}",
+                file=sys.stderr,
+            )
+            continue
+
+        forbidden = found & FORBIDDEN
+        if forbidden:
+            failed = True
+            print(
+                f"{wheel.name}: ships binaries that must not be in the wheel: "
+                f"{', '.join(sorted(forbidden))}",
                 file=sys.stderr,
             )
             continue

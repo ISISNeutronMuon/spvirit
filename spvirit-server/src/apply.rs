@@ -562,7 +562,10 @@ impl RecordInstance {
     /// (for example 300 into a `byte` record, or NaN into an integer one) is
     /// refused with `Err`: the record is left exactly as it was — not even
     /// restamped — so the caller can answer the client with an error status
-    /// instead of a success.
+    /// instead of a success. So is an enum PUT whose index is not an integer
+    /// or falls outside `choices`, and any PUT to a generic-structure record
+    /// (which has no wire PUT path). The `Err` text names the record and the
+    /// actual reason, e.g. `"B1: 300 not representable as ubyte"`.
     pub fn apply_put(
         &mut self,
         value: &DecodedValue,
@@ -579,9 +582,9 @@ impl RecordInstance {
             }
         };
 
-        let Some(value_changed) = self.apply_put_fields(value, compute_alarms) else {
-            return Err(format!("value not representable in {}'s type", self.name));
-        };
+        let value_changed = self
+            .apply_put_fields(value, compute_alarms)
+            .map_err(|reason| format!("{}: {reason}", self.name))?;
 
         let client_ts = client_timestamp(value);
         let client_stamped = client_ts.is_some();
@@ -607,11 +610,17 @@ impl RecordInstance {
     /// Apply the data-carrying fields of a PUT body. `value` is guaranteed to
     /// be a `Structure` by the caller.
     ///
-    /// `None` means the PUT carried a `value` the record's type cannot
-    /// represent; nothing was modified. Otherwise `Some(changed)`.
-    fn apply_put_fields(&mut self, value: &DecodedValue, compute_alarms: bool) -> Option<bool> {
+    /// `Err(reason)` means the PUT was refused (for example a `value` the
+    /// record's type cannot represent); nothing was modified. Otherwise
+    /// `Ok(changed)`.
+    fn apply_put_fields(
+        &mut self,
+        value: &DecodedValue,
+        compute_alarms: bool,
+    ) -> Result<bool, String> {
+        const ARRAY_REFUSAL: &str = "value not representable in the record's element type";
         let DecodedValue::Structure(fields) = value else {
-            return Some(false);
+            return Ok(false);
         };
 
         match &mut self.data {
@@ -636,7 +645,11 @@ impl RecordInstance {
                 if let Some((_, val)) = fields.iter().find(|(name, _)| name == "value")
                     && !apply_value_update(&mut NtScalar::from_value(nt.value.clone()), val, false)
                 {
-                    return None;
+                    return Err(format!(
+                        "{} not representable as {}",
+                        put_value_text(val),
+                        scalar_type_name(&nt.value)
+                    ));
                 }
                 let before = nt.value.clone();
                 let mut changed = false;
@@ -651,42 +664,80 @@ impl RecordInstance {
                         _ => {}
                     }
                 }
-                Some(changed || nt.value != before)
+                Ok(changed || nt.value != before)
             }
             RecordData::Waveform { nt, nord, .. }
             | RecordData::Aai { nt, nord, .. }
             | RecordData::Aao { nt, nord, .. }
-            | RecordData::SubArray { nt, nord, .. } => apply_scalar_array_put(nt, nord, value),
-            RecordData::NtTable { nt, .. } => apply_table_put(nt, value),
-            RecordData::NtNdArray { nt, .. } => apply_ndarray_put(nt, value),
+            | RecordData::SubArray { nt, nord, .. } => {
+                apply_scalar_array_put(nt, nord, value).ok_or_else(|| ARRAY_REFUSAL.to_string())
+            }
+            RecordData::NtTable { nt, .. } => {
+                apply_table_put(nt, value).ok_or_else(|| ARRAY_REFUSAL.to_string())
+            }
+            RecordData::NtNdArray { nt, .. } => {
+                apply_ndarray_put(nt, value).ok_or_else(|| ARRAY_REFUSAL.to_string())
+            }
             RecordData::NtEnum { nt, .. } => {
                 // A wire PUT delivers `value` as the NTEnum sub-structure
                 // `{index, choices}`; a bare integer (host-side callers and
                 // older clients) is accepted too. A `value` that yields no
-                // integer, or an index outside `choices`, is refused: `None`
+                // integer, or an index outside `choices`, is refused: `Err`
                 // leaves the record untouched, so the caller answers the
                 // client with an error instead of a success.
                 let Some((_, val)) = fields.iter().find(|(name, _)| name == "value") else {
-                    return Some(false);
+                    return Ok(false);
                 };
                 let idx = match val {
                     DecodedValue::Structure(inner) => {
                         crate::convert::field(inner, "index").and_then(decoded_to_i32)
                     }
                     other => decoded_to_i32(other),
-                }?;
+                }
+                .ok_or_else(|| {
+                    format!("enum value {} is not an integer index", put_value_text(val))
+                })?;
                 if idx < 0 || (idx as usize) >= nt.choices.len() {
-                    return None;
+                    return Err(format!("index {idx} outside {} choices", nt.choices.len()));
                 }
                 let changed = nt.index != idx;
                 nt.index = idx;
-                Some(changed)
+                Ok(changed)
             }
             // A generic structure has no wire PUT path: refuse it rather than
             // report a success that changed nothing. Write it server-side with
             // `store.put_nt()`.
-            RecordData::Generic { .. } => None,
+            RecordData::Generic { .. } => Err("no wire PUT path for this record type".to_string()),
         }
+    }
+}
+
+/// PVA type name of a scalar record value, for refusal messages.
+fn scalar_type_name(v: &ScalarValue) -> &'static str {
+    match v {
+        ScalarValue::Bool(_) => "boolean",
+        ScalarValue::I8(_) => "byte",
+        ScalarValue::I16(_) => "short",
+        ScalarValue::I32(_) => "int",
+        ScalarValue::I64(_) => "long",
+        ScalarValue::U8(_) => "ubyte",
+        ScalarValue::U16(_) => "ushort",
+        ScalarValue::U32(_) => "uint",
+        ScalarValue::U64(_) => "ulong",
+        ScalarValue::F32(_) => "float",
+        ScalarValue::F64(_) => "double",
+        ScalarValue::Str(_) => "string",
+    }
+}
+
+/// The PUT value as shown in a refusal message. Floats print without the
+/// fixed six decimals the `Display` impl uses, so NaN reads as `NaN` and 1.5
+/// as `1.5`.
+fn put_value_text(val: &DecodedValue) -> String {
+    match val {
+        DecodedValue::Float64(v) => v.to_string(),
+        DecodedValue::Float32(v) => v.to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -1052,7 +1103,66 @@ mod tests {
             },
             raw_fields: HashMap::new(),
         };
-        assert!(rec.apply_put(&DecodedValue::Int32(1), false).is_err());
+        let err = rec
+            .apply_put(&DecodedValue::Int32(1), false)
+            .expect_err("a generic record has no wire PUT path");
+        assert_eq!(err, "G: no wire PUT path for this record type");
+    }
+
+    #[test]
+    fn enum_refusals_name_the_real_reason() {
+        let mut rec = mbbo_record();
+        let out_of_range = DecodedValue::Structure(vec![(
+            "value".to_string(),
+            DecodedValue::Structure(vec![("index".to_string(), DecodedValue::Int32(5))]),
+        )]);
+        assert_eq!(
+            rec.apply_put(&out_of_range, false).unwrap_err(),
+            "E: index 5 outside 2 choices"
+        );
+        assert_eq!(
+            rec.apply_put(&DecodedValue::String("B".to_string()), false)
+                .unwrap_err(),
+            "E: enum value \"B\" is not an integer index"
+        );
+    }
+
+    #[test]
+    fn array_refusal_still_says_not_representable() {
+        let mut rec = waveform_record(vec![1.0]);
+        let RecordData::Waveform { nt, .. } = &mut rec.data else {
+            unreachable!()
+        };
+        nt.value = ScalarArrayValue::U8(vec![1]);
+        let body = DecodedValue::Array(vec![DecodedValue::Int32(300)]);
+        let err = rec.apply_put(&body, false).unwrap_err();
+        assert!(err.contains("not representable"), "{err}");
+    }
+
+    #[test]
+    fn enum_put_of_the_whole_enum_t_applies_the_index_and_keeps_choices() {
+        let mut rec = mbbo_record();
+        let body = DecodedValue::Structure(vec![(
+            "value".to_string(),
+            DecodedValue::Structure(vec![
+                ("index".to_string(), DecodedValue::Int32(1)),
+                (
+                    "choices".to_string(),
+                    DecodedValue::Array(vec![
+                        DecodedValue::String("X".to_string()),
+                        DecodedValue::String("Y".to_string()),
+                        DecodedValue::String("Z".to_string()),
+                    ]),
+                ),
+            ]),
+        )]);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
+        assert!(outcome.value_changed);
+        let RecordData::NtEnum { nt, .. } = &rec.data else {
+            panic!("expected NtEnum");
+        };
+        assert_eq!(nt.index, 1);
+        assert_eq!(nt.choices, vec!["A".to_string(), "B".to_string()]);
     }
 
     fn ndarray_record() -> RecordInstance {
@@ -1299,7 +1409,7 @@ mod tests {
         let err = rec
             .apply_put(&body, true)
             .expect_err("300 does not fit a byte");
-        assert!(err.contains("not representable"), "{err}");
+        assert_eq!(err, "T: 300 not representable as byte");
         assert_eq!(
             rec, before,
             "a refused PUT must leave the record untouched, stamp included"
@@ -1307,10 +1417,10 @@ mod tests {
         assert_eq!(stamp_of(&rec), OLD);
 
         let nan = DecodedValue::Float64(f64::NAN);
-        assert!(
-            rec.apply_put(&nan, true).is_err(),
-            "NaN does not fit a byte"
-        );
+        let err = rec
+            .apply_put(&nan, true)
+            .expect_err("NaN does not fit a byte");
+        assert_eq!(err, "T: NaN not representable as byte");
         assert_eq!(rec, before);
     }
 
