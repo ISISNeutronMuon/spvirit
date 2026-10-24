@@ -14,7 +14,7 @@ Then from another terminal:
     spget SIM:TEMPERATURE.MDEL     # 0.5
     spput SIM:SETPOINT 500         # accepted — drive limits are advisory
     spinfo SIM:GAIN                # wire type: ushort
-    spinfo SIM:STATUS              # wire type: byte
+    spinfo SIM:STATUS              # wire type: ubyte
 """
 
 import spvirit
@@ -45,7 +45,7 @@ setpoint = spvirit.ao(
 # `type=` picks the wire type by name (or alias, e.g. "u16"); `writable=True`
 # serves the output flavor, `False` (default) the input flavor.
 gain = spvirit.scalar("SIM:GAIN", 1, type="ushort", writable=True)
-status = spvirit.scalar("SIM:STATUS", 0, type="byte")
+status = spvirit.scalar("SIM:STATUS", 0, type="ubyte")
 # ANCHOR_END: types
 
 server = spvirit.Server(pvs=[temperature, setpoint, gain, status])

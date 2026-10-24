@@ -24,7 +24,7 @@
 //!                              # the server. Reject out-of-range writes
 //!                              # yourself with `.on_put(...)`.
 //!   spinfo SIM:GAIN            # wire type: ushort
-//!   spinfo SIM:STATUS          # wire type: byte
+//!   spinfo SIM:STATUS          # wire type: ubyte
 
 use spvirit_server::{AnyPv, Pv, PvaServer};
 use spvirit_types::ScalarValue;

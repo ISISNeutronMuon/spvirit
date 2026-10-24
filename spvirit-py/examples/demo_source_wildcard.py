@@ -30,7 +30,7 @@ class WildcardSource:
         self._notifier: spvirit.Notifier | None = None
         self._lock = threading.Lock()
 
-    # Called by the server right after build() — stash the notifier.
+    # Called once at server start (start()/start_background()/run()) — stash the notifier.
     def on_start(self, notifier: spvirit.Notifier) -> None:
         self._notifier = notifier
 
