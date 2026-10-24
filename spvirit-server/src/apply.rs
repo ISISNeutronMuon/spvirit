@@ -660,34 +660,32 @@ impl RecordInstance {
             RecordData::NtTable { nt, .. } => apply_table_put(nt, value),
             RecordData::NtNdArray { nt, .. } => apply_ndarray_put(nt, value),
             RecordData::NtEnum { nt, .. } => {
-                // Accept index updates for NtEnum PVs. Known gap #1: a wire
-                // PUT delivers `value` as a sub-structure, which no arm here
-                // matches — deliberately left alone, see known-gaps.md.
-                let mut changed = false;
-                for (name, val) in fields {
-                    if name != "value" {
-                        continue;
+                // A wire PUT delivers `value` as the NTEnum sub-structure
+                // `{index, choices}`; a bare integer (host-side callers and
+                // older clients) is accepted too. A `value` that yields no
+                // integer, or an index outside `choices`, is refused: `None`
+                // leaves the record untouched, so the caller answers the
+                // client with an error instead of a success.
+                let Some((_, val)) = fields.iter().find(|(name, _)| name == "value") else {
+                    return Some(false);
+                };
+                let idx = match val {
+                    DecodedValue::Structure(inner) => {
+                        crate::convert::field(inner, "index").and_then(decoded_to_i32)
                     }
-                    let idx = match val {
-                        DecodedValue::Int32(v) => Some(*v),
-                        DecodedValue::Int64(v) => Some(*v as i32),
-                        DecodedValue::Int16(v) => Some(*v as i32),
-                        DecodedValue::Int8(v) => Some(*v as i32),
-                        DecodedValue::Float64(v) => Some(*v as i32),
-                        _ => None,
-                    };
-                    if let Some(idx) = idx {
-                        if idx < 0 || (idx as usize) >= nt.choices.len() {
-                            // out-of-range index — reject, keep value
-                        } else if nt.index != idx {
-                            nt.index = idx;
-                            changed = true;
-                        }
-                    }
+                    other => decoded_to_i32(other),
+                }?;
+                if idx < 0 || (idx as usize) >= nt.choices.len() {
+                    return None;
                 }
+                let changed = nt.index != idx;
+                nt.index = idx;
                 Some(changed)
             }
-            RecordData::Generic { .. } => Some(false),
+            // A generic structure has no wire PUT path: refuse it rather than
+            // report a success that changed nothing. Write it server-side with
+            // `store.put_nt()`.
+            RecordData::Generic { .. } => None,
         }
     }
 }
@@ -979,6 +977,82 @@ mod tests {
             panic!("expected NtEnum");
         };
         assert!(nt.time_stamp.seconds_past_epoch > OLD.seconds_past_epoch);
+    }
+
+    fn mbbo_record() -> RecordInstance {
+        let mut nt = NtEnum::new(0, vec!["A".to_string(), "B".to_string()]);
+        nt.time_stamp = OLD;
+        RecordInstance {
+            name: "E".to_string(),
+            record_type: RecordType::Mbbo,
+            common: DbCommonState::default(),
+            data: RecordData::NtEnum {
+                nt,
+                inp: None,
+                out: None,
+                omsl: OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        }
+    }
+
+    fn enum_index(rec: &RecordInstance) -> i32 {
+        let RecordData::NtEnum { nt, .. } = &rec.data else {
+            panic!("expected NtEnum");
+        };
+        nt.index
+    }
+
+    #[test]
+    fn enum_put_unwraps_the_wire_index_substructure() {
+        let mut rec = mbbo_record();
+        let body = DecodedValue::Structure(vec![(
+            "value".to_string(),
+            DecodedValue::Structure(vec![("index".to_string(), DecodedValue::Int32(1))]),
+        )]);
+        let outcome = rec.apply_put(&body, false).expect("PUT accepted");
+        assert!(outcome.value_changed);
+        assert_eq!(enum_index(&rec), 1);
+    }
+
+    #[test]
+    fn enum_put_out_of_range_or_without_an_index_is_refused() {
+        for value in [
+            DecodedValue::Structure(vec![("index".to_string(), DecodedValue::Int32(2))]),
+            DecodedValue::Int32(-1),
+            DecodedValue::Structure(vec![(
+                "choices".to_string(),
+                DecodedValue::Array(Vec::new()),
+            )]),
+            DecodedValue::String("B".to_string()),
+        ] {
+            let mut rec = mbbo_record();
+            let body = DecodedValue::Structure(vec![("value".to_string(), value.clone())]);
+            assert!(rec.apply_put(&body, false).is_err(), "{value:?} must be refused");
+            assert_eq!(enum_index(&rec), 0);
+            let RecordData::NtEnum { nt, .. } = &rec.data else {
+                unreachable!()
+            };
+            assert_eq!(nt.time_stamp, OLD, "a refused PUT must not restamp");
+        }
+    }
+
+    #[test]
+    fn generic_put_is_refused() {
+        let mut rec = RecordInstance {
+            name: "G".to_string(),
+            record_type: RecordType::Generic,
+            common: DbCommonState::default(),
+            data: RecordData::Generic {
+                struct_id: "x:1.0".to_string(),
+                fields: Vec::new(),
+                inp: None,
+                out: None,
+                omsl: OutputMode::Supervisory,
+            },
+            raw_fields: HashMap::new(),
+        };
+        assert!(rec.apply_put(&DecodedValue::Int32(1), false).is_err());
     }
 
     fn ndarray_record() -> RecordInstance {

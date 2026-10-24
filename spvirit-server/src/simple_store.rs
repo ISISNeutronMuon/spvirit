@@ -1082,11 +1082,9 @@ record(ao, "DB:AO") {
         );
         let store = SimplePvStore::new(records, HashMap::new(), vec![], false);
 
-        // Out-of-range index — must be a no-op (Ok, no changed PVs), index unchanged.
-        let result = Source::put(&store, "E", &DecodedValue::Int32(7))
-            .await
-            .unwrap();
-        assert!(result.is_empty());
+        // Out-of-range index — refused with an error, index unchanged.
+        let result = Source::put(&store, "E", &DecodedValue::Int32(7)).await;
+        assert!(result.is_err(), "out-of-range index must be refused");
         assert_eq!(store.get_value("E").await.unwrap(), ScalarValue::I32(0));
 
         // In-range index — applied.

@@ -240,8 +240,9 @@ mode = spvirit.mbbi("SIM:MODE", ["Off", "Standby", "Running"], 0)
 cmd  = spvirit.mbbo("SIM:CMD",  ["Stop", "Start", "Reset"],   0, desc="Command")
 ```
 
-`mbbi` is read-only over the wire, `mbbo` is writable. Writes with an
-out-of-range index are rejected. Only the `desc` option applies to enums.
+`mbbi` is read-only over the wire (a client PUT is refused, as for an EPICS
+input record; update it from Python with `set()`), `mbbo` is writable. Writes
+with an out-of-range index are refused with an error. Only the `desc` option applies to enums.
 
 Array records (served as NTScalarArray):
 

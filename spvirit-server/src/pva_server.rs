@@ -1432,8 +1432,8 @@ impl RunningServer {
     }
 
     /// Add an NTEnum record at runtime. `writable` selects an `mbbo`
-    /// (output) vs `mbbi` (input) record type; note both accept client PUTs
-    /// at the store layer. Replaces any existing record with the same name.
+    /// (output, client PUTs allowed) vs `mbbi` (input, read-only over the
+    /// wire). Replaces any existing record with the same name.
     pub async fn add_enum(&self, name: &str, choices: Vec<String>, index: i32, writable: bool) {
         let record = make_enum_record(name, choices, index, writable);
         self.store.insert(name.to_string(), record).await;
@@ -2264,7 +2264,7 @@ mod tests {
             other => panic!("expected enum, got {other:?}"),
         }
 
-        // read-only enum -> mbbi; still writable() at the store layer (documented)
+        // read-only enum -> mbbi, refused over the wire like an EPICS input
         server
             .add_enum("RT:ENUM_RO", vec!["A".into(), "B".into()], 0, false)
             .await;
@@ -2272,6 +2272,10 @@ mod tests {
             server.store().get_nt("RT:ENUM_RO").await,
             Some(NtPayload::Enum(_))
         ));
+        let info = crate::pvstore::Source::claim(server.store().as_ref(), "RT:ENUM_RO")
+            .await
+            .expect("claimed");
+        assert!(!info.writable);
 
         // table with two typed columns
         server

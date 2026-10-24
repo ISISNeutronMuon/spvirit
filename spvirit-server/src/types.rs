@@ -360,7 +360,9 @@ impl RecordInstance {
             RecordData::Waveform { .. } => true,
             RecordData::NtTable { .. } => true,
             RecordData::NtNdArray { .. } => true,
-            RecordData::NtEnum { .. } => true,
+            // An enum is writable only as an `mbbo` (an output, caught by
+            // `is_output` above). `mbbi` is an input record and, as in EPICS,
+            // read-only over the wire; host-side writes do not consult this.
             RecordData::Generic { .. } => true,
             _ => false,
         }

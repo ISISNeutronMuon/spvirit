@@ -225,7 +225,8 @@ lets any in-flight `notify_monitors` finish first.
 ## Record model and .db parsing
 
 - `RecordType` (types.rs:24): 17 kinds; `from_db_name` maps `.db` strings
-  (`mbbi`|`ntenum` both → `Mbbi`); `is_output()` gates writability.
+  (`mbbi`|`ntenum` both → `Mbbi`); `is_output()` gates writability (`mbbi`,
+  an input, is read-only over the wire).
 - `RecordData` (types.rs:128): one variant per record family carrying the NT
   payload + record-specific fields (INP/OUT/DOL/DRVL/DRVH/SIML/…).
   **`nt()`/`nt_mut()` panic** on non-scalar variants (types.rs:244, 256) —
@@ -389,11 +390,11 @@ sources](../03-progressive/sources.md).
    `stamp_missing_timestamps` (types.rs:387) is called on store insert
    (simple_store.rs:74, 109) so static/`.db`-loaded records are stamped too
    (see chapter 08).
-2. **PUT to `Generic` is not wired.** `RecordInstance::apply_put`
-   (apply.rs:639) returns `false` for `Generic` without looking at the PUT
-   body. `NtTable`/`NtNdArray` dispatch to `apply_table_put`/
-   `apply_ndarray_put` (apply.rs:609–610) and are writable over the wire;
-   `Generic` is writable only via `put_nt`.
+2. **PUT to `Generic` is refused.** `RecordInstance::apply_put` has no
+   wire path for `Generic` and answers a client PUT with an error.
+   `NtTable`/`NtNdArray` dispatch to `apply_table_put`/`apply_ndarray_put`
+   and `NtEnum` unwraps `value.index`, so all three are writable over the
+   wire; `Generic` is writable only via `put_nt`.
 3. **CANCEL_REQUEST is unimplemented** (returns an error message); some
    clients use it. ACL_CHANGE/MESSAGE/MULTIPLE_DATA/ORIGIN_TAG and Op 14/16
    likewise return errors.

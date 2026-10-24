@@ -1089,6 +1089,7 @@ mod tests {
         let rec = m.pending_record().unwrap();
         assert_eq!(rec.record_type, crate::types::RecordType::Mbbi);
         assert_eq!(rec.current_value(), ScalarValue::I32(1));
+        assert!(!rec.writable(), "mbbi is read-only over the wire");
 
         let o = Pv::mbbo("M:O", vec!["A".into(), "B".into()], 0);
         assert!(o.pending_record().unwrap().writable());

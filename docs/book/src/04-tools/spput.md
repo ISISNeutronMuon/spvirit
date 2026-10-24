@@ -70,10 +70,10 @@ rejected one. Pass `--no-flow-fallback` to suppress the retry, and write
 `on_put` callbacks to be idempotent either way — see
 [Reacting to writes](../03-progressive/reacting-to-writes.md).
 
-**Read-only records refuse explicitly.** `ai`, `bi`, `stringin` and `aai`
-answer with `PUT init error: Write access denied` rather than accepting
-and discarding.
+**Read-only records refuse explicitly.** `ai`, `bi`, `stringin`, `aai` and
+`mbbi` answer with `PUT init error: Write access denied` rather than
+accepting and discarding.
 
-**Enum writes are accepted and dropped.** `spput SIM:MODE --json
-'{"value":{"index":2}}'` prints `OK` and changes nothing. This is a server
-bug, documented in [Enums](../03-progressive/enums.md).
+**Enum writes take the index.** `spput SIM:MODE --json
+'{"value":{"index":2}}'` selects choice 2 of an `mbbo`; an out-of-range
+index is refused with an error. See [Enums](../03-progressive/enums.md).

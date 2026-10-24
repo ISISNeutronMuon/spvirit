@@ -59,8 +59,8 @@ $ spput VAC:PRESSURE 1e-5
 VAC:PRESSURE ERROR protocol error: PUT init error: Write access denied
 ```
 
-The record type is an input type. `ai`, `bi`, `stringin`, `longin`, `aai`
-and `subArray` refuse writes; their output counterparts accept them. The
+The record type is an input type. `ai`, `bi`, `stringin`, `longin`, `mbbi`,
+`aai` and `subArray` refuse writes; their output counterparts accept them. The
 matrix is on [Record types](record-types.md).
 
 If you meant it to be writable, you wanted `ao` rather than `ai`. If you
@@ -69,17 +69,12 @@ simulation mode is writable (`spvirit-server/src/types.rs:308`).
 
 ## The write is accepted and nothing changes
 
-Three different causes, and they look identical from the client:
-
 **A validator rejected it.** Then you get an error, not silence — check the
 exit status. `spput` returns non-zero on a rejected write.
 
-**It is an enum.** A wire PUT of an `NtEnum` index currently reports success
-and changes nothing. [Known gaps](known-gaps.md).
-
-**It is a `Generic` record.** The `Generic` arm of `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:639`) is a no-op. Write it server-side with
-`store.put_nt()`.
+An enum PUT with an out-of-range index, a PUT to an `mbbi`, and a PUT to a
+`Generic` record are all refused with an error too — none of them reports
+success without a change. [Known gaps](known-gaps.md).
 
 ## A monitor looks frozen
 

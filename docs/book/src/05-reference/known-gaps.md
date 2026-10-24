@@ -13,24 +13,7 @@ so you can scan the list before you spend an afternoon on one.
 
 Nothing here is a plan. These are findings, not commitments.
 
-## 1. An enum write is accepted and dropped
-
-**What happens.** `spput SIM:MODE --json '{"value":{"index":2}}'` prints
-`OK`. The record does not change.
-
-**Why.** The `NtEnum` arm of `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:631`) accepts a field literally named
-`value` carrying a scalar integer. A wire PUT of an enum delivers `value` as
-a sub-structure, so no branch matches, `changed` stays false, and the
-operation reports success.
-
-**Consequence.** The one failure mode worse than an error: a write that says
-it worked. `mbbi`/`mbbo` records are read-only in practice over the wire.
-
-**Where it is documented.** [Enums and binary records](../03-progressive/enums.md),
-[`spput`](../04-tools/spput.md).
-
-## 2. `.db` refuses record types that EPICS Base has
+## 1. `.db` refuses record types that EPICS Base has
 
 **What happens.** Given this file:
 
@@ -70,7 +53,7 @@ records are not served either.
 
 **Where it is documented.** [Serving a .db file](../03-progressive/db-files.md).
 
-## 3. `spput` delivers a rejected write twice
+## 2. `spput` delivers a rejected write twice
 
 **What happens.** A write a validator rejects reaches the server's `on_put`
 twice; an accepted write reaches it once.
@@ -87,7 +70,7 @@ hardware poke — doubles up on exactly the writes you were trying to refuse.
 **Where it is documented.** [`spput`](../04-tools/spput.md),
 [Reacting to writes](../03-progressive/reacting-to-writes.md).
 
-## 4. `ADEL` is parsed and exposed but not applied
+## 3. `ADEL` is parsed and exposed but not applied
 
 `MDEL` gates monitor posts (`should_post_update`,
 `spvirit-server/src/simple_store.rs:571`).
@@ -95,24 +78,23 @@ hardware poke — doubles up on exactly the writes you were trying to refuse.
 as a field, and no posting logic consults it. A `.db` that relies on `ADEL`
 behaves as though it were absent.
 
-## 5. Wire PUT is not wired for generic structures
+## 4. Wire PUT is refused for generic structures
 
 The `Generic` arm of `RecordInstance::apply_put`
-(`spvirit-server/src/apply.rs:659`) is a no-op — it returns `false` without
-looking at the PUT body. `NtTable` and `NtNdArray` are wired (both arms call
-into `apply.rs`'s table/ndarray helpers), so a generic record is now the one
-kind that reports itself writable and silently discards every wire PUT — the
-same failure shape as gap 1. Write it server-side with `store.put_nt()`.
+(`spvirit-server/src/apply.rs`) has no wire PUT path, so a client PUT to a
+generic record is answered with a PUT error and the record is left as it
+was. `NtTable`, `NtNdArray` and `NtEnum` are wired. Write a generic record
+server-side with `store.put_nt()`.
 
-## 6. The builder has no `longin`/`longout`
+## 5. The builder has no `longin`/`longout`
 
 `PvaServerBuilder` covers fifteen record constructors and omits these two,
 which both the Rust handle API (`Pv::longin`, `Pv::longout`) and the Python
-module do have. Combined with gap 2, the builder and `.db` are the only two
+module do have. Combined with gap 1, the builder and `.db` are the only two
 routes that cannot produce a `longin`. The matrix is on
 [Record types](record-types.md).
 
-## 7. `CANCEL_REQUEST` is unimplemented
+## 6. `CANCEL_REQUEST` is unimplemented
 
 The server answers PVA command `CANCEL_REQUEST` with
 `"CANCEL_REQUEST command is not supported"`
@@ -121,7 +103,7 @@ The server answers PVA command `CANCEL_REQUEST` with
 Clients that cancel a request rather than destroying the channel will see the
 error; the common clients do not.
 
-## 8. Large values are sent as one frame, never segmented
+## 7. Large values are sent as one frame, never segmented
 
 spvirit reassembles segmented messages it receives — `SegmentReassembler` in
 `spvirit-codec/src/segment.rs:34`, driven by the client transport and the
@@ -177,8 +159,9 @@ than drained gracefully.
 ## What is *not* on this list
 
 Behaviour that is deliberate and merely surprising lives in the chapters, not
-here — `spget` accepting exactly one PV name, `spsine` printing nothing on
-success, `discover` and `off` suppressing enumeration but not discovery,
+here — `mbbi` refusing client writes (an input record, read-only over the
+wire as in EPICS; drive it with `pv.set(index)`), `spget` accepting exactly
+one PV name, `spsine` printing nothing on success, `discover` and `off` suppressing enumeration but not discovery,
 `spget`'s value column being a display rendering rather than the wire value.
 Each is a gotcha in its own tool page.
 
