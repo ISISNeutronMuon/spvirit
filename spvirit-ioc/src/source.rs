@@ -379,6 +379,38 @@ impl IocSource {
         Ok(events)
     }
 
+    /// The value a PUT writes, whichever shape it arrives in.
+    ///
+    /// A real PVA client's PUT reaches `Source::put` as the channel's
+    /// structure, decoded by the server (`decode_put_body`):
+    /// `Structure([("value", ..), ..])`, possibly with other members the
+    /// client's bitset selected. Internal callers and unit tests pass the
+    /// bare scalar. Both mean "write this value", so a structure is unwrapped
+    /// to its `value` member and anything else is used as is — the same
+    /// unwrap `SimplePvStore` (`apply_value_update`) and `Pv::on_put`
+    /// perform.
+    ///
+    /// Only `value` is client-writable on an IOC record: alarm and timestamp
+    /// belong to the record's own processing, so other members of the
+    /// structure are ignored. A structure with *no* `value` member (e.g. a
+    /// PUT that selects only `alarm`) therefore has nothing this source can
+    /// apply. `SimplePvStore` would apply such a PUT's alarm members, which
+    /// an IOC record must not take from a client, and accepting it as a
+    /// silent no-op would tell the client its write landed when nothing
+    /// changed — so it is refused with an error naming the PV.
+    fn put_value<'a>(name: &str, value: &'a DecodedValue) -> Result<&'a DecodedValue, String> {
+        match value {
+            DecodedValue::Structure(fields) => fields
+                .iter()
+                .find(|(field, _)| field == "value")
+                .map(|(_, v)| v)
+                .ok_or_else(|| {
+                    format!("PUT to '{name}' has no 'value' member; only value is writable here")
+                }),
+            other => Ok(other),
+        }
+    }
+
     fn value_of(decoded: &DecodedValue) -> Result<Value, String> {
         match decoded {
             DecodedValue::Float64(v) => Ok(Value::Double(*v)),
@@ -767,8 +799,9 @@ impl Source for IocSource {
         value: &DecodedValue,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<(String, NtPayload)>, String>> + Send + '_>> {
         let name = name.to_string();
-        let value = value.clone();
+        let value = Self::put_value(name.as_str(), value).cloned();
         Box::pin(async move {
+            let value = value?;
             let id = match self.db.lookup(&name) {
                 Some(id) => id,
                 // A field PV: SCAN/EVNT/PHAS are writable and route into the
