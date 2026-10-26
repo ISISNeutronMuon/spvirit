@@ -28,7 +28,7 @@ Check it:
 
 ```console
 $ python -c "from importlib.metadata import version; print(version('spvirit'))"
-0.4.0
+0.4.1
 ```
 
 (The module itself has no `__version__` attribute — ask the package
