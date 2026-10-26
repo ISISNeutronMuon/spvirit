@@ -21,8 +21,8 @@ cargo install spvirit-tools
 
 ## Tools
 
-Thirteen binaries ship in the default build and the pip wheel (plus two
-packet-capture tools behind the `scry` feature, below). They are named `sp*` rather than `pv*` so they can sit
+Thirteen binaries ship in the default build; the pip wheel has those plus
+the two packet-capture tools below. They are named `sp*` rather than `pv*` so they can sit
 alongside an EPICS Base installation without shadowing `pvget`, `pvput`, and
 friends.
 
@@ -58,10 +58,14 @@ and decode live PVAccess traffic off a network interface:
 | `spvirit-scry` | capture, TUI | passively capture and decode PVA traffic |
 | `spvirit-scry_influx_collector` | capture | the same capture, exported to InfluxDB and Loki |
 
-They are behind the optional `scry` feature and are **not** in the pip
-wheel or a default build, because they link against libpcap (Linux,
-`libpcap-dev`) or the Npcap SDK (Windows, found automatically or via
-`NPCAP_SDK`):
+Both are in the pip wheel. On Windows they need the
+[Npcap](https://npcap.com/#download) runtime, which the wheel does not
+bundle (licence); without it they print a warning and exit, and every other
+tool works as usual.
+
+From source they are behind the optional `scry` feature (not in a default
+build), because they link against libpcap (Linux, `libpcap-dev`) or the
+Npcap SDK (Windows, found automatically or via `NPCAP_SDK`):
 
 ```sh
 cargo install spvirit-tools --features scry

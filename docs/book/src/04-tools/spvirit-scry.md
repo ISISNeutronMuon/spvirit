@@ -19,18 +19,39 @@ They used to ship as the separate `spvirit-scry` crate and now live in
 `spvirit-tools`, decoding with the workspace's own codec. The binary names
 and flags are unchanged.
 
+## Installing them
+
+Both ship in the Python wheel:
+
+```bash
+pip install spvirit-tools
+```
+
+The Linux wheels bundle libpcap and macOS has it built in, so nothing else is
+needed there. On Windows the [Npcap](https://npcap.com/#download) runtime
+must be installed; the wheel does not bundle it (Npcap's licence forbids
+redistribution). If it is missing, the tools print a warning naming what is
+missing and where to get it, and exit with status 3, rather than failing to
+start. The other `spvirit-tools` work without Npcap. `--help` and
+`--version` work either way.
+
+They look for `wpcap.dll` in Npcap's own folder
+(`%SystemRoot%\System32\Npcap`) first, then on the normal DLL search path
+(Npcap's "WinPcap API-compatible mode", or a legacy WinPcap install). Setting
+`SPVIRIT_NPCAP_DIR` to a directory makes that directory the only place
+checked; it exists for testing.
+
 ## Building them
 
-They need the optional `scry` feature, which is **not** on by default and is
-not part of the `pip install spvirit-tools` wheel, because packet capture
-links against a system library:
+From source they need the optional `scry` feature, which is **not** on by
+default, because packet capture links against a system library:
 
-- **Linux**: `libpcap-dev`, `libssl-dev` and `pkg-config` (or your
-  distribution's equivalents); the InfluxDB collector's HTTP client links
-  OpenSSL.
-- **Windows**: the [Npcap](https://npcap.com/) runtime and the
-  [Npcap SDK](https://npcap.com/#download). The build script finds the SDK
-  automatically (see below), or set `NPCAP_SDK` to the extracted SDK root.
+- **Linux**: `libpcap-dev` and `pkg-config` (or your distribution's
+  equivalents). The InfluxDB collector's HTTP client uses rustls, so no
+  OpenSSL is needed.
+- **Windows**: the [Npcap SDK](https://npcap.com/#download) to build, and the
+  Npcap runtime to capture. The build script finds the SDK automatically
+  (see below), or set `NPCAP_SDK` to the extracted SDK root.
 
 ```bash
 cargo build -p spvirit-tools --features scry --bins
@@ -59,9 +80,10 @@ administrator rights on Windows.
 
 ## Requirements
 
-- **Rust** toolchain (edition 2024).
-- **Linux**: `libpcap-dev`, `libssl-dev` and `pkg-config` installed and available.
-- **Windows**: [Npcap](https://npcap.com/) runtime and the [Npcap SDK](https://npcap.com/#download). The build script auto-detects the SDK, or set `NPCAP_SDK` to the extracted SDK root.
+- **Rust** toolchain (edition 2024) -- only when building from source; the
+  wheel needs none.
+- **Linux** (source builds): `libpcap-dev` and `pkg-config` installed and available.
+- **Windows**: the [Npcap](https://npcap.com/) runtime (wheel and source builds), plus the [Npcap SDK](https://npcap.com/#download) for source builds. The build script auto-detects the SDK, or set `NPCAP_SDK` to the extracted SDK root.
 - **Linux**: Packet capture requires either `sudo` or `CAP_NET_RAW` capability (see below).
 
 ### Packet capture without sudo (Linux)
@@ -73,7 +95,8 @@ sudo setcap cap_net_raw=eip $(which spvirit-scry)
 sudo setcap cap_net_raw=eip $(which spvirit-scry_influx_collector)
 ```
 
-This only needs to be done once per install (re-run after `cargo install` upgrades the binary).
+This only needs to be done once per install (re-run after `cargo install` or
+`pip install --upgrade` replaces the binary).
 
 ## Usage
 

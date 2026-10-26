@@ -111,8 +111,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The wheel enables the `scry` feature (spvirit-tools/pyproject.toml),
+      # which links pcap. Windows links against the Npcap SDK's import
+      # libraries; the Npcap runtime is NOT bundled (licence) -- the scry
+      # binaries delay-load wpcap.dll and warn at start-up if it is missing.
+      - name: Fetch the Npcap SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:RUNNER_TEMP "npcap-sdk"
+          $zip = Join-Path $env:RUNNER_TEMP "npcap-sdk.zip"
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $sdk -Force
+          echo "NPCAP_SDK=$sdk" >> $env:GITHUB_ENV
+
       # `bindings = "bin"` in spvirit-tools/pyproject.toml makes this package
-      # the thirteen executables rather than an extension module.
+      # the fifteen executables rather than an extension module. On Linux the
+      # manylinux container needs libpcap headers so pcap links and auditwheel
+      # bundles libpcap into the wheel; macOS links the system libpcap.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -120,6 +136,8 @@ jobs:
           target: ${{ matrix.platform.target }}
           args: --release --out dist
           manylinux: auto
+          before-script-linux: |
+            yum install -y libpcap-devel || dnf install -y libpcap-devel || (apt-get update && apt-get install -y libpcap-dev)
 
       # A wheel with no binaries in it installs cleanly and does nothing, so
       # the contents are asserted rather than assumed.

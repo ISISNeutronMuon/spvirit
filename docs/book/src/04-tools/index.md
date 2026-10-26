@@ -8,8 +8,9 @@
 
 `spvirit-tools` ships sixteen binaries: the fifteen below plus `spload`, an
 internal load driver for the `loadtest/` harness that is not documented here.
-Thirteen are in the default build and the Python wheel; the two `scry` tools
-and `spload` are opt-in features. They are named `sp*` rather than
+Thirteen are in the default build; the Python wheel has those thirteen plus
+the two `scry` tools, which are an opt-in feature for Cargo builds, as is
+`spload`. They are named `sp*` rather than
 `pv*` so they can sit alongside an EPICS Base installation without
 shadowing `pvget`, `pvput`, and friends.
 
@@ -31,8 +32,10 @@ shadowing `pvget`, `pvput`, and friends.
 | [`spvirit-scry`](spvirit-scry.md) | capture, TUI | passively capture and decode PVA traffic |
 | [`spvirit-scry_influx_collector`](spvirit-scry.md) | capture | the same capture, exported to InfluxDB and Loki |
 
-The last two need the `scry` feature and libpcap (Linux) or the Npcap SDK
-(Windows); they are not part of the Python wheel.
+The last two are in the Python wheel. On Windows they need the
+[Npcap](https://npcap.com/#download) runtime, which the wheel does not
+bundle; without it they print a warning and exit. Built with Cargo they need
+the `scry` feature and libpcap (Linux) or the Npcap SDK (Windows).
 
 ## Building them
 

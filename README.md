@@ -89,7 +89,11 @@ cargo install spvirit-tools     # same tools, via a Rust toolchain
 ```
 
 `spvirit` depends on `spvirit-tools`, so the first line gets you both: the
-importable module and the thirteen `sp*` binaries on your `PATH`, no compiler needed.
+importable module and the `sp*` binaries on your `PATH`, no compiler needed.
+The wheel includes the packet-capture tools `spvirit-scry` and
+`spvirit-scry_influx_collector`; on Windows they need the
+[Npcap](https://npcap.com/#download) runtime and print a warning if it is
+missing. `cargo install spvirit-tools` builds the thirteen default tools.
 
 To use the libraries from your own Rust project, add the layer you need:
 
@@ -158,9 +162,10 @@ Known divergences from EPICS Base behaviour are collected in
 ## Related Projects
 
 - `spvirit-scry`: packet capture and analysis for PVAccess, now built into
-  `spvirit-tools` behind the non-default `scry` feature:
+  `spvirit-tools`: in the Python wheel (`pip install spvirit-tools`; Windows
+  needs the Npcap runtime), or from source with
   `cargo install spvirit-tools --features scry` (needs libpcap on Linux or the
-  Npcap SDK on Windows; not in the Python wheel).
+  Npcap SDK on Windows).
 
 ## References
 

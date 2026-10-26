@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "spvirit-tools"
-description = "Command-line tools for EPICS PVAccess: get, put, monitor, list, info, and a terminal browser."
+description = "Command-line tools for EPICS PVAccess: get, put, monitor, list, info, a terminal browser, a gateway and a packet-capture analyser."
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
 authors = [
@@ -32,12 +32,20 @@ Issues = "https://github.com/ISISNeutronMuon/spvirit/issues"
 #
 # `bindings = "bin"` is stated explicitly rather than left to auto-detection:
 # maturin only infers it for a crate with a single binary target and no
-# library, and this crate has a library plus sixteen binary targets. In this
-# mode the binaries are packaged as wheel scripts, which pip installs into the
-# environment's bin/Scripts directory -- i.e. onto PATH.
+# library, and this crate has a library plus sixteen binary targets (fifteen
+# of them in the wheel). In this mode the binaries are packaged as wheel
+# scripts, which pip installs into the environment's bin/Scripts directory --
+# i.e. onto PATH.
 #
-# The build uses the crate's default features (client, server, tui) so all
-# thirteen default tools are produced (spvirit-tools/scripts/verify_wheel.py
-# lists them). The opt-in `scry` and `load` binaries are not in the wheel. No
-# Python ABI is involved, so the wheel tags as py3-none-<platform>.
+# The build uses the crate's default features (client, server, tui) plus
+# `scry`, so the wheel carries fifteen tools: the thirteen default ones and
+# spvirit-scry + spvirit-scry_influx_collector
+# (spvirit-tools/scripts/verify_wheel.py lists them). `scry` stays off by
+# default in Cargo.toml so `cargo install spvirit-tools` and CI need neither
+# Npcap nor libpcap; the wheel build supplies them (see release-python.yml).
+# The Npcap runtime itself is not bundled (licence): on Windows the scry
+# binaries delay-load wpcap.dll and print a warning if it is missing. The
+# internal `load` binary (spload) is not in the wheel. No Python ABI is
+# involved, so the wheel tags as py3-none-<platform>.
 bindings = "bin"
+features = ["scry"]

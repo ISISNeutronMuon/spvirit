@@ -20,7 +20,7 @@ Silicon), and Windows x86_64: those five platforms get prebuilt `abi3`
 wheels, so there is no compiler involved. Python 3.9 or newer.
 
 It also brings the command-line tools. `spvirit` depends on the
-`spvirit-tools` package, so the thirteen binaries below land on your `PATH`
+`spvirit-tools` package, so the fifteen binaries below land on your `PATH`
 in the same step — no Rust toolchain, and inside the virtualenv rather than
 in `~/.cargo/bin`.
 
@@ -39,12 +39,16 @@ which needs a Rust toolchain.
 
 ## Command-line tools
 
-Thirteen binaries: `spget`, `spput`, `spmonitor`, `spinfo`, `splist`,
+Fifteen binaries: `spget`, `spput`, `spmonitor`, `spinfo`, `splist`,
 `spsearch`, `spexplore`, `sptable`, `spserver`, `spsine`, `spdodeca`,
-`spget_compare`, and `spgateway`. The packet-capture tools `spvirit-scry` and
-`spvirit-scry_influx_collector` need the non-default `scry` feature, and the
-internal load driver `spload` the non-default `load` feature; none of the
-three is in the wheel.
+`spget_compare`, `spgateway`, and the packet-capture tools `spvirit-scry` and
+`spvirit-scry_influx_collector`. The internal load driver `spload` is not in
+the wheel.
+
+On Windows the two packet-capture tools need the
+[Npcap](https://npcap.com/#download) runtime, which the wheel does not
+bundle; without it they print a warning and exit, and the other tools are
+unaffected.
 
 ```bash
 pip install spvirit-tools
@@ -61,6 +65,10 @@ Or, with a Rust toolchain:
 ```bash
 cargo install spvirit-tools
 ```
+
+That builds the thirteen default tools. The packet-capture pair needs
+`--features scry` plus libpcap (Linux) or the Npcap SDK (Windows); see
+[spvirit-scry](../04-tools/spvirit-scry.md).
 
 [rustup](https://rustup.rs) is the usual way to get one. Stable is what CI
 builds against. This route installs into `~/.cargo/bin` and is the one to
