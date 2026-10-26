@@ -1,5 +1,6 @@
 use color_eyre::owo_colors::OwoColorize;
 use spvirit_tools::scry::common::stats::IfStats;
+use spvirit_tools::scry::npcap;
 use spvirit_tools::scry::utils::common_version_print::version_header;
 use spvirit_tools::scry::utils::influxdb_utils::InfluxDB;
 use spvirit_tools::scry::utils::loki_utils::LokiLogger;
@@ -128,6 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         version_header();
         std::process::exit(0);
     }
+    // Before any pcap call: explains a missing Npcap/libpcap instead of
+    // failing in the loader (wpcap.dll is delay-loaded on Windows).
+    npcap::exit_unless_capture_runtime("spvirit-scry_influx_collector");
 
     let if_stats = Arc::new(Mutex::new(IfStats::new()));
     if resolve {

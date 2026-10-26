@@ -5,6 +5,7 @@
 //! viewer and an InfluxDB/Loki collector for production monitoring.
 
 pub mod common;
+pub mod npcap;
 pub mod spvirit_state;
 pub mod ui;
 pub mod utils;

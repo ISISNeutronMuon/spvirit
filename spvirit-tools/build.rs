@@ -121,6 +121,20 @@ fn scry_main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rustc-link-search=native={}", lib_dir);
     }
 
+    // Delay-load wpcap.dll so a machine without Npcap still reaches main(),
+    // where spvirit_tools::scry::npcap prints a warning, instead of Windows
+    // refusing to start the exe with a "wpcap.dll was not found" dialog.
+    // Packet.dll is not a direct import of these binaries (only wpcap.dll
+    // loads it), so it needs no entry. MSVC linker only.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os == "windows" && target_env == "msvc" {
+        for bin in ["spvirit-scry", "spvirit-scry_influx_collector"] {
+            println!("cargo:rustc-link-arg-bin={bin}=/DELAYLOAD:wpcap.dll");
+            println!("cargo:rustc-link-arg-bin={bin}=delayimp.lib");
+        }
+    }
+
     // Provide a simple build timestamp to satisfy env usage in code.
     let build_timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

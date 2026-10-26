@@ -17,7 +17,8 @@ server = []
 tui = ["dep:ratatui", "dep:color-eyre"]
 # Packet capture + analysis (`spvirit-scry`, `spvirit-scry_influx_collector`).
 # Off by default: pcap links against the Npcap SDK (Windows) or libpcap
-# (Linux), which neither the default build, CI nor the wheel should need.
+# (Linux), which neither the default build nor CI should need. The pip wheel
+# turns it on (pyproject.toml `features`) and its build provides them.
 scry = [
     "tui",
     "dep:pcap",
@@ -68,7 +69,9 @@ pcap = { version = "2.3.0", features = ["capture-stream"], optional = true }
 colored = { version = "3.0.0", optional = true }
 dns-lookup = { version = "3.0.0", optional = true }
 gethostname = { version = "1.0.2", optional = true }
-reqwest = { version = "0.12.23", features = ["json"], optional = true }
+# rustls, not native-tls: no system OpenSSL is needed to build or run (the
+# manylinux wheel container has none to link).
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls"], optional = true }
 toml = { version = "0.8", optional = true }
 
 [build-dependencies]

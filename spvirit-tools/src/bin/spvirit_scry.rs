@@ -1,6 +1,7 @@
 use spvirit_tools::scry::common::interfaces::{default_interface_index, find_interface_index, InterfaceInfo, InterfaceSelection};
 use spvirit_tools::scry::common::stats::IfStats;
 use spvirit_tools::scry::ui::tui::main_funcs;
+use spvirit_tools::scry::npcap;
 use spvirit_tools::scry::utils::common_version_print::version_header;
 use spvirit_tools::scry::utils::packet_processor::process_packets;
 
@@ -183,6 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         version_header();
         std::process::exit(0);
     }
+    // Before any pcap call: explains a missing Npcap/libpcap instead of
+    // failing in the loader (wpcap.dll is delay-loaded on Windows).
+    npcap::exit_unless_capture_runtime("spvirit-scry");
 
     let if_stats = Arc::new(Mutex::new(IfStats::new()));
     if resolve {
