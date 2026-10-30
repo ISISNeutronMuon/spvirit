@@ -6,9 +6,9 @@
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
 
-Serves a rotating dodecahedron wireframe as an `NtNdArray` image PV. A
-demo, and a genuinely useful one: it is a moving image on the network with
-no camera, no driver, and no configuration.
+Serves a rotating dodecahedron wireframe as an `NtNdArray` image PV. It
+puts a moving image on the network without camera hardware or a
+configuration file.
 
 ```
 spdodeca [OPTIONS]
@@ -73,17 +73,13 @@ Setting all three to `0` freezes the wireframe — a still test image
 rather than a moving one. The image PV itself is read-only; a PUT to it is
 rejected.
 
-## What it is for
+## Uses
 
-**Testing an image client.** Area-detector viewers are hard to develop
-against without a detector. This gives you a deterministic, always-running
-one.
-
-**Load-testing the wire.** A 512×512 frame at 25 Hz is about 6 MB/s of
-PVAccess traffic through a single monitor — enough to expose buffering
-problems in a client.
-
-**Checking the NTNDArray encoding.** It exercises the union-typed `value`
-field and the dimension list, which is the part of the type most likely to
-be implemented differently at the other end. See
+Area-detector viewers are hard to develop against without a detector, and
+`spdodeca` stands in for one that is deterministic and always running. It
+also generates steady load: a 512×512 frame at 25 Hz is about 6 MB/s of
+PVAccess traffic through a single monitor, which is useful for testing how
+a client buffers incoming data. Finally, it exercises the union-typed
+`value` field and the dimension list, the parts of NTNDArray most likely to
+be implemented differently by another client. See
 [Tables and images](../03-progressive/tables-and-images.md).

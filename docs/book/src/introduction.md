@@ -1,20 +1,20 @@
 # Spvirit
 
-Spvirit is a pure-Rust implementation of the EPICS **PVAccess** protocol —
-client, server, wire codec, command-line tools, and Python bindings — with no
+Spvirit is a pure-Rust implementation of the EPICS **PVAccess** protocol
+(client, server, wire codec, command-line tools, and Python bindings) with no
 dependency on an EPICS base installation.
 
 ## Quickstart
 
 Install. This one command brings the Python module *and* the `sp*`
-command-line tools (thirteen binaries); there is no compiler and no Rust
+command-line tools (fifteen binaries); there is no compiler and no Rust
 toolchain involved on Linux, macOS, or Windows x86_64.
 
 ```bash
 pip install spvirit
 ```
 
-Save this as `first.py` — it is a complete soft IOC serving three PVs:
+Save this as `first.py`. It is a complete soft IOC serving three PVs:
 
 ```python
 {{#include ../../../spvirit-py/examples/demo_first_pv.py:serve}}
@@ -40,10 +40,9 @@ $ spput SIM:TEMPERATURE 5
 SIM:TEMPERATURE ERROR protocol error: PUT init error: Write access denied
 ```
 
-If you see those lines you have a working PVAccess server. Nobody
-configured a port, an address, or a permission: the client broadcast the PV
-name, the server answered, and `SIM:TEMPERATURE` refused the write it should
-refuse because `ai` is an input record.
+If you see those lines you have a working PVAccess server. The client found
+it by broadcasting the PV name, and `SIM:TEMPERATURE` refused the write
+because `ai` is an input record.
 
 The same thing in Rust is
 [Your first PV](02-getting-started/first-pv.md); every chapter of this book
@@ -51,19 +50,19 @@ shows both languages.
 
 ## Where to go next
 
-- Never met EPICS? → [EPICS in 10 minutes](01-fundamentals/epics-in-10-minutes.md)
-- Know EPICS, want a soft IOC? → [Your first PV](02-getting-started/first-pv.md)
-- Want the whole tour? → [Serving scalars](03-progressive/scalars.md) and the
+- New to EPICS: [EPICS in 10 minutes](01-fundamentals/epics-in-10-minutes.md)
+- Soft IOC quickstart: [Your first PV](02-getting-started/first-pv.md)
+- Full tour: [Serving scalars](03-progressive/scalars.md) and the
   twelve chapters after it
-- Looking up a function? → **[API reference](#api-reference)** below
+- Function lookup: **[API reference](#api-reference)** below
 
 ## How the site is laid out
 
 - **[Fundamentals](01-fundamentals/what-is-spvirit.md)** — what EPICS is, what
-  Normative Types are, and the one distinction worth understanding before you
-  write anything: [records vs raw NT](01-fundamentals/records-vs-raw-nt.md).
-- **[Getting started](02-getting-started/install.md)** — install, then a PV
-  served and read in under a page.
+  Normative Types are, and the choice to make before you write anything:
+  [records vs raw NT](01-fundamentals/records-vs-raw-nt.md).
+- **[Getting started](02-getting-started/install.md)** — install, then serve and
+  read a PV in under a page.
 - **[Progressive examples](03-progressive/scalars.md)** — thirteen chapters,
   Rust and Python side by side, ending in
   [a complete IOC](03-progressive/complete-ioc.md).
@@ -108,7 +107,7 @@ object carries a docstring, so `help(spvirit.ai)` works at the prompt.
 Every Rust sample is included verbatim from an example that CI compiles;
 Python samples are included from examples that CI syntax-checks. Console
 output and small `.db` fragments are shown inline. The badge at the top of each chapter links
-to that source and to the test that checks it — including the quickstart
+to that source and to the test that checks it, including the quickstart
 above:
 
 <!-- verify:begin -->

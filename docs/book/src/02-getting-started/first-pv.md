@@ -10,9 +10,8 @@
 
 A server holding three PVs, and a client that reads one back. Two terminals.
 
-The three records are deliberately of different kinds — one you can only
-read, two you can write — because that distinction is the first thing worth
-internalising.
+The three records are deliberately of different kinds: one you can only
+read, two you can write.
 
 ## Rust
 
@@ -34,7 +33,7 @@ server.
 {{#include ../../../../spvirit-client/examples/pvget.rs:core}}
 ```
 
-That sits inside `#[tokio::main] async fn main`, with `pv` a `String` — both
+That sits inside `#[tokio::main] async fn main`, with `pv` a `String`. Both
 the client and the server are async, so you need a Tokio runtime.
 
 ## Python
@@ -51,7 +50,7 @@ the client and the server are async, so you need a Tokio runtime.
 {{#include ../../../../spvirit-py/examples/demo_get.py:get}}
 ```
 
-The Python client is **blocking** — `client.get(...)` returns a value, no
+The Python client is **blocking**: `client.get(...)` returns a value, no
 `await`, no event loop. `result.value` is the whole NTScalar as a nested
 dict, which is why the value itself is `result.value["value"]`.
 
@@ -65,8 +64,7 @@ cargo run -p spvirit-server --example simple_server
 cargo run -p spvirit-client --example pvget -- SIM:TEMPERATURE
 ```
 
-Terminal 2 should print the whole structure — this is what success looks
-like:
+Terminal 2 prints the whole structure:
 
 ```console
 $ cargo run -p spvirit-client --example pvget -- SIM:TEMPERATURE
@@ -81,7 +79,7 @@ highAlarmLimit=0.000000, lowAlarmSeverity=0, lowWarningSeverity=0,
 highWarningSeverity=0, highAlarmSeverity=0, hysteresis=0}}
 ```
 
-That is one long line, wrapped here to fit the page — nothing has been
+That is one long line, wrapped here to fit the page; nothing has been
 elided. Or with the Python pair:
 
 ```bash
@@ -95,7 +93,7 @@ SIM:TEMPERATURE = 22.5
 severity: 0
 ```
 
-The two halves mix freely: the Rust client reads the Python server, `spget`
+The two halves interoperate: the Rust client reads the Python server, `spget`
 reads either, and so does `pvget` from EPICS Base.
 
 ## What to notice
@@ -112,7 +110,7 @@ $ spput SIM:TEMPERATURE 99
 SIM:TEMPERATURE ERROR protocol error: PUT init error: Write access denied
 ```
 
-The server enforces that from the record type alone — you did not configure
+The server enforces that from the record type alone; you did not configure
 any permissions.
 
 **You get more than a number back.** A raw `pvget` prints the entire
@@ -127,7 +125,7 @@ SIM:TEMPERATURE 2026-08-04 09:46:31.420 22.5
 `spget` renders that structure for humans; the example client prints it
 whole. Both received exactly the same bytes.
 
-**Nobody configured a port or an address.** The client broadcast the PV name
+**No port or address is configured.** The client broadcast the PV name
 and the server answered. If that step fails, see the note on ports in
 [Installation](install.md).
 

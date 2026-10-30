@@ -8,8 +8,7 @@
 
 ## What you'll build
 
-Client code that reads a PV and writes one, plus the CLI equivalents you
-will reach for far more often than you expect.
+Client code that reads a PV and writes one, plus the CLI equivalents.
 
 ## Rust
 
@@ -47,7 +46,7 @@ The `_fields` variants take a list of dotted paths and send them as a
 {{#include ../../../../spvirit-py/examples/demo_put.py:put}}
 ```
 
-The Python client is blocking — no `await`, no event loop. Both `get` and
+The Python client is blocking: no `await`, no event loop. Both `get` and
 `put` take the same optional `fields` argument as their Rust counterparts.
 
 ## From the command line
@@ -68,9 +67,9 @@ narrows it. For everything the tools take, see
 
 **A GET returns the whole structure, not a number.** In Rust
 `result.value` is a `DecodedValue`; in Python `result.value` is a nested
-dict, so the number itself is `result.value["value"]`. Everything else —
-alarm, timeStamp, display, control, valueAlarm — arrived in the same
-message and cost you nothing extra.
+dict, so the number itself is `result.value["value"]`. Everything else
+(alarm, timeStamp, display, control, valueAlarm) arrived in the same
+message.
 
 **A PUT targets a field, and that field defaults to `value`.** Python's
 `put(pv, v)` is `put(pv, v, fields=["value"])`. That is why writing to a PV
@@ -102,7 +101,7 @@ SIM:SETPOINT 2026-08-04 10:02:47.913  42
 
 This matches EPICS Base, where `recGblGetTimeStampSimm()` runs
 unconditionally in `process()`. The one wrinkle: if the PUT carried its own
-non-zero `timeStamp`, that value is honoured instead of server time — a
+non-zero `timeStamp`, that value is honoured instead of server time, so a
 gateway relaying a reading from elsewhere can forward the *originating*
 acquisition time rather than the moment it happened to relay it.
 
@@ -137,7 +136,7 @@ after put: 30.0
 (The `{...}` groups above are elided; see
 [Your first PV](../02-getting-started/first-pv.md) for the untrimmed dump.)
 
-A successful PUT returns no value — if you want to see the new number you
+A successful PUT returns no value. If you want to see the new number you
 have to read it back, which is exactly what `demo_put.py` does:
 
 ```console

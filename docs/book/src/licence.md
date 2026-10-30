@@ -28,9 +28,9 @@ the Python packages built from them.
 | Look up a Rust API | [docs.rs](https://docs.rs/spvirit-server/latest/spvirit_server/), or the [crate map](05-reference/crate-map.md) |
 | Look up a Python API | [Python API](05-reference/python-api.md) |
 
-Before filing a bug, [Known gaps](05-reference/known-gaps.md) is worth two
-minutes — it lists the behaviours that are deliberately absent, so you can
-tell "not implemented" from "regression". A useful report includes the
+Before filing a bug, check [Known gaps](05-reference/known-gaps.md): it lists
+the behaviours that are deliberately absent, so you can tell "not
+implemented" from "regression". A useful report includes the
 spvirit version (`python -c "from importlib.metadata import version;
 print(version('spvirit'))"` or `cargo tree -p spvirit-server`), the platform,
 and the smallest server and client pair that reproduces it.

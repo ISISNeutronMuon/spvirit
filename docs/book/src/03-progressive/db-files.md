@@ -8,11 +8,10 @@
 
 ## What you'll build
 
-A soft IOC defined the EPICS way — as a database file rather than as code.
+A soft IOC defined the EPICS way: as a database file rather than as code.
 
-This is the point where spvirit stops being "a PVAccess library" and starts
-being "an IOC you can drop into an existing control system". The same file
-an EPICS IOC would load, spvirit serves.
+Loading a `.db` file lets spvirit stand in for a soft IOC in an existing
+control system: it serves the same database format an EPICS IOC loads.
 
 ## The database
 
@@ -22,7 +21,9 @@ an EPICS IOC would load, spvirit serves.
 
 A `.db` file is a list of `record(type, "NAME") { field(FIELD, "value") }`
 blocks. Fields spvirit does not model are ignored rather than rejected, so
-a database written for a real IOC generally loads unchanged — you just get
+a database written for a real IOC loads unchanged as long as every record
+type in it is one spvirit can build from `.db` (`mbbi`, `mbbo`, `longin` and
+`longout` cannot be; see [What to notice](#what-to-notice)). You still get
 fewer behaviours than EPICS Base would give you.
 
 ## Rust
@@ -50,12 +51,11 @@ typed from the record's wire type:
 {{#include ../../../../spvirit-py/examples/demo_db_file.py:handle}}
 ```
 
-**That handle is already bound**, which is the catch worth knowing before
-you plan around it: `on_put`, `scan` and `calc` are only honoured on an
+**That handle is already bound.** `on_put`, `scan` and `calc` are only honoured on an
 *unbound* handle, so attaching one to a `.db` record does nothing (the core
 logs a warning and carries on). A record that needs a write validator or a
 scan callback has to be declared in code with `spvirit.ao(...)` rather than
-loaded from the file. The same is true in Rust — `PvaServer::pv()` attaches,
+loaded from the file. The same is true in Rust: `PvaServer::pv()` attaches,
 it does not re-declare. See [Reacting to writes](reacting-to-writes.md).
 
 ## From the command line
@@ -101,11 +101,11 @@ $ spput DEMO:TEMP 30
 DEMO:TEMP ERROR protocol error: PUT init error: Write access denied
 ```
 
-Use the `o` variants — `ao`, `bo`, `stringout`, `aao`, `waveform` — for
+Use the `o` variants (`ao`, `bo`, `stringout`, `aao`, `waveform`) for
 anything a client should set.
 
 **`mbbi`/`mbbo` cannot be loaded from `.db`.** They parse and are then
-rejected at construction. Build enum records in code — see
+rejected at construction. Build enum records in code; see
 [Enums](enums.md).
 
 **`longin`/`longout` are not recognised by the `.db` parser either.** They
@@ -156,8 +156,8 @@ $ spget DEMO:SETPOINT
 DEMO:SETPOINT 2026-08-06 09:14:58.052  25
 ```
 
-Four PVs and no Rust that names any of them — every field, including the
-`HIHI` limit that turned 46 into a MAJOR alarm, came out of the `.db` file.
+None of the four PVs is named in the Rust code. Every field, including the
+`HIHI` limit that turned 46 into a MAJOR alarm, comes from the `.db` file.
 The alarm clears on its own when the value drops back inside the limits;
 nothing acknowledged it.
 

@@ -1,6 +1,6 @@
 # Testing Guide
 
-## The four layers
+## The five layers
 
 | Layer | Where | Run with |
 |---|---|---|
@@ -84,7 +84,7 @@ run with `python -m pytest tests/test_ioc_host_api.py`. Conventions:
 ## Conventions for new work
 
 - TDD is the house style: write the failing test first, verify it fails,
-  implement, verify it passes, commit per task. Follow the same rhythm.
+  implement, verify it passes, commit per task.
 - Timestamps in tests: always set explicit `NtTimeStamp`s on payloads you
   assert against — a `None` timestamp is stamped at *encode* time and makes
   monitor-delta assertions flaky (see chapter 02).

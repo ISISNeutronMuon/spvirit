@@ -11,13 +11,13 @@ four ideas you need before the rest of this site makes sense.
 
 ## PVs
 
-A **Process Variable (PV)** is a named data point — a temperature reading, a
+A **Process Variable (PV)** is a named data point: a temperature reading, a
 motor position, a shutter state. `SIM:TEMPERATURE` is a PV name. PVs are what
 clients read and write over the network, and the name is the only thing a
 client needs to find one: there is no host, no port, no path. A client shouts
 the name onto the network and whichever server owns it answers.
 
-That is worth pausing on, because it shapes everything else. PV names are a
+This shapes everything else: PV names are a
 **flat global namespace**. Conventionally they are colon-separated to imply
 hierarchy (`BEAMLINE:SHUTTER:STATE`), but nothing enforces that, and two
 servers answering for the same name is a real and confusing failure mode.
@@ -25,13 +25,13 @@ servers answering for the same name is a real and confusing failure mode.
 ## Records
 
 On the server side, each PV is backed by a **Record**. A record has a
-**type** — `ai`, `ao`, `bi`, `bo`, `waveform`, and so on — and the type
+**type** (`ai`, `ao`, `bi`, `bo`, `waveform`, and so on), and the type
 decides three things: whether clients may write to it, what shape of data it
 holds, and what processing happens when it changes.
 
-The naming convention is worth learning because it is not obvious:
+The naming convention is not obvious:
 
-- **`i` means input, `o` means output** — from the *IOC's* point of view.
+- **`i` means input, `o` means output**, from the *IOC's* point of view.
 - An **input** record (`ai`, `bi`, `aai`) is read-only to clients. Its value
   comes from the server: a sensor, a scan callback, a simulation.
 - An **output** record (`ao`, `bo`, `aao`) accepts client writes.
@@ -44,15 +44,15 @@ writable bool.
 
 ## Record types at a glance
 
-`PvaServer::builder()` offers fifteen constructors, but they are **not all
-the same kind of thing**, and the distinction matters more than the list
-does.
+`PvaServer::builder()` offers fifteen constructors (twelve for the record types in
+the first table below, where `longin` and `longout` are handle-only, and three
+in the second), but they are **not all the same kind of thing**.
 
 ### EPICS record types
 
 These are genuine EPICS record types, documented in the [EPICS Base Record
-Reference](https://docs.epics-controls.org/projects/base/en/latest/ComponentReference.html)
-— the same names, the same `i`/`o` conventions, and the same
+Reference](https://docs.epics-controls.org/projects/base/en/latest/ComponentReference.html):
+the same names, the same `i`/`o` conventions, and the same
 [dbCommon](https://docs.epics-controls.org/projects/base/en/latest/dbCommonRecord.html)
 fields you would find in an IOC's `.dbd`. They are what you declare in a
 `.db` file, they carry alarm limits and deadbands, and the server processes
@@ -60,7 +60,7 @@ them: scanning, link evaluation, automatic timestamps, computed severity.
 
 EPICS Base defines 35 record types; Spvirit implements the 14 below. If you
 need `calc`, `calcout`, `compress`, `fanout`, `seq`, or the `Direct`
-variants, they are not here — though `.link()` covers a good deal of what
+variants, they are not here, though `.link()` covers a good deal of what
 people reach for `calc` to do.
 
 | Record type | Rust builder | Direction | Data shape | Typical use |
@@ -92,33 +92,31 @@ serve those structures directly under a PV name.
 | `NtNdArray` | `.nt_ndarray(name, data, dims)` | NTNDArray | Image / detector data |
 | `generic` | `.generic(name, struct_id, fields)` | any | Custom structure |
 
-The difference is not cosmetic. An `ai` record is a **processing entity**: it
+An `ai` record is a **processing entity**: it
 has `SCAN`, `PINI`, `FLNK`, alarm thresholds, and a deadband, and the server
 runs a processing model over it. An `NtTable` is a **payload**: a shape on
 the wire with a name attached. It has no `SCAN`, no `MDEL`, no alarm
 computation, and no `.FIELD` channels, because there is no record underneath
 it to have them.
 
-This is the EPICS ideology showing through, and it is worth taking
-seriously. EPICS treats a control system as a **distributed database of
-records that process** — the record, not the value, is the unit of meaning.
-Alarm state, engineering units, and scan behaviour are properties *of the
-record*, declared once, and every client sees the same story. Reaching for
+EPICS treats a control system as a **distributed database of records that
+process**. Alarm state, engineering units, and scan behaviour are properties
+*of the record*, declared once, and every client sees the same values. Reaching for
 `generic` or `nt_ndarray` steps outside that model: you gain the freedom to
 send any structure you like, and you give up everything the record layer was
 doing on your behalf.
 
-The full trade-off — and when stepping outside is the right call — is
+The full trade-off, and when stepping outside is the right call, is in
 [Records vs raw NT](records-vs-raw-nt.md).
 
-### Two gaps worth knowing before you trip over them
+### Two gaps
 
-- `sub_array`, `nt_table`, `nt_ndarray`, and `generic` are **builder-only** —
+- `sub_array`, `nt_table`, `nt_ndarray`, and `generic` are **builder-only**:
   there is no typed `Pv<T>` handle for them.
 - `longin`/`longout` are the reverse: they exist as **typed handles only**
   (`Pv::longin(name, i32)`), not as builder methods, and `.db` loading for
-  them is not wired up — `spvirit-server/src/db.rs` carries a `TODO` saying
-  so. Declaring a `longin` record in a `.db` file will not give you one.
+  them is not wired up (`spvirit-server/src/db.rs` carries a `TODO` saying
+  so). Declaring a `longin` record in a `.db` file will not give you one.
 
 ## Fields
 
@@ -144,14 +142,14 @@ $ spget T:TEMP.EGU
 T:TEMP.EGU   2026-08-04 09:36:18.269 degC
 ```
 
-> **A gap worth knowing about.** Field access only serves two things: the
+> **Gap: field access.** Field access only serves two things: the
 > **dbCommon** fields every record carries (`DESC`, `SCAN`, `PINI`, `STAT`,
 > `SEVR`, `MDEL`, `ADEL`, and about fifteen more), plus any field
 > **literally present in a parsed `.db` file**.
 >
 > Record-specific fields set *programmatically* are not served. If you build
 > a PV with `spvirit.ai("X", 22.5, units="degC", prec=2)` or
-> `Pv::ai(...).units("degC")`, then `X.EGU` and `X.PREC` do **not** resolve —
+> `Pv::ai(...).units("degC")`, then `X.EGU` and `X.PREC` do **not** resolve;
 > the client times out, because the channel does not exist. The same record
 > loaded from a `.db` with `field(EGU, "degC")` serves `X.EGU` fine.
 >
@@ -159,7 +157,7 @@ T:TEMP.EGU   2026-08-04 09:36:18.269 degC
 > `spvirit-server/src/record_fields.rs`: `field_value` consults
 > `record.raw_fields`, which is populated by the `.db` parser and left empty
 > by the builder and handle APIs. The metadata is still present in the
-> NTScalar's `display` structure either way — only the separate `.FIELD`
+> NTScalar's `display` structure either way; only the separate `.FIELD`
 > channel is missing.
 
 ## `.db` files
@@ -184,9 +182,9 @@ record(ao, "SIM:SETPOINT") {
 }
 ```
 
-In Spvirit a `RecordInstance` holds all of it — the record type, the current
+In Spvirit a `RecordInstance` holds all of it: the record type, the current
 value as a Normative Type, and the fields. You can build records three ways,
-and they mix freely in one server:
+and use all three in one server:
 
 ```mermaid
 flowchart LR
@@ -200,7 +198,7 @@ flowchart LR
 ## Enums, and the ZNAM/ONAM wart
 
 EPICS has no first-class enum type. **Binary records** (`bi`/`bo`) fake one
-with two string labels — `ZNAM` for the zero state, `ONAM` for the one state:
+with two string labels: `ZNAM` for the zero state, `ONAM` for the one state:
 
 ```
 record(bo, "SHUTTER:CTRL") {
@@ -226,7 +224,7 @@ protocol; **PVAccess (PVA)** is its successor, and it is what Spvirit
 implements. The visible difference is that CA returns a value in one of a
 fixed set of DBR types (plain, or with time/alarm or graphic/control metadata
 chosen per request), while PVA returns a **self-describing structure** whose
-shape the server defines — value plus alarm plus timestamp plus display
+shape the server defines: value plus alarm plus timestamp plus display
 metadata, in one message. That structure is the subject of the
 [next chapter](normative-types.md).
 
@@ -259,7 +257,7 @@ flowchart TD
     end
 ```
 
-That is the whole vocabulary. Next: what actually travels on the wire.
+The next chapter, [Normative Types](normative-types.md), covers what travels on the wire.
 
 ## Further reading
 

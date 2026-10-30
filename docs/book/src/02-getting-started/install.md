@@ -15,9 +15,8 @@ require EPICS Base — Spvirit speaks PVAccess itself.
 pip install spvirit
 ```
 
-That is the whole story on Linux (x86_64, aarch64), macOS (Intel and Apple
-Silicon), and Windows x86_64: those five platforms get prebuilt `abi3`
-wheels, so there is no compiler involved. Python 3.9 or newer.
+Linux (x86_64, aarch64), macOS (Intel and Apple Silicon), and Windows
+x86_64 get prebuilt `abi3` wheels, so there is no compiler involved. Python 3.9 or newer.
 
 It also brings the command-line tools. `spvirit` depends on the
 `spvirit-tools` package, so the fifteen binaries below land on your `PATH`

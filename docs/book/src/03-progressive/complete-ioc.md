@@ -10,8 +10,7 @@
 
 One server that uses everything in Part III at once: a scanned readback
 with units and a deadband, a validated setpoint, a derived PV, an array,
-and an explicitly-managed alarm. It is small, but it is shaped like a real
-piece of equipment rather than a demo.
+and an explicitly-managed alarm, all modelling one simulated device.
 
 The device is a vacuum system:
 
@@ -29,7 +28,7 @@ The device is a vacuum system:
 {{#include ../../../../spvirit-server/examples/complete_ioc.rs:build}}
 ```
 
-Everything above is declarative — you describe the records and hand them
+Everything above is declarative: you describe the records and hand them
 to the server. Anything the IOC needs to *do* beyond that is an ordinary
 Tokio task holding the same handles:
 
@@ -45,13 +44,13 @@ times as you have distinct handle types.
 
 ## Python
 
-The same five records, with three differences worth naming:
+The same five records, with three differences:
 
 ```python
 {{#include ../../../../spvirit-py/examples/demo_complete_ioc.py:build}}
 ```
 
-`Server(pvs=[...])` takes **one flat list** — the two-call split above is a
+`Server(pvs=[...])` takes **one flat list**. The two-call split above is a
 Rust type-system constraint, not a protocol one, so the array handle goes
 in beside the scalars.
 
@@ -99,7 +98,7 @@ __pvlist
 ```
 
 `splist` with no argument lists *servers*; `splist <target>` lists the PVs
-on one. `__pvlist` is the server's own introspection channel — it is how
+on one. `__pvlist` is the server's own introspection channel. It is how
 that second call works, and it appears in every listing.
 
 Read and write:
@@ -139,16 +138,16 @@ VAC:SETPOINT 2026-08-04 10:35:57.902 0.0003
 Each read carries the time of its own PUT, not the record's *creation*
 time. `RecordInstance::apply_put`
 (`spvirit-server/src/apply.rs:569`) updates `value`, `alarm`, `display`
-and `control` from the client's structure and then always restamps —
-with the client's `timeStamp` if the PUT carried a non-default one, so a
-gateway can forward the originating acquisition time, otherwise with
-server time — whether or not the value itself changed. That matches
+and `control` from the client's structure and then always restamps,
+whether or not the value itself changed. If the PUT carried a non-default
+`timeStamp` it uses that one, so a gateway can forward the originating
+acquisition time; otherwise it uses server time. That matches
 EPICS Base, where `recGblGetTimeStampSimm()` runs unconditionally in
-`process()`. Server-driven updates — `scan`, `calc`, `set` — stamp too,
+`process()`. Server-driven updates (`scan`, `calc`, `set`) stamp too,
 which is why `VAC:PRESSURE` and `VAC:ERROR` above move on the same
 rhythm as the client-written `VAC:SETPOINT`.
 
-**The deadband is doing its job.** `VAC:PRESSURE` scans every 500 ms, but
+**The deadband drops about half the scans.** `VAC:PRESSURE` scans every 500 ms, but
 a monitor posts roughly once a second:
 
 ```console
@@ -158,11 +157,11 @@ VAC:PRESSURE 2026-08-04 10:36:10.065   0
 ```
 
 `.mdel(1.0e-8)` suppresses every tick whose change is smaller than that.
-Half the scans move less than a nanobar and are dropped. See
+Half the scans move less than `1e-8` mbar and are dropped. See
 [Monitors](monitors.md).
 
 **`spget` formatting is not the value.** Once the chamber pumps below
-about `1e-7` the display collapses to `0`. The wire value is intact —
+about `1e-7` the display collapses to `0`. The wire value is intact:
 `spget -F value` and `spmonitor` read the same double. For a fixed number
 of digits, use the record's `PREC` field and a client that honours it, or
 read the raw field.
@@ -175,14 +174,13 @@ construction time instead of at first read.
 
 **Validation belongs in `on_put`, not in `DRVL`/`DRVH`.** The drive limits
 are published for GUIs; nothing enforces them. The range check here is the
-only thing keeping `1.0` out of the record — and because `spput` retries a
+only thing keeping `1.0` out of the record. Because `spput` retries a
 rejected write, keep the callback idempotent
 ([Reacting to writes](reacting-to-writes.md)).
 
 ## Where to go next
 
-You now have every building block. The remaining parts of this book are
-reference rather than tutorial:
+The remaining parts of this book are reference rather than tutorial:
 
 - [Command-line tools](../04-tools/index.md) — the `sp*` family in detail
 - [Developer guide](../06-dev-guide/index.md) — internals, protocol notes,

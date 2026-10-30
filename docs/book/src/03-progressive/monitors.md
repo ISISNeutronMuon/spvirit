@@ -9,8 +9,8 @@
 ## What you'll build
 
 A subscription: one request, then updates pushed by the server for as long
-as you care to listen. This is what PVAccess is actually for — polling a PV
-in a loop is almost always the wrong answer.
+as you care to listen. This is the normal way to follow a PV in PVAccess;
+polling it in a loop is almost always wrong.
 
 ## Rust
 
@@ -25,7 +25,7 @@ which the server dropped (see [Overruns](#overruns) below). It returns a
 `pvmonitor` runs until the callback breaks or the connection drops.
 
 `MonitorOptions::pipelined(q)` asks the server for flow control with a
-queue depth of `q` — useful on high-rate PVs where a slow consumer would
+queue depth of `q`. This is useful on high-rate PVs where a slow consumer would
 otherwise fall behind.
 
 ## Python
@@ -34,7 +34,7 @@ otherwise fall behind.
 {{#include ../../../../spvirit-py/examples/demo_monitor.py:monitor}}
 ```
 
-The Python callback receives a `spvirit.lowlevel.MonitorUpdate` too —
+The Python callback receives a `spvirit.lowlevel.MonitorUpdate` too;
 `update.value` is the decoded structure as a dict, so an NTScalar's number is
 `update.value["value"]`.
 
@@ -50,7 +50,7 @@ sub.close()
 ```
 
 If a subscription ends on a network error, `sub.error` holds the message
-and `sub.is_active` becomes `False` — worth checking, because a silently
+and `sub.is_active` becomes `False`. Check it, because a silently
 dead subscription looks exactly like a quiet PV.
 
 ## Overruns
@@ -64,7 +64,7 @@ a pipelined subscription is delivered losslessly, so it is never conflated.
 
 > **spvirit's own server does not populate the overrun bitset.** Under load it
 > conflates a non-pipelined subscriber's queued updates down to the latest value
-> per subscription — dropping the intermediate ones — and still sends an *empty*
+> per subscription (dropping the intermediate ones) and still sends an *empty*
 > overrun bitset, so `has_overrun()` stays `false` even when frames were
 > silently dropped. The bits remain meaningful against servers that do set them
 > (a real EPICS IOC, or pvxs), and pipelining a spvirit subscription avoids the
@@ -96,7 +96,7 @@ def on_update(update):
     return True
 ```
 
-The path `"<whole structure>"` appears when bit 0 is set — the server is
+The path `"<whole structure>"` appears when bit 0 is set: the server is
 reporting the whole value rather than naming individual fields.
 
 ## From the command line
@@ -119,8 +119,7 @@ SOME:IOC:PV: overrun on value, alarm.severity
 present state immediately, then changes. You do not need a GET before a
 monitor.
 
-**Monitors respect the record's `MDEL`.** This is the single most useful
-thing on this page. A record with `mdel=1.0` posts an update only when the
+**Monitors respect the record's `MDEL`.** A record with `mdel=1.0` posts an update only when the
 value has moved at least 1.0 from the **last posted** value — not from the
 last set value. Writing 0.1, 0.2, 0.3, 5.0, 5.1, 5.2, 20.0 to such a PV
 delivers three updates:
@@ -130,12 +129,12 @@ posted to monitor: [0.0, 5.0, 20.0]
 ```
 
 `0.0` is the initial value on subscribe; `5.0` and `20.0` each cleared the
-deadband. The intermediate writes landed in the record — a GET would show
-`5.2` — they just were not broadcast.
+deadband. The intermediate writes landed in the record (a GET would show
+`5.2`); they just were not broadcast.
 
 **`MDEL` defaults to 0, meaning no deadband.** A record you never gave an
-`mdel` posts every change. On a 1 kHz PV with a hundred subscribers, that
-is a decision, so make it deliberately.
+`mdel` posts every change. On a 1 kHz PV with a hundred subscribers, every
+change goes to every subscriber, so set `mdel` if that is not what you want.
 
 **Severity changes always get through.** The deadband is bypassed when the
 alarm severity changes, so a PV crossing into MAJOR is never silently

@@ -43,8 +43,8 @@ is not a bare scalar.
 
 By default `spput` performs the **full EPICS-Base-style PUT flow**: a GET
 before the write, a get-put capability probe, the write, a GET after, then
-an explicit destroy. That is what a real `pvput` does, and it is what
-exercises the same code paths in a server under test.
+an explicit destroy. This matches EPICS Base `pvput`, so it exercises the
+same code paths in a server under test.
 
 ## Output
 
@@ -64,10 +64,10 @@ safe in a script.
 
 **A rejected write reaches the server twice.** When the full flow fails,
 `spput` silently falls back to the simple flow
-(`spvirit-tools/src/bin/spvirit_put.rs:236`). A server-side `on_put`
+(`spvirit-tools/src/bin/spvirit_put.rs:241-249`). A server-side `on_put`
 callback therefore fires once for an accepted write and twice for a
 rejected one. Pass `--no-flow-fallback` to suppress the retry, and write
-`on_put` callbacks to be idempotent either way — see
+`on_put` callbacks to be idempotent either way. See
 [Reacting to writes](../03-progressive/reacting-to-writes.md).
 
 **Read-only records refuse explicitly.** `ai`, `bi`, `stringin`, `aai` and

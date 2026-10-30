@@ -18,14 +18,14 @@ a GUID beginning with `0x`.
 
 ## Two modes
 
-**No argument — find servers:**
+**With no argument, it finds servers:**
 
 ```console
 $ splist
 GUID 0xC4960000E061B581C193C818 version 2: tcp@[ 10.64.23.134:5075 ]
 ```
 
-**With a target — list its PVs:**
+**With a target, it lists that server's PVs:**
 
 ```console
 $ splist 127.0.0.1:5075
@@ -43,7 +43,7 @@ useful when a server advertises an address you cannot route to directly.
 ## `__pvlist`
 
 That last entry is not one of your PVs. It is the server's introspection
-channel — the mechanism the second form uses. The server exposes
+channel, which the second form uses to read the listing. The server exposes
 `__pvlist` only with `--pvlist-mode list` (the default), and only while the
 listing is below `--pvlist-max`. With `discover` or `off` the name does not
 exist, which is why the listing fails in the example below.
@@ -52,7 +52,7 @@ exist, which is why the listing fails in the example below.
 
 **Listing is opt-in on the server side, discovery is not.** With
 `--pvlist-mode discover` or `off`, the server still answers a broadcast
-search — `splist` with no argument finds it — but refuses to enumerate:
+search (so `splist` with no argument finds it) but refuses to enumerate:
 
 ```console
 $ splist 127.0.0.1:5075
@@ -61,10 +61,10 @@ create_channel error: code=1 message=PV not found; GET_FIELD: disabled;
 RPC(server): ... RPC list endpoint disabled (set --pvlist-mode=list) ...")
 ```
 
-The error is long because `splist` tries four routes in turn — the
-`__pvlist` channel, `GET_FIELD`, an RPC endpoint, and a `server` GET — and
-reports every one that failed. "RPC list endpoint disabled" is the line
-that tells you it is a policy decision, not a broken server. Normal reads
+The error is long because `splist` tries four routes in turn (the
+`__pvlist` channel, `GET_FIELD`, an RPC endpoint, and a `server` GET) and
+reports every one that failed. The "RPC list endpoint disabled" line shows
+that the server is configured to refuse listing. Normal reads
 still work throughout. `--pvlist-max` and `--pvlist-allow-pattern` expose
 only part of a database. See [`spserver`](spserver.md).
 

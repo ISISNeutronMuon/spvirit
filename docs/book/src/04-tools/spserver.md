@@ -6,8 +6,8 @@
 > The badge reports the whole `docs-verify` suite, not this chapter alone.
 <!-- verify:end -->
 
-Serve an EPICS database file over PVAccess. No code, no build step — the
-soft-IOC equivalent of `softIoc -d my.db`.
+Serve an EPICS database file over PVAccess without writing or building any
+code. It does the job of `softIoc -d my.db`.
 
 ```
 spserver [OPTIONS]
@@ -51,9 +51,8 @@ INFO spserver: Conn 1: channel 'DEMO:SETPOINT' cid=1 sid=2
 INFO spserver: Conn 1: put init pv='DEMO:SETPOINT' ioid=1
 ```
 
-That startup line is worth reading. It tells you the effective ports and
-listing policy, which is faster than guessing when a client cannot find
-anything.
+The startup line reports the effective ports and listing policy. Check it
+first when a client cannot find anything.
 
 ## `--compute-alarms`
 
@@ -85,8 +84,8 @@ higher on a slow filesystem.
 | `discover` | answered | refused, "RPC list endpoint disabled" |
 | `off` | answered | refused |
 
-Note that `discover` and `off` do not hide the server — a broadcast search
-still finds it and named PVs still read and write. They only suppress
+`discover` and `off` do not hide the server: a broadcast search still
+finds it and named PVs still read and write. They only suppress
 enumeration.
 
 ## See also

@@ -8,8 +8,8 @@
 
 ## What you'll build
 
-An `NtTable` — columnar data, like a scan result or a device inventory —
-and an `NtNdArray` — a framed image.
+An `NtTable` (columnar data, like a scan result or a device inventory)
+and an `NtNdArray` (a framed image).
 
 These are the two places where spvirit steps outside the EPICS record
 model. As [Records vs raw NT](../01-fundamentals/records-vs-raw-nt.md)
@@ -93,8 +93,9 @@ union-shaped image `value` a client sends is **not applied** (see
 `store.put_nt(...)`, which is the natural way to drive both from server
 code.
 
-**No deadband, no alarm computation, no scanning.** All of that lives in
-the record layer, which these types are not part of. There is no MDEL
+**These types are not processed like records.** Deadbands, alarm
+computation and scanning live in the record layer, which these types are
+not part of. There is no MDEL
 deadband on `put_nt`: any payload that differs from the current one is
 posted. An identical payload is dropped.
 
@@ -108,21 +109,21 @@ $ spget SIM:IMG
 SIM:IMG 2026-08-06 09:14:32.958 {ubyteValue=[0, 16, 32, ...]}
 ```
 
-The `ubyteValue` field name is not decoration — NTNDArray's `value` is a
-union, and the field name identifies which arm is populated. An `int16`
+The `ubyteValue` field name identifies which arm of NTNDArray's `value`
+union is populated. An `int16`
 image would come back as `shortValue`.
 
 **There is no table *viewer* in the toolbox.** `spget` prints the shape,
 and that is the extent of it. [`sptable`](../04-tools/sptable.md) is a
-server, not a client — an interactive spreadsheet IOC that *serves* an
-`NtTable` — so it is the right tool for producing test data, not for
+server, not a client: an interactive spreadsheet IOC that *serves* an
+`NtTable`. It is the right tool for producing test data, not for
 inspecting someone else's PV.
 
 **Element types are fixed at creation.** Writing an `f64` column into a
 table created with `int` columns coerces to the record's type rather than
-retyping the record. The record is the authority.
+retyping the record.
 
-**Python needs lists, not numpy arrays.** Call `.tolist()` — `bytes` is
+**Python needs lists, not numpy arrays.** Call `.tolist()`; `bytes` is
 also accepted for `ubyte` data.
 
 ## Run it
@@ -149,13 +150,12 @@ SIM:IMG 2026-08-06 09:14:32.958 {ubyteValue=[0, 16, 32, 48, 64, 80, 96, 112,
 ```
 
 Both are one long line, wrapped here. `y` is `sin(x)` and the image is a
-4×4 greyscale ramp — small enough to read, which is the whole point of the
-example. Note what `spget` does *not* print: the table's `labels`
+4×4 greyscale ramp, small enough to read. Note what `spget` does *not* print: the table's `labels`
 (`["X", "Y"]`), and the image's `dimension` array. Both are on the wire;
 `spget` renders the `value` field only.
 
 `spinfo SIM:IMG` shows why NTNDArray is the most involved normative type in
-the book — `value` is a *union* of twelve typed arrays, and the shape lives
+the book: `value` is a *union* of twelve typed arrays, and the shape lives
 in a separate `dimension` structure array:
 
 ```console

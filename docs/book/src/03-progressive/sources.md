@@ -8,7 +8,7 @@
 
 ## What you'll build
 
-A PV provider that is not a record store at all — PVs backed by a file, by
+A PV provider that is not a record store at all: PVs backed by a file, by
 another process, by a naming convention, or computed on demand.
 
 Everything so far has used the built-in record store: you declare PVs up
@@ -29,7 +29,7 @@ fn rpc(&self, name, args)     -> Result<NtPayload, String>;   // has a default
 fn names(&self)               -> Vec<String>;
 ```
 
-(Shown with the `Pin<Box<dyn Future<...>>>` wrappers elided — the trait is
+(Shown with the `Pin<Box<dyn Future<...>>>` wrappers elided. The trait is
 object-safe rather than `async fn`, so every method returns a boxed future.
 See `spvirit-server/src/pvstore.rs:111`.)
 
@@ -41,7 +41,7 @@ memo. `claim` also runs before every GET/PUT/subscribe/RPC on the name. Keep it
 cheap, and implement `try_claim` from the same in-memory predicate if you can
 answer without I/O, so a search is answered on the first datagram.
 
-In Python there is no trait to implement — a source is any object with the
+In Python there is no trait to implement; a source is any object with the
 matching methods, checked by duck typing:
 
 ```python
@@ -54,14 +54,14 @@ class MySource:
     def on_start(self, notifier): ... # optional: stash the notifier
 ```
 
-Two differences from Rust worth knowing up front. `on_start` has no Rust
-counterpart — it is how a Python source gets the `Notifier` it needs to push
+Two differences from Rust. `on_start` has no Rust
+counterpart; it is how a Python source gets the `Notifier` it needs to push
 monitor updates. And `subscribe` is *not* part of the Python protocol: define
 it and it is ignored (`spvirit-py/src/source.rs:733`). Monitors are driven by
 `notifier.notify(name, payload)` instead.
 
 `on_start` fires at server start (`start()`/`start_background()`/`run()`),
-not at `build()` — and it shares one ordered list with `@builder.on_start`
+not at `build()`, and it shares one ordered list with `@builder.on_start`
 hooks registered on `ServerBuilder`: whichever was registered first (a
 source via `add_source`, or a hook via `@builder.on_start`) runs first. A
 source's `order` only decides which source claims a PV name; it plays no
@@ -89,37 +89,29 @@ and the built-in record store sits at **0**:
 ```
 
 So `-10` shadows the built-in store, and `10` is a fallback for names it
-does not know. This is the whole resolution model: first claim wins.
+does not know. The first source to claim a name wins.
 
 ## Claiming by naming convention
 
 A source can serve PVs that were never declared. This one owns everything
-starting with `XYZ:` and creates each PV on first touch:
+starting with `XYZ:` and stores a value for each one when it is first written:
 
 ```rust
 {{#include ../../../../spvirit-server/examples/wildcard_source.rs:claim}}
 ```
 
-The Python equivalent, claiming `SCRATCH:` instead — same three methods,
+The Python equivalent claims `SCRATCH:` instead, with the same three methods
 plus the notifier that publishes each PUT to subscribers:
 
 ```python
 {{#include ../../../../spvirit-py/examples/demo_source_wildcard.py:claim}}
 ```
 
-```console
-$ spget XYZ:NEW
-XYZ:NEW   0          # claimed on the search; reads the default until first written
-
-$ spput XYZ:NEW 42 && spget XYZ:NEW
-XYZ:NEW  42
-
-$ spget ABC:NEW
-Error: Timeout("search response")    # nothing claims ABC:
-```
-
-Note the failure mode for an unclaimed name: a **search timeout**, not a
-"not found" error. Nothing answers the UDP search, so the client waits.
+Any `XYZ:` name is claimed on the search and reads `0` until first written;
+see [Run it](#run-it) for a session. A name nothing claims, such as
+`ABC:NEW`, fails with a **search timeout**
+(`Error: Timeout("search response")`), not a "not found" error. Nothing answers the UDP search, so the
+client waits.
 
 ## Backing PVs with a file
 
@@ -128,20 +120,12 @@ Note the failure mode for an unclaimed name: a **search timeout**, not a
 ```
 
 Values survive a restart because `put` writes the JSON file synchronously
-and the constructor reads it back:
-
-```console
-$ spput JSON:SETPOINT_A 123.4
-JSON:SETPOINT_A OK
-# ... stop the server, start it again ...
-$ spget JSON:SETPOINT_A
-JSON:SETPOINT_A 123.4
-```
+and the constructor reads it back. [Run it](#run-it) shows a restart.
 
 ## Pushing monitor updates
 
-A source with a value that changes on its own — a polled instrument, a
-subscription to some other system — needs to *push*. In Rust that is
+A source with a value that changes on its own (a polled instrument, a
+subscription to some other system) needs to *push*. In Rust that is
 `subscribe`, returning a channel the server drains. In Python `subscribe` is
 ignored; you keep the `Notifier` from `on_start` and call it from whatever
 thread produces the data:
@@ -157,11 +141,11 @@ exactly one:
 - **Return a channel from `subscribe`** and leave `pushes_own_updates` at its
   default `false`. When a client starts a monitor, the server calls your
   `subscribe`, then runs one pump task per PV that drains the channel into the
-  monitor registry — so every value you send reaches the client. This is the
+  monitor registry, so every value you send reaches the client. This is the
   path for gateway proxies, group PVs, and any source whose values originate
   elsewhere. It is what makes a monitor through the gateway deliver *ongoing*
   updates, not just the first value.
-- **Push into the monitor registry yourself** — the built-in record store and
+- **Push into the monitor registry yourself.** The built-in record store and
   the IOC engine already call `notify_monitors` on every write. Such a source
   returns `pushes_own_updates() -> true`, which tells the server *not* to also
   pump `subscribe`; pumping a source that already self-notifies would deliver
@@ -175,15 +159,15 @@ were `true`.
 
 ## RPC
 
-`rpc` has a default implementation that returns `Err("RPC not supported")`,
-as do `pushes_own_updates` (`false`) and `try_claim` (`Unknown`). A source
-opts in to RPC by overriding it:
+`rpc` has a default implementation that returns `Err("RPC not supported")`.
+(`pushes_own_updates` and `try_claim` also have defaults, `false` and
+`Unknown`.) A source opts in to RPC by overriding `rpc`:
 
 ```rust
 {{#include ../../../../spvirit-server/examples/rpc_source.rs:rpc}}
 ```
 
-In Python it is likewise optional — a source without an `rpc` method simply
+In Python it is likewise optional: a source without an `rpc` method simply
 has no RPC channel:
 
 ```python
@@ -191,7 +175,7 @@ has no RPC channel:
 ```
 
 **spvirit ships no general-purpose RPC client.** Neither `spvirit-client`
-nor any of the CLI tools can call an arbitrary RPC channel — the only RPC
+nor any of the CLI tools can call an arbitrary RPC channel. The only RPC
 in the client is an internal path used by `pvlist`. To exercise an RPC
 source, use p4p or pvxs:
 
@@ -210,7 +194,7 @@ print(ctx.rpc('RPC:add', {'a': 3.0, 'b': 4.0}))   # 7.0
 | `custom_pvstore.rs` | replacing the store wholesale rather than layering on it |
 | `mailbox.rs` | minimal writable scratch PVs |
 
-The Python family is `demo_source_*.py` — `sensor`, `async`, `multi`,
+The Python family is `demo_source_*.py`: `sensor`, `async`, `multi`,
 `passthrough`, `aggregate`, `rpc`, `wildcard`. `demo_source_async.py` is the
 one with no Rust counterpart here: it shows a source whose methods are
 `async def`. The adapter runs each coroutine on a dedicated background
@@ -218,15 +202,15 @@ asyncio loop (thread `spvirit-asyncio`) and awaits the result.
 
 ## What to notice
 
-**`claim` is on the hot path.** It runs (in the background, for a search
-`try_claim` could not answer) for names searched by every client on the
-network, and before every operation. Keep it cheap — no I/O, no locks held
-across awaits. Do the expensive work in `get`.
+**`claim` is on the hot path.** It runs for names searched by every client
+on the network and before every operation, so keep it cheap (see
+[The `Source` trait](#the-source-trait)): no I/O, no locks held across
+awaits. Do the expensive work in `get`.
 
 **`names()` drives `splist`.** A source that returns an empty `names()`
 still serves its PVs; they just do not show up in listings. The wildcard
-source cannot enumerate what does not exist yet, which is the honest
-answer for a dynamic namespace.
+source lists only the names written so far, since it cannot enumerate a
+namespace with no fixed members.
 
 **Sources bypass the record layer entirely.** No MDEL, no alarm
 computation, no scan, and no `.FIELD` access unless you opt in: a Python
@@ -256,7 +240,7 @@ python spvirit-py/examples/demo_source_rpc.py
 
 Each is a server; drive it from a second terminal. `multi_source` registers
 several sources on one server, and `splist` shows them merged into one flat
-namespace — nothing in the listing says which source owns which PV:
+namespace; nothing in the listing says which source owns which PV:
 
 ```console
 $ splist 127.0.0.1:5075
@@ -276,8 +260,8 @@ $ spget SIM:COUNTER
 SIM:COUNTER 2026-08-06 09:19:56.859   3
 ```
 
-`wildcard_source` claims a whole prefix, so the PV does not exist until you
-write to it:
+`wildcard_source` claims a whole prefix. Every `XYZ:` name is readable, but
+it only appears in `splist` once it has been written:
 
 ```console
 $ spput XYZ:MyValue 42.0
@@ -296,13 +280,11 @@ XYZ:sensor/temp
 __pvlist
 ```
 
-Two things to notice. `spget XYZ:MyValue` prints **no timestamp**. The
+`spget XYZ:MyValue` prints **no timestamp**. The
 source's `claim` advertises a bare `{value}` structure (no
 `alarm`/`timeStamp`), and the server sends only what the descriptor declares.
 Claim with `descriptor_for_payload(&NtPayload::Scalar(..))` (as
-`multi_source` does) and a timestamp appears. And
-`splist` only reports the names created so far; a wildcard source cannot
-enumerate an infinite namespace.
+`multi_source` does) and a timestamp appears.
 
 `json_source` writes through to disk, so the value survives a restart:
 
@@ -329,11 +311,11 @@ JSON file-backed source server running on port 5075
   Storage file:   pvstore.json
 ```
 
-It creates `pvstore.json` in your working directory — delete it if you want
+It creates `pvstore.json` in your working directory. Delete it if you want
 to start from the defaults again.
 
-`rpc_source` has no expected output here, because as noted above spvirit
-ships no RPC client; use p4p or `pvcall` from pvxs against it.
+`rpc_source` has no expected output here, because spvirit ships no RPC
+client (see [RPC](#rpc)); use p4p or `pvcall` from pvxs against it.
 
 ## Next
 

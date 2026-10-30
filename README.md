@@ -9,12 +9,12 @@
 
 */ˈspɪrɪt/ of the Machine*
 
-Spvirit is a pure-Rust implementation of the EPICS **PVAccess** protocol —
-client, server, wire codec, command-line tools, and Python bindings — with no
+Spvirit is a pure-Rust implementation of the EPICS **PVAccess** protocol
+(client, server, wire codec, command-line tools, and Python bindings) with no
 dependency on an EPICS base installation. It is not yet production ready, but
 it is available for anyone to use and contribute to.
 
-📖 **[Read the documentation](https://isisneutronmuon.github.io/spvirit/)** —
+**[Read the documentation](https://isisneutronmuon.github.io/spvirit/)**:
 fundamentals, progressive examples in Rust and Python, and a page per CLI tool.
 
 Key areas of development in the near future include:
@@ -34,10 +34,10 @@ fun project with a moderately useful outcome.
 |---|---|
 | `spvirit-types` | Shared data model for PVAccess Normative Types (NT). |
 | `spvirit-codec` | PVAccess protocol encode/decode (PVA message layer + pvData) and segment reassembly. |
-| `spvirit-client` | Client library — search, connect, get, put, monitor. |
-| `spvirit-server` | Server library — `.db` parsing, `Source` trait, PVAccess server runtime. |
+| `spvirit-client` | Client library: search, connect, get, put, monitor. |
+| `spvirit-server` | Server library: `.db` parsing, `Source` trait, PVAccess server runtime. |
 | `spvirit-tools` | The `sp*` command-line tools. |
-| `spvirit-py` | Python bindings via PyO3 — client and server APIs from Python. |
+| `spvirit-py` | Python bindings via PyO3: client and server APIs from Python. |
 | `spvirit-ioc` | Synchronous EPICS record-processing engine (scan lists, links, lock sets). |
 | `spvirit-gateway` | p4p-compatible PVAccess gateway library. |
 | `spvirit-calc` | CALC expression evaluator. |
@@ -115,9 +115,9 @@ in [Installation](https://isisneutronmuon.github.io/spvirit/02-getting-started/i
 | `spmonitor` | `pvmonitor` | Subscribe to a PV and print value changes |
 | `spinfo` | `pvinfo` | Display field/metadata information for a PV |
 | `splist` | `pvlist` | List all available PVs on discovered servers |
-| `spserver` | `softIoc` | Not fully one-to-one — a demo, but it parses some `.db` vocabulary |
-| `spgateway` | `pvagw` | PVAccess gateway — proxy PVs between networks from a p4p-schema config |
-| `sptable` | | Interactive TUI IOC — build and drive records live |
+| `spserver` | `softIoc` | Not fully one-to-one: a demo, but it parses some `.db` vocabulary |
+| `spgateway` | `pvagw` | PVAccess gateway: proxy PVs between networks from a p4p-schema config |
+| `sptable` | | Interactive TUI IOC: build and drive records live |
 | `spexplore` | | Interactive TUI to browse servers, select PVs, and monitor values |
 | `spsearch` | | TUI showing PV search network traffic for diagnostics |
 | `spsine` | | Continuously write a sine wave to a PV (demo/testing) |
@@ -133,7 +133,7 @@ A page per tool, with real captured output, is at
 
 ## Examples
 
-The repository carries runnable examples for every concept — nearly thirty
+The repository carries runnable examples covering the main features: nearly thirty
 Rust examples under `spvirit-{codec,client,server}/examples/` and over thirty
 Python scripts under `spvirit-py/examples/`. Each is walked through in
 [Progressive examples](https://isisneutronmuon.github.io/spvirit/03-progressive/scalars.html),
@@ -153,7 +153,7 @@ I have tested the tools in this repo against the following EPICS PVAccess server
 
 ## Contributing
 
-Internals — the codec, the record model, the server runtime, the bindings —
+Internals (the codec, the record model, the server runtime, the bindings)
 are documented with file-and-line citations in the
 [developer guide](https://isisneutronmuon.github.io/spvirit/06-dev-guide/index.html).
 Known divergences from EPICS Base behaviour are collected in
@@ -169,7 +169,7 @@ Known divergences from EPICS Base behaviour are collected in
 
 ## References
 
-I used the following libraries and repos as refernce materials for PVAccess protocol:
+I used the following libraries and repos as reference materials for PVAccess protocol:
 
 - [pvxs](https://epics-base.github.io/pvxs/)
 - [pvAccess Protocol Specification](https://docs.epics-controls.org/en/latest/pv-access/protocol.html)
@@ -180,12 +180,12 @@ I used the following libraries and repos as refernce materials for PVAccess prot
 
 | Section / Area | What Was Done With AI | Plans Ahead |
 |---|---|---|
-| `spvirit-types` | Hand coded, few types completed with AI, the prettified with AI | keep the same, fairly complete |
-| `spvirit-codec` | Most was hand-coded, some restructuring and prettifying was done with AI.  | keep the same, bring in any common helpers, maybe write a siplified API for users |
+| `spvirit-types` | Hand coded, few types completed with AI, then prettified with AI | keep the same, fairly complete |
+| `spvirit-codec` | Most was hand-coded, some restructuring and prettifying was done with AI.  | keep the same, bring in any common helpers, maybe write a simplified API for users |
 | `spvirit-tools` | Mostly AI generated, manually coded parts of Put and Get then let the Agents build on top. Client and server logic has been split out into `spvirit-client` and `spvirit-server` crates. | The APIs are now split idiomatically. Continued refinement of high-level convenience functions for put and monitor. |
-| `PvaClient` / `PvaServer` | High-level builder-pattern APIs (`PvaClient::builder()`, `PvaServer::builder()`) designed with AI assistance. Wraps protocol-level operations into ergonomic one-liners for get, put, monitor, info, and typed server records. | Extend with more record types, structured put payloads, and TLS support. |
+| `PvaClient` / `PvaServer` | High-level builder-pattern APIs (`PvaClient::builder()`, `PvaServer::builder()`) designed with AI assistance. Wraps protocol-level operations into single-call methods for get, put, monitor, info, and typed server records. | Extend with more record types, structured put payloads, and TLS support. |
 | Testing | I wrote some basic tests, then used GenAI agents to generate more tests and test cases, which I then manually curated and edited. | Suite is fairly comprehensive so I will keep it as is. |
-| Documentation | The [documentation site](https://isisneutronmuon.github.io/spvirit/) was drafted with AI, with every code sample included verbatim from a compiled example and every claim checked against the source. | Keep it verified by CI — `cargo test -p spvirit-tools --test docs_verify`. |
+| Documentation | The [documentation site](https://isisneutronmuon.github.io/spvirit/) was drafted with AI, with every code sample included verbatim from a compiled example and every claim checked against the source. | Keep it verified by CI: `cargo test -p spvirit-tools --test docs_verify`. |
 
 ## Licence
 

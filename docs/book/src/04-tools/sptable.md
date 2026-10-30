@@ -7,8 +7,8 @@
 <!-- verify:end -->
 
 An interactive spreadsheet that *is* an IOC. Each row is a PV; adding a
-row serves it immediately. It is the fastest way to put a realistic set of
-PVs on the network without writing a `.db` file or a line of code.
+row serves it immediately. Use it to put a set of PVs on the network
+without writing a `.db` file or any code.
 
 ```
 sptable [OPTIONS]
@@ -37,8 +37,8 @@ everything else.
 | `?` | scrollable help modal |
 | `q` or `Esc` | quit |
 
-While you type a `:` command the footer shows a live hint for that verb —
-and for `:anim`, once the generator name is present, it switches to that
+While you type a `:` command the footer shows a live hint for that verb.
+For `:anim`, once the generator name is present, it switches to that
 generator's own parameters and defaults.
 
 ## Commands
@@ -81,11 +81,11 @@ exactly one name:
 {1..8}   {8..1}   {0..100..10}   {01..12}   {A,B,C}
 ```
 
-Multiple braces form a cartesian product — `S{1..4}:{A,B}` is eight PVs.
+Multiple braces form a cartesian product: `S{1..4}:{A,B}` is eight PVs.
 Zero-padding is inferred from the width of the bounds, so `{01..12}`
 produces `01`, `02`, … A pattern that would create more than 1000 PVs is
 rejected rather than expanded
-(`spvirit-tools/src/bin/spvirit_table/pattern.rs:4`) — a typo like
+(`spvirit-tools/src/bin/spvirit_table/pattern.rs:4`), so a typo like
 `{1..1000000}` fails instead of hanging the machine.
 
 ```text
@@ -113,20 +113,20 @@ the global tick rate.
 :rate 50
 ```
 
-`:rate` retunes every animation live — it is the tick rate, not a
-per-generator frequency. Use `period` for the shape of one waveform.
+`:rate` sets the global tick rate and retunes every animation live. Use
+`period` to set the shape of one waveform.
 
-**Inapplicable parameters are an error, not a no-op.** `:anim X sine min=-2`
-is rejected, because sine's range comes from `amp`/`offset` and a silently
-ignored `min` would look like it worked
+**`:anim` rejects parameters the generator does not use.** `:anim X sine
+min=-2` is rejected, because sine's range comes from `amp`/`offset` and a
+silently ignored `min` would look like it worked
 (`spvirit-tools/src/bin/spvirit_table/anim.rs:212`).
 
 ## Sessions
 
-`:write <file>` dumps the whole session — rate, every row with its current
-value and access, and every animation with its resolved parameters — as a
-script of the same commands. `:source <file>` replays it. The dump
-round-trips: what you write is what you can load.
+`:write <file>` dumps the whole session as a script of the same commands:
+the rate, every row with its current value and access, and every animation
+with its resolved parameters. `:source <file>` replays it and recreates the
+session.
 
 ```text
 # sptable session dump
@@ -143,13 +143,12 @@ written after `:rate 50` and edited by hand still loads exactly.
 **`:add` skips names that already exist** rather than overwriting, and
 reports how many it skipped. Bulk-adding an overlapping pattern is safe.
 
-**A table row cannot be `:set`.** The error is explicit — recreate it with
-`:add`. Tables are a payload type, not a record with a value field; see
-[Tables and images](../03-progressive/tables-and-images.md).
+**A table row cannot be `:set`.** The command reports an error; recreate
+the row with `:add`. A table is a payload type rather than a record with a
+scalar value; see [Tables and images](../03-progressive/tables-and-images.md).
 
-**Typed values are checked, not coerced.** `:set` and `:add` reject a value
-that does not parse as the row's type, so `:set X 3.7` on an `int32` row is
-an error. Animation output is different: each generator sample is rounded
+**`:set` and `:add` reject a value that does not parse as the row's
+type,** so `:set X 3.7` on an `int32` row is an error. Animation output is different: each generator sample is rounded
 and clamped to the row's type (`coerce_scalar`,
 `spvirit-tools/src/bin/spvirit_table/parse.rs:79`). The row's type wins in
 both cases.
