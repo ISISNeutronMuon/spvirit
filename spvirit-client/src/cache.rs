@@ -360,6 +360,9 @@ pub(crate) struct ClientCache {
     counters: CacheCounters,
     resolution: ResolutionCache,
     pool: ConnPool,
+    /// The client's shared UDP search: one socket per bind address and
+    /// batched SEARCH datagrams across concurrent resolves.
+    search: crate::search_engine::SearchEngine,
 }
 
 impl ClientCache {
@@ -368,6 +371,7 @@ impl ClientCache {
             resolution: ResolutionCache::new(cfg.resolve_ttl),
             counters: CacheCounters::default(),
             pool: ConnPool::new(cfg.conn_idle_ttl, cfg.pool_max_per_addr),
+            search: crate::search_engine::SearchEngine::default(),
             cfg,
         }
     }
@@ -394,7 +398,8 @@ impl ClientCache {
     ) -> Result<Resolved, PvGetError> {
         self.resolution
             .get_or_resolve(&opts.pv_name, &self.counters, || async {
-                let (addr, guid) = crate::search::resolve_pv_server(opts).await?;
+                let (addr, guid) =
+                    crate::search::resolve_pv_server_via(opts, Some(&self.search)).await?;
                 Ok(Resolved { addr, guid })
             })
             .await

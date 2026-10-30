@@ -44,6 +44,7 @@ pub mod put_encode;
 pub mod pva_client;
 pub mod pvlist;
 pub mod search;
+mod search_engine;
 pub mod transport;
 pub mod types;
 

@@ -8,12 +8,14 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use spvirit_client::MonitorOptions;
 use spvirit_codec::spvd_decode::{DecodedValue, StructureDesc};
 use spvirit_server::pvstore::{PvInfo, Source, TryClaim};
 use spvirit_types::NtPayload;
@@ -21,7 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::access::{AccessControl, Decision, Identity, Op};
 use crate::bridge::{
-    merge_monitor_delta, nt_payload_from_decoded, nt_payload_from_get, patch_nt_payload,
+    merge_monitor_delta_owned, nt_payload_from_decoded, nt_payload_from_get, patch_nt_payload,
 };
 use crate::cache::monitor::{MonitorCache, MonitorKey, UpstreamState};
 use crate::convert::decoded_to_json;
@@ -29,6 +31,9 @@ use crate::cache::negative::NegativeCache;
 use crate::lockutil::{lock_or_recover, try_lock_or_recover};
 use crate::loopguard::LoopGuard;
 use crate::upstream::UpstreamPool;
+
+/// What an upstream `pvinfo_full` yields: descriptor, server address, GUID.
+type Resolved = (StructureDesc, SocketAddr, [u8; 12]);
 
 /// Snapshots the current downstream connection's identity (socket peer host,
 /// and decoded `ca` user if any) into an [`Identity`] for
@@ -262,6 +267,73 @@ impl GatewaySource {
             .filter(|b| lock_or_recover(&b.last_get).is_some())
             .count()
     }
+    /// Bind downstream `name` to `target` on upstream `client_name`, or
+    /// refresh that binding in place if it already exists.
+    fn record_binding(
+        &self,
+        name: &str,
+        client_name: &str,
+        target: &str,
+        descriptor: &StructureDesc,
+    ) {
+        let mut bindings = lock_or_recover(&self.bindings);
+        // Two statements, not one `match` with an `insert` in
+        // its fallback arm: `get_mut`'s borrow of `bindings`
+        // would still be live in that arm, and the borrow
+        // checker rejects it (NLL problem case 3). Reducing
+        // the match to a `bool` ends the borrow at the
+        // semicolon.
+        let refreshed = match bindings.get_mut(name) {
+            // Refresh in place. Replacing the whole `Binding`
+            // (what this used to do) resets `last_get` to
+            // `None` — and `SourceRegistry` claims immediately
+            // before every `get`, so the getholdoff cache was
+            // wiped before every read it was meant to serve.
+            Some(existing)
+                if existing.client_name == client_name
+                    && existing.real_name == target =>
+            {
+                // An upstream that restructured invalidates the
+                // cached value: `handler.rs` encodes whatever
+                // `last_get` holds against the descriptor this
+                // binding currently advertises, so serving a
+                // payload cached against the superseded one
+                // emits a frame whose data does not match its
+                // own introspection — and in this protocol one
+                // malformed frame takes the whole TCP
+                // connection down, not just that value. Do NOT
+                // simplify this to an unconditional refresh:
+                // the equality check is what keeps a stale
+                // payload from outliving its structure. It is
+                // equally not an unconditional clear — that
+                // would wipe the cache on every claim and so
+                // disable getholdoff altogether, which is the
+                // very bug the in-place refresh above fixes.
+                if existing.descriptor != *descriptor {
+                    *lock_or_recover(&existing.last_get) = None;
+                }
+                existing.descriptor = descriptor.clone();
+                existing.bound_at = Instant::now();
+                true
+            }
+            // A different client or a different upstream target
+            // is a different binding: the cached value came
+            // from somewhere else and must not carry over.
+            _ => false,
+        };
+        if !refreshed {
+            bindings.insert(
+                name.to_string(),
+                Binding {
+                    client_name: client_name.to_string(),
+                    real_name: target.to_string(),
+                    descriptor: descriptor.clone(),
+                    bound_at: Instant::now(),
+                    last_get: Mutex::new(None),
+                },
+            );
+        }
+    }
 }
 
 impl Source for GatewaySource {
@@ -360,104 +432,95 @@ impl Source for GatewaySource {
                 }
             }
 
-            for client_name in &self.client_order {
+            // Every client is asked at once, so a name only the k-th client
+            // serves costs one timeout rather than k-1 of them. The answer is
+            // still the one sequential order would give: client i's result is
+            // taken only once every client before it has failed (or resolved
+            // into a banned address), so a name served by several clients
+            // binds to the first in `client_order`, exactly as before.
+            // Returning drops the `JoinSet`, aborting lower-priority lookups
+            // still in flight.
+            let mut lookups = tokio::task::JoinSet::new();
+            let mut lookup_ids = HashMap::new();
+            // Per client, in order: `None` while its lookup is in flight,
+            // then `Some(None)` for a miss or `Some(Some(..))` for a hit.
+            let mut outcomes: Vec<Option<Option<Resolved>>> =
+                Vec::with_capacity(self.client_order.len());
+            for (idx, client_name) in self.client_order.iter().enumerate() {
                 let Some(client) = self.pool.client(client_name) else {
+                    // An unknown client is a settled miss.
+                    outcomes.push(Some(None));
                     continue;
                 };
+                outcomes.push(None);
                 self.resolves
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let (descriptor, server_addr, guid) = match client.pvinfo_full(&target).await {
-                    Ok(resolved) => resolved,
+                let target = target.clone();
+                let handle = lookups.spawn(async move { client.pvinfo_full(&target).await });
+                lookup_ids.insert(handle.id(), idx);
+            }
+
+            let mut next = 0;
+            loop {
+                // Walk forward over settled misses; stop at the first client
+                // still pending or the first usable hit.
+                while let Some(Some(outcome)) = outcomes.get(next) {
+                    if let Some((descriptor, server_addr, guid)) = outcome {
+                        // Loop / self-connection prevention: if this name
+                        // resolved back into one of our own downstream server
+                        // sockets (or an `ignoreaddr` host), or the
+                        // responder's GUID matches one of our own servers'
+                        // GUIDs, do NOT bind it — forwarding would loop a
+                        // search into ourselves. Move on to the next client.
+                        if !self.guard.is_banned(*server_addr) && !self.guard.is_guid_banned(guid) {
+                            let client_name = &self.client_order[next];
+                            let descriptor = descriptor.clone();
+                            self.record_binding(&name, client_name, &target, &descriptor);
+                            return Some(PvInfo {
+                                descriptor,
+                                writable: true,
+                            });
+                        }
+                    }
+                    next += 1;
+                }
+                if next == outcomes.len() {
+                    break;
+                }
+                let Some(joined) = lookups.join_next_with_id().await else {
+                    break;
+                };
+                let (idx, result) = match joined {
+                    Ok((id, result)) => (lookup_ids[&id], result),
+                    // A panicked lookup is a miss for that client only.
                     Err(e) => {
-                        // Downstream a failed resolve is indistinguishable from
-                        // "no such PV", so this line is the only place the
-                        // difference is recorded. `debug` rather than `warn`:
-                        // on a multi-client gateway most clients legitimately
-                        // do not host most names, so a miss here is routine.
-                        tracing::debug!(
-                            "gateway: upstream resolve failed for downstream={name:?} \
-                             real={target:?} via client={client_name:?}: {e}"
-                        );
+                        outcomes[lookup_ids[&e.id()]] = Some(None);
                         continue;
                     }
                 };
-                // Loop / self-connection prevention: if this name resolved
-                // back into one of our own downstream server sockets (or an
-                // `ignoreaddr` host), or the responder's GUID matches one of
-                // our own servers' GUIDs, do NOT bind it — forwarding would
-                // loop a search into ourselves. Skip to the next client.
-                if self.guard.is_banned(server_addr) || self.guard.is_guid_banned(&guid) {
-                    continue;
-                }
-                {
-                    let mut bindings = lock_or_recover(&self.bindings);
-                    // Two statements, not one `match` with an `insert` in
-                    // its fallback arm: `get_mut`'s borrow of `bindings`
-                    // would still be live in that arm, and the borrow
-                    // checker rejects it (NLL problem case 3). Reducing
-                    // the match to a `bool` ends the borrow at the
-                    // semicolon.
-                    let refreshed = match bindings.get_mut(&name) {
-                        // Refresh in place. Replacing the whole `Binding`
-                        // (what this used to do) resets `last_get` to
-                        // `None` — and `SourceRegistry` claims immediately
-                        // before every `get`, so the getholdoff cache was
-                        // wiped before every read it was meant to serve.
-                        Some(existing)
-                            if existing.client_name == *client_name
-                                && existing.real_name == target =>
-                        {
-                            // An upstream that restructured invalidates the
-                            // cached value: `handler.rs` encodes whatever
-                            // `last_get` holds against the descriptor this
-                            // binding currently advertises, so serving a
-                            // payload cached against the superseded one
-                            // emits a frame whose data does not match its
-                            // own introspection — and in this protocol one
-                            // malformed frame takes the whole TCP
-                            // connection down, not just that value. Do NOT
-                            // simplify this to an unconditional refresh:
-                            // the equality check is what keeps a stale
-                            // payload from outliving its structure. It is
-                            // equally not an unconditional clear — that
-                            // would wipe the cache on every claim and so
-                            // disable getholdoff altogether, which is the
-                            // very bug the in-place refresh above fixes.
-                            if existing.descriptor != descriptor {
-                                *lock_or_recover(&existing.last_get) = None;
-                            }
-                            existing.descriptor = descriptor.clone();
-                            existing.bound_at = Instant::now();
-                            true
-                        }
-                        // A different client or a different upstream target
-                        // is a different binding: the cached value came
-                        // from somewhere else and must not carry over.
-                        _ => false,
-                    };
-                    if !refreshed {
-                        bindings.insert(
-                            name.clone(),
-                            Binding {
-                                client_name: client_name.clone(),
-                                real_name: target.clone(),
-                                descriptor: descriptor.clone(),
-                                bound_at: Instant::now(),
-                                last_get: Mutex::new(None),
-                            },
+                outcomes[idx] = Some(match result {
+                    Ok(resolved) => Some(resolved),
+                    Err(e) => {
+                        // Downstream a failed resolve is indistinguishable
+                        // from "no such PV", so this line is the only place
+                        // the difference is recorded. `debug` rather than
+                        // `warn`: on a multi-client gateway most clients
+                        // legitimately do not host most names, so a miss here
+                        // is routine.
+                        tracing::debug!(
+                            "gateway: upstream resolve failed for downstream={name:?} \
+                             real={target:?} via client={:?}: {e}",
+                            self.client_order[idx]
                         );
+                        None
                     }
-                }
-                return Some(PvInfo {
-                    descriptor,
-                    writable: true,
                 });
             }
 
-            // Stamped now, not with the `now` taken at entry: the loop above
-            // just spent a full `PvaClient` operation timeout per configured
-            // client, and charging that against this entry would make any TTL
-            // shorter than the search expire the moment it is written.
+            // Stamped now, not with the `now` taken at entry: the lookups above
+            // just spent up to a full `PvaClient` operation timeout, and
+            // charging that against this entry would make any TTL shorter
+            // than the search expire the moment it is written.
             self.neg.record_miss(&name, Instant::now());
             None
         })
@@ -607,37 +670,45 @@ impl Source for GatewaySource {
                 // owning) the handle IS the record of whether the stop was
                 // deliberate, and unlike the flag it cannot go stale, because
                 // it is the same object the cancellation acts on.
-                let handle = client.pvmonitor_spawn(&real_name, move |update| {
-                    // Owned by the callback so that it is dropped — and fires —
-                    // when the subscription task ends. See `EndSignal`.
-                    let _end_signal = &end_signal;
-                    merge_monitor_delta(&mut last_full, update);
+                // The owned-update spawn lets the merge move changed values
+                // into `last_full` rather than deep-clone them.
+                let handle = client.pvmonitor_spawn_owned(
+                    &real_name,
+                    &[],
+                    MonitorOptions::default(),
+                    move |mut update| {
+                        // Owned by the callback so that it is dropped — and fires —
+                        // when the subscription task ends. See `EndSignal`.
+                        let _end_signal = &end_signal;
+                        merge_monitor_delta_owned(&mut last_full, &mut update);
+                        let update = &update;
 
-                    // Patch in place when the delta names its changed fields;
-                    // only rebuild (re-converting every field of the
-                    // structure) when it cannot be applied incrementally — a
-                    // whole-structure delta, the first tick, or a path the
-                    // payload does not yet have.
-                    let needs_rebuild = match cached_payload.as_mut() {
-                        Some(cached) => !patch_nt_payload(cached, &last_full, update),
-                        None => true,
-                    };
-                    if needs_rebuild {
-                        cached_payload =
-                            Some(nt_payload_from_decoded(&last_full, struct_id.clone()));
-                    }
-                    let payload = cached_payload.as_ref().expect("filled immediately above");
+                        // Patch in place when the delta names its changed fields;
+                        // only rebuild (re-converting every field of the
+                        // structure) when it cannot be applied incrementally — a
+                        // whole-structure delta, the first tick, or a path the
+                        // payload does not yet have.
+                        let needs_rebuild = match cached_payload.as_mut() {
+                            Some(cached) => !patch_nt_payload(cached, &last_full, update),
+                            None => true,
+                        };
+                        if needs_rebuild {
+                            cached_payload =
+                                Some(nt_payload_from_decoded(&last_full, struct_id.clone()));
+                        }
+                        let payload = cached_payload.as_ref().expect("filled immediately above");
 
-                    if callback_monitors.dispatch_or_retire(&callback_key, &callback_entry, payload)
-                    {
-                        ControlFlow::Continue(())
-                    } else {
-                        // Belt and braces: `dispatch_or_retire` has already
-                        // cancelled us on its way out, so this only matters if
-                        // the cancel signal loses a race with the next update.
-                        ControlFlow::Break(())
-                    }
-                });
+                        if callback_monitors.dispatch_or_retire(&callback_key, &callback_entry, payload)
+                        {
+                            ControlFlow::Continue(())
+                        } else {
+                            // Belt and braces: `dispatch_or_retire` has already
+                            // cancelled us on its way out, so this only matters if
+                            // the cancel signal loses a race with the next update.
+                            ControlFlow::Break(())
+                        }
+                    },
+                );
                 entry.attach_upstream(handle);
 
                 tokio::spawn(async move {
@@ -963,6 +1034,118 @@ mod tests {
             "the miss was recorded with the pre-search instant, so its 2 s TTL had already \
              expired by the time claim returned after {search_took:?}"
         );
+    }
+
+    /// A loopback server hosting `pvs`, plus the UDP port it searches on.
+    async fn serve(
+        pvs: impl FnOnce(
+            spvirit_server::pva_server::PvaServerBuilder,
+        ) -> spvirit_server::pva_server::PvaServerBuilder,
+    ) -> Option<(spvirit_server::pva_server::RunningServer, u16)> {
+        let builder = spvirit_server::pva_server::PvaServer::builder()
+            .port(0)
+            .udp_port(0)
+            .listen_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let running = pvs(builder).build().start().await.ok()?;
+        let (_tcp, udp) = running.local_addrs().await.ok()?;
+        Some((running, udp.port()))
+    }
+
+    /// A source over one loopback client per `(name, udp_port)`, searched in
+    /// the given order.
+    fn source_over(clients: &[(&str, u16)]) -> Option<GatewaySource> {
+        let entries: Vec<String> = clients
+            .iter()
+            .map(|(name, port)| {
+                format!(
+                    r#"{{"name": "{name}", "addrlist": "127.0.0.1", "autoaddrlist": false,
+                        "bcastport": {port}, "interface": ["127.0.0.1"]}}"#
+                )
+            })
+            .collect();
+        let names: Vec<String> = clients.iter().map(|(n, _)| format!("\"{n}\"")).collect();
+        let cfg_json = format!(
+            r#"{{"version": 2, "clients": [{}],
+                "servers": [{{"name": "s", "clients": [{}]}}]}}"#,
+            entries.join(","),
+            names.join(",")
+        );
+        let cfg = GatewayConfig::from_json_str(&cfg_json).ok()?;
+        let pool = Arc::new(UpstreamPool::from_config(&cfg));
+        let guard = Arc::new(LoopGuard::build(
+            &cfg,
+            &cfg.servers[0],
+            std::collections::HashSet::new(),
+        ));
+        Some(GatewaySource::new(
+            pool,
+            clients.iter().map(|(n, _)| n.to_string()).collect(),
+            open_neg(),
+            guard,
+            0,
+            allow_all(),
+        ))
+    }
+
+    fn dead_udp_port() -> Option<u16> {
+        Some(
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .ok()?
+                .local_addr()
+                .ok()?
+                .port(),
+        )
+    }
+
+    /// Upstream clients are asked concurrently: a name only the third client
+    /// serves costs about one client timeout, not one per dead client ahead
+    /// of it (the sequential loop took at least 2 × 5 s here).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_name_on_the_last_client_does_not_wait_out_each_earlier_one() {
+        let (Some((_live, live_port)), Some(d1), Some(d2)) = (
+            serve(|b| b.ai("LAST:PV", 1.0)).await,
+            dead_udp_port(),
+            dead_udp_port(),
+        ) else {
+            eprintln!("Skipping test: cannot bind loopback ports in this environment");
+            return;
+        };
+        let Some(src) = source_over(&[("a", d1), ("b", d2), ("c", live_port)]) else {
+            return;
+        };
+
+        let before = Instant::now();
+        assert!(src.claim("LAST:PV").await.is_some());
+        let took = before.elapsed();
+        assert!(
+            took < Duration::from_secs(8),
+            "claim took {took:?}: the dead clients were waited out one after another"
+        );
+        assert_eq!(src.upstream_resolve_count(), 3, "every client is asked once");
+        let bindings = lock_or_recover(&src.bindings);
+        assert_eq!(bindings["LAST:PV"].client_name, "c");
+    }
+
+    /// Concurrency must not change who wins: with two clients serving the
+    /// same name, the binding goes to the first in `client_order`, as the
+    /// sequential loop guaranteed — whichever answers first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_client_in_order_still_wins_a_name_both_serve() {
+        let (Some((_first, first_port)), Some((_second, second_port))) = (
+            serve(|b| b.ai("BOTH:PV", 1.0)).await,
+            serve(|b| b.ai("BOTH:PV", 2.0)).await,
+        ) else {
+            eprintln!("Skipping test: cannot bind loopback ports in this environment");
+            return;
+        };
+        for _ in 0..5 {
+            let Some(src) = source_over(&[("first", first_port), ("second", second_port)]) else {
+                return;
+            };
+            assert!(src.claim("BOTH:PV").await.is_some());
+            let bindings = lock_or_recover(&src.bindings);
+            assert_eq!(bindings["BOTH:PV"].client_name, "first");
+        }
     }
 
     /// The access decision must run before the value conversion. A read-only

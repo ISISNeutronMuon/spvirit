@@ -100,7 +100,7 @@ functions, so a change to `encode_common` covers all three names.
 (spvd_decode.rs:507) → `parse_type_desc` → `parse_structure_desc`. Tag bytes:
 `0x80` structure, `0x81` union, `0x82` variant (+`0x08` for array forms),
 scalar/array mode bits `& 0x18`, base type `& 0xE7`. Encode side:
-`spvd_encode::encode_structure_desc` (spvd_encode.rs:23) plus per-NT descriptor
+`spvd_encode::encode_structure_desc` (spvd_encode.rs:27) plus per-NT descriptor
 builders (`nt_scalar_desc`:275, `nt_scalar_array_desc`:759, `nt_table_desc`:820,
 `nt_ndarray_desc`:999, `nt_enum_desc`:1265, dispatcher `nt_payload_desc`:1388).
 
@@ -139,8 +139,8 @@ API; in the workspace only `spvirit-scry`'s packet processor selects it
 single-bitset decoders `decode_structure_with_bitset` (spvd_decode.rs:1240)
 and `pub(crate) decode_structure_with_bitset_body` (:1270) are what
 `monitor.rs` builds on. Encode side: `encode_nt_payload_delta`
-(spvd_encode.rs:2602), `compute_changed_bits`:2499,
-`encode_structure_bitset`:341.
+(spvd_encode.rs:3271), `compute_changed_bits`:3159,
+`encode_structure_bitset`:348.
 
 The path order in `flatten_field_paths` (monitor.rs:106) must stay in step with
 `count_structure_fields`, which numbers the bits: depth-first, self then

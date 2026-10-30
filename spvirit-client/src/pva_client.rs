@@ -24,6 +24,7 @@ use tokio::time::{Instant, interval};
 
 use spvirit_codec::MonitorUpdate;
 use spvirit_codec::epics_decode::{PvaPacket, PvaPacketCommand};
+use spvirit_codec::monitor::bit_paths;
 use spvirit_codec::spvd_decode::{PvdDecoder, StructureDesc};
 use spvirit_codec::spvd_encode::{encode_pv_request, encode_pv_request_with_options};
 use spvirit_codec::spvirit_encode::{
@@ -880,8 +881,11 @@ impl PvaClient {
 
         let desc = decode_init_introspection(&init_bytes, "PUT")?;
 
-        // Split stream; background reader logs PUT errors
-        let (mut reader, writer) = stream.into_split();
+        // Split stream; background reader logs PUT errors. The INIT exchange
+        // above read whole frames only, so nothing is buffered yet and the
+        // read half can take a read-ahead buffer for the rest of its life.
+        let (reader, writer) = stream.into_split();
+        let mut reader = crate::transport::buffered(reader);
         let reader_is_be = is_be;
         // The reassembler is created once, outside the loop: a per-iteration
         // one would discard the segments of a message split across frames.
@@ -974,12 +978,12 @@ impl PvaClient {
         pv_name: &str,
         fields: &[&str],
         options: MonitorOptions,
-        callback: F,
+        mut callback: F,
     ) -> Result<(), PvGetError>
     where
         F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
     {
-        self.pvmonitor_inner(pv_name, fields, options, callback, None)
+        self.pvmonitor_inner(pv_name, fields, options, move |u| callback(&u), None)
             .await
             .map(|_| ())
     }
@@ -1007,10 +1011,29 @@ impl PvaClient {
         pv_name: &str,
         fields: &[&str],
         options: MonitorOptions,
-        callback: F,
+        mut callback: F,
     ) -> MonitorHandle
     where
         F: FnMut(&MonitorUpdate) -> ControlFlow<()> + Send + 'static,
+    {
+        self.pvmonitor_spawn_owned(pv_name, fields, options, move |u| callback(&u))
+    }
+
+    /// [`pvmonitor_spawn_with_options`](Self::pvmonitor_spawn_with_options),
+    /// but the callback takes each update by value.
+    ///
+    /// The update is dropped right after the callback returns either way, so
+    /// owning it costs nothing — and lets a consumer that keeps the value (the
+    /// gateway's merged-value cache) move it instead of deep-cloning it.
+    pub fn pvmonitor_spawn_owned<F>(
+        &self,
+        pv_name: &str,
+        fields: &[&str],
+        options: MonitorOptions,
+        callback: F,
+    ) -> MonitorHandle
+    where
+        F: FnMut(MonitorUpdate) -> ControlFlow<()> + Send + 'static,
     {
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let client = self.clone();
@@ -1041,7 +1064,7 @@ impl PvaClient {
         mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<MonitorEnd, PvGetError>
     where
-        F: FnMut(&MonitorUpdate) -> ControlFlow<()>,
+        F: FnMut(MonitorUpdate) -> ControlFlow<()>,
     {
         let ChannelConn {
             mut stream,
@@ -1099,6 +1122,14 @@ impl PvaClient {
         .await?;
 
         let field_desc = decode_init_introspection(&init_bytes, "MONITOR")?;
+        // The bit-to-path table depends only on the descriptor: build it once
+        // here rather than on every update.
+        let paths = bit_paths(&field_desc);
+
+        // From here on this loop is the only reader of the connection, so it
+        // gets a read-ahead buffer (`read_until` above read whole frames only,
+        // so nothing is buffered elsewhere). Writes pass straight through.
+        let mut stream = crate::transport::buffered(stream);
 
         // Start subscription: START (0x04) | GET (0x40) = 0x44. The pipeline
         // bit 0x80 must NOT be set here — on a non-INIT MONITOR message the
@@ -1180,8 +1211,13 @@ impl PvaClient {
                     // `recycle` needs it by value. `MonitorUpdate` is owned
                     // (spvirit-codec/src/monitor.rs:19-34), so nothing borrows
                     // `bytes` past this statement.
-                    let decoded = monitor_data_body(&bytes, ioid, is_be)
-                        .map(|body| decoder.decode_monitor_update(body, &field_desc));
+                    let decoded = monitor_data_body(&bytes, ioid, is_be).map(|body| {
+                        decoder.decode_monitor_update_with_paths(
+                            body,
+                            &field_desc,
+                            Arc::clone(&paths),
+                        )
+                    });
 
                     // The frame buffer is finished with: hand its allocation
                     // back so the next frame does not allocate. `frame_buf` is
@@ -1209,7 +1245,7 @@ impl PvaClient {
                         }
 
                     if let Ok(update) = decoded
-                        && callback(&update).is_break() {
+                        && callback(update).is_break() {
                             // Best-effort DESTROY so the server releases
                             // its per-subscription state promptly.
                             let destroy = encode_monitor_request(

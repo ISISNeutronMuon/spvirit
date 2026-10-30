@@ -1,7 +1,7 @@
 use std::io::{self, ErrorKind};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout};
 
@@ -28,6 +28,26 @@ pub const MAX_INBOUND_PAYLOAD_BYTES: usize = spvirit_codec::DEFAULT_MAX_MESSAGE_
 /// monitor count and can be forced by one hostile frame. At 64 KiB the
 /// worst-case pinned memory is 64 KiB per monitor connection.
 const RECYCLE_RETAIN_MAX: usize = 64 * 1024;
+
+/// Read-ahead buffer for a long-lived frame-reading loop (see [`buffered`]).
+///
+/// Unbuffered, every frame costs at least two `recv` calls — 8 header bytes,
+/// then the payload. With a 64 KiB read-ahead a burst of small monitor
+/// updates is pulled off the socket in one call and parsed from memory.
+pub const READ_BUF_BYTES: usize = 64 * 1024;
+
+/// Wrap a reader in a [`READ_BUF_BYTES`] read-ahead buffer.
+///
+/// Only for a reader that a single loop owns until the connection ends: the
+/// buffer holds bytes already taken off the socket, so dropping it mid-stream
+/// loses them. Inside that loop the read helpers stay cancellation-safe — a
+/// dropped `read()` on a [`BufReader`] consumes nothing, and anything it
+/// already buffered stays in the `BufReader`, which outlives the dropped
+/// future just as [`FrameBuf`] does. Writes pass straight through to the inner
+/// stream.
+pub fn buffered<R: AsyncRead>(reader: R) -> BufReader<R> {
+    BufReader::with_capacity(READ_BUF_BYTES, reader)
+}
 
 /// Persistent partial-read state for one connection, used by
 /// [`read_frame_resumable`].
@@ -444,7 +464,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::sleep;
 
     #[test]
@@ -802,6 +822,71 @@ mod tests {
         .expect("resumed read failed");
 
         assert_eq!(got, expected, "resumed frame must be reassembled intact");
+    }
+
+    /// The buffered monitor path: one `recv` delivers frame A, all of B and
+    /// half of C. The read-ahead holds B and C's head; a read future for C
+    /// is then dropped mid-frame (the echo tick winning the `select!`).
+    /// Nothing may be lost — B comes back from the buffer, and C resumes from
+    /// `fb` once its tail arrives.
+    #[tokio::test]
+    async fn buffered_reader_keeps_read_ahead_and_partial_frames_across_a_drop() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let a = frame_with_payload(b"AAAA");
+        let b = frame_with_payload(&[0xBB; 40]);
+        let c = frame_with_payload(&[0xCC; 30]);
+        let mut first = a.clone();
+        first.extend_from_slice(&b);
+        first.extend_from_slice(&c[..13]);
+        server.write_all(&first).await.unwrap();
+        server.flush().await.unwrap();
+
+        let mut reader = buffered(client);
+        let mut reass = SegmentReassembler::new();
+        let mut fb = FrameBuf::new();
+        let t = Duration::from_secs(5);
+
+        let got_a = read_frame_resumable(&mut reader, t, &mut reass, &mut fb)
+            .await
+            .unwrap();
+        assert_eq!(got_a, a);
+        assert!(
+            !reader.buffer().is_empty(),
+            "B and the head of C should be sitting in the read-ahead"
+        );
+        let got_b = read_frame_resumable(&mut reader, t, &mut reass, &mut fb)
+            .await
+            .unwrap();
+        assert_eq!(got_b, b);
+
+        tokio::select! {
+            _ = read_frame_resumable(&mut reader, t, &mut reass, &mut fb) => {
+                panic!("C is incomplete; read must not resolve yet");
+            }
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
+        assert!(fb.header_done, "C's header must survive the drop");
+        assert_eq!(fb.payload_filled, 5, "C's partial payload must survive");
+
+        server.write_all(&c[13..]).await.unwrap();
+        server.flush().await.unwrap();
+        let got_c = read_frame_resumable(&mut reader, t, &mut reass, &mut fb)
+            .await
+            .unwrap();
+        assert_eq!(got_c, c);
+    }
+
+    /// Writes on the buffered wrapper go straight to the inner stream, so the
+    /// monitor loop can keep writing echoes/ACKs through the same handle.
+    #[tokio::test]
+    async fn buffered_reader_passes_writes_through() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut wrapped = buffered(client);
+        wrapped.write_all(b"ping").await.unwrap();
+        wrapped.flush().await.unwrap();
+        let mut got = [0u8; 4];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping");
     }
 
     /// A control frame (segment/control bit set, zero payload) round-trips

@@ -285,6 +285,64 @@ pub fn merge_monitor_delta(last_full: &mut DecodedValue, update: &MonitorUpdate)
     }
 }
 
+/// [`merge_monitor_delta`] for a caller that owns the update: the changed
+/// values are moved out of `update.value` instead of deep-cloned.
+///
+/// The clone is the whole cost of a merge — for a 100k-element waveform it is
+/// a 100k-element copy per tick — and the upstream monitor drops the update
+/// right after its callback anyway. On return `update.value` is unspecified
+/// (taken fields are left `Null`); `changed`, `overrun` and `paths` are
+/// untouched, which is all [`patch_nt_payload`] reads.
+///
+/// Nested bits: `paths` is parent-before-child with each sub-tree contiguous
+/// (`bit_paths` is depth-first, self-then-nested). A set parent bit moves the
+/// whole sub-structure, children included, so the set child bits that follow
+/// it are skipped — the borrowed merge would re-copy the very values the
+/// parent just delivered, so the result is the same.
+pub fn merge_monitor_delta_owned(last_full: &mut DecodedValue, update: &mut MonitorUpdate) {
+    let has_prior = !matches!(last_full, DecodedValue::Null);
+    if !has_prior || bit_is_set(&update.changed, 0) {
+        *last_full = std::mem::replace(&mut update.value, DecodedValue::Null);
+        return;
+    }
+
+    let paths = std::sync::Arc::clone(&update.paths);
+    let mut moved: Option<&str> = None;
+    for (bit, path) in paths.iter().enumerate().skip(1) {
+        if !bit_is_set(&update.changed, bit) {
+            continue;
+        }
+        if let Some(parent) = moved
+            && path.len() > parent.len()
+            && path.starts_with(parent)
+            && path.as_bytes()[parent.len()] == b'.'
+        {
+            continue;
+        }
+        let Some(slot) = get_at_path_mut(&mut update.value, path) else {
+            continue;
+        };
+        let new_val = std::mem::replace(slot, DecodedValue::Null);
+        set_at_path(last_full, path, new_val);
+        moved = Some(path);
+    }
+}
+
+/// Mutable twin of [`get_at_path`].
+fn get_at_path_mut<'a>(v: &'a mut DecodedValue, path: &str) -> Option<&'a mut DecodedValue> {
+    if path.is_empty() || path == "<whole structure>" {
+        return Some(v);
+    }
+    let mut cur = v;
+    for segment in path.split('.') {
+        let DecodedValue::Structure(fields) = cur else {
+            return None;
+        };
+        cur = &mut fields.iter_mut().find(|(n, _)| n == segment)?.1;
+    }
+    Some(cur)
+}
+
 /// Applies the fields named by `update`'s changed bitset to an already-built
 /// `cached` payload, reading their (already merged) values out of `last_full`.
 ///
@@ -511,6 +569,51 @@ mod tests {
         assert_eq!(fields.len(), 1, "alarm must be gone: wholesale replace");
         let value = &fields[0].1;
         assert!(matches!(value, DecodedValue::Float64(x) if (*x - 9.0).abs() < 1e-9));
+    }
+
+    /// The owned merge must land on exactly what the borrowed merge does, for
+    /// every combination of changed bits — including a parent and its
+    /// children set together, and a field that legitimately decodes as
+    /// `Null` — with or without a prior value.
+    #[test]
+    fn owned_merge_matches_borrowed_merge_for_every_changed_bitset() {
+        let delta_value = DecodedValue::Structure(vec![
+            ("value".to_string(), DecodedValue::Float64(7.0)),
+            (
+                "alarm".to_string(),
+                DecodedValue::Structure(vec![
+                    ("severity".to_string(), DecodedValue::Null),
+                    ("message".to_string(), DecodedValue::String("hi".to_string())),
+                ]),
+            ),
+        ]);
+        for prior in [sample_last_full(), DecodedValue::Null] {
+            for bits in 0u8..32 {
+                let update = MonitorUpdate {
+                    value: delta_value.clone(),
+                    changed: vec![bits],
+                    overrun: vec![],
+                    consumed: 0,
+                    paths: sample_paths(),
+                };
+                let mut borrowed = prior.clone();
+                merge_monitor_delta(&mut borrowed, &update);
+
+                let mut owned_update = update.clone();
+                let mut owned = prior.clone();
+                merge_monitor_delta_owned(&mut owned, &mut owned_update);
+
+                // `DecodedValue` has no `PartialEq`; its `Debug` form is a
+                // faithful structural rendering.
+                assert_eq!(
+                    format!("{owned:?}"),
+                    format!("{borrowed:?}"),
+                    "bits={bits:#07b} prior={prior:?}"
+                );
+                assert_eq!(owned_update.changed, update.changed);
+                assert!(std::sync::Arc::ptr_eq(&owned_update.paths, &update.paths));
+            }
+        }
     }
 
     #[test]

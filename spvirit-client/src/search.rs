@@ -12,6 +12,7 @@ use tokio::net::UdpSocket;
 use tracing::debug;
 
 use crate::auth::AuthnzCreds;
+use crate::search_engine::SearchEngine;
 use crate::transport::read_packet;
 use crate::types::{PvGetError, PvGetOptions};
 use spvirit_codec::SegmentReassembler;
@@ -21,7 +22,7 @@ use spvirit_codec::spvirit_encode::{
     socket_addr_from_pva_bytes,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchTarget {
     pub target: IpAddr,
     pub bind: IpAddr,
@@ -301,7 +302,7 @@ fn join_multicast_any(socket: &std::net::UdpSocket, bind: IpAddr) {
     }
 }
 
-fn decode_search_response_addr(addr: [u8; 16], port: u16, src: SocketAddr) -> SocketAddr {
+pub(crate) fn decode_search_response_addr(addr: [u8; 16], port: u16, src: SocketAddr) -> SocketAddr {
     socket_addr_from_pva_bytes(addr, port)
         .filter(|a| !a.ip().is_unspecified())
         .unwrap_or_else(|| SocketAddr::new(src.ip(), port))
@@ -376,24 +377,34 @@ struct SearchSockets {
     rx: tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>,
 }
 
-/// Shared UDP setup for [`search_pv`] and [`discover_servers`]: group targets
-/// by bind address, open one ephemeral socket per bind, send the request built
-/// by `build_msg(reply_port, reply_addr)` to every target, and spawn a
-/// receiver task per socket forwarding packets into a shared channel.
+/// One bound UDP search socket and the destinations it sends to.
+pub(crate) struct SearchGroup {
+    pub(crate) socket: Arc<UdpSocket>,
+    /// Port servers should reply to (the socket's ephemeral port).
+    pub(crate) reply_port: u16,
+    /// Address servers should reply to, in PVA's 16-byte form.
+    pub(crate) reply_addr: [u8; 16],
+    pub(crate) dests: Vec<SocketAddr>,
+    /// Kept for debug logging only.
+    actual_bind_addr: SocketAddr,
+}
+
+impl SearchGroup {
+    pub(crate) fn is_ipv6(&self) -> bool {
+        self.actual_bind_addr.is_ipv6()
+    }
+}
+
+/// Group targets by bind address and open one ephemeral UDP socket per bind.
 ///
-/// Returns `Err(last_io_error)` when no socket could be opened, so the caller
-/// can pick the error kind appropriate to its operation (`None` = no I/O error
-/// occurred, the caller had no viable targets/binds).
-async fn open_search_sockets<F>(
+/// Returns the groups that came up, plus the last I/O error seen (if any) so
+/// a caller left with no groups can report why.
+pub(crate) fn bind_search_groups(
     udp_port: u16,
     targets: &[SearchTarget],
     debug_enabled: bool,
     op: &str,
-    mut build_msg: F,
-) -> Result<SearchSockets, Option<std::io::Error>>
-where
-    F: FnMut(u16, [u8; 16]) -> Vec<u8>,
-{
+) -> (Vec<SearchGroup>, Option<std::io::Error>) {
     let mut last_io_error: Option<std::io::Error> = None;
 
     // Group targets by bind address so we can share a socket per bind.
@@ -406,10 +417,7 @@ where
         }
     }
 
-    // Open sockets and send to all targets first, then collect responses.
-    // Store (socket, message, destinations) for retransmission.
-    let mut socket_info: Vec<(Arc<UdpSocket>, Vec<u8>, Vec<SocketAddr>)> = Vec::new();
-
+    let mut groups = Vec::new();
     for (bind_ip, group_targets) in &bind_groups {
         // Always use an ephemeral port for the client socket. We only receive
         // unicast replies, so sharing the server's search port is unnecessary
@@ -465,7 +473,6 @@ where
                 continue;
             }
         };
-        let msg = build_msg(reply_port, reply_addr);
 
         let socket = match UdpSocket::from_std(std_sock) {
             Ok(socket) => socket,
@@ -488,46 +495,67 @@ where
             .map(|ip| SocketAddr::new(*ip, udp_port))
             .collect();
 
-        // Send to every target in this bind group immediately.
-        for dest in &dests {
+        groups.push(SearchGroup {
+            socket: Arc::new(socket),
+            reply_port,
+            reply_addr,
+            dests,
+            actual_bind_addr,
+        });
+    }
+    (groups, last_io_error)
+}
+
+/// Send `msg` to every destination of `group`, logging (when enabled) and
+/// returning the last send error.
+pub(crate) async fn send_to_group(
+    group: &SearchGroup,
+    msg: &[u8],
+    udp_port: u16,
+    debug_enabled: bool,
+    op: &str,
+) -> Option<std::io::Error> {
+    let mut last_io_error = None;
+    for dest in &group.dests {
+        if debug_enabled {
+            debug!(
+                "pva {op} bind={} target={} server_port={} reply_port={}",
+                group.actual_bind_addr,
+                dest.ip(),
+                udp_port,
+                group.reply_port
+            );
+            debug!("pva {op} send {} bytes to {}", msg.len(), dest);
+        }
+        if let Err(err) = group.socket.send_to(msg, dest).await {
             if debug_enabled {
                 debug!(
-                    "pva {op} bind={} target={} server_port={} reply_port={}",
-                    actual_bind_addr,
-                    dest.ip(),
-                    udp_port,
-                    reply_port
+                    "pva {op} send_to target={} kind={:?} err={}",
+                    dest,
+                    err.kind(),
+                    err
                 );
-                debug!("pva {op} send {} bytes to {}", msg.len(), dest);
             }
-            if let Err(err) = socket.send_to(&msg, dest).await {
-                if debug_enabled {
-                    debug!(
-                        "pva {op} send_to target={} kind={:?} err={}",
-                        dest,
-                        err.kind(),
-                        err
-                    );
-                }
-                last_io_error = Some(err);
-            }
+            last_io_error = Some(err);
         }
-
-        socket_info.push((Arc::new(socket), msg, dests));
     }
+    last_io_error
+}
 
-    if socket_info.is_empty() {
-        return Err(last_io_error);
-    }
-
-    // Spawn a receiver task per socket that forwards packets into a shared
-    // channel. The tasks are held in a JoinSet so that when the operation ends
-    // — on success, timeout, or error — the JoinSet is dropped and every
-    // receiver task is aborted, closing the ephemeral socket instead of
-    // leaking it (see the `SearchSockets` doc and the fd-leak regression test).
+/// Spawn a receiver task per socket that forwards packets into one channel.
+///
+/// The tasks are held in the returned `JoinSet`: dropping it aborts every
+/// receiver, closing the sockets instead of leaking them (see the
+/// `SearchSockets` doc and the fd-leak regression test).
+pub(crate) fn spawn_search_receivers<'a>(
+    sockets: impl IntoIterator<Item = &'a Arc<UdpSocket>>,
+) -> (
+    tokio::task::JoinSet<()>,
+    tokio::sync::mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+) {
     let (tx, rx) = tokio::sync::mpsc::channel::<(Vec<u8>, SocketAddr)>(64);
     let mut recv_tasks = tokio::task::JoinSet::new();
-    for (sock, _, _) in &socket_info {
+    for sock in sockets {
         let sock = Arc::clone(sock);
         let tx = tx.clone();
         recv_tasks.spawn(async move {
@@ -546,7 +574,45 @@ where
         });
     }
     drop(tx); // Only spawned tasks hold senders; channel closes when they exit.
+    (recv_tasks, rx)
+}
 
+/// Shared UDP setup for [`search_pv`] and [`discover_servers`]: open one
+/// ephemeral socket per bind group, send the request built by
+/// `build_msg(reply_port, reply_addr)` to every target, and spawn a receiver
+/// task per socket forwarding packets into a shared channel.
+///
+/// Returns `Err(last_io_error)` when no socket could be opened, so the caller
+/// can pick the error kind appropriate to its operation (`None` = no I/O error
+/// occurred, the caller had no viable targets/binds).
+async fn open_search_sockets<F>(
+    udp_port: u16,
+    targets: &[SearchTarget],
+    debug_enabled: bool,
+    op: &str,
+    mut build_msg: F,
+) -> Result<SearchSockets, Option<std::io::Error>>
+where
+    F: FnMut(u16, [u8; 16]) -> Vec<u8>,
+{
+    let (groups, mut last_io_error) = bind_search_groups(udp_port, targets, debug_enabled, op);
+
+    // Send to all targets first, then collect responses. Store (socket,
+    // message, destinations) for retransmission.
+    let mut socket_info: Vec<(Arc<UdpSocket>, Vec<u8>, Vec<SocketAddr>)> = Vec::new();
+    for group in groups {
+        let msg = build_msg(group.reply_port, group.reply_addr);
+        if let Some(err) = send_to_group(&group, &msg, udp_port, debug_enabled, op).await {
+            last_io_error = Some(err);
+        }
+        socket_info.push((group.socket, msg, group.dests));
+    }
+
+    if socket_info.is_empty() {
+        return Err(last_io_error);
+    }
+
+    let (recv_tasks, rx) = spawn_search_receivers(socket_info.iter().map(|(s, _, _)| s));
     Ok(SearchSockets {
         socket_info,
         recv_tasks,
@@ -935,6 +1001,16 @@ pub async fn search_pv_tcp_with_creds(
 ///   via TCP search.
 /// - Falls back to UDP search using `build_search_targets()`.
 pub async fn resolve_pv_server(opts: &PvGetOptions) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
+    resolve_pv_server_via(opts, None).await
+}
+
+/// [`resolve_pv_server`], with the UDP search routed through `engine` when
+/// given — the shared, batching search a `PvaClient` owns — instead of a
+/// one-shot [`search_pv`].
+pub(crate) async fn resolve_pv_server_via(
+    opts: &PvGetOptions,
+    engine: Option<&SearchEngine>,
+) -> Result<(SocketAddr, [u8; 12]), PvGetError> {
     if let Some(addr) = opts.server_addr {
         // Unicast shortcut — there's no search response to read a guid
         // from, so the caller gets the "unknown" sentinel.
@@ -981,8 +1057,16 @@ pub async fn resolve_pv_server(opts: &PvGetOptions) -> Result<(SocketAddr, [u8; 
     if !no_broadcast {
         let pv = pv.clone();
         let targets = targets.clone();
+        let engine = engine.cloned();
         set.spawn(async move {
-            let result = search_pv(&pv, udp_port, timeout_dur, &targets, debug_enabled).await?;
+            let result = match engine {
+                Some(engine) => {
+                    engine
+                        .search(&pv, udp_port, timeout_dur, &targets, debug_enabled)
+                        .await?
+                }
+                None => search_pv(&pv, udp_port, timeout_dur, &targets, debug_enabled).await?,
+            };
             Ok(result)
         });
     }
