@@ -9,7 +9,7 @@ covers the internals.
 ## Packaging
 
 - `Cargo.toml`: package `spvirit-py`, **`version.workspace = true`** — it now
-  shares the single workspace version (0.4.1 at time of writing) with every
+  shares the single workspace version (0.4.2 at time of writing) with every
   Rust crate; it is *no longer* versioned independently. `edition = "2024"`.
   `[lib] name = "spvirit"`, `crate-type = ["cdylib", "rlib"]` — the `rlib` is
   there only so `cargo test -p spvirit-py --no-default-features --features
@@ -24,7 +24,7 @@ covers the internals.
   test in `source.rs` and the ordered-notify tests in that file).
 - `pyproject.toml`: maturin backend, distribution name `spvirit`, version
   `dynamic` (from Cargo.toml, so it tracks the workspace version). Pins the
-  runtime dependency `spvirit-tools == 0.4.1`.
+  runtime dependency `spvirit-tools == 0.4.2`.
 - **There is no Python source package** — the whole API is the compiled
   module plus three Rust-registered submodules `spvirit.codec`,
   `spvirit.lowlevel` and `spvirit.ioc` (each injected into `sys.modules` at

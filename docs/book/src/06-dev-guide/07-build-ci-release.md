@@ -57,7 +57,7 @@ Two independent release tracks:
 
 - All nine crates (eight Rust library/binary crates plus `spvirit-py`)
   inherit one version from `[workspace.package]` in the root `Cargo.toml`
-  (currently **0.4.1**). Internal dependencies are declared once under
+  (currently **0.4.2**). Internal dependencies are declared once under
   `[workspace.dependencies]`, so a release is a one-line version bump plus
   those six pins.
 - Published to crates.io **manually via `cargo-release`** (the `chore:
@@ -69,7 +69,7 @@ Two independent release tracks:
 
 ### Python wheels (automated)
 
-- `spvirit-py` shares the workspace version (0.4.1). maturin reads the
+- `spvirit-py` shares the workspace version (0.4.2). maturin reads the
   wheel version from its `Cargo.toml` (`dynamic = ["version"]`).
   `pyproject.toml` pins `spvirit-tools == <workspace version>` by hand, and
   `spvirit-tools/tests/version_pin.rs` fails the build if the pin drifts.
