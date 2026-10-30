@@ -76,9 +76,11 @@ pub struct MonitorRegistry {
 /// A pump task plus its cooperative-shutdown signal.
 ///
 /// Retirement signals `shutdown` rather than aborting the task: an abort could
-/// drop the pump future mid-`write_all` inside a shared [`ConnWriter`], wedging
-/// that connection's flusher. Cooperative shutdown lets any in-flight
-/// `notify_monitors` (and its socket write) finish before the task exits.
+/// drop the pump future between `notify_monitors` charging a pipelined
+/// subscriber's credit and depositing its frame (invariant R1-L1 on
+/// `route_monitor_frame`). Cooperative shutdown lets any in-flight
+/// `notify_monitors` finish its fan-out before the task exits; that never
+/// waits on a socket, since a [`ConnWriter`] deposit does not.
 struct PumpHandle {
     /// Identifies *which* pump task this handle belongs to, so an exiting task
     /// can retire its own entry without risking the removal of a successor
@@ -374,9 +376,8 @@ impl MonitorRegistry {
     /// module takes `pumps` before `monitors`, so there is no cycle.
     ///
     /// Shutdown is cooperative (signal, not abort): the pump finishes any
-    /// in-flight `notify_monitors` — including its socket write — before
-    /// exiting, so a flush is never dropped mid-write to wedge the shared
-    /// [`ConnWriter`]. That remains a *signal*: the retired task may still be
+    /// in-flight `notify_monitors` fan-out before exiting, so no charged
+    /// pipelined frame is dropped between subscribers. That remains a *signal*: the retired task may still be
     /// inside its `select!` when a later `ensure_pump` spawns a successor, so
     /// two pumps can briefly coexist and one extra update can be delivered.
     /// Duplicate delivery, never silence.
@@ -396,7 +397,7 @@ impl MonitorRegistry {
             // Signal cooperative shutdown; the task exits at its next loop turn.
             let _ = shutdown.send(());
             // Detach: the task stops on its own. Do NOT abort (would risk
-            // dropping a flush mid-write).
+            // dropping a fan-out midway, see R1-L1).
             drop(handle);
         }
     }
@@ -1413,7 +1414,11 @@ mod tests {
             .flat_map(|p| encode_monitor_data_response_payload(42, 0x00, p, 2, false))
             .collect();
 
-        for _ in 0..40 {
+        // The parked write finishes on the writer's continuation task, not on
+        // `t`, so wait on the delivered bytes with a wall-clock deadline.
+        t.await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             sink.release(4);
             if sink
                 .writes
@@ -1426,9 +1431,8 @@ mod tests {
             {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
-        t.await.unwrap();
 
         // Batching is now at the write layer, so assert on the byte stream, not
         // on the number of write_all calls: the control lane is FIFO and
@@ -1822,6 +1826,56 @@ mod tests {
             got, le,
             "fixture regression: this case must actually distinguish endianness"
         );
+    }
+
+    /// One subscriber's peer stops reading; the next one must still get every
+    /// update promptly. `notify_monitors` deposits per subscriber in turn, so a
+    /// deposit that waited on the stalled socket used to hold the fan-out (and
+    /// the pump, store setter or gateway dispatch calling it) indefinitely, and
+    /// the fast subscriber after it received nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_subscriber_does_not_delay_a_fast_one() {
+        use spvirit_types::{NtScalarArray, ScalarArrayValue};
+        let reg = Arc::new(MonitorRegistry::new());
+        // Subscriber 0: a 4 KiB pipe whose reading end nobody reads.
+        let (_unread, stalled) = tokio::io::duplex(4096);
+        let fast = PlainRec::new();
+        {
+            let mut conns = reg.conns.lock().await;
+            conns.insert(1, ConnWriter::new(stalled));
+            conns.insert(2, ConnWriter::new(fast.clone()));
+        }
+        {
+            let mut monitors = reg.monitors.lock().await;
+            monitors.insert(
+                "PV:BIG".to_string(),
+                vec![make_sub_on(1, 42, 2, false), make_sub_on(2, 43, 2, false)],
+            );
+        }
+        // 8 KiB of doubles per update: more than the stalled pipe can hold.
+        let update = |v: f64| {
+            let samples = ScalarArrayValue::F64(vec![v; 1024]);
+            NtPayload::ScalarArray(NtScalarArray::from_value(samples))
+        };
+
+        for i in 0..3 {
+            let before = fast.writes.lock().unwrap().len();
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                reg.notify_monitors("PV:BIG", &update(i as f64)),
+            )
+            .await
+            .expect("notify_monitors must not wait on the stalled subscriber");
+            let after = fast.writes.lock().unwrap().len();
+            assert!(
+                after > before + 8 * 1024,
+                "update {i} must reach the fast subscriber by the time \
+                 notify_monitors returns ({before} -> {after} bytes)"
+            );
+        }
+        // The stalled peer is behind, not dead: the deadline has not passed.
+        let stalled_cw = reg.conn_writer(1).await.unwrap();
+        assert!(!stalled_cw.is_dead());
     }
 
     /// Fan-out is the point of a gateway: when the upstream dies, EVERY

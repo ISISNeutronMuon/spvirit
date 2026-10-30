@@ -789,11 +789,17 @@ impl Replier {
     }
 
     /// Queue one complete frame on the connection's lossless control lane.
+    ///
+    /// Then wait while the connection's unsent backlog is over the high-water
+    /// mark: this is the connection's own reply path, so a peer that sends
+    /// requests but does not read the replies stalls its own request loop
+    /// instead of growing the queue without bound.
     pub async fn send(&self, bytes: Vec<u8>) {
         if let Some(cr) = &self.client_registry {
             cr.add_tx(self.conn_id, bytes.len() as u64);
         }
         self.cw.send_control(bytes).await;
+        self.cw.backpressure().await;
     }
 
     /// A weak handle for a reply that may outlive the connection.
@@ -843,6 +849,7 @@ impl WeakReplier {
             cr.add_tx(self.conn_id, bytes.len() as u64);
         }
         cw.send_control(bytes).await;
+        cw.backpressure().await;
     }
 }
 
@@ -1472,8 +1479,8 @@ pub fn disable_nagle(stream: &TcpStream, conn_id: u64) {
 /// connection's `ConnWriter`, its channel-tables registration, its
 /// `ClientRegistry` row and its `monitors[pv]` entries (which kept its pumps
 /// alive forever). Any early return added later is now safe by construction.
-/// `Drop` cannot `await`, so the work is spawned — the same shape as
-/// `conn_writer::FlushGuard`. With no runtime to spawn on (process shutting
+/// `Drop` cannot `await`, so the work is spawned — the same shape as the
+/// `ConnWriter` flush hand-off. With no runtime to spawn on (process shutting
 /// down) there is nothing left to leak into. If a runtime exists but is
 /// already shutting down, the spawned cleanup task may itself be cancelled
 /// before it runs — that is harmless too, since the `MonitorRegistry` it
@@ -1521,6 +1528,11 @@ pub async fn handle_connection(
         registry: state.registry.clone(),
         conn_id,
     };
+    // Resolves once a write fails or stalls past the deadline, so a peer that
+    // stopped reading is dropped even while it keeps sending.
+    let closed_cw = cw.clone();
+    let writer_closed = closed_cw.closed();
+    tokio::pin!(writer_closed);
     let replier = Replier::new(cw, conn_id, state.client_registry.clone());
 
     if let Some(cr) = &state.client_registry
@@ -1575,7 +1587,13 @@ pub async fn handle_connection(
             break;
         }
         let remaining = conn_timeout - elapsed;
-        let read_header = tokio::time::timeout(remaining, reader.read_exact(&mut header)).await;
+        let read_header = tokio::select! {
+            r = tokio::time::timeout(remaining, reader.read_exact(&mut header)) => r,
+            _ = &mut writer_closed => {
+                info!("Conn {} write failed or stalled; closing", conn_id);
+                break;
+            }
+        };
         match read_header {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => break,
@@ -1604,8 +1622,13 @@ pub async fn handle_connection(
                 break;
             }
             let remaining = conn_timeout - elapsed;
-            let read_payload =
-                tokio::time::timeout(remaining, reader.read_exact(&mut payload)).await;
+            let read_payload = tokio::select! {
+                r = tokio::time::timeout(remaining, reader.read_exact(&mut payload)) => r,
+                _ = &mut writer_closed => {
+                    info!("Conn {} write failed or stalled; closing", conn_id);
+                    break;
+                }
+            };
             match read_payload {
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) => break,
