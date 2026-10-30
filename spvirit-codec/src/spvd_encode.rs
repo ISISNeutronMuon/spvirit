@@ -2,13 +2,14 @@
 //!
 //! Minimal encoder for NTScalar introspection and value updates.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::spvd_decode::{FieldDesc, FieldType, StructureDesc, TypeCode};
 
 use spvirit_types::{
-    NdDimension, NtAlarm, NtAttribute, NtDisplay, NtEnum, NtNdArray, NtPayload, NtScalar,
+    NdCodec, NdDimension, NtAlarm, NtAttribute, NtDisplay, NtEnum, NtNdArray, NtPayload, NtScalar,
     NtScalarArray, NtTable, NtTableColumn, NtTimeStamp, PvValue, ScalarArrayValue, ScalarValue,
     STANDARD_FORM_CHOICES,
 };
@@ -18,7 +19,10 @@ use spvirit_types::{
 // as `encode_size_pva` / `encode_string_pva`. These private aliases keep this
 // module's existing call sites reading `_pvd`, which matches the pvData spec
 // language used throughout the file.
-use crate::encode_common::{encode_size as encode_size_pvd, encode_string as encode_string_pvd};
+use crate::encode_common::{
+    encode_size as encode_size_pvd, encode_string as encode_string_pvd, push_size as push_size_pvd,
+    push_string as push_string_pvd,
+};
 
 pub fn encode_structure_desc(desc: &StructureDesc, is_be: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -160,10 +164,7 @@ fn encode_bool(value: bool) -> Vec<u8> {
 
 fn encode_string_array<S: AsRef<str>>(values: &[S], is_be: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&encode_size_pvd(values.len(), is_be));
-    for v in values {
-        out.extend_from_slice(&encode_string_pvd(v.as_ref(), is_be));
-    }
+    push_string_array(&mut out, values, is_be);
     out
 }
 
@@ -183,7 +184,18 @@ fn encode_timestamp(nt: &NtScalar, is_be: bool) -> Vec<u8> {
     // leave `secondsPastEpoch` identical (never flagged changed) while
     // `nanoseconds` differs (spuriously flagged) — freezing the seconds on the
     // client. A stored `time_stamp` is stable across encodes and fixes this.
-    let (seconds_past_epoch, nanos, user_tag) = match &nt.time_stamp {
+    let (seconds_past_epoch, nanos, user_tag) = scalar_stamp(nt);
+
+    out.extend_from_slice(&encode_i64(seconds_past_epoch, is_be));
+    out.extend_from_slice(&encode_i32(nanos, is_be));
+    out.extend_from_slice(&encode_i32(user_tag, is_be));
+    out
+}
+
+/// An `NtScalar`'s `(secondsPastEpoch, nanoseconds, userTag)`: the stored
+/// timestamp, or `now()` when there is none.
+fn scalar_stamp(nt: &NtScalar) -> (i64, i32, i32) {
+    match &nt.time_stamp {
         Some(ts) => (ts.seconds_past_epoch, ts.nanoseconds, ts.user_tag),
         None => {
             let now = SystemTime::now()
@@ -191,12 +203,7 @@ fn encode_timestamp(nt: &NtScalar, is_be: bool) -> Vec<u8> {
                 .unwrap_or_default();
             (now.as_secs() as i64, now.subsec_nanos() as i32, 0)
         }
-    };
-
-    out.extend_from_slice(&encode_i64(seconds_past_epoch, is_be));
-    out.extend_from_slice(&encode_i32(nanos, is_be));
-    out.extend_from_slice(&encode_i32(user_tag, is_be));
-    out
+    }
 }
 
 fn encode_display(nt: &NtScalar, is_be: bool) -> Vec<u8> {
@@ -625,103 +632,71 @@ fn scalar_array_field_type(value: &ScalarArrayValue) -> FieldType {
     }
 }
 
-fn encode_scalar_array_value_pvd(value: &ScalarArrayValue, is_be: bool) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Append a size-prefixed run of fixed-width elements, reserving once.
+fn push_fixed_width<T: Copy, const N: usize>(
+    out: &mut Vec<u8>,
+    values: &[T],
+    is_be: bool,
+    to_be: fn(T) -> [u8; N],
+    to_le: fn(T) -> [u8; N],
+) {
+    push_size_pvd(out, values.len(), is_be);
+    out.reserve(values.len() * N);
+    let to_bytes = if is_be { to_be } else { to_le };
+    for v in values {
+        out.extend_from_slice(&to_bytes(*v));
+    }
+}
+
+/// Append a scalar array's PVA wire bytes to `out` (sink form).
+fn push_scalar_array_value_pvd(out: &mut Vec<u8>, value: &ScalarArrayValue, is_be: bool) {
     match value {
         ScalarArrayValue::Bool(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                out.push(if *i { 1 } else { 0 });
-            }
+            push_size_pvd(out, v.len(), is_be);
+            out.extend(v.iter().map(|b| *b as u8));
         }
         ScalarArrayValue::I8(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                out.push(*i as u8);
-            }
+            push_size_pvd(out, v.len(), is_be);
+            out.extend(v.iter().map(|b| *b as u8));
         }
         ScalarArrayValue::I16(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                let b = if is_be {
-                    i.to_be_bytes()
-                } else {
-                    i.to_le_bytes()
-                };
-                out.extend_from_slice(&b);
-            }
+            push_fixed_width(out, v, is_be, i16::to_be_bytes, i16::to_le_bytes)
         }
         ScalarArrayValue::I32(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                out.extend_from_slice(&encode_i32(*i, is_be));
-            }
+            push_fixed_width(out, v, is_be, i32::to_be_bytes, i32::to_le_bytes)
         }
         ScalarArrayValue::I64(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                out.extend_from_slice(&encode_i64(*i, is_be));
-            }
+            push_fixed_width(out, v, is_be, i64::to_be_bytes, i64::to_le_bytes)
         }
         ScalarArrayValue::U8(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
+            push_size_pvd(out, v.len(), is_be);
             out.extend_from_slice(v);
         }
         ScalarArrayValue::U16(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                let b = if is_be {
-                    i.to_be_bytes()
-                } else {
-                    i.to_le_bytes()
-                };
-                out.extend_from_slice(&b);
-            }
+            push_fixed_width(out, v, is_be, u16::to_be_bytes, u16::to_le_bytes)
         }
         ScalarArrayValue::U32(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                let b = if is_be {
-                    i.to_be_bytes()
-                } else {
-                    i.to_le_bytes()
-                };
-                out.extend_from_slice(&b);
-            }
+            push_fixed_width(out, v, is_be, u32::to_be_bytes, u32::to_le_bytes)
         }
         ScalarArrayValue::U64(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                let b = if is_be {
-                    i.to_be_bytes()
-                } else {
-                    i.to_le_bytes()
-                };
-                out.extend_from_slice(&b);
-            }
+            push_fixed_width(out, v, is_be, u64::to_be_bytes, u64::to_le_bytes)
         }
         ScalarArrayValue::F32(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                let b = if is_be {
-                    i.to_be_bytes()
-                } else {
-                    i.to_le_bytes()
-                };
-                out.extend_from_slice(&b);
-            }
+            push_fixed_width(out, v, is_be, f32::to_be_bytes, f32::to_le_bytes)
         }
         ScalarArrayValue::F64(v) => {
-            out.extend_from_slice(&encode_size_pvd(v.len(), is_be));
-            for i in v {
-                out.extend_from_slice(&encode_f64(*i, is_be));
-            }
+            push_fixed_width(out, v, is_be, f64::to_be_bytes, f64::to_le_bytes)
         }
-        ScalarArrayValue::Str(v) => {
-            out.extend_from_slice(&encode_string_array(v, is_be));
-        }
+        ScalarArrayValue::Str(v) => push_string_array(out, v, is_be),
     }
-    out
+}
+
+/// Append a size-prefixed string array to `out` (sink form).
+fn push_string_array<S: AsRef<str>>(out: &mut Vec<u8>, values: &[S], is_be: bool) {
+    push_size_pvd(out, values.len(), is_be);
+    for v in values {
+        push_string_pvd(out, v.as_ref(), is_be);
+    }
 }
 
 fn encode_nt_alarm(alarm: &NtAlarm, is_be: bool) -> Vec<u8> {
@@ -802,7 +777,7 @@ pub fn nt_scalar_array_desc(value: &ScalarArrayValue) -> StructureDesc {
 
 /// Append the full `epics:nt/NTScalarArray:1.0` value block to `out` (sink form).
 pub(crate) fn push_nt_scalar_array_full(out: &mut Vec<u8>, nt: &NtScalarArray, is_be: bool) {
-    out.extend_from_slice(&encode_scalar_array_value_pvd(&nt.value, is_be));
+    push_scalar_array_value_pvd(out, &nt.value, is_be);
     out.extend_from_slice(&encode_nt_alarm(&nt.alarm, is_be));
     out.extend_from_slice(&encode_nt_timestamp(&nt.time_stamp, is_be));
     out.extend_from_slice(&encode_nt_display(&nt.display, is_be));
@@ -861,7 +836,7 @@ pub fn nt_table_desc(nt: &NtTable) -> StructureDesc {
 pub(crate) fn push_nt_table_full(out: &mut Vec<u8>, nt: &NtTable, is_be: bool) {
     out.extend_from_slice(&encode_string_array(&nt.labels, is_be));
     for NtTableColumn { values, .. } in &nt.columns {
-        out.extend_from_slice(&encode_scalar_array_value_pvd(values, is_be));
+        push_scalar_array_value_pvd(out, values, is_be);
     }
     out.extend_from_slice(&encode_string_pvd(
         nt.descriptor.as_deref().unwrap_or(""),
@@ -953,23 +928,13 @@ fn ndarray_union_index(value: &ScalarArrayValue) -> usize {
     }
 }
 
-fn encode_ndarray_union(value: &ScalarArrayValue, is_be: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&encode_size_pvd(ndarray_union_index(value), is_be));
-    out.extend_from_slice(&encode_scalar_array_value_pvd(value, is_be));
-    out
-}
-
 /// The `codec.parameters` variant: a `0x80` full-structure introspection whose
 /// fields are the parameter names, followed by the values in the same order.
 ///
 /// Keys are sorted so the frame is byte-stable across processes and so the two
 /// walks below cannot disagree — `HashMap` iteration order is unspecified and
 /// `dv_nt_ndarray_fields` walks the same map a third time.
-fn encode_codec_parameters(
-    parameters: &std::collections::HashMap<String, String>,
-    is_be: bool,
-) -> Vec<u8> {
+fn encode_codec_parameters(parameters: &HashMap<String, String>, is_be: bool) -> Vec<u8> {
     if parameters.is_empty() {
         return vec![0xFF];
     }
@@ -1202,7 +1167,8 @@ fn encode_attribute_variant(attr: &NtAttribute, is_be: bool) -> Vec<u8> {
 /// The image payload is the largest body the codec writes; appending it to
 /// the caller's frame buffer avoids a multi-MB temporary and copy.
 pub(crate) fn push_nt_ndarray_full(out: &mut Vec<u8>, nt: &NtNdArray, is_be: bool) {
-    out.extend_from_slice(&encode_ndarray_union(&nt.value, is_be));
+    push_size_pvd(out, ndarray_union_index(&nt.value), is_be);
+    push_scalar_array_value_pvd(out, &nt.value, is_be);
     out.extend_from_slice(&encode_string_pvd(&nt.codec.name, is_be));
     out.extend_from_slice(&encode_codec_parameters(&nt.codec.parameters, is_be));
     out.extend_from_slice(&encode_i64(nt.compressed_size, is_be));
@@ -1370,9 +1336,7 @@ fn pv_value_field_type(val: &PvValue) -> FieldType {
 pub(crate) fn push_pv_value(out: &mut Vec<u8>, val: &PvValue, is_be: bool) {
     match val {
         PvValue::Scalar(sv) => out.extend_from_slice(&encode_scalar_value(sv, is_be)),
-        PvValue::ScalarArray(sa) => {
-            out.extend_from_slice(&encode_scalar_array_value_pvd(sa, is_be))
-        }
+        PvValue::ScalarArray(sa) => push_scalar_array_value_pvd(out, sa, is_be),
         PvValue::Structure { fields, .. } => push_pv_value_fields(out, fields, is_be),
     }
 }
@@ -1441,66 +1405,63 @@ use crate::spvd_decode::DecodedValue;
 
 /// Encode a `DecodedValue` back to PVA wire bytes.
 pub fn encode_decoded_value(val: &DecodedValue, is_be: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_decoded_value(&mut out, val, is_be);
+    out
+}
+
+/// Append a `DecodedValue`'s PVA wire bytes to `out` (sink form of
+/// [`encode_decoded_value`]).
+fn push_decoded_value(out: &mut Vec<u8>, val: &DecodedValue, is_be: bool) {
     match val {
-        DecodedValue::Null => Vec::new(),
-        DecodedValue::Boolean(v) => vec![if *v { 1 } else { 0 }],
-        DecodedValue::Int8(v) => vec![*v as u8],
+        DecodedValue::Null => {}
+        DecodedValue::Boolean(v) => out.push(*v as u8),
+        DecodedValue::Int8(v) => out.push(*v as u8),
         DecodedValue::Int16(v) => {
-            if is_be {
-                v.to_be_bytes().to_vec()
-            } else {
-                v.to_le_bytes().to_vec()
-            }
+            out.extend_from_slice(&endian(v.to_be_bytes(), v.to_le_bytes(), is_be))
         }
-        DecodedValue::Int32(v) => encode_i32(*v, is_be),
-        DecodedValue::Int64(v) => encode_i64(*v, is_be),
-        DecodedValue::UInt8(v) => vec![*v],
+        DecodedValue::Int32(v) => {
+            out.extend_from_slice(&endian(v.to_be_bytes(), v.to_le_bytes(), is_be))
+        }
+        DecodedValue::Int64(v) => {
+            out.extend_from_slice(&endian(v.to_be_bytes(), v.to_le_bytes(), is_be))
+        }
+        DecodedValue::UInt8(v) => out.push(*v),
         DecodedValue::UInt16(v) => {
-            if is_be {
-                v.to_be_bytes().to_vec()
-            } else {
-                v.to_le_bytes().to_vec()
-            }
+            out.extend_from_slice(&endian(v.to_be_bytes(), v.to_le_bytes(), is_be))
         }
         DecodedValue::UInt32(v) => {
-            if is_be {
-                v.to_be_bytes().to_vec()
-            } else {
-                v.to_le_bytes().to_vec()
-            }
+            out.extend_from_slice(&endian(v.to_be_bytes(), v.to_le_bytes(), is_be))
         }
         DecodedValue::UInt64(v) => {
-            if is_be {
-                v.to_be_bytes().to_vec()
-            } else {
-                v.to_le_bytes().to_vec()
-            }
+            out.extend_from_slice(&endian(v.to_be_bytes(), v.to_le_bytes(), is_be))
         }
         DecodedValue::Float32(v) => {
-            if is_be {
-                v.to_be_bytes().to_vec()
-            } else {
-                v.to_le_bytes().to_vec()
-            }
+            out.extend_from_slice(&endian(v.to_be_bytes(), v.to_le_bytes(), is_be))
         }
-        DecodedValue::Float64(v) => encode_f64(*v, is_be),
-        DecodedValue::String(v) => encode_string_pvd(v, is_be),
+        DecodedValue::Float64(v) => {
+            out.extend_from_slice(&endian(v.to_be_bytes(), v.to_le_bytes(), is_be))
+        }
+        DecodedValue::String(v) => push_string_pvd(out, v, is_be),
         DecodedValue::Array(arr) => {
-            let mut out = encode_size_pvd(arr.len(), is_be);
+            push_size_pvd(out, arr.len(), is_be);
             for item in arr {
-                out.extend_from_slice(&encode_decoded_value(item, is_be));
+                push_decoded_value(out, item, is_be);
             }
-            out
         }
         DecodedValue::Structure(fields) => {
-            let mut out = Vec::new();
             for (_name, value) in fields {
-                out.extend_from_slice(&encode_decoded_value(value, is_be));
+                push_decoded_value(out, value, is_be);
             }
-            out
         }
-        DecodedValue::Raw(data) => data.clone(),
+        DecodedValue::Raw(data) => out.extend_from_slice(data),
     }
+}
+
+/// Pick the big- or little-endian byte form.
+#[inline]
+fn endian<const N: usize>(be: [u8; N], le: [u8; N], is_be: bool) -> [u8; N] {
+    if is_be { be } else { le }
 }
 
 // ---------------------------------------------------------------------------
@@ -1765,7 +1726,9 @@ fn nt_payload_shape_matches(payload: &NtPayload, desc: &StructureDesc) -> bool {
 
 /// Encode the value bytes of an `NtPayload` projected onto a (possibly
 /// narrowed) descriptor. Fields not represented in `desc` are omitted;
-/// sub-structures are encoded recursively.
+/// sub-structures are encoded recursively. Byte-identical to
+/// [`encode_decoded_projected`] on the payload's decoded tree, without
+/// building the tree.
 pub fn encode_nt_payload_values_for_desc(
     payload: &NtPayload,
     desc: &StructureDesc,
@@ -1780,8 +1743,9 @@ pub fn encode_nt_payload_values_for_desc(
             return encode_nt_payload_full(payload, is_be);
         }
     }
-    let decoded = nt_payload_to_decoded_for(payload, Some(desc), is_be);
-    encode_decoded_projected(&decoded, desc, is_be)
+    let mut out = Vec::new();
+    push_view_projected(&mut out, View::of_payload(payload), desc, is_be);
+    out
 }
 
 fn structure_desc_equal(a: &StructureDesc, b: &StructureDesc) -> bool {
@@ -1832,15 +1796,17 @@ fn decode_payload_to_structure(payload: &NtPayload, is_be: bool) -> Option<Decod
 }
 
 // ---------------------------------------------------------------------------
-// Direct NtPayload -> DecodedValue projection (codec-C1)
+// NtPayload -> DecodedValue tree (codec-C1)
 //
 // Mirrors `encode_nt_payload_full` composed with
 // `PvdDecoder::decode_structure` EXACTLY, but builds the in-memory tree with no
-// wire round-trip. This must stay byte-identical to the round-trip path: field
-// order and names come from `nt_payload_desc`, and the `DecodedValue` variant
-// chosen for each leaf must match what `decode_scalar`/`decode_value` yields
-// for the corresponding wire bytes. The `direct_projection_matches_roundtrip_*`
-// differential tests assert this over every NtPayload variant.
+// wire round-trip. The `direct_projection_matches_roundtrip_*` differential
+// tests assert this over every NtPayload variant.
+//
+// Production no longer builds this tree: the delta, change-detection and
+// narrowed-encode paths walk the payload in place (see `View` below). The
+// whole-tree builders are kept, test-only, as the reference that walk is
+// checked against. The leaf builders are shared with `View::to_decoded`.
 // ---------------------------------------------------------------------------
 
 fn dv_scalar(v: &ScalarValue) -> DecodedValue {
@@ -1899,6 +1865,7 @@ fn dv_form_choices(v: &[String]) -> DecodedValue {
     }
 }
 
+#[cfg(test)]
 fn dv_alarm(severity: i32, status: i32, message: &str) -> DecodedValue {
     DecodedValue::Structure(vec![
         ("severity".to_string(), DecodedValue::Int32(severity)),
@@ -1907,6 +1874,7 @@ fn dv_alarm(severity: i32, status: i32, message: &str) -> DecodedValue {
     ])
 }
 
+#[cfg(test)]
 fn dv_timestamp(secs: i64, nanos: i32, user_tag: i32) -> DecodedValue {
     DecodedValue::Structure(vec![
         ("secondsPastEpoch".to_string(), DecodedValue::Int64(secs)),
@@ -1915,27 +1883,22 @@ fn dv_timestamp(secs: i64, nanos: i32, user_tag: i32) -> DecodedValue {
     ])
 }
 
+#[cfg(test)]
 fn dv_nt_timestamp(ts: &NtTimeStamp) -> DecodedValue {
     dv_timestamp(ts.seconds_past_epoch, ts.nanoseconds, ts.user_tag)
 }
 
 /// Mirror `encode_timestamp`'s stored-value-or-`now()` fallback for NtScalar.
+#[cfg(test)]
 fn dv_scalar_timestamp(nt: &NtScalar) -> DecodedValue {
-    let (secs, nanos, user_tag) = match &nt.time_stamp {
-        Some(ts) => (ts.seconds_past_epoch, ts.nanoseconds, ts.user_tag),
-        None => {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            (now.as_secs() as i64, now.subsec_nanos() as i32, 0)
-        }
-    };
+    let (secs, nanos, user_tag) = scalar_stamp(nt);
     dv_timestamp(secs, nanos, user_tag)
 }
 
 /// display_t with the 5 common fields (used by NTScalarArray / NTNDArray).
 /// The `display_t` tree for an [`NtDisplay`]. Mirrors `encode_nt_display`,
 /// including the standard `form` enum that `NtDisplay` has no field for.
+#[cfg(test)]
 fn dv_display(d: &NtDisplay) -> DecodedValue {
     DecodedValue::Structure(vec![
         ("limitLow".to_string(), DecodedValue::Float64(d.limit_low)),
@@ -1956,6 +1919,7 @@ fn dv_display(d: &NtDisplay) -> DecodedValue {
     ])
 }
 
+#[cfg(test)]
 fn dv_pv_value(v: &PvValue) -> DecodedValue {
     match v {
         PvValue::Scalar(sv) => dv_scalar(sv),
@@ -1988,11 +1952,68 @@ fn ndarray_union_field_name(v: &ScalarArrayValue) -> &'static str {
     }
 }
 
+/// `codec.parameters` — Variant: empty -> Null, else a structure of the
+/// string values.
+fn dv_codec_parameters(parameters: &HashMap<String, String>) -> DecodedValue {
+    if parameters.is_empty() {
+        return DecodedValue::Null;
+    }
+    // Keys sorted, matching `encode_codec_parameters`. Both walks must agree,
+    // and `HashMap` order is unspecified.
+    let mut keys: Vec<&String> = parameters.keys().collect();
+    keys.sort();
+    DecodedValue::Structure(
+        keys.into_iter()
+            .map(|k| (k.clone(), DecodedValue::String(parameters[k].clone())))
+            .collect(),
+    )
+}
+
+/// The NTNDArray `dimension` structure array.
+fn dv_dimensions(dimension: &[NdDimension]) -> DecodedValue {
+    DecodedValue::Array(
+        dimension
+            .iter()
+            .map(|d| {
+                DecodedValue::Structure(vec![
+                    ("size".to_string(), DecodedValue::Int32(d.size)),
+                    ("offset".to_string(), DecodedValue::Int32(d.offset)),
+                    ("fullSize".to_string(), DecodedValue::Int32(d.full_size)),
+                    ("binning".to_string(), DecodedValue::Int32(d.binning)),
+                    ("reverse".to_string(), DecodedValue::Boolean(d.reverse)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+/// The NTNDArray `attribute` structure array.
+fn dv_attributes(attribute: &[NtAttribute]) -> DecodedValue {
+    DecodedValue::Array(
+        attribute
+            .iter()
+            .map(|a| {
+                DecodedValue::Structure(vec![
+                    ("name".to_string(), DecodedValue::String(a.name.clone())),
+                    ("value".to_string(), dv_scalar(&a.value)),
+                    (
+                        "descriptor".to_string(),
+                        DecodedValue::String(a.descriptor.clone()),
+                    ),
+                    ("sourceType".to_string(), DecodedValue::Int32(a.source_type)),
+                    ("source".to_string(), DecodedValue::String(a.source.clone())),
+                ])
+            })
+            .collect(),
+    )
+}
+
 /// True when the caller wants a top-level field named `name`.
 ///
 /// `None` means "unfiltered — build everything". `Some(desc)` means the caller
 /// will project onto `desc`, so any top-level field `desc` does not name is
 /// going to be discarded and need never be built.
+#[cfg(test)]
 fn wants_field(desc: Option<&StructureDesc>, name: &str) -> bool {
     match desc {
         None => true,
@@ -2003,11 +2024,11 @@ fn wants_field(desc: Option<&StructureDesc>, name: &str) -> bool {
 /// Direct, allocation-only projection of an [`NtPayload`] into the
 /// `DecodedValue::Structure` tree that the encode→decode round-trip would
 /// yield. Byte-identity with [`decode_payload_to_structure`] is enforced by
-/// the differential tests; the production monitor delta hot path uses this
-/// to avoid the redundant wire serialization (finding codec-C1).
+/// the differential tests. Test-only: the reference for the direct walk.
 ///
 /// `desc: None` builds every field; `Some(desc)` builds only the top-level
 /// fields `desc` names, skipping the rest (finding codec-perf, Task 7).
+#[cfg(test)]
 fn nt_payload_to_decoded_for(
     payload: &NtPayload,
     desc: Option<&StructureDesc>,
@@ -2027,9 +2048,7 @@ fn nt_payload_to_decoded_for(
 }
 
 /// Unfiltered (`desc: None`) form of [`nt_payload_to_decoded_for`], builds
-/// every field. Test-only: production code calls `nt_payload_to_decoded_for`
-/// directly. Retained so the differential tests and
-/// [`decode_payload_to_structure`] comparisons keep their exact meaning.
+/// every field.
 #[cfg(test)]
 fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
     nt_payload_to_decoded_for(payload, None, is_be)
@@ -2037,6 +2056,7 @@ fn nt_payload_to_decoded(payload: &NtPayload, is_be: bool) -> DecodedValue {
 
 /// The `epics:nt/NTScalar:1.0` field list, restricted to the top-level fields
 /// `desc` names. Mirrors `encode_nt_scalar_full`.
+#[cfg(test)]
 fn dv_nt_scalar_fields(nt: &NtScalar, desc: Option<&StructureDesc>) -> Vec<(String, DecodedValue)> {
     let mut out: Vec<(String, DecodedValue)> = Vec::with_capacity(6);
     if wants_field(desc, "value") {
@@ -2153,6 +2173,7 @@ fn dv_nt_scalar_fields(nt: &NtScalar, desc: Option<&StructureDesc>) -> Vec<(Stri
 
 /// The `epics:nt/NTScalarArray:1.0` field list, restricted to the top-level
 /// fields `desc` names.
+#[cfg(test)]
 fn dv_nt_scalar_array_fields(
     nt: &NtScalarArray,
     desc: Option<&StructureDesc>,
@@ -2197,6 +2218,7 @@ fn dv_nt_scalar_array_fields(
 
 /// The `epics:nt/NTTable:1.0` field list, restricted to the top-level fields
 /// `desc` names.
+#[cfg(test)]
 fn dv_nt_table_fields(nt: &NtTable, desc: Option<&StructureDesc>) -> Vec<(String, DecodedValue)> {
     let mut out: Vec<(String, DecodedValue)> = Vec::with_capacity(5);
     if wants_field(desc, "labels") {
@@ -2232,6 +2254,7 @@ fn dv_nt_table_fields(nt: &NtTable, desc: Option<&StructureDesc>) -> Vec<(String
 
 /// The `epics:nt/NTNDArray:1.0` field list, restricted to the top-level fields
 /// `desc` names.
+#[cfg(test)]
 fn dv_nt_ndarray_fields(
     nt: &NtNdArray,
     desc: Option<&StructureDesc>,
@@ -2246,26 +2269,7 @@ fn dv_nt_ndarray_fields(
         out.push(("value".to_string(), value));
     }
     if wants_field(desc, "codec") {
-        // codec.parameters — Variant: empty -> Null, else Structure of
-        // string key/value pairs.
-        let codec_parameters = if nt.codec.parameters.is_empty() {
-            DecodedValue::Null
-        } else {
-            DecodedValue::Structure({
-                // Keys sorted, matching `encode_codec_parameters`. Both
-                // walks must agree, and `HashMap` order is unspecified.
-                let mut keys: Vec<&String> = nt.codec.parameters.keys().collect();
-                keys.sort();
-                keys.into_iter()
-                    .map(|k| {
-                        (
-                            k.clone(),
-                            DecodedValue::String(nt.codec.parameters[k].clone()),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-        };
+        let codec_parameters = dv_codec_parameters(&nt.codec.parameters);
         let codec = DecodedValue::Structure(vec![
             (
                 "name".to_string(),
@@ -2288,21 +2292,7 @@ fn dv_nt_ndarray_fields(
         ));
     }
     if wants_field(desc, "dimension") {
-        let dimension = DecodedValue::Array(
-            nt.dimension
-                .iter()
-                .map(|d| {
-                    DecodedValue::Structure(vec![
-                        ("size".to_string(), DecodedValue::Int32(d.size)),
-                        ("offset".to_string(), DecodedValue::Int32(d.offset)),
-                        ("fullSize".to_string(), DecodedValue::Int32(d.full_size)),
-                        ("binning".to_string(), DecodedValue::Int32(d.binning)),
-                        ("reverse".to_string(), DecodedValue::Boolean(d.reverse)),
-                    ])
-                })
-                .collect(),
-        );
-        out.push(("dimension".to_string(), dimension));
+        out.push(("dimension".to_string(), dv_dimensions(&nt.dimension)));
     }
     if wants_field(desc, "uniqueId") {
         out.push(("uniqueId".to_string(), DecodedValue::Int32(nt.unique_id)));
@@ -2314,24 +2304,7 @@ fn dv_nt_ndarray_fields(
         ));
     }
     if wants_field(desc, "attribute") {
-        let attribute = DecodedValue::Array(
-            nt.attribute
-                .iter()
-                .map(|a| {
-                    DecodedValue::Structure(vec![
-                        ("name".to_string(), DecodedValue::String(a.name.clone())),
-                        ("value".to_string(), dv_scalar(&a.value)),
-                        (
-                            "descriptor".to_string(),
-                            DecodedValue::String(a.descriptor.clone()),
-                        ),
-                        ("sourceType".to_string(), DecodedValue::Int32(a.source_type)),
-                        ("source".to_string(), DecodedValue::String(a.source.clone())),
-                    ])
-                })
-                .collect(),
-        );
-        out.push(("attribute".to_string(), attribute));
+        out.push(("attribute".to_string(), dv_attributes(&nt.attribute)));
     }
     if wants_field(desc, "descriptor") {
         out.push((
@@ -2359,6 +2332,7 @@ fn dv_nt_ndarray_fields(
 
 /// The `epics:nt/NTEnum:1.0` field list, restricted to the top-level fields
 /// `desc` names.
+#[cfg(test)]
 fn dv_nt_enum_fields(nt: &NtEnum, desc: Option<&StructureDesc>) -> Vec<(String, DecodedValue)> {
     let mut out: Vec<(String, DecodedValue)> = Vec::with_capacity(3);
     if wants_field(desc, "value") {
@@ -2384,6 +2358,7 @@ fn dv_nt_enum_fields(nt: &NtEnum, desc: Option<&StructureDesc>) -> Vec<(String, 
 
 /// The `Generic` payload's field list — a flat pass-through of `PvValue`s,
 /// restricted to the entries `desc` names.
+#[cfg(test)]
 fn dv_generic_fields(
     fields: &[(String, PvValue)],
     desc: Option<&StructureDesc>,
@@ -2402,39 +2377,724 @@ pub fn encode_decoded_projected(
     desc: &StructureDesc,
     is_be: bool,
 ) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_decoded_projected(&mut out, value, desc, is_be);
+    out
+}
+
+/// Sink form of [`encode_decoded_projected`].
+fn push_decoded_projected(
+    out: &mut Vec<u8>,
+    value: &DecodedValue,
+    desc: &StructureDesc,
+    is_be: bool,
+) {
     let DecodedValue::Structure(fields) = value else {
         // Fallback: not a structure – emit raw bytes.
-        return encode_decoded_value(value, is_be);
+        return push_decoded_value(out, value, is_be);
     };
-    let mut out = Vec::new();
+    let mut hint = 0;
     for target in &desc.fields {
-        let Some((_, sub_value)) = fields.iter().find(|(n, _)| n == &target.name) else {
+        let Some(sub_value) = find_field(fields, &target.name, &mut hint) else {
             continue;
         };
         match &target.field_type {
-            FieldType::Structure(inner) => {
-                out.extend_from_slice(&encode_decoded_projected(sub_value, inner, is_be));
-            }
-            _ => {
-                out.extend_from_slice(&encode_decoded_value(sub_value, is_be));
-            }
+            FieldType::Structure(inner) => push_decoded_projected(out, sub_value, inner, is_be),
+            _ => push_decoded_value(out, sub_value, is_be),
         }
     }
-    out
+}
+
+/// Index of the field called `name` among `len` fields named by `name_at`.
+///
+/// Tries position `*hint` first, then scans from the start, and on a hit moves
+/// `*hint` past the field. A descriptor walked in the fields' own order (every
+/// descriptor `filter_structure_desc` produces) therefore resolves each name
+/// in O(1) rather than rescanning the level, which made a delta quadratic in
+/// the field count. Any other order still gets the first field of that name.
+///
+/// Where a level repeats a name, an in-order descriptor pairs each repeat with
+/// its own field; a plain first-match scan paired every repeat with the first.
+fn locate<'n>(
+    len: usize,
+    name_at: impl Fn(usize) -> &'n str,
+    name: &str,
+    hint: &mut usize,
+) -> Option<usize> {
+    let at = if *hint < len && name_at(*hint) == name {
+        *hint
+    } else {
+        (0..len).find(|&i| name_at(i) == name)?
+    };
+    *hint = at + 1;
+    Some(at)
+}
+
+/// [`locate`] over a decoded structure's fields.
+fn find_field<'v>(
+    fields: &'v [(String, DecodedValue)],
+    name: &str,
+    hint: &mut usize,
+) -> Option<&'v DecodedValue> {
+    locate(fields.len(), |i| fields[i].0.as_str(), name, hint).map(|i| &fields[i].1)
+}
+
+// ---------------------------------------------------------------------------
+// Direct NtPayload walk (sparse delta, change detection, narrowed encode)
+//
+// A `View` is one node of the tree `nt_payload_to_decoded_for` would build,
+// read in place from the payload: no tree, and no per-element `DecodedValue`.
+// `views_equal` and `push_view` give exactly what `decoded_values_equal` and
+// `encode_decoded_value` give on that tree, so the wire bytes are unchanged;
+// `delta_bytes_match_the_frozen_tree_path_oracle` and
+// `direct_walk_matches_the_tree_path` pin that.
+//
+// The NTNDArray metadata leaves (`dimension`, `attribute`, `codec.parameters`)
+// are small and still go through a materialised `DecodedValue`.
+// ---------------------------------------------------------------------------
+
+/// The `DecodedValue` variant a [`View`] stands for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Null,
+    Boolean,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
+    Float64,
+    String,
+    Array,
+    Structure,
+}
+
+/// One node of a payload's decoded tree, borrowed from the payload.
+#[derive(Clone, Copy)]
+enum View<'a> {
+    Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    F32(f32),
+    F64(f64),
+    Str(&'a str),
+    /// An array of the scalar array's elements.
+    Array(&'a ScalarArrayValue),
+    /// An array of strings.
+    Strings(&'a [String]),
+    /// `display.form.choices` reading as `STANDARD_FORM_CHOICES`.
+    StandardChoices,
+    Dimensions(&'a [NdDimension]),
+    Attributes(&'a [NtAttribute]),
+    /// `Null` when empty, else a structure of the values by sorted key.
+    CodecParameters(&'a HashMap<String, String>),
+    Struct(Node<'a>),
+}
+
+/// A structure: a fixed list of named fields.
+#[derive(Clone, Copy)]
+enum Node<'a> {
+    /// An `NtScalar` root. The timestamp is resolved once: a missing one reads
+    /// the clock, and the comparison and the encode must see the same sample.
+    Scalar(&'a NtScalar, (i64, i32, i32)),
+    ScalarArray(&'a NtScalarArray),
+    Table(&'a NtTable),
+    NdArray(&'a NtNdArray),
+    Enum(&'a NtEnum),
+    /// A `Generic` root or a `PvValue::Structure`.
+    Fields(&'a [(String, PvValue)]),
+    Alarm(i32, i32, &'a str),
+    TimeStamp(i64, i32, i32),
+    ScalarDisplay(&'a NtScalar),
+    /// `display_t` of an `NtDisplay`; `None` reads as `NtDisplay::default()`.
+    Display(Option<&'a NtDisplay>),
+    /// `display.form`; empty choices are the standard ones.
+    Form(i32, &'a [String]),
+    Control(f64, f64, f64),
+    ValueAlarm(&'a NtScalar),
+    TableColumns(&'a [NtTableColumn]),
+    EnumValue(i32, &'a [String]),
+    /// The NTNDArray `value` union: one field, named for the element type.
+    NdValue(&'a ScalarArrayValue),
+    Codec(&'a NdCodec),
+}
+
+const ALARM_FIELDS: &[&str] = &["severity", "status", "message"];
+const TIMESTAMP_FIELDS: &[&str] = &["secondsPastEpoch", "nanoseconds", "userTag"];
+const DISPLAY_FIELDS: &[&str] = &[
+    "limitLow",
+    "limitHigh",
+    "description",
+    "units",
+    "precision",
+    "form",
+];
+const ENUM_T_FIELDS: &[&str] = &["index", "choices"];
+const CONTROL_FIELDS: &[&str] = &["limitLow", "limitHigh", "minStep"];
+
+fn alarm_view(severity: i32, status: i32, message: &str) -> View<'_> {
+    View::Struct(Node::Alarm(severity, status, message))
+}
+
+fn optional_alarm_view(alarm: Option<&NtAlarm>) -> View<'_> {
+    match alarm {
+        Some(a) => alarm_view(a.severity, a.status, &a.message),
+        None => alarm_view(0, 0, ""),
+    }
+}
+
+fn timestamp_view(ts: &NtTimeStamp) -> View<'static> {
+    View::Struct(Node::TimeStamp(
+        ts.seconds_past_epoch,
+        ts.nanoseconds,
+        ts.user_tag,
+    ))
+}
+
+fn optional_timestamp_view(ts: Option<&NtTimeStamp>) -> View<'static> {
+    ts.map_or(View::Struct(Node::TimeStamp(0, 0, 0)), timestamp_view)
+}
+
+impl<'a> Node<'a> {
+    /// Field names for the nodes whose shape does not depend on the payload.
+    fn fixed_names(&self) -> &'static [&'static str] {
+        match self {
+            Node::Scalar(..) => &[
+                "value",
+                "alarm",
+                "timeStamp",
+                "display",
+                "control",
+                "valueAlarm",
+            ],
+            Node::ScalarArray(_) => &["value", "alarm", "timeStamp", "display", "control"],
+            Node::Table(_) => &["labels", "value", "descriptor", "alarm", "timeStamp"],
+            Node::NdArray(_) => &[
+                "value",
+                "codec",
+                "compressedSize",
+                "uncompressedSize",
+                "dimension",
+                "uniqueId",
+                "dataTimeStamp",
+                "attribute",
+                "descriptor",
+                "alarm",
+                "timeStamp",
+                "display",
+            ],
+            Node::Enum(_) => &["value", "alarm", "timeStamp"],
+            Node::Alarm(..) => ALARM_FIELDS,
+            Node::TimeStamp(..) => TIMESTAMP_FIELDS,
+            Node::ScalarDisplay(_) | Node::Display(_) => DISPLAY_FIELDS,
+            Node::Form(..) | Node::EnumValue(..) => ENUM_T_FIELDS,
+            Node::Control(..) => CONTROL_FIELDS,
+            Node::ValueAlarm(_) => &[
+                "active",
+                "lowAlarmLimit",
+                "lowWarningLimit",
+                "highWarningLimit",
+                "highAlarmLimit",
+                "lowAlarmSeverity",
+                "lowWarningSeverity",
+                "highWarningSeverity",
+                "highAlarmSeverity",
+                "hysteresis",
+            ],
+            Node::Codec(_) => &["name", "parameters"],
+            Node::Fields(_) | Node::TableColumns(_) | Node::NdValue(_) => &[],
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Node::Fields(f) => f.len(),
+            Node::TableColumns(c) => c.len(),
+            Node::NdValue(_) => 1,
+            _ => self.fixed_names().len(),
+        }
+    }
+
+    fn name(&self, i: usize) -> &'a str {
+        match self {
+            Node::Fields(f) => &f[i].0,
+            Node::TableColumns(c) => &c[i].name,
+            Node::NdValue(v) => ndarray_union_field_name(v),
+            _ => self.fixed_names()[i],
+        }
+    }
+
+    /// Field `i`, for `i < self.len()`.
+    fn field(&self, i: usize) -> View<'a> {
+        match *self {
+            Node::Scalar(nt, (secs, nanos, user_tag)) => match i {
+                0 => View::scalar(&nt.value),
+                1 => alarm_view(nt.alarm_severity, nt.alarm_status, &nt.alarm_message),
+                2 => View::Struct(Node::TimeStamp(secs, nanos, user_tag)),
+                3 => View::Struct(Node::ScalarDisplay(nt)),
+                4 => View::Struct(Node::Control(
+                    nt.control_low,
+                    nt.control_high,
+                    nt.control_min_step,
+                )),
+                _ => View::Struct(Node::ValueAlarm(nt)),
+            },
+            Node::ScalarArray(nt) => match i {
+                0 => View::Array(&nt.value),
+                1 => alarm_view(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
+                2 => timestamp_view(&nt.time_stamp),
+                3 => View::Struct(Node::Display(Some(&nt.display))),
+                _ => View::Struct(Node::Control(
+                    nt.control.limit_low,
+                    nt.control.limit_high,
+                    nt.control.min_step,
+                )),
+            },
+            Node::Table(nt) => match i {
+                0 => View::Strings(&nt.labels),
+                1 => View::Struct(Node::TableColumns(&nt.columns)),
+                2 => View::Str(nt.descriptor.as_deref().unwrap_or("")),
+                3 => optional_alarm_view(nt.alarm.as_ref()),
+                _ => optional_timestamp_view(nt.time_stamp.as_ref()),
+            },
+            Node::NdArray(nt) => match i {
+                0 => View::Struct(Node::NdValue(&nt.value)),
+                1 => View::Struct(Node::Codec(&nt.codec)),
+                2 => View::I64(nt.compressed_size),
+                3 => View::I64(nt.uncompressed_size),
+                4 => View::Dimensions(&nt.dimension),
+                5 => View::I32(nt.unique_id),
+                6 => timestamp_view(&nt.data_time_stamp),
+                7 => View::Attributes(&nt.attribute),
+                8 => View::Str(nt.descriptor.as_deref().unwrap_or("")),
+                9 => optional_alarm_view(nt.alarm.as_ref()),
+                10 => optional_timestamp_view(nt.time_stamp.as_ref()),
+                _ => View::Struct(Node::Display(nt.display.as_ref())),
+            },
+            Node::Enum(nt) => match i {
+                0 => View::Struct(Node::EnumValue(nt.index, &nt.choices)),
+                1 => alarm_view(nt.alarm.severity, nt.alarm.status, &nt.alarm.message),
+                _ => timestamp_view(&nt.time_stamp),
+            },
+            Node::Fields(f) => View::pv(&f[i].1),
+            Node::Alarm(severity, status, message) => match i {
+                0 => View::I32(severity),
+                1 => View::I32(status),
+                _ => View::Str(message),
+            },
+            Node::TimeStamp(secs, nanos, user_tag) => match i {
+                0 => View::I64(secs),
+                1 => View::I32(nanos),
+                _ => View::I32(user_tag),
+            },
+            Node::ScalarDisplay(nt) => match i {
+                0 => View::F64(nt.display_low),
+                1 => View::F64(nt.display_high),
+                2 => View::Str(&nt.display_description),
+                3 => View::Str(&nt.units),
+                4 => View::I32(nt.display_precision),
+                _ => View::Struct(Node::Form(nt.display_form_index, &nt.display_form_choices)),
+            },
+            Node::Display(d) => match (i, d) {
+                (0, Some(d)) => View::F64(d.limit_low),
+                (1, Some(d)) => View::F64(d.limit_high),
+                (2, Some(d)) => View::Str(&d.description),
+                (3, Some(d)) => View::Str(&d.units),
+                (4, Some(d)) => View::I32(d.precision),
+                (0 | 1, None) => View::F64(0.0),
+                (2 | 3, None) => View::Str(""),
+                (4, None) => View::I32(0),
+                _ => View::Struct(Node::Form(0, &[])),
+            },
+            Node::Form(index, choices) => match i {
+                0 => View::I32(index),
+                _ if choices.is_empty() => View::StandardChoices,
+                _ => View::Strings(choices),
+            },
+            Node::Control(low, high, min_step) => View::F64([low, high, min_step][i]),
+            Node::ValueAlarm(nt) => match i {
+                0 => View::Bool(nt.value_alarm_active),
+                1 => View::F64(nt.value_alarm_low_alarm_limit),
+                2 => View::F64(nt.value_alarm_low_warning_limit),
+                3 => View::F64(nt.value_alarm_high_warning_limit),
+                4 => View::F64(nt.value_alarm_high_alarm_limit),
+                5 => View::I32(nt.value_alarm_low_alarm_severity),
+                6 => View::I32(nt.value_alarm_low_warning_severity),
+                7 => View::I32(nt.value_alarm_high_warning_severity),
+                8 => View::I32(nt.value_alarm_high_alarm_severity),
+                _ => View::U8(nt.value_alarm_hysteresis),
+            },
+            Node::TableColumns(c) => View::Array(&c[i].values),
+            Node::EnumValue(index, choices) => match i {
+                0 => View::I32(index),
+                _ => View::Strings(choices),
+            },
+            Node::NdValue(v) => View::Array(v),
+            Node::Codec(c) => match i {
+                0 => View::Str(&c.name),
+                _ => View::CodecParameters(&c.parameters),
+            },
+        }
+    }
+}
+
+impl<'a> View<'a> {
+    fn of_payload(payload: &'a NtPayload) -> Self {
+        View::Struct(match payload {
+            NtPayload::Scalar(nt) => Node::Scalar(nt, scalar_stamp(nt)),
+            NtPayload::ScalarArray(nt) => Node::ScalarArray(nt),
+            NtPayload::Table(nt) => Node::Table(nt),
+            NtPayload::NdArray(nt) => Node::NdArray(nt),
+            NtPayload::Enum(nt) => Node::Enum(nt),
+            NtPayload::Generic { fields, .. } => Node::Fields(fields),
+        })
+    }
+
+    fn scalar(v: &'a ScalarValue) -> Self {
+        match v {
+            ScalarValue::Bool(x) => View::Bool(*x),
+            ScalarValue::I8(x) => View::I8(*x),
+            ScalarValue::I16(x) => View::I16(*x),
+            ScalarValue::I32(x) => View::I32(*x),
+            ScalarValue::I64(x) => View::I64(*x),
+            ScalarValue::U8(x) => View::U8(*x),
+            ScalarValue::U16(x) => View::U16(*x),
+            ScalarValue::U32(x) => View::U32(*x),
+            ScalarValue::U64(x) => View::U64(*x),
+            ScalarValue::F32(x) => View::F32(*x),
+            ScalarValue::F64(x) => View::F64(*x),
+            ScalarValue::Str(x) => View::Str(x),
+        }
+    }
+
+    fn pv(v: &'a PvValue) -> Self {
+        match v {
+            PvValue::Scalar(sv) => View::scalar(sv),
+            PvValue::ScalarArray(sa) => View::Array(sa),
+            PvValue::Structure { fields, .. } => View::Struct(Node::Fields(fields)),
+        }
+    }
+
+    fn kind(&self) -> Kind {
+        match self {
+            View::Bool(_) => Kind::Boolean,
+            View::I8(_) => Kind::Int8,
+            View::I16(_) => Kind::Int16,
+            View::I32(_) => Kind::Int32,
+            View::I64(_) => Kind::Int64,
+            View::U8(_) => Kind::UInt8,
+            View::U16(_) => Kind::UInt16,
+            View::U32(_) => Kind::UInt32,
+            View::U64(_) => Kind::UInt64,
+            View::F32(_) => Kind::Float32,
+            View::F64(_) => Kind::Float64,
+            View::Str(_) => Kind::String,
+            View::Array(_)
+            | View::Strings(_)
+            | View::StandardChoices
+            | View::Dimensions(_)
+            | View::Attributes(_) => Kind::Array,
+            View::CodecParameters(p) if p.is_empty() => Kind::Null,
+            View::CodecParameters(_) | View::Struct(_) => Kind::Structure,
+        }
+    }
+
+    /// Element count of a [`Kind::Array`] view.
+    fn array_len(&self) -> usize {
+        match self {
+            View::Array(a) => scalar_array_len(a),
+            View::Strings(s) => s.len(),
+            View::StandardChoices => STANDARD_FORM_CHOICES.len(),
+            View::Dimensions(d) => d.len(),
+            View::Attributes(a) => a.len(),
+            _ => 0,
+        }
+    }
+
+    /// Element kind of a non-empty [`Kind::Array`] view.
+    fn element_kind(&self) -> Kind {
+        match self {
+            View::Array(a) => match a {
+                ScalarArrayValue::Bool(_) => Kind::Boolean,
+                ScalarArrayValue::I8(_) => Kind::Int8,
+                ScalarArrayValue::I16(_) => Kind::Int16,
+                ScalarArrayValue::I32(_) => Kind::Int32,
+                ScalarArrayValue::I64(_) => Kind::Int64,
+                ScalarArrayValue::U8(_) => Kind::UInt8,
+                ScalarArrayValue::U16(_) => Kind::UInt16,
+                ScalarArrayValue::U32(_) => Kind::UInt32,
+                ScalarArrayValue::U64(_) => Kind::UInt64,
+                ScalarArrayValue::F32(_) => Kind::Float32,
+                ScalarArrayValue::F64(_) => Kind::Float64,
+                ScalarArrayValue::Str(_) => Kind::String,
+            },
+            View::Strings(_) | View::StandardChoices => Kind::String,
+            _ => Kind::Structure,
+        }
+    }
+
+    /// The field called `name`, if this is a structure (see [`locate`]).
+    fn field(&self, name: &str, hint: &mut usize) -> Option<View<'a>> {
+        match self {
+            View::Struct(node) => {
+                locate(node.len(), |i| node.name(i), name, hint).map(|i| node.field(i))
+            }
+            // Keys are unique, so the first match is the only one.
+            View::CodecParameters(p) => p.get(name).map(|v| View::Str(v)),
+            _ => None,
+        }
+    }
+
+    /// The `DecodedValue` this view stands for.
+    fn to_decoded(self) -> DecodedValue {
+        match self {
+            View::Bool(x) => DecodedValue::Boolean(x),
+            View::I8(x) => DecodedValue::Int8(x),
+            View::I16(x) => DecodedValue::Int16(x),
+            View::I32(x) => DecodedValue::Int32(x),
+            View::I64(x) => DecodedValue::Int64(x),
+            View::U8(x) => DecodedValue::UInt8(x),
+            View::U16(x) => DecodedValue::UInt16(x),
+            View::U32(x) => DecodedValue::UInt32(x),
+            View::U64(x) => DecodedValue::UInt64(x),
+            View::F32(x) => DecodedValue::Float32(x),
+            View::F64(x) => DecodedValue::Float64(x),
+            View::Str(s) => DecodedValue::String(s.to_string()),
+            View::Array(a) => dv_scalar_array(a),
+            View::Strings(s) => dv_string_array(s),
+            View::StandardChoices => dv_form_choices(&[]),
+            View::Dimensions(d) => dv_dimensions(d),
+            View::Attributes(a) => dv_attributes(a),
+            View::CodecParameters(p) => dv_codec_parameters(p),
+            View::Struct(node) => DecodedValue::Structure(
+                (0..node.len())
+                    .map(|i| (node.name(i).to_string(), node.field(i).to_decoded()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+fn scalar_array_len(v: &ScalarArrayValue) -> usize {
+    match v {
+        ScalarArrayValue::Bool(a) => a.len(),
+        ScalarArrayValue::I8(a) => a.len(),
+        ScalarArrayValue::I16(a) => a.len(),
+        ScalarArrayValue::I32(a) => a.len(),
+        ScalarArrayValue::I64(a) => a.len(),
+        ScalarArrayValue::U8(a) => a.len(),
+        ScalarArrayValue::U16(a) => a.len(),
+        ScalarArrayValue::U32(a) => a.len(),
+        ScalarArrayValue::U64(a) => a.len(),
+        ScalarArrayValue::F32(a) => a.len(),
+        ScalarArrayValue::F64(a) => a.len(),
+        ScalarArrayValue::Str(a) => a.len(),
+    }
+}
+
+/// `decoded_values_equal` on two scalar arrays' element lists: element-wise,
+/// NaN equal to NaN, and arrays of different element types equal only when
+/// both are empty.
+fn scalar_arrays_equal(a: &ScalarArrayValue, b: &ScalarArrayValue) -> bool {
+    use ScalarArrayValue as S;
+    match (a, b) {
+        (S::Bool(x), S::Bool(y)) => x == y,
+        (S::I8(x), S::I8(y)) => x == y,
+        (S::I16(x), S::I16(y)) => x == y,
+        (S::I32(x), S::I32(y)) => x == y,
+        (S::I64(x), S::I64(y)) => x == y,
+        (S::U8(x), S::U8(y)) => x == y,
+        (S::U16(x), S::U16(y)) => x == y,
+        (S::U32(x), S::U32(y)) => x == y,
+        (S::U64(x), S::U64(y)) => x == y,
+        (S::F32(x), S::F32(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|(p, q)| p == q || (p.is_nan() && q.is_nan()))
+        }
+        (S::F64(x), S::F64(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|(p, q)| p == q || (p.is_nan() && q.is_nan()))
+        }
+        (S::Str(x), S::Str(y)) => x == y,
+        _ => scalar_array_len(a) == 0 && scalar_array_len(b) == 0,
+    }
+}
+
+/// [`decoded_values_equal`] on the values two views stand for.
+fn views_equal(a: View, b: View) -> bool {
+    match (a, b) {
+        (View::Bool(x), View::Bool(y)) => x == y,
+        (View::I8(x), View::I8(y)) => x == y,
+        (View::I16(x), View::I16(y)) => x == y,
+        (View::I32(x), View::I32(y)) => x == y,
+        (View::I64(x), View::I64(y)) => x == y,
+        (View::U8(x), View::U8(y)) => x == y,
+        (View::U16(x), View::U16(y)) => x == y,
+        (View::U32(x), View::U32(y)) => x == y,
+        (View::U64(x), View::U64(y)) => x == y,
+        (View::F32(x), View::F32(y)) => x == y || (x.is_nan() && y.is_nan()),
+        (View::F64(x), View::F64(y)) => x == y || (x.is_nan() && y.is_nan()),
+        (View::Str(x), View::Str(y)) => x == y,
+        (View::Array(x), View::Array(y)) => scalar_arrays_equal(x, y),
+        (View::Strings(x), View::Strings(y)) => x == y,
+        (View::Array(ScalarArrayValue::Str(x)), View::Strings(y))
+        | (View::Strings(y), View::Array(ScalarArrayValue::Str(x))) => x == y,
+        (View::StandardChoices, View::StandardChoices) => true,
+        (View::Dimensions(x), View::Dimensions(y)) => x == y,
+        // Equal maps are equal sorted (key, value) lists, and both empty is
+        // `Null == Null`.
+        (View::CodecParameters(x), View::CodecParameters(y)) => x == y,
+        (View::Struct(x), View::Struct(y)) => {
+            x.len() == y.len()
+                && (0..x.len())
+                    .all(|i| x.name(i) == y.name(i) && views_equal(x.field(i), y.field(i)))
+        }
+        _ => {
+            if a.kind() != b.kind() {
+                return false;
+            }
+            if a.kind() == Kind::Array {
+                let len = a.array_len();
+                if len != b.array_len() {
+                    return false;
+                }
+                if len == 0 {
+                    return true;
+                }
+                if a.element_kind() != b.element_kind() {
+                    return false;
+                }
+            }
+            // Rare pairs: NTNDArray metadata, standard form choices against an
+            // explicit list, a parameter map against another structure.
+            decoded_values_equal(&a.to_decoded(), &b.to_decoded())
+        }
+    }
+}
+
+/// Append what `encode_decoded_value` gives for the value `v` stands for.
+fn push_view(out: &mut Vec<u8>, v: View, is_be: bool) {
+    match v {
+        View::Bool(x) => out.push(x as u8),
+        View::I8(x) => out.push(x as u8),
+        View::I16(x) => out.extend_from_slice(&endian(x.to_be_bytes(), x.to_le_bytes(), is_be)),
+        View::I32(x) => out.extend_from_slice(&endian(x.to_be_bytes(), x.to_le_bytes(), is_be)),
+        View::I64(x) => out.extend_from_slice(&endian(x.to_be_bytes(), x.to_le_bytes(), is_be)),
+        View::U8(x) => out.push(x),
+        View::U16(x) => out.extend_from_slice(&endian(x.to_be_bytes(), x.to_le_bytes(), is_be)),
+        View::U32(x) => out.extend_from_slice(&endian(x.to_be_bytes(), x.to_le_bytes(), is_be)),
+        View::U64(x) => out.extend_from_slice(&endian(x.to_be_bytes(), x.to_le_bytes(), is_be)),
+        View::F32(x) => out.extend_from_slice(&endian(x.to_be_bytes(), x.to_le_bytes(), is_be)),
+        View::F64(x) => out.extend_from_slice(&endian(x.to_be_bytes(), x.to_le_bytes(), is_be)),
+        View::Str(s) => push_string_pvd(out, s, is_be),
+        View::Array(a) => push_scalar_array_value_pvd(out, a, is_be),
+        View::Strings(s) => push_string_array(out, s, is_be),
+        View::StandardChoices => push_string_array(out, &STANDARD_FORM_CHOICES[..], is_be),
+        View::Struct(node) => {
+            for i in 0..node.len() {
+                push_view(out, node.field(i), is_be);
+            }
+        }
+        View::Dimensions(_) | View::Attributes(_) | View::CodecParameters(_) => {
+            push_decoded_value(out, &v.to_decoded(), is_be)
+        }
+    }
+}
+
+/// Direct form of [`encode_decoded_projected`] over a payload view.
+fn push_view_projected(out: &mut Vec<u8>, value: View, desc: &StructureDesc, is_be: bool) {
+    if value.kind() != Kind::Structure {
+        return push_view(out, value, is_be);
+    }
+    let mut hint = 0;
+    for target in &desc.fields {
+        let Some(sub) = value.field(&target.name, &mut hint) else {
+            continue;
+        };
+        match &target.field_type {
+            FieldType::Structure(inner) => push_view_projected(out, sub, inner, is_be),
+            _ => push_view(out, sub, is_be),
+        }
+    }
+}
+
+/// Pre-order walk of a descriptor over two payload views: the direct form of
+/// [`compute_changed_bits`] followed by `encode_values_for_bits`, on the two
+/// payloads' projections onto the descriptor.
+struct DeltaWalk<'s> {
+    /// Changed-bit flags and the value block for changed leaves. `None` only
+    /// answers whether anything changed, and stops at the first change.
+    sink: Option<(&'s mut [bool], &'s mut Vec<u8>)>,
+    /// Bit of the next field; bit 0 is the whole structure.
+    bit: usize,
+    is_be: bool,
+}
+
+impl DeltaWalk<'_> {
+    fn level(&mut self, prev: Option<View>, next: Option<View>, desc: &StructureDesc) -> bool {
+        let (mut prev_hint, mut next_hint) = (0, 0);
+        let mut any = false;
+        for field in &desc.fields {
+            let bit = self.bit;
+            self.bit += 1;
+            let p = prev.and_then(|v| v.field(&field.name, &mut prev_hint));
+            let n = next.and_then(|v| v.field(&field.name, &mut next_hint));
+            let changed = match &field.field_type {
+                // A structure's own bit stays clear; its leaves carry the change.
+                FieldType::Structure(inner) => self.level(p, n, inner),
+                _ => {
+                    let changed = match (p, n) {
+                        (Some(a), Some(b)) => !views_equal(a, b),
+                        (None, None) => false,
+                        _ => true,
+                    };
+                    if changed && let Some((bits, values)) = &mut self.sink {
+                        bits[bit] = true;
+                        if let Some(n) = n {
+                            push_view(values, n, self.is_be);
+                        }
+                    }
+                    changed
+                }
+            };
+            if changed {
+                any = true;
+                if self.sink.is_none() {
+                    return true;
+                }
+            }
+        }
+        any
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Sparse delta encoding (Phase 3)
 // ---------------------------------------------------------------------------
 
-/// Project an [`NtPayload`] onto `desc`, returning a [`DecodedValue::Structure`]
-/// that contains only the fields represented in `desc`. Missing descriptor
-/// fields are silently dropped.
+/// The `DecodedValue` tree path's projection, kept as the reference the
+/// direct walk is checked against.
+#[cfg(test)]
 fn project_payload_on_desc(payload: &NtPayload, desc: &StructureDesc, is_be: bool) -> DecodedValue {
     let decoded = nt_payload_to_decoded_for(payload, Some(desc), is_be);
     project_decoded(&decoded, desc)
 }
 
+#[cfg(test)]
 fn project_decoded(value: &DecodedValue, desc: &StructureDesc) -> DecodedValue {
     let DecodedValue::Structure(fields) = value else {
         return value.clone();
@@ -2508,9 +3168,10 @@ pub fn compute_changed_bits(
     if any { Some(bits) } else { None }
 }
 
-fn get_field_by_name<'a>(val: &'a DecodedValue, name: &str) -> Option<&'a DecodedValue> {
+/// [`locate`] in a decoded value, if it is a structure.
+fn field_of<'v>(val: &'v DecodedValue, name: &str, hint: &mut usize) -> Option<&'v DecodedValue> {
     match val {
-        DecodedValue::Structure(f) => f.iter().find(|(n, _)| n == name).map(|(_, v)| v),
+        DecodedValue::Structure(f) => find_field(f, name, hint),
         _ => None,
     }
 }
@@ -2523,11 +3184,12 @@ fn fill_changed_bits(
     idx: &mut usize,
 ) -> bool {
     let mut any = false;
+    let (mut prev_hint, mut next_hint) = (0, 0);
     for field in &desc.fields {
         let this = *idx;
         *idx += 1;
-        let p = get_field_by_name(prev, &field.name);
-        let n = get_field_by_name(next, &field.name);
+        let p = field_of(prev, &field.name, &mut prev_hint);
+        let n = field_of(next, &field.name, &mut next_hint);
         match &field.field_type {
             FieldType::Structure(inner) => {
                 let empty = DecodedValue::Structure(Vec::new());
@@ -2553,6 +3215,8 @@ fn fill_changed_bits(
     any
 }
 
+/// Tree-path counterpart of the value block `DeltaWalk` writes.
+#[cfg(test)]
 fn encode_values_for_bits(
     value: &DecodedValue,
     desc: &StructureDesc,
@@ -2561,10 +3225,11 @@ fn encode_values_for_bits(
     is_be: bool,
     out: &mut Vec<u8>,
 ) {
+    let mut hint = 0;
     for field in &desc.fields {
         let this = *idx;
         *idx += 1;
-        let sub = get_field_by_name(value, &field.name);
+        let sub = field_of(value, &field.name, &mut hint);
         match &field.field_type {
             FieldType::Structure(inner) => {
                 let empty = DecodedValue::Structure(Vec::new());
@@ -2573,9 +3238,10 @@ fn encode_values_for_bits(
             }
             _ => {
                 if bits[this]
-                    && let Some(v) = sub {
-                        out.extend_from_slice(&encode_decoded_value(v, is_be));
-                    }
+                    && let Some(v) = sub
+                {
+                    push_decoded_value(out, v, is_be);
+                }
             }
         }
     }
@@ -2599,36 +3265,37 @@ fn encode_bitset_from_flags(bits: &[bool], is_be: bool) -> Vec<u8> {
 /// `filtered_desc`. Returns `None` if nothing changed in the filtered view
 /// (caller should suppress the update). Otherwise returns `(bitset, values)`
 /// with only the changed leaves marked and encoded.
+///
+/// Reads both payloads in place (see [`View`]): a changed array leaf is
+/// compared as a slice and written to the value block in one pass.
 pub fn encode_nt_payload_delta(
     prev: &NtPayload,
     next: &NtPayload,
     filtered_desc: &StructureDesc,
     is_be: bool,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
-    let prev_proj = project_payload_on_desc(prev, filtered_desc, is_be);
-    let next_proj = project_payload_on_desc(next, filtered_desc, is_be);
-    let bits = compute_changed_bits(&prev_proj, &next_proj, filtered_desc)?;
-    let bitset = encode_bitset_from_flags(&bits, is_be);
+    let mut bits = vec![false; 1 + crate::spvd_decode::count_structure_fields(filtered_desc)];
     let mut values = Vec::new();
-    let mut idx = 1usize;
-    encode_values_for_bits(
-        &next_proj,
-        filtered_desc,
-        &bits,
-        &mut idx,
+    let changed = DeltaWalk {
+        sink: Some((&mut bits, &mut values)),
+        bit: 1,
         is_be,
-        &mut values,
+    }
+    .level(
+        Some(View::of_payload(prev)),
+        Some(View::of_payload(next)),
+        filtered_desc,
     );
-    Some((bitset, values))
+    changed.then(|| (encode_bitset_from_flags(&bits, is_be), values))
 }
 
 /// True if the projections of `prev` and `next` onto `filtered_desc` differ.
 ///
 /// The change detector for filtered subscriptions. Exactly equivalent to
 /// `encode_nt_payload_delta(prev, next, filtered_desc, is_be).is_some()`, but
-/// stops after the comparison instead of also building a bitset and a value
-/// block the caller discards. For an NTNDArray subscriber that discarded block
-/// is the whole image.
+/// stops at the first changed leaf instead of also building a bitset and a
+/// value block the caller discards. For an NTNDArray subscriber that discarded
+/// block is the whole image.
 ///
 /// Deliberately has **no** `prev == next` fast path: an `NtScalar` with no
 /// stored timestamp is stamped with `SystemTime::now()` on each projection, so
@@ -2641,9 +3308,16 @@ pub fn nt_payload_changed_on_desc(
     filtered_desc: &StructureDesc,
     is_be: bool,
 ) -> bool {
-    let prev_proj = project_payload_on_desc(prev, filtered_desc, is_be);
-    let next_proj = project_payload_on_desc(next, filtered_desc, is_be);
-    compute_changed_bits(&prev_proj, &next_proj, filtered_desc).is_some()
+    DeltaWalk {
+        sink: None,
+        bit: 1,
+        is_be,
+    }
+    .level(
+        Some(View::of_payload(prev)),
+        Some(View::of_payload(next)),
+        filtered_desc,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3912,7 +4586,6 @@ pub(crate) mod tests {
     }
 
     /// Reference delta computed via the OLD encode→decode round-trip
-    /// projection. The production `encode_nt_payload_delta` now uses the direct
     /// projection; this reproduces the pre-C1 behavior for differential
     /// comparison.
     fn reference_delta(
@@ -4397,5 +5070,533 @@ pub(crate) mod tests {
         };
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].0, "value");
+    }
+
+    // -----------------------------------------------------------------------
+    // Delta / projected-encode byte oracle
+    //
+    // `encode_nt_payload_delta`, `nt_payload_changed_on_desc` and the narrowed
+    // `encode_nt_payload_values_for_desc` used to run through a `DecodedValue`
+    // tree. They now walk the `NtPayload` directly. These cases pin the tree
+    // path's output, including its handling of descriptors that do not match
+    // the payload (foreign, reordered, retyped).
+    // -----------------------------------------------------------------------
+
+    struct Fnv(u64);
+
+    impl Fnv {
+        fn new() -> Self {
+            Fnv(0xcbf2_9ce4_8422_2325)
+        }
+        fn bytes(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 ^= u64::from(b);
+                self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        fn sized(&mut self, bytes: &[u8]) {
+            self.bytes(&(bytes.len() as u64).to_le_bytes());
+            self.bytes(bytes);
+        }
+    }
+
+    fn bump_scalar(v: &ScalarValue) -> ScalarValue {
+        match v {
+            ScalarValue::Bool(x) => ScalarValue::Bool(!x),
+            ScalarValue::I8(x) => ScalarValue::I8(x.wrapping_add(1)),
+            ScalarValue::I16(x) => ScalarValue::I16(x.wrapping_add(1)),
+            ScalarValue::I32(x) => ScalarValue::I32(x.wrapping_add(1)),
+            ScalarValue::I64(x) => ScalarValue::I64(x.wrapping_add(1)),
+            ScalarValue::U8(x) => ScalarValue::U8(x.wrapping_add(1)),
+            ScalarValue::U16(x) => ScalarValue::U16(x.wrapping_add(1)),
+            ScalarValue::U32(x) => ScalarValue::U32(x.wrapping_add(1)),
+            ScalarValue::U64(x) => ScalarValue::U64(x.wrapping_add(1)),
+            ScalarValue::F32(x) => ScalarValue::F32(x + 1.0),
+            ScalarValue::F64(x) => ScalarValue::F64(x + 1.0),
+            ScalarValue::Str(x) => ScalarValue::Str(format!("{x}!")),
+        }
+    }
+
+    /// Change the last element of an array (or add one to an empty array).
+    fn bump_array(v: &ScalarArrayValue) -> ScalarArrayValue {
+        fn last<T: Clone>(v: &[T], f: impl Fn(&T) -> T, fill: T) -> Vec<T> {
+            let mut out = v.to_vec();
+            match out.last_mut() {
+                Some(x) => *x = f(x),
+                None => out.push(fill),
+            }
+            out
+        }
+        match v {
+            ScalarArrayValue::Bool(a) => ScalarArrayValue::Bool(last(a, |x| !x, true)),
+            ScalarArrayValue::I8(a) => ScalarArrayValue::I8(last(a, |x| x.wrapping_add(1), 1)),
+            ScalarArrayValue::I16(a) => ScalarArrayValue::I16(last(a, |x| x.wrapping_add(1), 1)),
+            ScalarArrayValue::I32(a) => ScalarArrayValue::I32(last(a, |x| x.wrapping_add(1), 1)),
+            ScalarArrayValue::I64(a) => ScalarArrayValue::I64(last(a, |x| x.wrapping_add(1), 1)),
+            ScalarArrayValue::U8(a) => ScalarArrayValue::U8(last(a, |x| x.wrapping_add(1), 1)),
+            ScalarArrayValue::U16(a) => ScalarArrayValue::U16(last(a, |x| x.wrapping_add(1), 1)),
+            ScalarArrayValue::U32(a) => ScalarArrayValue::U32(last(a, |x| x.wrapping_add(1), 1)),
+            ScalarArrayValue::U64(a) => ScalarArrayValue::U64(last(a, |x| x.wrapping_add(1), 1)),
+            ScalarArrayValue::F32(a) => ScalarArrayValue::F32(last(a, |x| x + 1.0, 1.0)),
+            ScalarArrayValue::F64(a) => ScalarArrayValue::F64(last(a, |x| x + 1.0, 1.0)),
+            ScalarArrayValue::Str(a) => {
+                ScalarArrayValue::Str(last(a, |x| format!("{x}!"), "s".into()))
+            }
+        }
+    }
+
+    fn bump_pv_value(v: &PvValue) -> PvValue {
+        match v {
+            PvValue::Scalar(s) => PvValue::Scalar(bump_scalar(s)),
+            PvValue::ScalarArray(a) => PvValue::ScalarArray(bump_array(a)),
+            PvValue::Structure { struct_id, fields } => PvValue::Structure {
+                struct_id: struct_id.clone(),
+                fields: bump_every_third(fields),
+            },
+        }
+    }
+
+    fn bump_every_third(fields: &[(String, PvValue)]) -> Vec<(String, PvValue)> {
+        fields
+            .iter()
+            .enumerate()
+            .map(|(i, (n, v))| {
+                let changed = i % 3 == 0 || matches!(v, PvValue::Structure { .. });
+                (
+                    n.clone(),
+                    if changed { bump_pv_value(v) } else { v.clone() },
+                )
+            })
+            .collect()
+    }
+
+    /// Change the `value` data (and, for NTNDArray, its metadata arrays).
+    fn mutate_value(payload: &NtPayload) -> NtPayload {
+        match payload {
+            NtPayload::Scalar(nt) => {
+                let mut n = nt.clone();
+                n.value = bump_scalar(&n.value);
+                NtPayload::Scalar(n)
+            }
+            NtPayload::ScalarArray(nt) => {
+                let mut n = nt.clone();
+                n.value = bump_array(&n.value);
+                NtPayload::ScalarArray(n)
+            }
+            NtPayload::Table(nt) => {
+                let mut n = nt.clone();
+                if let Some(c) = n.columns.first_mut() {
+                    c.values = bump_array(&c.values);
+                }
+                NtPayload::Table(n)
+            }
+            NtPayload::NdArray(nt) => {
+                let mut n = nt.clone();
+                n.value = bump_array(&n.value);
+                if let Some(d) = n.dimension.first_mut() {
+                    d.binning += 1;
+                }
+                if let Some(a) = n.attribute.last_mut() {
+                    a.value = bump_scalar(&a.value);
+                }
+                n.codec.parameters.insert("extra".into(), "1".into());
+                NtPayload::NdArray(n)
+            }
+            NtPayload::Enum(nt) => {
+                let mut n = nt.clone();
+                n.choices.push("NEW".into());
+                NtPayload::Enum(n)
+            }
+            NtPayload::Generic { struct_id, fields } => NtPayload::Generic {
+                struct_id: struct_id.clone(),
+                fields: bump_every_third(fields),
+            },
+        }
+    }
+
+    fn retype_array(v: &ScalarArrayValue) -> ScalarArrayValue {
+        match v {
+            ScalarArrayValue::F64(a) => {
+                ScalarArrayValue::F32(a.iter().map(|x| *x as f32).collect())
+            }
+            ScalarArrayValue::Str(a) => ScalarArrayValue::Str(a.clone()),
+            other => ScalarArrayValue::F64(match other {
+                ScalarArrayValue::Bool(a) => a.iter().map(|x| *x as u8 as f64).collect(),
+                ScalarArrayValue::I8(a) => a.iter().map(|x| *x as f64).collect(),
+                ScalarArrayValue::I16(a) => a.iter().map(|x| *x as f64).collect(),
+                ScalarArrayValue::I32(a) => a.iter().map(|x| *x as f64).collect(),
+                ScalarArrayValue::I64(a) => a.iter().map(|x| *x as f64).collect(),
+                ScalarArrayValue::U8(a) => a.iter().map(|x| *x as f64).collect(),
+                ScalarArrayValue::U16(a) => a.iter().map(|x| *x as f64).collect(),
+                ScalarArrayValue::U32(a) => a.iter().map(|x| *x as f64).collect(),
+                ScalarArrayValue::U64(a) => a.iter().map(|x| *x as f64).collect(),
+                ScalarArrayValue::F32(a) => a.iter().map(|x| *x as f64).collect(),
+                ScalarArrayValue::F64(_) | ScalarArrayValue::Str(_) => unreachable!(),
+            }),
+        }
+    }
+
+    /// Change the element type of `value` while keeping its data.
+    fn retype_value(payload: &NtPayload) -> NtPayload {
+        match payload {
+            NtPayload::Scalar(nt) => {
+                let mut n = nt.clone();
+                n.value = match &n.value {
+                    ScalarValue::F64(x) => ScalarValue::I64(*x as i64),
+                    ScalarValue::Str(s) => ScalarValue::Str(s.clone()),
+                    _ => ScalarValue::F64(1.0),
+                };
+                NtPayload::Scalar(n)
+            }
+            NtPayload::ScalarArray(nt) => {
+                let mut n = nt.clone();
+                n.value = retype_array(&n.value);
+                NtPayload::ScalarArray(n)
+            }
+            NtPayload::NdArray(nt) => {
+                let mut n = nt.clone();
+                n.value = retype_array(&n.value);
+                NtPayload::NdArray(n)
+            }
+            NtPayload::Table(nt) => {
+                let mut n = nt.clone();
+                for c in &mut n.columns {
+                    c.values = retype_array(&c.values);
+                }
+                NtPayload::Table(n)
+            }
+            NtPayload::Generic { struct_id, fields } => NtPayload::Generic {
+                struct_id: struct_id.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(name, v)| {
+                        let v = match v {
+                            PvValue::ScalarArray(a) => PvValue::ScalarArray(retype_array(a)),
+                            PvValue::Scalar(_) => PvValue::Scalar(ScalarValue::F64(0.0)),
+                            s => s.clone(),
+                        };
+                        (name.clone(), v)
+                    })
+                    .collect(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// A generic payload large enough to need more than one bitset byte per
+    /// level, with nested structures and duplicate-free names.
+    fn wide_generic_sample() -> NtPayload {
+        let mut fields: Vec<(String, PvValue)> = Vec::new();
+        for i in 0..40 {
+            let v = match i % 5 {
+                0 => PvValue::Scalar(ScalarValue::I32(i)),
+                1 => PvValue::Scalar(ScalarValue::F64(i as f64 * 0.5)),
+                2 => PvValue::ScalarArray(ScalarArrayValue::F64(vec![i as f64, f64::NAN])),
+                3 => PvValue::ScalarArray(ScalarArrayValue::Str(vec![format!("s{i}")])),
+                _ => PvValue::Structure {
+                    struct_id: format!("sub{i}_t"),
+                    fields: vec![
+                        (
+                            "a".into(),
+                            PvValue::Scalar(ScalarValue::Str(format!("a{i}"))),
+                        ),
+                        (
+                            "b".into(),
+                            PvValue::ScalarArray(ScalarArrayValue::U16(vec![i as u16])),
+                        ),
+                        (
+                            "deep".into(),
+                            PvValue::Structure {
+                                struct_id: String::new(),
+                                fields: vec![(
+                                    "x".into(),
+                                    PvValue::Scalar(ScalarValue::Bool(true)),
+                                )],
+                            },
+                        ),
+                    ],
+                },
+            };
+            fields.push((format!("f{i}"), v));
+        }
+        NtPayload::Generic {
+            struct_id: "wide_t".into(),
+            fields,
+        }
+    }
+
+    /// `pinned_time_samples()` plus NaN-bearing and wide generic payloads.
+    fn delta_oracle_samples() -> Vec<NtPayload> {
+        let mut out = pinned_time_samples();
+        out.push(NtPayload::Scalar(scalar_sample(ScalarValue::F64(f64::NAN))));
+        out.push(NtPayload::ScalarArray(scalar_array_sample(
+            ScalarArrayValue::F64(vec![f64::NAN, -0.0, 1.0]),
+        )));
+        out.push(NtPayload::ScalarArray(scalar_array_sample(
+            ScalarArrayValue::F32(vec![f32::NAN, 0.0]),
+        )));
+        out.push(NtPayload::ScalarArray(scalar_array_sample(
+            ScalarArrayValue::I32(vec![]),
+        )));
+        out.push(wide_generic_sample());
+        out
+    }
+
+    /// Descriptors to project onto: the payload's own, narrowed ones, a
+    /// reordered one, and other payloads' descriptors (names and types that do
+    /// not match).
+    fn delta_oracle_descs(i: usize, samples: &[NtPayload]) -> Vec<StructureDesc> {
+        let full = nt_payload_desc(&samples[i]);
+        let mut descs = vec![full.clone()];
+        descs.push(filter_structure_desc(&full, &[full.fields[0].name.clone()]));
+        let mut tail = full.clone();
+        tail.fields.remove(0);
+        descs.push(tail);
+        let first_leaves: Vec<String> = full
+            .fields
+            .iter()
+            .map(|f| match &f.field_type {
+                FieldType::Structure(inner) if !inner.fields.is_empty() => {
+                    format!("{}.{}", f.name, inner.fields[0].name)
+                }
+                _ => f.name.clone(),
+            })
+            .collect();
+        descs.push(filter_structure_desc(&full, &first_leaves));
+        let mut reversed = full.clone();
+        reversed.fields.reverse();
+        for f in &mut reversed.fields {
+            if let FieldType::Structure(inner) = &mut f.field_type {
+                inner.fields.reverse();
+            }
+        }
+        descs.push(reversed);
+        descs.push(nt_payload_desc(&samples[(i + 1) % samples.len()]));
+        descs.push(nt_payload_desc(&samples[(i + 7) % samples.len()]));
+        descs
+    }
+
+    /// Fold every delta, change-detector and projected-encode output for
+    /// sample `i` into one digest.
+    fn delta_oracle_digest(i: usize, samples: &[NtPayload]) -> u64 {
+        let payload = &samples[i];
+        let nexts = [
+            payload.clone(),
+            pin_timestamps(mutate_payload(payload)),
+            mutate_value(payload),
+            retype_value(payload),
+        ];
+        let mut h = Fnv::new();
+        for desc in delta_oracle_descs(i, samples) {
+            for next in &nexts {
+                for is_be in [false, true] {
+                    match encode_nt_payload_delta(payload, next, &desc, is_be) {
+                        None => h.bytes(&[0]),
+                        Some((bitset, values)) => {
+                            h.bytes(&[1]);
+                            h.sized(&bitset);
+                            h.sized(&values);
+                        }
+                    }
+                    h.bytes(&[nt_payload_changed_on_desc(payload, next, &desc, is_be) as u8]);
+                    h.sized(&encode_nt_payload_values_for_desc(next, &desc, is_be));
+                }
+            }
+        }
+        h.0
+    }
+
+    /// One digest per `delta_oracle_samples()` entry, COMPUTED AT b3f0aa8 with
+    /// the `DecodedValue`-tree delta path. Never regenerate this from HEAD: it
+    /// is the byte guard the direct walk is checked against.
+    const TREE_PATH_DELTA_ORACLE: &[u64] = &[
+        0xc46ce082442da88b,
+        0x3fe679541818166b,
+        0xdea20053be94fbc1,
+        0x78cfde039c30d72f,
+        0x4d160253fc18f489,
+        0x6c15459e662cc8c1,
+        0x484cdd3eeb25c83d,
+        0x8f20640752e075fb,
+        0xdc55d4ff8137aeb7,
+        0x48dd50918cb410bb,
+        0x3e0c450e8d03d241,
+        0xbac4b50ae4816153,
+        0x6740225592796f13,
+        0x2f5a00fc816d5e5f,
+        0xd6439cdd57afcc81,
+        0xdab90fbc3ab61a15,
+        0x051dba92925c7489,
+        0xad87e5e749f38813,
+        0x18c23ac100acb0f7,
+        0x5e47b7d88e7d04f5,
+        0x677fb8fe2168c5e5,
+        0x3e1274ab7093a98b,
+        0xf6db10eb16321729,
+        0x0980b217aeee183d,
+        0xc7e190cbf84a917f,
+        0x4baad422506cd47d,
+        0x1ad9e3fba36e59ad,
+        0xe20f7a9de6401f1d,
+        0x5a537b809bf76eef,
+        0xa5124f074e06debb,
+        0x233f41c5df07d45b,
+        0x285e137ef4dbe753,
+        0x1484eacdb910f4df,
+        0xf201f73bfc6819c9,
+        0xd982fe95ada4078d,
+    ];
+
+    #[test]
+    fn delta_bytes_match_the_frozen_tree_path_oracle() {
+        let samples = delta_oracle_samples();
+        assert_eq!(
+            TREE_PATH_DELTA_ORACLE.len(),
+            samples.len(),
+            "sample set changed; the oracle no longer covers it"
+        );
+        for (i, &want) in TREE_PATH_DELTA_ORACLE.iter().enumerate() {
+            assert_eq!(delta_oracle_digest(i, &samples), want, "sample {i}");
+        }
+    }
+
+    /// The delta as the `DecodedValue`-tree path computed it.
+    fn tree_path_delta(
+        prev: &NtPayload,
+        next: &NtPayload,
+        desc: &StructureDesc,
+        is_be: bool,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let prev_proj = project_payload_on_desc(prev, desc, is_be);
+        let next_proj = project_payload_on_desc(next, desc, is_be);
+        let bits = compute_changed_bits(&prev_proj, &next_proj, desc)?;
+        let mut values = Vec::new();
+        let mut idx = 1usize;
+        encode_values_for_bits(&next_proj, desc, &bits, &mut idx, is_be, &mut values);
+        Some((encode_bitset_from_flags(&bits, is_be), values))
+    }
+
+    /// Case-by-case companion to the frozen oracle: the direct walk against
+    /// the retained tree path, so a failure names the case.
+    #[test]
+    fn direct_walk_matches_the_tree_path() {
+        let samples = delta_oracle_samples();
+        for (i, payload) in samples.iter().enumerate() {
+            let nexts = [
+                payload.clone(),
+                pin_timestamps(mutate_payload(payload)),
+                mutate_value(payload),
+                retype_value(payload),
+            ];
+            for (d, desc) in delta_oracle_descs(i, &samples).iter().enumerate() {
+                for (m, next) in nexts.iter().enumerate() {
+                    for is_be in [false, true] {
+                        let case = format!("sample {i}, desc {d}, next {m}, is_be={is_be}");
+                        let tree = tree_path_delta(payload, next, desc, is_be);
+                        assert_eq!(
+                            encode_nt_payload_delta(payload, next, desc, is_be),
+                            tree,
+                            "{case}"
+                        );
+                        assert_eq!(
+                            nt_payload_changed_on_desc(payload, next, desc, is_be),
+                            tree.is_some(),
+                            "{case}"
+                        );
+                        let decoded = nt_payload_to_decoded_for(next, Some(desc), is_be);
+                        let mut direct = Vec::new();
+                        push_view_projected(&mut direct, View::of_payload(next), desc, is_be);
+                        assert_eq!(
+                            direct,
+                            encode_decoded_projected(&decoded, desc, is_be),
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Floats compare with `==` plus NaN-equals-NaN, as `decoded_values_equal`
+    /// does: NaN payloads (of any bit pattern) and -0.0 against 0.0 are
+    /// unchanged, and a real change is still seen.
+    #[test]
+    fn delta_float_comparison_keeps_the_nan_rule() {
+        let other_nan = f64::from_bits(f64::NAN.to_bits() ^ 1);
+        assert!(other_nan.is_nan());
+        let a = NtPayload::ScalarArray(scalar_array_sample(ScalarArrayValue::F64(vec![
+            f64::NAN,
+            0.0,
+            1.0,
+        ])));
+        let b = NtPayload::ScalarArray(scalar_array_sample(ScalarArrayValue::F64(vec![
+            other_nan, -0.0, 1.0,
+        ])));
+        let c = NtPayload::ScalarArray(scalar_array_sample(ScalarArrayValue::F64(vec![
+            f64::NAN,
+            0.0,
+            2.0,
+        ])));
+        let desc = nt_payload_desc(&a);
+        assert_eq!(encode_nt_payload_delta(&a, &b, &desc, false), None);
+        assert!(!nt_payload_changed_on_desc(&a, &b, &desc, false));
+        let (bitset, values) = encode_nt_payload_delta(&a, &c, &desc, false).expect("changed");
+        // Untrimmed: one byte per 8 descriptor bits, trailing zero bytes kept.
+        assert_eq!(bitset, vec![3, 0b0000_0010, 0, 0], "only `value` (bit 1)");
+        let value_only = filter_structure_desc(&desc, &["value".into()]);
+        assert_eq!(
+            values,
+            encode_nt_payload_values_for_desc(&c, &value_only, false)
+        );
+
+        let x = NtPayload::Scalar(scalar_sample(ScalarValue::F32(f32::NAN)));
+        let y = NtPayload::Scalar(scalar_sample(ScalarValue::F32(f32::NAN)));
+        assert_eq!(
+            encode_nt_payload_delta(&x, &y, &nt_payload_desc(&x), true),
+            None
+        );
+    }
+
+    /// One changed element of a large array resends the whole array (the
+    /// leaf), and nothing else.
+    #[test]
+    fn delta_of_one_changed_element_writes_the_whole_array_once() {
+        let prev: Vec<f64> = (0..100_000).map(f64::from).collect();
+        let mut next = prev.clone();
+        next[50_000] = -1.0;
+        let prev = NtPayload::ScalarArray(scalar_array_sample(ScalarArrayValue::F64(prev)));
+        let next = NtPayload::ScalarArray(scalar_array_sample(ScalarArrayValue::F64(next)));
+        let full = nt_payload_desc(&prev);
+        let value_only = filter_structure_desc(&full, &["value".into()]);
+        for is_be in [false, true] {
+            let expected = encode_nt_payload_values_for_desc(&next, &value_only, is_be);
+            assert_eq!(expected.len(), 5 + 8 * 100_000);
+            for desc in [&full, &value_only] {
+                let (_, values) =
+                    encode_nt_payload_delta(&prev, &next, desc, is_be).expect("changed");
+                assert_eq!(values, expected, "is_be={is_be}");
+            }
+        }
+    }
+
+    /// A level that repeats a field name (the types allow it) used to resolve
+    /// every repeat to the first field, so a change to a later one was missed
+    /// and the first one's bytes were sent in its place. Walking in order pairs
+    /// each descriptor field with its own payload field.
+    #[test]
+    fn delta_pairs_repeated_names_by_position() {
+        let fields = |second: i32| NtPayload::Generic {
+            struct_id: String::new(),
+            fields: vec![
+                ("x".into(), PvValue::Scalar(ScalarValue::I32(1))),
+                ("x".into(), PvValue::Scalar(ScalarValue::I32(second))),
+            ],
+        };
+        let (prev, next) = (fields(2), fields(3));
+        let desc = nt_payload_desc(&prev);
+        let (bitset, values) =
+            encode_nt_payload_delta(&prev, &next, &desc, false).expect("changed");
+        assert_eq!(bitset, vec![1, 0b0000_0100], "only the second `x` (bit 2)");
+        assert_eq!(values, 3i32.to_le_bytes());
     }
 }
