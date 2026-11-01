@@ -131,6 +131,9 @@ jobs:
       # bundles libpcap into the wheel; macOS links the system libpcap.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
+        env:
+          CARGO_NET_RETRY: 10
+          CARGO_HTTP_TIMEOUT: 120
         with:
           working-directory: spvirit-tools
           target: ${{ matrix.platform.target }}
