@@ -53,7 +53,7 @@ Then:
 2. Skim [EPICS in 10 minutes](../01-fundamentals/epics-in-10-minutes.md) if
    EPICS/PVAccess is new to you, then chapter 01 here.
 
-## Orientation in 60 seconds
+## Orientation
 
 Nine crates, strict layering: `types` (pure data) → `codec` (wire format) →
 `client`/`server` → `ioc` (record processing, server-only) and `gateway`
@@ -79,8 +79,8 @@ selection, has since landed; chapter 08 records how.
 - Protocol questions: the [pvAccess Protocol Specification](https://docs.epics-controls.org/en/latest/pv-access/protocol.html)
   and [pvxs](https://epics-base.github.io/pvxs/) (the reference
   implementation this project most closely mirrors).
-- "Why is this code like this": the commit history is the archaeology —
-  commits are per-task and carry the reasoning in their messages.
+- "Why is this code like this": read the commit history. Commits are
+  per-task and carry the reasoning in their messages.
 - Wire debugging: `spsearch` (search traffic TUI), `spget --raw` /
   `spmonitor --raw` (hex dumps), `spget_compare` (byte-compare against
   captures), and `spvirit-scry` (passive packet capture, built from

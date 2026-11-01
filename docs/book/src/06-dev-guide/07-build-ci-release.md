@@ -16,11 +16,13 @@ maturin build --release                        # wheel → target/wheels/
 
 Facts a new team should know:
 
-- All crates are **edition 2024**; there is **no `rust-toolchain.toml`, no
-  MSRV declaration, no committed `.cargo/config.toml`** (it's gitignored for
-  local patch overrides), and **no clippy/rustfmt config** — CI uses
-  `dtolnay/rust-toolchain@stable` and formatting is by convention
-  (`cargo fmt` before committing; history shows manual `style:` commits).
+- All crates are edition 2024. The repo has none of the following:
+  - a `rust-toolchain.toml` or MSRV declaration (CI uses
+    `dtolnay/rust-toolchain@stable`);
+  - a committed `.cargo/config.toml` (it is gitignored for local patch
+    overrides);
+  - a clippy or rustfmt config. Formatting is by convention (`cargo fmt`
+    before committing; history shows manual `style:` commits).
 - `[workspace.dependencies]` covers only the internal `spvirit-*` crates.
   External deps (tokio, serde_json, ...) are declared per crate, so their
   versions can drift. Check them when you bump a shared dep like tokio.
@@ -39,15 +41,15 @@ Runs on push and PR to `main`, two jobs on ubuntu-latest:
    spvirit-py embedded-interpreter tests (`cargo test -p spvirit-py
    --no-default-features --features test-embed`, after installing
    `libpython3-dev`), the `docs_verify` suite, and `mdbook build docs/book`.
-2. **p4p-interop** — installs `p4p` (Python 3.12), builds, runs the p4p
+2. **p4p-interop**: installs `p4p` (Python 3.12), builds, runs the p4p
    provider matrix (`interop_tool_matrix -- p4p_provider_matrix`) with
    `PVA_TEST_P4P=1` etc.
 
 `.github/workflows/pages.yml` builds the book and deploys it to GitHub Pages
 on pushes to `main` that touch `docs/**`, `README.md` or the workflow itself.
 
-**There is no clippy or rustfmt gate in CI.** If you want one, add it — but
-be aware the codebase has never been held to a CI lint bar.
+There is no clippy or rustfmt gate in CI. The codebase has never been held
+to a CI lint bar, so expect a backlog of warnings if you add one.
 
 ## Releases
 
@@ -61,9 +63,9 @@ Two independent release tracks:
   `[workspace.dependencies]`, so a release is a one-line version bump plus
   those six pins.
 - Published to crates.io **manually via `cargo-release`** (the `chore:
-  Release` commits) — there is **no workflow for this**; no release-plz.
+  Release` commits). There is no workflow for this and no release-plz.
 - History includes a version-numbering hiccup (`chore: bump versions past the
-  unrecorded 0.1.15 / 0.1.12 releases`) — when bumping, keep crate versions
+  unrecorded 0.1.15 / 0.1.12 releases`). When bumping, keep crate versions
   and path-dep pins consistent, and verify what's actually on crates.io
   before choosing the next number.
 
@@ -78,11 +80,13 @@ Two independent release tracks:
   matrix (linux x86_64 + aarch64, windows x64, macOS x86_64 + aarch64) plus
   an sdist, and publishes to PyPI via **trusted publishing (OIDC,
   environment `pypi`)** — only on the tag push, not on manual dispatch.
-- The same tag also builds `spvirit-tools` wheels (the thirteen default-build
-  CLI binaries packaged as wheel scripts, `bindings = "bin"`) on the same
-  five-platform matrix, plus an sdist. A step checks each tools wheel's
-  contents (`spvirit-tools/scripts/verify_wheel.py`: every default tool
-  present, and neither `spload` nor the `scry` binaries). `spvirit-tools` is
+- The same tag also builds `spvirit-tools` wheels (fifteen CLI binaries
+  packaged as wheel scripts, `bindings = "bin"`: the thirteen default-build
+  tools plus `spvirit-scry` and `spvirit-scry_influx_collector`, since the
+  wheel build enables the `scry` feature) on the same five-platform matrix,
+  plus an sdist. A step checks each tools wheel's contents
+  (`spvirit-tools/scripts/verify_wheel.py`: every expected tool present, and
+  no `spload`). `spvirit-tools` is
   published **before** `spvirit`, because `spvirit` depends on it by exact
   version.
 - PyPI package names: `spvirit` and `spvirit-tools`.
@@ -107,10 +111,10 @@ Two independent release tracks:
 - Planning workflow: substantial features get a design spec and a task-by-task
   TDD plan (checkbox steps, exact commands, per-task commit messages) before
   any code is written. Those working documents stay local and are not
-  committed — the durable record is `docs/book/src/06-dev-guide/`, the commit history, and
+  committed. The durable record is `docs/book/src/06-dev-guide/`, the commit history, and
   the tests.
-- README has a **GenAI Usage Log** table documenting which parts were
-  AI-assisted — keep it updated (transparency requirement).
+- README has a GenAI Usage Log table documenting which parts were
+  AI-assisted. Keep it updated (transparency requirement).
 - License: BSD-3-Clause, ISIS Neutron and Muon Source.
 - No CONTRIBUTING.md yet; contribution guidance is informal ("PRs welcome").
 
@@ -123,5 +127,6 @@ Two independent release tracks:
   `.venv\Scripts\...` paths); CI is Linux. Watch for path and
   socket-semantics differences (the client deliberately treats SO_REUSEADDR
   as Unix-only).
-- Interop test matrix validated against EPICS Base, p4p/pvxs, and
-  PVAccessJava.
+- Interop tests exist for EPICS Base, p4p/pvxs and PVAccessJava, but CI
+  runs only the p4p provider matrix. The EPICS Base and PVAccessJava suites
+  are env-gated and run only when enabled locally (see chapter 06).

@@ -12,8 +12,8 @@ first. This page is the orientation map: what the module contains, and where
 the full reference lives.
 
 The complete API reference is
-[`spvirit-py/README.md`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md)
-— around a thousand lines covering every class, method and keyword argument.
+[`spvirit-py/README.md`](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md),
+around a thousand lines covering every class, method and keyword argument.
 It is not duplicated here; this page tells you which part of it you want.
 Every object also carries a docstring, so `help(spvirit.ai)` and
 `help(spvirit.Server)` work at the interpreter prompt.
@@ -23,9 +23,11 @@ For the **Rust** side there is generated reference documentation on docs.rs:
 [codec](https://docs.rs/spvirit-codec/latest/spvirit_codec/) ·
 [client](https://docs.rs/spvirit-client/latest/spvirit_client/) ·
 [server](https://docs.rs/spvirit-server/latest/spvirit_server/) ·
+[ioc](https://docs.rs/spvirit-ioc/latest/spvirit_ioc/) ·
 [tools](https://docs.rs/spvirit-tools/latest/spvirit_tools/) ·
 [calc](https://docs.rs/spvirit-calc/latest/spvirit_calc/). The Python
-module is a thin layer over `spvirit-client` and `spvirit-server`, so when a
+module is a thin layer over `spvirit-client`, `spvirit-server` and
+`spvirit-ioc`, so when a
 Python docstring is terse the Rust page for the same call is often the
 fuller answer. See the [crate map](crate-map.md).
 
@@ -50,8 +52,8 @@ usual platforms; building from source needs a Rust toolchain. See
 | Low level | `spvirit.lowlevel`, `spvirit.codec` | Raw frames and wire encoding, for proxies and analysers. |
 
 Monitor callbacks (`Client.monitor`, `Client.subscribe`,
-`lowlevel.Channel.monitor`) receive a `MonitorUpdate` — `.value` plus `.changed`/`.overrun` (dotted field
-paths) and `.has_overrun` — rather than the bare value.
+`lowlevel.Channel.monitor`) receive a `MonitorUpdate` (`.value` plus `.changed`/`.overrun` (dotted field
+paths) and `.has_overrun`) rather than the bare value.
 
 ## Constructors
 
@@ -62,7 +64,7 @@ ai  ao  bi  bo  string_in  string_out  longin  longout
 mbbi  mbbo  waveform  aai  aao  calc  pv  scalar
 ```
 
-`pv` and `scalar` are the generic forms — you pass the type explicitly rather
+`pv` and `scalar` are the generic forms: you pass the type explicitly rather
 than getting it from the constructor name. The full type-coverage table (which
 NT scalar types each constructor accepts) is in the
 [README's *NT scalar type coverage* section](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md#nt-scalar-type-coverage).
@@ -81,20 +83,21 @@ Most operations come in both flavours: `set`/`set_async`, `get`/`get_async`,
 they block, so they are safe to call from a thread. The README's
 *Threading and async model* section is the one to read before you mix them.
 
-## The rule that catches everyone
+## Attach callbacks before constructing the server
 
 **Attach callbacks before constructing the server.** `on_put` and `scan`
 must be registered on a handle while it is still unbound, and `calc` PVs must
 be created before it. Constructing `spvirit.Server(pvs=[...])` binds the
-handles; after that a late `on_put`/`scan` is ignored (only a log
-warning). The same rule holds in Rust, but Python makes it easier to trip over
-because the server object is mutable and the failure is silent. See
+handles; after that a late `on_put`/`scan` is ignored with only a log
+warning, and no exception is raised. The same rule holds in Rust, but Python
+makes it easier to trip over because the server object is mutable and
+nothing fails at the call site. See
 [Reacting to writes](../03-progressive/reacting-to-writes.md) and
 [Troubleshooting](troubleshooting.md).
 
 ## Examples
 
-`spvirit-py/examples/` holds around forty runnable scripts — one concept
+`spvirit-py/examples/` holds around forty runnable scripts, one concept
 each. The ones the book's chapters use directly:
 
 | Script | Chapter |
@@ -111,7 +114,7 @@ each. The ones the book's chapters use directly:
 | `demo_table.py` | [Tables and images](../03-progressive/tables-and-images.md) |
 
 For [Custom data sources](../03-progressive/sources.md) the Python route is
-the `demo_source_*.py` family — `sensor`, `async`, `multi`, `passthrough`,
+the `demo_source_*.py` family: `sensor`, `async`, `multi`, `passthrough`,
 `aggregate`, `rpc`, `wildcard`. The rest of the directory — gateways, stress
 tests, wire inspectors, the 10 000-PV farm — is listed in the README's
 *Examples* section.

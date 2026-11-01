@@ -1,10 +1,10 @@
-# spvirit-client & spvirit-tools — Client Library and CLI Tools
+# spvirit-client & spvirit-tools: Client Library and CLI Tools
 
 ## spvirit-client
 
 Library-only crate (~9,800 LOC). Deps: `spvirit-types`, `spvirit-codec`,
 `tokio`, `serde_json`, `dns-lookup`, `get_if_addrs`, `socket2`, `chrono`.
-**No TLS crate — TLS is the biggest known gap.**
+There is no TLS crate; TLS support is the biggest known gap.
 
 | File | ~LOC | Purpose |
 |---|---|---|
@@ -29,8 +29,8 @@ first success wins, rest aborted.
 
 - Targets: explicit `--search-addr` overrides everything; otherwise
   `EPICS_PVA_ADDR_LIST` entries + auto-broadcast targets (per-interface
-  directed broadcast + IPv4 multicast `224.0.0.128` + IPv6 `ff02::42:1` —
-  multicast added because Docker overlay networks may block broadcast).
+  directed broadcast + IPv4 multicast `224.0.0.128` + IPv6 `ff02::42:1`;
+  multicast was added because Docker overlay networks may block broadcast).
 - Retransmit schedule: 100/500/1000/2000 ms within the overall timeout.
 - **Ephemeral source port is intentional** (search.rs:414): binding the client
   to 5076 with SO_REUSEPORT loops packets back to the sender on Linux. Do not
@@ -54,8 +54,9 @@ first success wins, rest aborted.
   and PVD bytes and the introspection.
 - **PUT**: defaults to field `["value"]`; value is `impl Into<serde_json::Value>`,
   encoded by `put_encode.rs` (which does support nested structures, unions,
-  variants, structure-arrays — the README's "structured put payloads"
-  caveat means *not fully surfaced/battle-tested*, not absent).
+  variants, structure-arrays. The README's "structured put payloads"
+  caveat means the high-level API does not fully expose them and they have
+  little test coverage, not that they are absent).
   `open_put_channel` returns a `PvaChannel` for streaming puts (reuses
   introspection, echo keepalive after 10 s idle, background reader aborted on
   Drop).
@@ -70,8 +71,8 @@ first success wins, rest aborted.
   INIT body *and* sets bit 0x80 on the INIT subcmd; ACKs at queueSize/2, and the
   ACK-credit accounting runs on *every* consumed update (decode success or
   failure) so a decode error can never leak a credit and stall the stream.
-  **Critical invariant** (pva_client.rs:1102–1107): never set 0x80 on the START
-  message — on non-INIT monitor messages 0x80 means "ACK with u32 body", and
+  **Invariant** (pva_client.rs:1102–1107): never set 0x80 on the START
+  message. On non-INIT monitor messages 0x80 means "ACK with u32 body", and
   getting this wrong makes pvxs/Java drop the TCP connection.
 - **INFO**: GET_FIELD (cmd 0x11) → `StructureDesc`.
 
@@ -93,9 +94,9 @@ read by the client — ports come from builder/CLI defaults (5075/5076).
 
 - **Epoch disambiguation heuristic** (format.rs:96): `secondsPastEpoch` is
   interpreted as UNIX or EPICS-1990 epoch by picking whichever is closer to
-  "now" — fragile for historical or far-future timestamps.
+  "now". This is fragile for historical or far-future timestamps.
 - pvlist's server-GET strategy scrapes ASCII candidates from raw bytes with a
-  denylist filter — heuristic, can false-positive.
+  denylist filter. It is a heuristic and can give false positives.
 - `spinfo` works around servers that crash on an empty GET_FIELD field name
   by retrying without the wire field, then falling back to pvget.
 - There is no reconnect for monitors or `PvaChannel`. Short `PvaClient`
@@ -113,8 +114,8 @@ capture, pcap; adds `spvirit-scry` and `spvirit-scry_influx_collector`) and
 `load` (adds `spload`); `tui` pulls ratatui 0.29 + color-eyre. Source files are named `spvirit_*.rs` but the installed binaries
 are the `sp*` names (see the `[[bin]]` table in Cargo.toml).
 
-All client tools share `CommonClientArgs` (src/spvirit_client/cli.rs:25) —
-timeout/server/search-addr/name-server/ports/debug/authnz/fields flags — via
+All client tools share `CommonClientArgs` (src/spvirit_client/cli.rs:25)
+(timeout/server/search-addr/name-server/ports/debug/authnz/fields flags) via
 the `argparse` crate, and `block_on` a manually built tokio runtime.
 
 | Binary | LOC | What it is / what it exercises |
@@ -130,7 +131,7 @@ the `argparse` crate, and `block_on` a manually built tokio runtime.
 | `spsearch` | 1091 | ratatui TUI: **passive** search-traffic sniffer; decodes frames directly with `PvaPacket` |
 | `spserver` | 4201 | Full PVA server binary: `.db` loading, hot-reload, beacons, MDEL, `__pvlist`/discovery modes; record logic comes from the spvirit-server crate |
 | `spdodeca` | 1163 | Self-contained single-PV server streaming a rotating dodecahedron as NTNDArray. It has its own accept/search loop and does not use `PvaServer` or the record store, but it borrows `ConnWriter` and the search-reply helpers from spvirit-server. |
-| `sptable` | 1324 (2266 with anim/parse/pattern) | ratatui TUI spreadsheet IOC. Rows are dynamically added PVs: 12 scalar types, arrays, **NTEnum**, **NTTable**. Modal `a` wizard **plus a vim-style `:` command line** (`:add/:set/:del/:mv/:ro/:rw/:anim/:stop/:source`, shorthands, `:help`). Bash-style **pattern expansion** (`RING:BPM{01..99}`, products) for bulk ops. **Animation** generators (sine/ramp/triangle/square/noise/walk/count, enum `cycle`) driven by a server-side tick (`--rate`, default 10 Hz). |
+| `sptable` | 1324 (2266 with anim/parse/pattern) | ratatui TUI spreadsheet IOC. Rows are dynamically added PVs (12 scalar types, arrays, NTEnum, NTTable). Modal `a` wizard and a vim-style `:` command line; brace pattern expansion for bulk ops; animation generators on a server-side tick (`--rate`, default 10 Hz). See the reference below. |
 | `spgateway` | 436 | PVAccess gateway binary over spvirit-gateway (p4p-compatible JSON config, `--metrics`) |
 | `spload` | 493 | Gateway load/benchmark driver: `spload drive` (PUT counters at a rate) / `spload watch` (M×N monitors, coalescing/latency); only with `--features load` |
 | `spvirit-scry`, `spvirit-scry_influx_collector` | 368 / 302 | Packet-capture PVA analyser + InfluxDB collector; only with `--features scry` (pcap) |
@@ -155,7 +156,7 @@ Mirrors `help_text()` in `spvirit_table/main.rs` — keep in sync.
 
 `write`/`w` and `source`/`so` are inverses: `:w <file>` writes a `rate`
 line, one `add` per PV (values read back so edits and table contents
-survive), and one `anim` per animated PV — all in row order; `:source
+survive), and one `anim` per animated PV, all in row order; `:source
 <file>` replays it to rebuild the session.
 
 Typespec aliases: `bool int8 int16 int32(int) int64(long) uint8 uint16
@@ -167,9 +168,9 @@ Pattern forms (bash-brace style, expanded before every name verb):
 (zero-padded), `{A,B,C}` (list), and products like `S{1..4}:{A,B}`.
 
 Generators: `sine ramp triangle square noise walk count` for scalars,
-`cycle` for enums — e.g. `:anim RING:BPM{01..99} noise min=-1 max=1`. Each
+`cycle` for enums, e.g. `:anim RING:BPM{01..99} noise min=-1 max=1`. Each
 generator only accepts the params it uses (`:help` lists them with defaults);
-a param it doesn't use is rejected — e.g. `sine` takes `amp offset period
+a param it doesn't use is rejected. For example, `sine` takes `amp offset period
 phase` (range is `amp`±`offset`), not `min`/`max`.
 
 Value forms: enum accepts a choice name or index (`OFF`, `ON`, `TRIP`, or

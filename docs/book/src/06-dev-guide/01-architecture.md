@@ -46,7 +46,7 @@ apart), is the mermaid diagram on the [Crate map](../05-reference/crate-map.md).
   process infrastructure. Depends on the server (and codec/types), not the
   client.
 - **spvirit-gateway** — the PVAccess proxy engine behind the `spgateway`
-  binary: it consumes both the client (to reach upstream servers) and the
+  binary. It consumes both the client (to reach upstream servers) and the
   server (to face downstream clients). Chapter 04 (`spgateway`).
 - **spvirit-tools** — 13 CLI binaries in a default build (`spget`, `spput`,
   `spmonitor`, `spexplore`, `spserver`, `spgateway`, …), plus `spload` behind
@@ -68,16 +68,16 @@ modules:
    byte, payload length), ~20 command types (Search, CreateChannel, the Op
    family for GET/PUT/MONITOR/RPC, Beacon, …).
 2. **PVD data layer** (`spvd_decode.rs` / `spvd_encode.rs`): self-describing
-   structured data — type descriptors (`FieldDesc`/`StructureDesc`) with a
+   structured data made of type descriptors (`FieldDesc`/`StructureDesc`) with a
    per-connection introspection cache, values (`DecodedValue`), and bitsets
    for delta updates.
 
-Key asymmetry to internalize: **NT types flow into the encoder; the decoder
-emits `DecodedValue`**, a separate tree. Consumers (server, client, py) each
-convert `DecodedValue` to what they need — there is no shared reverse
+The two directions are asymmetric: **NT types flow into the encoder; the
+decoder emits `DecodedValue`**, a separate tree. Consumers (server, client, py)
+each convert `DecodedValue` to what they need; there is no shared reverse
 mapping.
 
-## Server data flow (the picture to keep in your head)
+## Server data flow
 
 ```
                      ┌────────────── PvaServer::run ──────────────┐
@@ -97,16 +97,17 @@ mapping.
 
 Two write entry points converge on the store: wire PUTs (via the handler →
 registry → `Source::put`) and internal writes (scan callbacks, `Pv::set`,
-link evaluation → `store.set_value`). A third, for sources whose values
-change upstream (gateway, group), is a per-PV pump task that drains
-`Source::subscribe` — started at monitor init for any source that does not
-self-notify (`Source::pushes_own_updates`). All three end at
-`MonitorRegistry::notify_monitors`, which builds a self-contained,
-fully-filtered frame per subscriber (the stored delta baseline serves only as
-a change detector, never as wire output) and hands the bytes to each
-connection's `ConnWriter` — a two-lane flat-combining writer that coalesces
-monitor frames on a latest-per-ioid lane while control replies take a
-lossless FIFO lane.
+link evaluation → `store.set_value`). A third path serves sources whose values
+change upstream (gateway, group): a per-PV pump task that drains
+`Source::subscribe`, started at monitor init for any source that does not
+self-notify (`Source::pushes_own_updates`).
+
+All three end at `MonitorRegistry::notify_monitors`, which builds a
+self-contained, fully-filtered frame per subscriber. The stored delta baseline
+serves only as a change detector, never as wire output. The bytes go to each
+connection's `ConnWriter`, a two-lane flat-combining writer: monitor frames are
+coalesced on a latest-per-ioid lane, and control replies take a lossless FIFO
+lane.
 
 ## Two API levels, everywhere
 
@@ -130,18 +131,18 @@ should be sugar over the NT level, not a parallel implementation.
    table/NDArray timestamp encodes as epoch 0, which the Archiver Appliance
    rejects. The store stamps missing (`None`/epoch-0) timestamps on entry,
    and every mutation path stamps update time; keep it that way.
-2. **The introspection registry is per-connection state** — decoders must be
+2. **The introspection registry is per-connection state**: decoders must be
    reused across a connection's packets (0xFE type refs). The same lifetime
    rule applies to `SegmentReassembler`: one per connection, because it holds
    the message currently being reassembled.
-3. **First-claim-wins source priority** — `claim` must be cheap and
+3. **First-claim-wins source priority**: `claim` must be cheap and
    idempotent because `get`/`put`/`subscribe` re-claim.
 4. **on_put (post-apply, can't reject) vs PUT validator (pre-apply, can
    reject)** are different mechanisms; the Python handle-level `Pv.on_put`
    maps to the validator, and the builder-level `ServerBuilder.on_put(name,
    cb)` maps to the post-apply callback and cannot reject.
-5. **Monitor bitset ordering is spec-exact by default** — changed bitset,
-   data, overrun bitset — and every workspace call site uses it. The old
+5. **Monitor bitset ordering is spec-exact by default** (changed bitset,
+   data, overrun bitset), and every workspace call site uses it. The old
    try-every-layout scoring heuristic still exists behind
    `DecodeMode::Lenient` for mid-stream captures of implementations that
    disagree; the packet-capture tool `spvirit-scry` uses it

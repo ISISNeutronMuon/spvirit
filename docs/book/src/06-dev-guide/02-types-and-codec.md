@@ -1,8 +1,9 @@
-# spvirit-types & spvirit-codec — Foundation Crates
+# spvirit-types & spvirit-codec
 
 These two crates are the foundation of the workspace: `spvirit-types` is the pure
-data model, `spvirit-codec` is the wire format. Everything else (`-client`,
-`-server`, `-tools`, `-py`) depends on both.
+data model, `spvirit-codec` is the wire format. Every other crate except
+`spvirit-calc` (`-client`, `-server`, `-ioc`, `-gateway`, `-tools`, `-py`)
+depends directly on both; `spvirit-calc` depends on neither.
 
 ```
 spvirit-types  (NtPayload, NtScalar, ScalarValue, PvValue, …)   ← zero dependencies
@@ -11,7 +12,7 @@ spvirit-types  (NtPayload, NtScalar, ScalarValue, PvValue, …)   ← zero depen
 spvirit-codec  (PVA wire codec + PVD codec + segment reassembly)
       │             re-exports spvirit_types at crate root (lib.rs:46)
       ▼
-spvirit-client / spvirit-server / spvirit-tools / spvirit-py
+spvirit-client / spvirit-server / spvirit-ioc / spvirit-gateway / spvirit-tools / spvirit-py
 ```
 
 Deps: `spvirit-types` has none; `spvirit-codec` uses only `spvirit-types`,
@@ -28,22 +29,22 @@ validation. No I/O, no wire format.
 | `ScalarValue` | lib.rs:9 | Tagged union of the twelve NTScalar value types (Bool, I8–I64, U8–U64, F32, F64, Str) |
 | `ScalarArrayValue` | lib.rs:25 | Array counterpart; `len()`, `element_size_bytes()`, `type_label()` at lib.rs:40–99 |
 | `NtAlarm` / `NtTimeStamp` / `NtDisplay` / `NtControl` | lib.rs:102–130 | Normative sub-structures |
-| `NtScalar` | lib.rs:132 | The big one: value + flattened alarm/display/control/valueAlarm/units + **optional `time_stamp`** (lib.rs:167) |
+| `NtScalar` | lib.rs:132 | The largest type: value + flattened alarm/display/control/valueAlarm/units + **optional `time_stamp`** (lib.rs:167) |
 | `NtScalarArray` | lib.rs:345 | Array payload |
 | `NtTable` / `NtTableColumn` | lib.rs:366–405 | Table; `validate()` checks column-length equality |
 | `NtNdArray` + `NdCodec`/`NdDimension`/`NtAttribute` | lib.rs:408–523 | Image/detector model; `validate()` checks dims × element size vs `uncompressed_size` |
 | `NtEnum` | lib.rs:543 | `index: i32` + `choices: Vec<String>`; `selected()` |
 | `PvValue` | lib.rs:579 | **Recursive** value tree (Scalar/ScalarArray/Structure) so this crate can represent arbitrary structures without depending on the codec |
-| `NtPayload` | lib.rs:589 | Top-level union: `Scalar/ScalarArray/Table/NdArray/Enum/Generic{struct_id, fields}` — the primary hand-off type between server/client and codec |
+| `NtPayload` | lib.rs:589 | Top-level union: `Scalar/ScalarArray/Table/NdArray/Enum/Generic{struct_id, fields}`; the primary hand-off type between server/client and codec |
 
 `NtScalar::update_alarm_from_value` (lib.rs:281) computes alarm severity from
-the HIHI/HIGH/LOW/LOLO limits — this is the server's alarm engine, but note it
+the HIHI/HIGH/LOW/LOLO limits. This is the server's alarm engine, but it
 lives here in the types crate.
 
 ### Footgun: `NtScalar.time_stamp` is `Option`
 
 `None` means the encoder stamps `SystemTime::now()` **at encode time**
-(non-deterministic — it breaks monitor delta detection of `secondsPastEpoch`
+(non-deterministic: it breaks monitor delta detection of `secondsPastEpoch`
 and makes tests flaky). `Some` is stable. Documented at lib.rs:161–167. The
 server stamps timestamps on every mutation and at store-entry time
 (`stamp_missing_timestamps`, `spvirit-server/src/types.rs:457`) precisely
@@ -75,20 +76,20 @@ Encode entry point: `encode_header` (spvirit_encode.rs:98); each
 `encode_*_response/request` builds a payload then prepends the header.
 
 **Byte order** is decided per-packet by header flag bit 7. Every integer
-read/write branches on `is_be` — there is no abstraction layer, the
+read/write branches on `is_be`. There is no abstraction layer; the
 `if is_be {…} else {…}` pattern is repeated everywhere. Byte order lives
 with each consumer's connection state (for example the server's
 per-connection `is_be`, or `spvirit-tools`' scry `ConnectionState.is_be`,
 which defaults to little-endian); the codec itself is stateless about it.
 
 **Sizes/strings** use the PVA varint: 1 byte < 254, `0xFE` + u32 above, `0xFF`
-= null. **Decode is now consolidated:** `error::decode_size_prefixed`
+= null. For decode, `error::decode_size_prefixed`
 (error.rs:116) and `error::decode_string_prefixed` (error.rs:153) are the
 single source of truth. Both `epics_decode::decode_size`/`decode_string`
 (epics_decode.rs:335/346) and `PvdDecoder::decode_size`/`decode_string`
-(spvd_decode.rs:493/502) are thin wrappers over them — the split that remains
+(spvd_decode.rs:493/502) are thin wrappers over them. The one remaining split
 is the deliberate `Utf8Policy` one: framing decodes `Lossy` (passive observer),
-structured pvData values decode `Strict` (a non-UTF-8 value is a real error).
+and structured pvData values decode `Strict` (a non-UTF-8 value is a real error).
 **Encode has one public size encoder**
 (`spvirit_encode::encode_size_pva` at spvirit_encode.rs:16, which delegates to
 `encode_common::encode_size` at encode_common.rs:5). `spvd_encode` keeps
@@ -106,7 +107,7 @@ builders (`nt_scalar_desc`:275, `nt_scalar_array_desc`:759, `nt_table_desc`:820,
 
 **The introspection registry is stateful.** `0xFD` = "full type with id"
 (parse + cache under a u16 key), `0xFE` = "only id" (look up cached type).
-The registry lives inside a `RefCell` in `PvdDecoder` (spvd_decode.rs:432) —
+The registry lives inside a `RefCell` in `PvdDecoder` (spvd_decode.rs:432), so
 **a single `PvdDecoder` instance must be reused across a connection's packets**
 or `0xFE` references won't resolve. This is easy to get wrong.
 
@@ -122,18 +123,18 @@ budget is rejected with `DecodeError::Malformed` (no separate variant).
 **Bitsets (monitor deltas).** Bit 0 = whole structure; field bits start at
 bit 1; nested structs consume a contiguous bit block (`count_structure_fields`,
 spvd_decode.rs:1457, flattens the count). Decoding is **spec-exact by
-default** — changed bitset, data, overrun bitset — via
+default** (changed bitset, data, overrun bitset) via
 `PvdDecoder::decode_monitor_update` (monitor.rs:125), which returns a
 `MonitorUpdate` (monitor.rs:20): the decoded value, both raw bitsets, the
 bytes consumed, and the bit-indexed field paths captured at decode time
-(`changed_paths`:69, `overrun_paths`:75, `overrun_fields`:62 — the last takes
+(`changed_paths`:69, `overrun_paths`:75, and `overrun_fields`:62, which takes
 the descriptor explicitly). `PvaOpPayload::decode_with_field_desc`
 (epics_decode.rs:1540) selects the policy with a `DecodeMode`
 (epics_decode.rs:1579); every server and client call site passes
 `DecodeMode::Strict`. `DecodeMode::Lenient` retains the old
-try-every-layout scoring heuristic — `decode_monitor_update_lenient`
-(monitor.rs:163) reports the winning `MonitorLayout` (monitor.rs:42) — for
-mid-stream captures and peers that disagree on the ordering. It is public
+try-every-layout scoring heuristic for mid-stream captures and peers that
+disagree on the ordering; `decode_monitor_update_lenient` (monitor.rs:163)
+reports the winning `MonitorLayout` (monitor.rs:42). It is public
 API; in the workspace only `spvirit-scry`'s packet processor selects it
 (`spvirit-tools/src/scry/utils/packet_processor.rs`). The
 single-bitset decoders `decode_structure_with_bitset` (spvd_decode.rs:1240)
@@ -157,7 +158,7 @@ over `FieldType`. Every array count is checked before anything is allocated
 ceiling is `DecodeError::ArrayTooLarge`, and a count that cannot fit in the
 bytes that remain is `DecodeError::CountExceedsBuffer`. The limit is checked
 first, so a corrupt length that violates both is reported as `ArrayTooLarge`.
-**Nothing is silently truncated.** `DecodeLimits` (spvd_decode.rs:23) defaults
+Oversized arrays are rejected, never truncated. `DecodeLimits` (spvd_decode.rs:23) defaults
 to 4 000 000 elements for scalar arrays and 65 536 each for string, structure,
 union and variant arrays; override per decoder with `PvdDecoder::with_limits`
 (spvd_decode.rs:473) and read them back with `limits()`.
@@ -165,13 +166,14 @@ union and variant arrays; override per decoder with `PvdDecoder::with_limits`
 **Segmentation is reassembled by the codec.** The flags byte carries
 first/middle/last segment bits, decoded into `PvaControlFlags`
 (epics_decode.rs:52). `SegmentReassembler` (segment.rs:34) turns a run of them
-back into one message: `push` (segment.rs:77) takes an 8-byte header plus its
-payload and answers `SegmentOutcome::Pending`, `::Complete` — the first
-segment's header with the segment bits cleared and `payload_length` rewritten
-to the concatenated total — or `::Control`, since control frames are legal
-between the segments of one message and leave the in-progress state alone. It
-is sans-io and holds one message at a time, so it needs **one instance per
-connection** — the same lifetime rule as `PvdDecoder`. The ceiling is
+back into one message. `push` (segment.rs:77) takes an 8-byte header plus its
+payload and answers `SegmentOutcome::Pending`, `::Complete` or `::Control`.
+`::Complete` carries the first segment's header with the segment bits cleared
+and `payload_length` rewritten to the concatenated total. `::Control` is
+returned because control frames are legal between the segments of one message;
+they leave the in-progress state alone. The reassembler is sans-io and holds
+one message at a time, so it needs **one instance per connection**, the same
+lifetime rule as `PvdDecoder`. The ceiling is
 `DEFAULT_MAX_MESSAGE_BYTES` (segment.rs:7, 256 MiB), overridable with
 `with_max_bytes` (segment.rs:50). `spvirit-client`'s `read_packet`
 (transport.rs:400) and the server handler (handler.rs:1568) both drive one.
@@ -181,24 +183,24 @@ oversized outgoing message into segments; the server sends one large frame
 regardless of size. Roadmap item 6 in
 [Current State and Roadmap](08-current-state.md).
 
-### Data-flow asymmetry (important)
+### Data-flow asymmetry
 
 NT types flow **into** the encoder (`spvd_encode` takes `spvirit-types`
 structs → wire bytes + `StructureDesc`). The decoder emits `DecodedValue`, a
-separate codec-local tree — **there is no `DecodedValue → NtPayload` reverse
+separate codec-local tree. **There is no `DecodedValue → NtPayload` reverse
 mapping in these crates**; each consumer interprets `DecodedValue` itself
 (see `spvirit-server/src/convert.rs`, `spvirit-py/src/convert.rs`).
 
 ### Known issues & sharp edges
 
 - `PvaHeader::new` (epics_decode.rs:124) and `PvaPacket::new`
-  (epics_decode.rs:195) panic on input shorter than the 8-byte header — the
+  (epics_decode.rs:195) panic on input shorter than the 8-byte header, the
   former via `.expect(...)`. Use the fallible `PvaHeader::try_new`
   (epics_decode.rs:128) / `PvaPacket::try_new` (epics_decode.rs:205), which
   return `None`, on any network-ingress path where the length is
   attacker-controlled (e.g. raw UDP datagrams).
 - `StructureArray` null elements decode to an empty-struct placeholder, not a
-  true null — lossy.
+  true null, which is lossy.
 - `decoded_to_scalar_value`-style truthy-first conversions live in consumers;
   see the server chapter for the bool-coercion bug that every `PvScalar` impl
   works around.

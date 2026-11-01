@@ -7,7 +7,7 @@
 <!-- verify:end -->
 
 A p4p-compatible PVAccess gateway. It reads a p4p-schema JSON configuration
-(with an additive `x-spvirit` superset for spvirit-only features — metrics,
+(with an additive `x-spvirit` superset for spvirit-only features: metrics,
 audit, hot reload, negative-search caching, rate limiting) and proxies
 PVAccess traffic between an upstream "client" network and a downstream
 "server" network.
@@ -55,8 +55,7 @@ $ spgateway gateway.json
 client pool and one PVA server per `servers[]` entry, then serves until it
 receives Ctrl-C. Each server resolves names across its configured `clients`
 (in order), reads with `getholdoff` staleness suppression, writes, and
-fans out monitors — proxying between the upstream "client" network and the
-downstream "server" network. Requires the `client` and `server` features.
+fans out monitors.
 
 A normal start is not silent: the gateway installs a tracing subscriber at
 `INFO` and logs a one-line-per-server startup banner (which port each server
@@ -99,15 +98,12 @@ the field defaults to `true`. The multicast join is best-effort: if it fails
 the server logs a warning and continues serving unicast/broadcast searches.
 
 Only the UDP search socket is affected. The TCP listener still binds the
-configured `interface` IP, and the address advertised in search responses
-remains the `interface` IP — parity changes *which searches are heard*, not
-where connections are made or what address is handed back.
+configured `interface` IP, and search responses still advertise the
+`interface` IP.
 
 The `--discovery-parity` / `--no-discovery-parity` CLI flags override this
-field for **every** server, taking precedence over the JSON value. This is
-convenient for toggling the behavior across a whole config without editing it
-(for example, `--no-discovery-parity` to restore interface-pinned binding on
-all servers).
+field for **every** server, so you can toggle it across a whole config without
+editing the JSON.
 
 ## Status
 
@@ -121,14 +117,16 @@ The `x-spvirit.metrics` block (`{enabled, listen, path}`, defaults
 failure stops the gateway.
 
 Not yet enforced in M1 (parsed but inert, or deferred to a later milestone):
-the `x-spvirit` audit / hot-reload / rate-limit blocks, RPC
-forwarding to upstream servers (the local `asTest` status RPC below is
-answered by the gateway itself, not proxied), and a true upstream `pvlist`
-fan-out for downstream `splist` (`names()` reports only PVs this gateway has
-already claimed), and the per-server `acf-client` field (parsed and
-referentially validated against `clients[]`, but not yet consulted at
-runtime). Ctrl-C shutdown is immediate rather than a graceful drain.
-These and the representation limits (array-of-structure, `union`/`any`,
+
+- the `x-spvirit` audit / hot-reload / rate-limit blocks;
+- RPC forwarding to upstream servers (the local `asTest` status RPC below is
+  answered by the gateway itself, not proxied);
+- a true upstream `pvlist` fan-out for downstream `splist` (`names()` reports
+  only PVs this gateway has already claimed);
+- the per-server `acf-client` field (parsed and referentially validated
+  against `clients[]`, but not yet consulted at runtime).
+
+Ctrl-C shutdown is immediate rather than a graceful drain. These and the representation limits (array-of-structure, `union`/`any`,
 non-finite floats, multi-token `addrlist`) are collected on the
 [Known gaps](../05-reference/known-gaps.md) page.
 
@@ -141,20 +139,20 @@ inputs, evaluated in a fixed precedence:
 |---|---|---|---|
 | 1 (highest) | Read-only mode | top-level `readOnly` | Denies every `put` and RPC. Never affects `get`/`subscribe`. |
 | 2 | `pvlist` | per-server `pvlist` (path to a p4p-format ALLOW/DENY/ALIAS file) | First matching rule wins. `DENY` hides the PV from every operation, including reads. `ALLOW`/`ALIAS` bind an ASG/ASL for step 3. An `ALIAS` rule also rewrites the name the gateway proxies upstream. |
-| 3 (lowest) | `access` | per-server `access` (path to a `.acf` file: `UAG`/`HAG`/`ASG` blocks) | Grants or denies `put`/RPC by matching the caller's user against `UAG` and host against `HAG`, gated by the ASG/ASL bound in step 2 (or `DEFAULT`/`0` if no `pvlist` is configured). **Never consulted for `get`/`subscribe`** — only a `pvlist DENY` can hide a read. |
+| 3 (lowest) | `access` | per-server `access` (path to a `.acf` file: `UAG`/`HAG`/`ASG` blocks) | Grants or denies `put`/RPC by matching the caller's user against `UAG` and host against `HAG`, gated by the ASG/ASL bound in step 2 (or `DEFAULT`/`0` if no `pvlist` is configured). **Never consulted for `get`/`subscribe`**; only a `pvlist DENY` can hide a read. |
 
 If no `pvlist` is configured for a server, every PV is eligible (step 2 is
 skipped entirely) and falls through to the ACF step under the implicit
 `DEFAULT` ASG at ASL `0`. If a `pvlist` *is* configured, a PV that matches no
-rule in it is **denied** — first-match-wins with no fallthrough default is a
-fail-closed design, matching p4p/pvagw.
+rule in it is **denied**: first-match-wins with no fallthrough default fails
+closed, matching p4p/pvagw.
 
 `.acf` support is a documented subset: `UAG`, `HAG`, and `ASG`/`RULE` blocks
 parse; `CALC` guard expressions in a `RULE` are a hard parse error rather than
 being silently ignored, so a config that depends on `CALC` fails `-T`
 validation instead of serving with a weaker rule than the operator intended.
 A duplicate `UAG`, `HAG`, or `ASG` name is also a hard parse error, so a
-second definition can never silently shadow the first. `READ`/`GET`,
+second definition can never shadow the first. `READ`/`GET`,
 `WRITE`/`PUT`, and `RPC` are the recognised `RULE` operations; any other
 op keyword is rejected. Referenced but undefined `UAG`/`HAG` names, and an
 `ASG` absent from the file, fail closed (they grant nothing) rather than
@@ -164,15 +162,12 @@ erroring.
 
 `validate()` (and therefore `spgateway -T`) loads and parses every
 configured `pvlist` and `access` file up front. A missing file, a file that
-cannot be read, or one that fails to parse is a validation error — the
-gateway refuses to start rather than falling back to "no restriction". There
-is no way to configure a `pvlist`/`access` path that is silently ignored if
-broken.
+cannot be read, or one that fails to parse is a validation error: the
+gateway refuses to start rather than falling back to "no restriction".
 
 `clients[].provider` is also validated: spvirit only speaks PVAccess
 upstream, so any client whose `provider` is not `"pva"` (the default) fails
-validation rather than being silently accepted and then never resolving
-anything.
+validation rather than being accepted and then never resolving anything.
 
 ```console
 $ spgateway -T gateway.json
@@ -185,14 +180,14 @@ A bidirectional gateway (or two gateway instances on the same host) must
 never resolve a PV search back into one of its own downstream servers. Each
 server's `LoopGuard` bans:
 
-- **Own-server sockets** — every `servers[].interface` IP (or, for a server
+- **Own-server sockets**: every `servers[].interface` IP (or, for a server
   with no `interface`, every local interface address the process can
-  enumerate — the `0.0.0.0` backstop) paired with that server's
+  enumerate, the `0.0.0.0` backstop) paired with that server's
   `serverport`. This is socket-specific: a real upstream IOC sharing the
   gateway's IP but a different port still resolves normally.
-- **`ignoreaddr` hosts** — an operator-supplied list of hostnames/IPs,
+- **`ignoreaddr` hosts**: an operator-supplied list of hostnames/IPs,
   forward-resolved to IPs and banned on *every* port.
-- **The gateway's own server GUIDs** — generated up front at startup for
+- **The gateway's own server GUIDs**: generated up front at startup for
   every `servers[]` entry, before any client connects. A search response
   carrying one of these GUIDs is treated as a self-reference and rejected
   regardless of which address it claims to come from. This closes the gap a
@@ -204,43 +199,44 @@ server's `LoopGuard` bans:
 
 Setting a server's `statusprefix` (e.g. `"gw:status:"`) serves 15
 introspection PVs under that prefix, gated through the same `AccessControl`
-as the data plane:
+as the data plane.
 
 The shapes match the p4p gateway's status PVs (not plain scalars): `clients`
 and `cache` are `NTScalarArray` string lists, `refs` and the bandwidth PVs are
 `NTTable`s, and `asTest` returns p4p's `epics:p2p/Permission:1.0` structure.
 Live PVs post a fresh monitor frame whenever their underlying value changes
 (the monitor pump suppresses byte-identical frames, so a constant value posts
-once and then stays quiet — matching p4p's post-on-change).
+once and then stays quiet, matching p4p's post-on-change). The table lists
+all 15:
 
 | Group | PVs | Shape / Notes |
 |---|---|---|
-| Live | `clients`, `cache` | `NTScalarArray` (string list). `cache` is the live list of upstream channels held in the monitor cache — it updates as monitors come and go. `clients` is the live list of connected downstream peers, one entry per connection: `user@ip` when the client identified itself, else the bare peer IP, sorted. |
+| Live | `clients`, `cache` | `NTScalarArray` (string list). `cache` is the live list of upstream channels held in the monitor cache, and it updates as monitors come and go. `clients` is the live list of connected downstream peers, one entry per connection: `user@ip` when the client identified itself, else the bare peer IP, sorted. |
 | Live | `refs` | `NTTable` with columns `type`/`count`/`delta` (labels `Type`/`Count`/`Delta`), matching p4p's `RefAdapter`. No object-refcount collector exists in M1, so the rows are empty (correct shape; data follow-up). |
-| Live | `stats` | `epics:p2p/Stats:1.0` structure of cache-size counters, matching p4p's `statsType` (six `NTScalar('L')` ulong fields: `ccacheSize`, `mcacheSize`, `gcacheSize`, `banHostSize`, `banPVSize`, `banHostPVSize`). `mcacheSize` is live (the active upstream-monitor count); the other five are `0` — spvirit has no channel/GC caches or ban lists in M1 (correct shape; data follow-up). |
-| Live (writable) | `poke` | `NTScalar`. The one writable status PV: a `put` bumps an internal generation counter, and `poke`'s own value reports it — useful for confirming the status source is alive. |
+| Live | `stats` | `epics:p2p/Stats:1.0` structure of cache-size counters, matching p4p's `statsType` (six `NTScalar('L')` ulong fields: `ccacheSize`, `mcacheSize`, `gcacheSize`, `banHostSize`, `banPVSize`, `banHostPVSize`). `mcacheSize` is live (the active upstream-monitor count); the other five are `0` because spvirit has no channel/GC caches or ban lists in M1 (correct shape; data follow-up). |
+| Live (writable) | `poke` | `NTScalar`. The one writable status PV: a `put` bumps an internal generation counter, and `poke`'s own value reports it, which is useful for confirming the status source is alive. |
 | Live | `ds:bypv:rx/tx`, `ds:byhost:rx/tx`, `us:bypv:rx/tx`, `us:byhost:rx/tx` | `NTTable`s matching p4p's bandwidth tables (`bypv` -> `PV`/rate; `us:byhost` -> `Server`/rate; `ds:byhost` -> `Account`/`Client`/rate; the rate column is labelled `TX (B/s)`/`RX (B/s)`). Rows are per-second rates, recomputed once a second by the gateway's bandwidth sampler, and the table's timeStamp is the sample time. `ds:bypv:rx` counts PUT frames only (an approximation). |
-| Static + RPC | `threads` | Gettable/subscribable static `NTScalar('s')` whose value is the constant string `"RPC only"`, matching p4p's `SharedPV(nt=NTScalar('s'), initial='RPC only')`. It **also** responds to RPC, which returns a shape-correct best-effort thread summary (available-parallelism plus a note that an OS-level stack dump is not collected and that work runs on tokio async tasks). As in p4p, the get/subscribe value never changes — the richer detail is available only via RPC. |
-| RPC | `asTest` | Diagnostic: evaluates `put`/`rpc` access for a `{pv, user, host}` argument struct against this server's `AccessControl`, without touching any upstream. Returns p4p's `epics:p2p/Permission:1.0` structure (`pv`, `account`, `peer`, plus a nested `permission` sub-structure of `put`/`rpc`/`uncached`/`audit` booleans). `roles`/`asg`/`asl` are present for shape parity but empty/zero — spvirit's `AccessControl` does not model them yet. |
+| Static + RPC | `threads` | Gettable/subscribable static `NTScalar('s')` whose value is the constant string `"RPC only"`, matching p4p's `SharedPV(nt=NTScalar('s'), initial='RPC only')`. It **also** responds to RPC, which returns a shape-correct best-effort thread summary (available-parallelism plus a note that an OS-level stack dump is not collected and that work runs on tokio async tasks). As in p4p, the get/subscribe value never changes; the richer detail is available only via RPC. |
+| RPC | `asTest` | Diagnostic: evaluates `put`/`rpc` access for a `{pv, user, host}` argument struct against this server's `AccessControl`, without touching any upstream. Returns p4p's `epics:p2p/Permission:1.0` structure (`pv`, `account`, `peer`, plus a nested `permission` sub-structure of `put`/`rpc`/`uncached`/`audit` booleans). `roles`/`asg`/`asl` are present for shape parity but empty/zero, because spvirit's `AccessControl` does not model them yet. |
 
 ## Trust boundary
 
 The connecting client supplies its own `user` and `host` identity in the
 PVAccess `ca` connection-validation credentials, and the gateway decodes
-them as-is — nothing about that exchange authenticates the claim.
+them as-is; nothing about that exchange authenticates the claim.
 
 For `host`, the gateway does **not** trust the client's word: `pvlist
 FROM`/ACF `HAG` matching is always evaluated against the TCP socket's actual
 peer-IP address, never against the client-asserted `host` string in the `ca`
 credentials. That asserted `host` is decoded and available for diagnostics
-(e.g. `asTest`), but it is advisory only and never feeds an access decision
-— trusting it would let a client claim a trusted hostname it isn't actually
+(e.g. `asTest`), but it is advisory only and never feeds an access decision.
+Trusting it would let a client claim a trusted hostname it isn't actually
 connecting from and bypass host-based rules.
 
 For `user`, the gateway matches p4p/pvagw's long-standing posture: the
 `ca`-asserted user is trusted as-is for `UAG` matching, with no independent
-authentication. `UAG` is therefore authorization, not authentication —
-operators who need real user authentication should treat this like any
+authentication. `UAG` is therefore authorization, not authentication.
+Operators who need real user authentication should treat this like any
 other unauthenticated network boundary, since M1 has no mechanism (TLS
 client certs, Kerberos, etc.) to bind the declared identity to the
 transport.

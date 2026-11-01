@@ -23,8 +23,7 @@ The shared client flags apply ([see the index](index.md)).
 payload as hex (`raw_pva:` / `raw_pvd:` lines), and `--json` prints the
 result as JSON.
 
-`-F`/`--fields` is the one worth knowing: it narrows the field request
-sent to the server, so `-F value` fetches the value without the alarm,
+`-F`/`--fields` narrows the field request sent to the server, so `-F value` fetches the value without the alarm,
 timestamp, and display blocks.
 
 ## Output
@@ -57,7 +56,8 @@ however many there are. A 1024-point waveform is one very long line.
 
 ## Gotchas
 
-**The printed value is formatted, not raw.** Small doubles collapse:
+**The printed value goes through a display formatter.** Small doubles
+collapse:
 
 ```console
 $ spget VAC:SETPOINT     # the record holds 5e-7
@@ -81,8 +81,9 @@ $ spget --json VAC:SETPOINT
 otherwise read the PV from a client library rather than a CLI.
 
 **Search failure looks like a timeout.** If nothing answers, you get
-`Timeout("search response")` — not "PV not found". No server on the
-network can distinguish the two, so neither can the client. Check the PV
+`Timeout("search response")` rather than "PV not found". A PVA server
+answers a search only for names it serves and sends nothing for the rest,
+so the client cannot tell a wrong name from a missing server. Check the PV
 name, then `splist`, then `--server`.
 
 ## See also

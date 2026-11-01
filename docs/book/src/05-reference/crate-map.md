@@ -67,12 +67,12 @@ the codec and the type vocabulary underneath it.
 The remaining crate, `spvirit-calc`
 ([docs.rs](https://docs.rs/spvirit-calc/latest/spvirit_calc/)), implements
 the EPICS CALC expression language. It is a workspace member and is published
-alongside the rest, but nothing in the diagram above depends on it — it stands
-alone, and you add it explicitly if you want it.
+alongside the rest, but nothing in the diagram above depends on it; add it
+explicitly if you want it.
 
 This book is the tutorial; the docs.rs pages are the exhaustive per-item
 reference. They are generated from the same source tree and versioned with
-each release, so `latest` always matches the newest published version.
+each release.
 
 ## Versions
 
@@ -94,8 +94,7 @@ ship on PyPI as `spvirit-tools`, and `spvirit` pins them by exact version.
 | `load` | no | `spload`, the internal load driver for the `loadtest/` harness (not in the pip wheel) |
 
 The first three are on by default. A build with `--no-default-features` produces
-**no binaries at all** — a fact worth knowing before you spend ten minutes
-wondering where they went. See
+**no binaries at all**; enable the features for the tools you want. See
 [Installation](../02-getting-started/install.md).
 
 `spvirit-types`, `spvirit-codec`, `spvirit-client`, `spvirit-server`,

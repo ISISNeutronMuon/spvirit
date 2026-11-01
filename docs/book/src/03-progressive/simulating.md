@@ -8,7 +8,7 @@
 
 ## What you'll build
 
-PVs that change on their own — a periodic **scan**, and **computed** PVs
+PVs that change on their own: a periodic **scan**, and **computed** PVs
 that recalculate whenever their inputs move. Together these are most of
 what a test double needs.
 
@@ -49,11 +49,11 @@ handle side, which is the same idea with `f64` types filled in for you.
 
 ## What to notice
 
-**Scan and calc fail differently, and neither one shouts.**
+**Scan and calc fail differently, and neither raises an error to the client.**
 
 | | On a callback exception |
 |---|---|
-| `scan` | logs the error, re-posts the **last value the scan produced** (or the type default — `0.0`/`False`/`0`/`""` — if it has never produced one) |
+| `scan` | logs the error, re-posts the **last value the scan produced** (or the type default, `0.0`/`False`/`0`/`""`, if it has never produced one) |
 | `calc` | logs the error, posts **`0.0`** |
 
 So a `calc` that starts throwing pins its PV at zero, which looks exactly
@@ -142,7 +142,7 @@ SIM:TEMPERATURE 21.89275
 SIM:TEMPERATURE 2026-08-06 09:25:30.028 22.347997
 ```
 
-Ten updates a second, forever, with no client asking for them. The
+Ten updates a second, whether or not a client is connected. The
 timestamp is reprinted only when the wall-clock second rolls over.
 
 ## Next

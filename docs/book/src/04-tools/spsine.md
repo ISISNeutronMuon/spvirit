@@ -37,9 +37,8 @@ $ spget DEMO:SETPOINT
 DEMO:SETPOINT 2026-08-04 10:40:21.801 29.993539
 ```
 
-It prints nothing. Silence is success — watch the PV with
-[`spmonitor`](spmonitor.md) in another terminal if you want to see it
-move.
+It prints nothing when it succeeds. To see the PV move, watch it with
+[`spmonitor`](spmonitor.md) in another terminal.
 
 ## Gotchas
 
@@ -50,8 +49,8 @@ something that does not look like one.
 **Each write is a full PUT.** `spsine` sends one PUT per sample
 (`Channel::put` on a persistent channel), so each sample triggers any
 server-side `on_put` callback. At
-`--rate 100` that is a hundred callbacks a second — which is precisely
-what makes this useful for load testing, and a nuisance if you forgot.
+`--rate 100` that is a hundred callbacks a second. That is useful for load
+testing, but check what your callbacks do before you start it.
 
 **It writes; it does not serve.** If nothing answers the search you get a
 timeout. To *generate* a moving PV rather than drive an existing one, use

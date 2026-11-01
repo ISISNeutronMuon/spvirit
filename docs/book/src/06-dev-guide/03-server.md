@@ -1,7 +1,7 @@
 # spvirit-server — Server Architecture
 
 The server crate provides `.db` parsing, the `Source` provider abstraction,
-the PVAccess protocol runtime, and the ergonomic typed-handle (`Pv<T>`) layer.
+the PVAccess protocol runtime, and the typed-handle (`Pv<T>`) layer.
 It is the largest and most active crate.
 
 ## Module map
@@ -22,7 +22,7 @@ All paths under `spvirit-server/src/`.
 | `monitor.rs` | 2893 | `MonitorRegistry`: per-PV subscriber lists, the per-connection `ConnWriter` map, `build_monitor_frame` (pure, self-contained frames), pipeline credit accounting, subscribe-only pump management |
 | `record_fields.rs` | 731 | QSRV-style field access: serves `<pv>.<FIELD>` and `<pv>.<FIELD>$` as read-only channels; dbCommon defaults table |
 | `pvstore.rs` | 1414 | The **`Source` trait** + `StoreSource` + `PvInfo` + `SourceRegistry` |
-| `conn_writer.rs` | 512 | `ConnWriter`: the per-connection two-lane flat-combining writer (coalescing monitor lane + FIFO lossless control lane) that replaced the old mpsc-plus-writer-task tail |
+| `conn_writer.rs` | 512 | `ConnWriter`: the per-connection two-lane flat-combining writer (coalescing monitor lane + FIFO lossless control lane) |
 | `field_provider.rs` | 372 | `RecordFieldProvider`: the value-level field-access seam shared by `SimplePvStore` and `spvirit-ioc` (`field_descriptor` resolves type without a read) |
 | `convert.rs` | 437 | `DecodedValue` → `ScalarValue`/`ScalarArrayValue` conversions |
 | `server.rs` | 418 | Orchestration: `run_pva_server_with_registry` binds TCP/UDP/beacon and joins the tasks |
@@ -38,21 +38,21 @@ All paths under `spvirit-server/src/`.
 `Source` (pvstore.rs:111) is the object-safe provider abstraction (modeled on
 pvxs's provider registry). Methods return boxed futures: `claim` (returns
 `PvInfo{descriptor, writable}` or `None`), `get`, `put` (returns the
-`(name, payload)` pairs the handler should publish. `IocSource` returns every
-record its pass changed; `SimplePvStore` returns only the target and notifies
-link outputs itself), `subscribe` (returns `mpsc::Receiver<NtPayload>`),
+`(name, payload)` pairs the handler should publish: `IocSource` returns every
+record its pass changed, while `SimplePvStore` returns only the target and
+notifies link outputs itself), `subscribe` (returns `mpsc::Receiver<NtPayload>`),
 `rpc` (default `Err`), `names`, plus `try_claim` (the non-blocking
 search-path answer, default `Unknown`) and `pushes_own_updates` (default
 `false`). `StoreSource` (pvstore.rs:237) extends `Source` for fixed record
 stores (`record_names`, `set_monitor_registry`, `start_scanning`, …).
 
-`SourceRegistry` (pvstore.rs:323) is a priority-ordered list — the **first
-source to claim a name wins**. Note that `get`/`put`/`subscribe` each call
-`claim` again before dispatching, so `claim` must be cheap and idempotent.
+`SourceRegistry` (pvstore.rs:323) is a priority-ordered list: the **first
+source to claim a name wins**. `get`/`put`/`subscribe` each call `claim`
+again before dispatching, so `claim` must be cheap and idempotent.
 
-Registration in `PvaServer::serve_after_start_hooks` (pva_server.rs:1121–1222),
-which `run()` calls after the start hooks. `builtin` and `ioc` are registered
-with `add_store`:
+Registration happens in `PvaServer::serve_after_start_hooks`
+(pva_server.rs:1121–1222), which `run()` calls after the start hooks.
+`builtin` and `ioc` are registered with `add_store`:
 
 | Order | Label | Source | Claims |
 |---|---|---|---|
@@ -69,23 +69,23 @@ value). Key paths:
 
 - **Public writers** `set_value` / `set_array_value` / `put_nt` bypass
   on_put/validators; each calls an `_inner` writer then `evaluate_links`.
-- **`Source::put`** (simple_store.rs:479) — the wire PUT path: run the PUT
-  validator (cloned out of the lock first, so user callbacks can't hold the
-  lock across `.await`), apply via `RecordInstance::apply_put`
+- **`Source::put`** (simple_store.rs:479) is the wire PUT path. It runs the
+  PUT validator (cloned out of the lock first, so user callbacks can't hold
+  the lock across `.await`), then applies via `RecordInstance::apply_put`
   (apply.rs:569). It refuses a value the record's type cannot represent (and
   an out-of-range enum index, or any Generic PUT) with `Err` naming the
   reason (record untouched, not restamped; the client gets an error status
   and `on_put` does not run). Otherwise it restamps and reports
-  `value_changed` / `client_stamped`, then MDEL-gate the post (or force it when the PUT was
-  client-stamped and the value did not change), spawn the `on_put` callback
-  as a detached task, evaluate links.
+  `value_changed` / `client_stamped`, MDEL-gates the post (or forces it when
+  the PUT was client-stamped and the value did not change), spawns the
+  `on_put` callback as a detached task, and evaluates links.
 - **Links/calc**: `evaluate_links` (simple_store.rs:391) is a BFS over
   `LinkDef`s whose inputs include the changed PV, with a `visited` set for
   cycle detection; uses `set_value_inner` to avoid re-triggering.
 - **Descriptors**: `descriptor_for_payload` / `descriptor_for_record`
   (simple_store.rs:680/690) delegate every payload shape, NTScalar included,
-  to `spvirit_codec::spvd_encode::nt_payload_desc`. A local copy used to
-  drift from the codec and broke string PUTs.
+  to `spvirit_codec::spvd_encode::nt_payload_desc`, so the store and the
+  codec cannot disagree on a descriptor.
 
 ## Protocol runtime
 
@@ -102,8 +102,7 @@ TCP-accept and beacon tasks and joins them.
   `infer_udp_response_ip` (connect-a-socket trick) → zeros.
 - **TCP connection** (`handle_connection`, handler.rs:1501): a per-connection
   reader whose write half is wrapped in a [`ConnWriter`](#monitor-delivery-the-connwriter)
-  (handler.rs:1515) — the flat-combining two-lane writer that replaced the old
-  dedicated writer task draining an `mpsc::channel<Vec<u8>>(128)`. Handshake:
+  (handler.rs:1515), the flat-combining two-lane writer. Handshake:
   SET_BYTE_ORDER → CONNECTION_VALIDATION → client's validation →
   CONNECTION_VALIDATED. Then the command dispatch (CreateChannel; Op 10 GET /
   11 PUT / 12 PUT_GET / 13 MONITOR / 20 RPC; DestroyChannel; DestroyRequest;
@@ -126,7 +125,7 @@ TCP-accept and beacon tasks and joins them.
    counter and calls `registry.notify_monitors` per change.
 4. `MonitorRegistry::notify_monitors` (monitor.rs:594) builds one frame per
    subscriber via the pure `build_monitor_frame` (monitor.rs:477) — first
-   frame full (possibly field-filtered); a **filtered** subscriber's later
+   frame full (possibly field-filtered). A **filtered** subscriber's later
    frames are self-contained *full filtered* frames (not sparse deltas, so a
    coalesced drop cannot corrupt the client's value), no-op-suppressed when the
    filtered view is unchanged; an **unfiltered** subscriber gets full-or-
@@ -138,14 +137,13 @@ TCP-accept and beacon tasks and joins them.
    coalescing monitor lane (latest-per-ioid, lossy under load); a **pipelined**
    monitor goes on the FIFO lossless control lane so no charged credit is ever
    coalesced away. Whichever task wins the flusher election drains the lanes
-   (control first) to the socket — in the common case inline on the producing
-   task, with no cross-thread wakeup.
+   (control first) to the socket, in the common case inline on the producing
+   task with no cross-thread wakeup.
 
 **Internal writes** (scan, `Pv::set`, links) enter at step 2 via
 `store.set_value` and notify monitors *from inside the store* (the store holds
 the registry via `set_registry`). So there are two notification origins:
-protocol PUTs notify from the handler, internal writes from the store. Note
-the beacon change counter is only bumped on the protocol-PUT path. With an
+protocol PUTs notify from the handler, internal writes from the store. With an
 `.ioc()` engine there is another origin: scan-thread passes publish through
 the engine's notify-drain task (`IocSource::start_scanning`) into the same
 `notify_monitors`.
@@ -160,9 +158,9 @@ drains the channel into `notify_monitors`. The pump is shared across every
 subscriber of that PV and retired (`retire_pump_if_idle`) when the last one
 goes away; it holds a `Weak` reference to the registry to avoid a cycle.
 Self-notifying sources (`SimplePvStore`, `IocSource`, `PySourceAdapter`) return
-`true` and are skipped, so their updates are never delivered twice. Without this
-pump a monitor through the gateway received only its initial snapshot and then
-nothing.
+`true` and are skipped, so their updates are never delivered twice. The pump is
+what delivers updates after the initial snapshot to a monitor on a
+subscribe-only PV.
 
 ### Concurrency summary
 
@@ -171,16 +169,15 @@ connection, one per `.scan()`, detached `on_put` tasks, one per
 group-subscription fan-in, one monitor pump per subscribe-only PV under
 monitor, and, with an `.ioc()` engine, its notify-drain task. The engine's
 scan lists run on OS threads, one per distinct `SCAN` period (at most 64),
-stopped and joined at server shutdown. Note there is **no** dedicated per-connection writer task any more:
-the `ConnWriter` flat-combines, so socket writes happen inline on whichever
-task deposited the frame and won the flusher election. Locks: store `pvs`
+stopped and joined at server shutdown. There is **no** per-connection writer
+task: the `ConnWriter` flat-combines, so socket writes happen inline on
+whichever task deposited the frame and won the flusher election. Locks: store `pvs`
 (`RwLock`), monitor registry (`Mutex`), source registry (`RwLock`); each
 `ConnWriter` guards its coalescing state with a **std `Mutex`** (never held
 across `.await`) and its socket write half with an async `Mutex`; each `Pv`
 handle's shared state is a **std `Mutex`** held only briefly, never across
-`.await`. Channels: per-subscriber NtPayload (64) — the store's
-`Source::subscribe` stream a monitor pump drains. The old per-connection
-outbound `mpsc(128)` is gone, subsumed by the `ConnWriter`.
+`.await`. Channels: per-subscriber NtPayload (64), the store's
+`Source::subscribe` stream that a monitor pump drains.
 
 ## Monitor delivery: the `ConnWriter`
 
@@ -215,24 +212,28 @@ safety: if the flusher future is dropped mid-`write_all` (its task cancelled),
 the guard hands the election to a spawned continuation so pending bytes are
 never stranded and no depositor is wedged behind a stale `flushing == true`.
 
-**Frame building is pure.** `MonitorRegistry::build_monitor_frame` (monitor.rs:477)
+### Frame building
+
+`MonitorRegistry::build_monitor_frame` (monitor.rs:477) is pure: it
 takes only a `MonitorSub` and an `NtPayload` and returns `Option<Vec<u8>>`:
 `Some(bytes)` when there is something to send, `None` for a no-op (a duplicate
 under the subscriber's field view). A `None` **does not consume pipeline
 credit** and does not advance the delta baseline. Because the monitor lane may
 drop intermediate frames, every subsequent filtered frame is a *self-contained
-full filtered* frame, not a sparse delta — a dropped self-contained frame is
+full filtered* frame, not a sparse delta. A dropped self-contained frame is
 harmless, whereas a dropped delta would silently corrupt the client's value.
 
-**Pipelined flow control is lossless.** A `MonitorSub` (state.rs) carries per-sub
+### Pipelined flow control
+
+Pipelined flow control is lossless. A `MonitorSub` (state.rs) carries per-sub
 `nfree`, `last_snapshot`, `filtered_desc` and `pipeline_enabled`. Pipelined
 subscribers do credit-based flow control, so every charged frame must arrive;
 `route_monitor_frame` (monitor.rs:679) sends their frames on the lossless
-**control** lane, never the coalescing monitor lane — coalescing one away would
+**control** lane, never the coalescing monitor lane. Coalescing one away would
 spend a credit the client never receives and drift its window until it stalls.
 The client-supplied window is capped server-side at `MAX_PIPELINE_WINDOW = 4096`
-(handler.rs:49) at three points: monitor init, ACK refill, and the registry's
-`update_monitor_subscription` gate — so a stalled pipelined client cannot grow
+(handler.rs:49) at three points (monitor init, ACK refill, and the registry's
+`update_monitor_subscription` gate), so a stalled pipelined client cannot grow
 the lossless lane without bound.
 
 Pump retirement is **cooperative** (a `oneshot` shutdown signal, not `abort`):
@@ -308,32 +309,32 @@ RwLock<HashMap<String, Vec<EventHandler>>>`, an `mpsc::channel` of capacity
 `DISPATCH_QUEUE_CAPACITY` (1024), and `AtomicU64` counters for drops
 (`dropped_count`) and handler panics (`failed_count`).
 
-- **`EventSink`** (events.rs:40) is an async trait — `fn on_event(&self,
-  event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>` — awaited
+- **`EventSink`** (events.rs:40) is an async trait (`fn on_event(&self,
+  event: &str) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>`) awaited
   inline by `Events::post`, in registration order, before any handler is
   queued. It is a boxed future rather than a plain `fn` for the same reason
   `EventHandler` is: every store mutation is `async`, and `post` is reachable
   from inside the dispatcher on a `current_thread` runtime, where
   `Handle::block_on` panics, `block_in_place` panics, and
-  `futures::executor::block_on` deadlocks on the store's tokio `RwLock` — so
-  a sync signature could not be honoured by any sink that touches a record.
+  `futures::executor::block_on` deadlocks on the store's tokio `RwLock`. A
+  sync signature could not be honoured by any sink that touches a record.
   The returned future borrows `&self`, not `event`. This is the seam the
   `spvirit-ioc` scanner uses for EPICS `EVNT` scan lists: when an engine is
   registered with `.ioc()`, `serve_after_start_hooks` adds the engine's
   `Scanner` as a sink (pva_server.rs:1156).
 - **`EventHandler`** (events.rs:50) is the deferred counterpart:
   `Arc<dyn Fn(Arc<SimplePvStore>, String) -> Pin<Box<dyn Future<Output = ()> +
-  Send>> + Send + Sync>`. `Events::post` (events.rs:222) awaits the sinks —
-  each wrapped in `catch_unwind(AssertUnwindSafe(..))`, so a panicking sink
-  is logged, counted in `failed_count`, and neither truncates the fan-out nor
-  stops handlers being queued — then increments `inflight` for the whole
-  batch *before* enqueueing any of it (so a concurrent `drain()` can never
-  observe `inflight == 0` mid-batch), and `try_send`s each handler — a full
-  queue drops and counts rather than blocking the poster.
+  Send>> + Send + Sync>`. `Events::post` (events.rs:222) first awaits the
+  sinks, each wrapped in `catch_unwind(AssertUnwindSafe(..))`, so a panicking
+  sink is logged, counted in `failed_count`, and neither truncates the fan-out
+  nor stops handlers being queued. It then increments `inflight` for the whole
+  batch *before* enqueueing any of it, so a concurrent `drain()` can never
+  observe `inflight == 0` mid-batch. Finally it `try_send`s each handler; a
+  full queue drops and counts rather than blocking the poster.
 - **`start_dispatcher`** (events.rs:149) spawns the single task that drains
   the channel and awaits each handler wrapped in
   `futures::FutureExt::catch_unwind(AssertUnwindSafe(fut))`: a panicking
-  handler is logged, counted in `failed_count`, and the loop continues —
+  handler is logged, counted in `failed_count`, and the loop continues, so
   handlers never abort the dispatcher. Handlers therefore run strictly one
   at a time, in the order they were enqueued across *all* events, so a slow
   handler for one event delays every other event's handlers behind it.
@@ -342,23 +343,23 @@ RwLock<HashMap<String, Vec<EventHandler>>>`, an `mpsc::channel` of capacity
   dispatcher-invariant (`catch_unwind` always present, `inflight` always
   decremented) is ever broken by a regression. It first checks the
   `dispatcher_started` flag and fails immediately if handler invocations are
-  queued with no dispatcher to run them — `build() -> post_event() ->
-  drain_events()` without a start used to burn the full 10 s and then blame
-  the dispatcher.
+  queued with no dispatcher to run them, so `build() -> post_event() ->
+  drain_events()` without a start fails at once instead of waiting out the
+  timeout.
 
-**Startup hooks** (`StartHook`, events.rs:57) are not part of `Events` —
+**Startup hooks** (`StartHook`, events.rs:57) are not part of `Events`;
 they are a plain `Vec` on `PvaServer` (`start_hooks`, pva_server.rs:868),
 run by `run_start_hooks()` (pva_server.rs:940) to completion, in order,
 *before* `serve_after_start_hooks()` builds the source registry, spawns
 scan tasks, starts the event dispatcher, and binds (pva_server.rs:1051–1222:
 `run()` is exactly `run_start_hooks().await?` then
 `serve_after_start_hooks().await`). A panicking hook returns
-`Err(format!("on_start hook #{i} panicked; aborting startup: {cause}"))` —
-the `catch_unwind` payload is downcast to `String`/`&str`, so the real cause
-(and any label the hook panicked with, such as a Python source's) survives
-instead of reaching the user only through the default panic hook on stderr
-— and `run()` never reaches `serve_after_start_hooks`: no scan task,
-dispatcher, or listener starts.
+`Err(format!("on_start hook #{i} panicked; aborting startup: {cause}"))`,
+and `run()` never reaches `serve_after_start_hooks`: no scan task,
+dispatcher, or listener starts. The `catch_unwind` payload is downcast to
+`String`/`&str`, so the real cause (and any label the hook panicked with,
+such as a Python source's) reaches the caller rather than only the default
+panic hook's output on stderr.
 `ServeBuilder::start()` runs the same hook phase to completion *before* it
 returns (`Result<RunningServer, String>`), so an aborting hook fails the
 call rather than handing back a handle to a server that never bound, and
@@ -368,7 +369,7 @@ starts the dispatcher (idempotent) before spawning, so
 its own `Arc<Events>` (`events()`, `post_event()`) because `start()` moves
 the `PvaServer` into the spawned task.
 
-**The two APIs order the dispatcher differently.** `run()` is hooks →
+The two APIs order the dispatcher differently. `run()` is hooks →
 sources → scan tasks → dispatcher → bind. `start()` and Python's
 `start_background()` are hooks → dispatcher → spawn(sources → scan tasks →
 bind), because the dispatcher must be running before the call returns or a
@@ -376,21 +377,20 @@ bind), because the dispatcher must be running before the call returns or a
 is that on the handle API an `on_event` handler can run before
 `.source()`-registered sources exist and before any scan task is spawned.
 Handlers receive only `Arc<SimplePvStore>`, and nothing has bound on either
-path, so this is not observable by a client — but a handler must not assume
-a source is registered. What both orders share is the part that matters: no
-hook runs late, and nothing binds before every hook has returned.
+path, so this is not observable by a client. A handler must still not assume
+a source is registered. In both orders every hook finishes before anything
+binds.
 `run_start_hooks` also installs the `MonitorRegistry` onto the store before
 the first hook runs (pva_server.rs:942), so a hook that writes the store
 reaches any monitor subscribed later, and a hook that reads the registry
 never sees `None`.
 
-**Python sources fold into the same list.** `spvirit-py/src/server.rs`
+Python sources fold into the same list. `spvirit-py/src/server.rs`
 registers a source's `on_start(notifier)` as one more `PvaServerBuilder::on_start`
-closure, at the point `add_source`/`.add_source()` is called — so a source's
+closure, at the point `add_source`/`.add_source()` is called, so a source's
 hook and a `@builder.on_start` hook interleave in true registration order,
-not "sources first" or "hooks first". This changed behaviour from an
-earlier revision where a Python source's `on_start` fired eagerly inside
-`build()`; see the Python-facing note in [Custom data
+not "sources first" or "hooks first". A Python source's `on_start` does not
+fire inside `build()`; see the Python-facing note in [Custom data
 sources](../03-progressive/sources.md).
 
 ## Alarms and deadbands

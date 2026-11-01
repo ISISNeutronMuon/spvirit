@@ -43,25 +43,21 @@ TCP channel, so most of them are meaningless. It has three:
 Green rows are PVs that at least one server has answered for. The detail
 panel shows who searched and who responded.
 
-## What it is for
+## Uses
 
-**Finding the client nobody remembers deploying.** A PV name appearing in
-the search table with no green means something is looking for a record
-that does not exist. The detail panel names the source address.
-
-**Confirming a server is answering.** Watch the row turn green while
-running `spget` from another terminal — that is the search-response leg of
-the protocol, live.
-
-**Diagnosing a multi-interface host.** If searches never appear, the
-listener is on the wrong NIC; pin it with `--bind-addr`.
+A PV name in the search table that never turns green means some client is
+looking for a record that does not exist; the detail panel names the
+source address, which is how you find a client nobody remembers deploying.
+To confirm a server is answering, run `spget` from another terminal and
+watch the row turn green when the server's search response arrives.
 
 ## Gotchas
 
 **It only sees broadcast and multicast traffic.** A client using
 `--server` or `EPICS_PVA_NAME_SERVERS` connects straight to TCP and never
 searches, so nothing shows up. Absence in `spsearch` does not mean absence
-on the network.
+on the network. This applies to your own commands too: to see your own
+traffic, let the client search instead of passing `--server`.
 
-**It shows requests, not the ones you make yourself with `--server`.** The
-same caveat, from the other side: to see your own traffic, let it search.
+**On a multi-interface host the listener can sit on the wrong NIC.** If
+searches never appear, pin it with `--bind-addr`.

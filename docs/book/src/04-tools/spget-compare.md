@@ -7,8 +7,7 @@
 <!-- verify:end -->
 
 Compare a captured PVAccess GET exchange against spvirit's encoders, byte
-for byte, offline. A protocol-debugging tool, not something you
-reach for day to day.
+for byte, offline. It is a protocol-debugging tool.
 
 ```
 spget_compare [OPTIONS]

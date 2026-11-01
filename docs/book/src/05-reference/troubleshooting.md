@@ -32,7 +32,7 @@ server is running, or the search never reached it. Check, in this order:
 3. Firewall? Windows blocks inbound UDP on a new binary the first time it
    binds. The server starts fine and answers nothing.
 4. Multi-homed host? The search leaves on one interface. `spsearch` shows
-   what is actually arriving — if it shows nothing, you are on the wrong NIC.
+   what is actually arriving. If it shows nothing, you are on the wrong NIC.
 
 **`"read header"`, `"name server connect"`, `"name server handshake"`** —
 something answered, and then the TCP leg failed. A stale
@@ -76,12 +76,16 @@ simulation mode is writable (`spvirit-server/src/types.rs:359`).
 
 ## The write is accepted and nothing changes
 
-**A validator rejected it.** Then you get an error, not silence — check the
-exit status. `spput` returns non-zero on a rejected write.
+Check the exit status first. A write that a validator rejects is reported as
+an error, and `spput` exits non-zero.
 
 An enum PUT with an out-of-range index, a PUT to an `mbbi`, and a PUT to a
-`Generic` record are all refused with an error too — none of them reports
-success without a change. [Known gaps](known-gaps.md).
+`Generic` record are also refused with an error.
+
+One case does report success without a change: a client PUT of an
+NTNDArray's image `value` is accepted, but the union-shaped value is not
+applied (gap 4 in [Known gaps](known-gaps.md)). Write the image server-side
+with `store.put_nt()`.
 
 ## A monitor looks frozen
 
@@ -91,7 +95,7 @@ the *post*, not the store, when the record is a numeric scalar, `MDEL` is
 greater than zero, the severity has not changed, and the delta is under
 `MDEL`.
 
-Confirm with `spget` — if the value has moved and the monitor has not, that
+Confirm with `spget`: if the value has moved and the monitor has not, that
 is the deadband. Set `MDEL` to 0 to post everything.
 
 Two things that are *not* the cause: alarm transitions always post regardless
@@ -118,17 +122,17 @@ server.start()
 
 Only for a *rejected* write, and only from `spput`. When the full PUT flow
 fails, `spput` silently retries with the simple flow
-(`spvirit-tools/src/bin/spvirit_put.rs:240-249`), so the server sees the write
-twice. Pass `--no-flow-fallback` to suppress the retry — and write `on_put`
+(`spvirit-tools/src/bin/spvirit_put.rs:241-249`), so the server sees the write
+twice. Pass `--no-flow-fallback` to suppress the retry, and write `on_put`
 callbacks to be idempotent regardless.
 
 ## Alarm limits are set but the severity stays `NO_ALARM`
 
-Limits — from `Pv::alarm_limits` or a `.db` file — are only evaluated when
-the server-level `compute_alarms` flag is on, and it is off by default
-(`spvirit-server/src/server.rs:64`) — `spserver --compute-alarms`, or
-`.compute_alarms(true)` on the builder. The limits are not applied to the
-initial value: severity changes on the first write. See
+Limits from `Pv::alarm_limits` or a `.db` file are only evaluated when the
+server-level `compute_alarms` flag is on. It is off by default
+(`spvirit-server/src/server.rs:64`). Turn it on with
+`spserver --compute-alarms`, or `.compute_alarms(true)` on the builder.
+The limits are not applied to the initial value: severity changes on the first write. See
 [Alarms and severity](../03-progressive/alarms.md).
 
 ## `cargo build` produced no binaries
@@ -139,7 +143,7 @@ initial value: severity changes on the first write. See
 
 ## `spget` prints `0` for a value that is not zero
 
-That column is a display rendering, not the wire value: `5e-7` prints as
+That column shows a display rendering of the value, so `5e-7` prints as
 `0`. Neither `-F value` nor `--json` shows the full-precision double (they
 use the same formatter). Use `spget --raw` for the payload bytes, or read the
 PV from a client library.

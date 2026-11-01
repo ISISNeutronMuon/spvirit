@@ -26,8 +26,8 @@ Update it:
 ```
 
 `store.set_array_value(name, ScalarArrayValue::F64(v))` replaces the whole
-array. `ScalarArrayValue` has a variant per element type — `F64`, `I32`,
-`U8`, `Bool`, `Str`, and the rest — and the variant is fixed when the
+array. `ScalarArrayValue` has a variant per element type (`F64`, `I32`,
+`U8`, `Bool`, `Str`, and the rest), and the variant is fixed when the
 record is created.
 
 ## Python
@@ -47,7 +47,7 @@ Note `server.start()` rather than `server.run()`. `run()` blocks forever;
 | `.aai(name, data)` | `aai` | no |
 | `.aao(name, data)` | `aao` | yes |
 
-Pick `aai` for anything a client should only read — a detector spectrum, a
+Pick `aai` for anything a client should only read, such as a detector spectrum or a
 computed histogram. Pick `aao` or `waveform` for a lookup table or a
 scan trajectory a client is meant to load.
 
@@ -56,7 +56,7 @@ which is the EPICS `subArray` record.
 
 ## What to notice
 
-**Python array setters take a `list`.** A numpy array is not a list —
+**Python array setters take a `list`.** A numpy array is not a list;
 call `.tolist()` first:
 
 ```python
@@ -71,8 +71,8 @@ selects the element type explicitly when the Python values are ambiguous:
 raise `TypeError`. Drive an array from your own loop with `pv.set(...)`,
 as the example above does.
 
-**Arrays carry their own timestamp handling.** Unlike `NtScalar` — where a
-`None` timestamp makes the encoder stamp at encode time — array payloads
+**Arrays carry their own timestamp handling.** Unlike `NtScalar`, where a
+`None` timestamp makes the encoder stamp at encode time, array payloads
 encode the timestamp they hold verbatim. The server stamps on every
 `set_array_value`, so this only matters if you build payloads by hand at
 the raw-NT level.
@@ -94,7 +94,7 @@ spget SIM:SPECTRUM
 spmonitor SIM:SPECTRUM
 ```
 
-Brace yourself: `spget` prints **all 1024 elements** on one line. There is
+`spget` prints **all 1024 elements** on one line. There is
 no truncation anywhere in the tool chain.
 
 ```console
@@ -136,9 +136,7 @@ control: structure
   minStep: double
 ```
 
-There is no `valueAlarm` — array records have no limit checking to do. And
-`spmonitor SIM:SPECTRUM` re-sends the whole 1024-element array on every
-update; PVAccess has no partial-array delta.
+There is no `valueAlarm`, because array records have no limit checking to do.
 
 ## Next
 

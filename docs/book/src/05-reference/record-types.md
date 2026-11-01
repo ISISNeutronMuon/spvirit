@@ -10,7 +10,7 @@
 (`spvirit-server/src/types.rs:24`). Not all seventeen are reachable by
 every route: the handle API, the server builder, and `.db` loading each
 cover a different subset. This page is that matrix, checked against the
-constructors that actually exist.
+constructors in the source.
 
 If you are not sure whether you want a record at all, read
 [Records vs raw NT](../01-fundamentals/records-vs-raw-nt.md) first.

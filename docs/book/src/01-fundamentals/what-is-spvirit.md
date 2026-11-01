@@ -28,7 +28,7 @@ described in the [crate map](../05-reference/crate-map.md).
 | `spvirit-client` | Search, connect, get, put, monitor. |
 | `spvirit-server` | `.db` parsing, the `Source` trait, the PVAccess server runtime. |
 | `spvirit-tools` | The command-line tools, and the integration test suites. |
-| `spvirit-py` | Python bindings via PyO3 — client and server. |
+| `spvirit-py` | Python bindings via PyO3, client and server. |
 
 ```mermaid
 flowchart LR
@@ -54,27 +54,25 @@ automatically.
 
 Spvirit is a good fit when you want to:
 
-- **Read or write PVs from a Rust program** without linking EPICS Base.
-- **Stand up a simulator or test double** — a handful of PVs that behave like
+- Read or write PVs from a Rust program without linking EPICS Base.
+- Stand up a simulator or test double: a handful of PVs that behave like
   an IOC, in a few lines, started and stopped from a test.
-- **Bridge something into PVAccess** — a REST API, a file, a piece of
-  hardware with its own protocol — using the `Source` trait.
-- **Debug the wire** — the tools hex-dump frames, watch search traffic, and
+- Bridge something into PVAccess (a REST API, a file, a piece of
+  hardware with its own protocol) using the `Source` trait.
+- Debug the wire: the tools hex-dump frames, watch search traffic, and
   byte-compare against captures from other implementations.
-- **Drive PVs from Python** without the p4p build chain.
+- Drive PVs from Python without the p4p build chain.
 
 ## When not to
 
-Be plain about this: **`spvirit-server` is not a production softIOC
-replacement.** It implements the record behaviours that matter for
-simulation and testing — values, alarms, deadbands, scan and put callbacks,
-links — but it is not EPICS Base. It does not implement the full record
+**`spvirit-server` is not a production softIOC replacement.** It implements
+the record behaviours that matter for simulation and testing (values, alarms,
+deadbands, scan and put callbacks, links), but it is not EPICS Base. It does not implement the full record
 processing model, database links with all their link types, or the
 sequencing guarantees a real IOC gives you. If you are running a beamline,
 run an IOC.
 
-`spvirit-server`'s record store is simulation-grade. The separate
-`spvirit-ioc` crate adds a real record-processing engine (scan lists, link
+The separate `spvirit-ioc` crate adds a real record-processing engine (scan lists, link
 graph, lock sets) for `ai`/`ao`/`bi`/`bo`/`longin`/`longout`; it is still not
 a full EPICS Base (no `calc`/`calcout`/`seq`/`fanout` records).
 

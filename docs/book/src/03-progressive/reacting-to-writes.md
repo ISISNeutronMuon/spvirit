@@ -8,7 +8,7 @@
 
 ## What you'll build
 
-A writable PV that runs your code when a client writes to it — and, in the
+A writable PV that runs your code when a client writes to it and, in the
 form that supports it, refuses writes it does not like.
 
 ## Rust
@@ -25,7 +25,7 @@ Fn(&str, &DecodedValue)
 ```
 
 It returns `()`. It runs *after* the value has been applied, and it has no
-way to say no. It is a notification hook, not a validator.
+way to say no. It is only a notification hook.
 
 To reject a write, use the **typed handle** form instead:
 
@@ -51,9 +51,8 @@ The rejected value never reached the record.
 `Ok(())` accepts it. You also get the value already converted to `T`
 instead of a raw `DecodedValue`.
 
-The two forms are not interchangeable, and the builder form's inability to
-reject is the single most common surprise in this API. If you are
-validating, use handles.
+The two forms are not interchangeable. The builder form cannot reject a
+write. If you are validating, use handles.
 
 ## Python
 
@@ -61,7 +60,7 @@ validating, use handles.
 {{#include ../../../../spvirit-py/examples/demo_on_put.py:callback}}
 ```
 
-Python has one form and it can reject: returning `False` — or raising —
+Python has one form and it can reject: returning `False` (or raising)
 rejects the PUT, and anything else accepts it. The callback runs **before**
 the value is applied.
 
@@ -77,8 +76,8 @@ SIM:SETPOINT ERROR protocol error: PUT failed: rejected by on_put
 
 **Attach callbacks before serving.** `on_put`, `scan`, and `calc` must be
 attached to a PV before it is handed to `Server(...)` / `PvaServer::serve`.
-Attaching afterwards is a **silent no-op** — the core logs a warning and
-carries on. Nothing raises, nothing fails; your callback simply never runs.
+Attaching afterwards is a **silent no-op**: the core logs a warning, raises
+no error, and never runs your callback.
 This is true in both languages.
 
 **Validation is the only enforcement you get.** Drive limits are advisory
@@ -109,7 +108,7 @@ must happen exactly once do not belong in one.
 
 **Array PVs do not support `on_put` or `scan` in Python.** Calling either
 on an array PV raises `TypeError`. Drive arrays with `pv.set(...)` from
-your own loop instead — see [Arrays and waveforms](arrays.md).
+your own loop instead; see [Arrays and waveforms](arrays.md).
 
 ## Run it
 
@@ -123,7 +122,7 @@ spput SIM:SETPOINT 30
 spput SIM:SETPOINT 500
 ```
 
-`on_put` only *observes* — both writes succeed, and the interesting output
+`on_put` only *observes*: both writes succeed, and the interesting output
 is in terminal 1:
 
 ```console

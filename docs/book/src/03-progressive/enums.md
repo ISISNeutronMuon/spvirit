@@ -8,7 +8,7 @@
 
 ## What you'll build
 
-PVs whose value is one of a fixed set of named states — the EPICS `mbbi`
+PVs whose value is one of a fixed set of named states: the EPICS `mbbi`
 and `mbbo` records, carried on the wire as an `NtEnum`.
 
 ## What an enum record is
@@ -30,7 +30,7 @@ render "Running" without a separate lookup. This is why `spget` prints
 | `bi` / `bo` | in / out | `ZNAM`, `ONAM` (exactly two) |
 | `mbbi` / `mbbo` | in / out | `ZRST`…`FFST` (up to sixteen) |
 
-`bi`/`bo` are *not* `NtEnum` in spvirit — they are `NtScalar` booleans, and
+`bi`/`bo` are *not* `NtEnum` in spvirit. They are `NtScalar` booleans, and
 `spget` prints `true`/`false`. `ZNAM`/`ONAM` name the two states in a `.db`
 file. If you need the labels on the wire, use `mbbi`/`mbbo`.
 
@@ -49,7 +49,7 @@ file. If you need the labels on the wire, use `mbbi`/`mbbo`.
 ## What to notice
 
 **Enum records ignore the scalar metadata options.** `units`, `prec`,
-`adel`, `mdel`, and the limit setters do not apply — only `desc` is
+`adel`, `mdel`, and the limit setters do not apply; only `desc` is
 accepted. An `NtEnum` has no engineering units to carry.
 
 **`.db` files cannot define enum records.** `mbbi` and `mbbo` parse, then
@@ -79,9 +79,9 @@ An `mbbi` is an input record and refuses client writes with
 spvirit, although EPICS Base allows VAL writes to input records. Drive it
 server-side with `pv.set(index)`.
 
-**Out-of-range indices are refused, not clamped.** A PUT whose index is
+**The server refuses out-of-range indices rather than clamping them.** A PUT whose index is
 outside `choices` (or whose `value` carries no integer index) is answered
-with a PUT error, and the record is left as it was — not even restamped.
+with a PUT error, and the record is left as it was (not even restamped).
 
 ## Run it
 
@@ -115,10 +115,7 @@ timeStamp: structure
   userTag: int
 ```
 
-`value` is a *structure*, not a number — that is what makes NTEnum
-different from an NTScalar holding an integer.
-
-Under a monitor the difference shows up on the wire:
+Under a monitor the structure shows up on the wire:
 
 ```console
 $ spmonitor SIM:STATE

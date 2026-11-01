@@ -12,16 +12,14 @@ The same two PVs as [Your first PV](../02-getting-started/first-pv.md), but
 described properly: engineering units, display precision, a description,
 alarm limits, drive limits, and a monitor deadband.
 
-This is the difference between a number and a reading.
-
 ## Rust
 
 ```rust
 {{#include ../../../../spvirit-server/examples/scalar_metadata.rs:meta}}
 ```
 
-Note what this is **not** using. `PvaServer::builder().ai(name, value)`
-takes a name and an initial value and nothing else — there is no
+This example does not use the builder. `PvaServer::builder().ai(name, value)`
+takes a name and an initial value and nothing else; there is no
 `.units()` on the builder. Metadata is set through typed `Pv<T>` handles,
 then handed to `PvaServer::serve([...])`. If you need metadata in code,
 that is the route.
@@ -35,7 +33,7 @@ that is the route.
 {{#include ../../../../spvirit-py/examples/demo_scalars.py:meta}}
 ```
 
-Python has no such split — `spvirit.ai()` takes all of it as keyword
+Python has no such split: `spvirit.ai()` takes all of it as keyword
 arguments, and `spvirit.Server(pvs=[...])` serves the handles.
 
 ## What to notice
@@ -50,7 +48,7 @@ and it is why a PVAccess GUI can label an axis without being told to.
 and crossing `lolo` or `hihi` is MAJOR, when the server runs with
 `compute_alarms` on (it is off by default); see [Alarms](alarms.md).
 
-**Drive limits are advertised, not enforced.** This one will catch you:
+**The server does not enforce drive limits.** It only advertises them:
 
 ```console
 $ spput SIM:SETPOINT 500
@@ -61,7 +59,7 @@ SIM:SETPOINT 2026-08-04 10:00:31.426 500
 ```
 
 `drive_limits(0.0, 100.0)` populates the NTScalar `control` structure so
-clients know the intended range — and that is all it does. Nothing in the
+clients know the intended range. It does nothing else. Nothing in the
 server clamps a write. If out-of-range values must be rejected, reject
 them yourself in an `on_put` handler; see
 [Reacting to writes](reacting-to-writes.md).
@@ -79,15 +77,15 @@ Error: Timeout("read header")
 ```
 
 `.EGU` times out because there is no such channel. Field access serves the
-dbCommon fields plus whatever a parsed `.db` file contained — and `units`
+dbCommon fields plus whatever a parsed `.db` file contained, and `units`
 set in code goes into the payload, not the field table. The units are still
 there; you just have to read the whole PV to see them. This is the gap
 described in [EPICS in 10 minutes](../01-fundamentals/epics-in-10-minutes.md).
 
 ## Choosing the wire type
 
-`ai`/`ao`/`bi`/`bo`/`longin`/`longout`/`string_in`/`string_out` (Rust) and
-`ai`/`ao`/`bi`/`bo`/`longin`/`longout`/`string_in`/`string_out` (Python) each
+The `ai`/`ao`/`bi`/`bo`/`longin`/`longout`/`string_in`/`string_out`
+constructors, which have the same names in Rust and Python, each
 fix the NTScalar wire type to one of `double`, `boolean`, `int` or
 `string`. PVAccess defines twelve NTScalar value types in total —
 `boolean`, `byte`, `short`, `int`, `long`, their unsigned variants
@@ -101,7 +99,7 @@ reaching the other eight needs an explicit type selection.
 ```
 
 `Pv::<ScalarValue>::scalar_out`/`scalar_in` build a record whose wire type
-is whatever `ScalarValue` variant `initial` holds — `scalar_out` for a
+is whatever `ScalarValue` variant `initial` holds: `scalar_out` for a
 writable PV, `scalar_in` for read-only.
 
 ### Python
@@ -115,9 +113,9 @@ wire type by name (or alias, e.g. `"u16"`/`"i32"`); `writable=True` serves
 the output flavor. The full type-name/alias table and the value coercion
 rules (overflow, widening, narrowing) are in
 [`spvirit-py`'s README, *NT scalar type coverage*
-section](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md#nt-scalar-type-coverage)
-— the same reference the [Python API](../05-reference/python-api.md) page
-points to for `pv`/`scalar`.
+section](https://github.com/ISISNeutronMuon/spvirit/blob/main/spvirit-py/README.md#nt-scalar-type-coverage).
+The [Python API](../05-reference/python-api.md) page points to the same
+reference for `pv`/`scalar`.
 
 ## Run it
 
@@ -148,8 +146,8 @@ SIM:SETPOINT OK
 ```
 
 `spinfo` prints the type of every field. Only the third line differs
-between the two records — `SIM:GAIN` is a `ushort`, `SIM:STATUS` a `ubyte`
-— and the remaining forty-odd lines are the same NTScalar skeleton in both:
+between the two records (`SIM:GAIN` is a `ushort`, `SIM:STATUS` a `ubyte`),
+and the remaining forty-odd lines are the same NTScalar skeleton in both:
 
 ```console
 $ spinfo SIM:GAIN

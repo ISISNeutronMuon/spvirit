@@ -8,8 +8,8 @@
 
 ## What you'll build
 
-PVs that tell a client not just *what* the value is but whether it should
-be worried about it.
+PVs that tell a client both the value and whether that value is in an
+alarm state.
 
 ## The alarm structure
 
@@ -27,7 +27,7 @@ on MINOR and red on MAJOR; an archiver may record the transition even when
 the value itself is inside the deadband.
 
 **Alarm transitions always post.** The MDEL deadband gates value changes
-only — a severity change reaches every subscriber regardless of how small
+only; a severity change reaches every subscriber regardless of how small
 the value moved (`should_post_update`,
 `spvirit-server/src/simple_store.rs:644`).
 
@@ -70,6 +70,10 @@ published but never compared against anything.
 
 ### Explicit
 
+`set_alarm(severity, status, message)` writes the alarm block directly, and
+the server evaluates nothing. The examples below show both routes:
+`.alarm_limits()` first, then `set_alarm`.
+
 ## Rust
 
 ```rust
@@ -96,8 +100,8 @@ argument rather than a builder call:
 ## What to notice
 
 **`.alarm_limits()` is published and evaluated.** Calling
-`.alarm_limits(lolo, low, high, hihi)` on a `Pv` handle — or passing
-`alarm_limits=(...)` in Python — fills in the `valueAlarm` structure that
+`.alarm_limits(lolo, low, high, hihi)` on a `Pv` handle (or passing
+`alarm_limits=(...)` in Python) fills in the `valueAlarm` structure that
 clients read back with `spinfo`, and also sets the limits the evaluator
 reads, the same ones the `.db` loader sets for `LOLO`/`LOW`/`HIGH`/`HIHI`. With `.compute_alarms(true)` every write is
 evaluated, whether it is a client `spput` or a host-side `pv.set(...)`:
@@ -117,7 +121,7 @@ value, and an explicit `set_alarm` is overwritten by the next computed
 write while `compute_alarms` is on.
 
 **INVALID is for "I don't know", not "bad value".** Severity 3 means the
-reading cannot be trusted — the device is unreachable, the scan threw, the
+reading cannot be trusted: the device is unreachable, the scan threw, the
 link is down. A value that is simply too high is MAJOR, not INVALID. This
 matters because clients treat INVALID as "ignore this number".
 
@@ -149,7 +153,7 @@ SIM:PRESSURE 2026-08-06 09:14:45.114  50
 ```
 
 `spget` appends severity, status and message after the value when the
-alarm is not `NO_ALARM` — and prints nothing extra when it is, which is why
+alarm is not `NO_ALARM`, and prints nothing extra when it is, which is why
 `SIM:PRESSURE` at 50 looks like a plain reading.
 
 The Rust `alarms` example is static, so `spmonitor SIM:PRESSURE` shows one
@@ -168,8 +172,8 @@ SIM:PRESSURE 2026-08-06 09:26:19.439 120
 SIM:PRESSURE {alarm={severity=2, status=1, message="HIHI"}} MAJOR READ HIHI
 ```
 
-Two things worth pausing on. The value and the alarm arrive as **separate
-updates** — the server changed `value` first, then the record layer
+Note two things. The value and the alarm arrive as **separate
+updates**: the server changed `value` first, then the record layer
 evaluated the limits and changed `alarm`. And the second line of each pair
 shows only the field that changed, because a monitor sends a change bitset;
 `spmonitor` renders the changed subtree and then the decoded severity.

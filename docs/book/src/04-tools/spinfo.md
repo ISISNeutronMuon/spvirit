@@ -60,7 +60,7 @@ valueAlarm: structure
   highAlarmLimit: double
 ```
 
-## What it is good for
+## Using the output
 
 **Confirming the normative type.** The first line is the type ID. If a
 client library refuses a PV, this tells you whether the server is really

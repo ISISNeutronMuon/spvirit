@@ -30,8 +30,8 @@ cannot reach into the builder. The seam is the other way round:
 `spvirit-server` declares the `StoreSource` trait and the
 `PvaServerBuilder::ioc` method, and the engine implements the trait. That
 also lets the builder check at construction time that the engine's records
-and the builtin store's do not overlap — see
-[Two stores, one server](#two-stores-one-server) below.
+and the builtin store's do not overlap (see
+[Two stores, one server](#two-stores-one-server) below).
 
 Registering through `.ioc()` rather than `.source()` is what wires the
 engine into the server lifecycle: it gets the monitor registry (so host-side
@@ -43,9 +43,9 @@ right for anything that is not a record store.
 
 ## Driving the engine from host code
 
-Records can be built without a `.db` file. The two paths converge before any
-field is interpreted — a `RecordSpec` lowers to the same `DbRecord` the parser
-produces — so they cannot drift:
+Records can be built without a `.db` file. A `RecordSpec` lowers to the same
+`DbRecord` the parser produces, so the two paths converge before any field is
+interpreted and cannot drift:
 
 ```rust
 use spvirit_ioc::{IocSource, RecordSpec};
@@ -76,7 +76,8 @@ Two things the engine will not do:
   the same restriction — `dbLoadRecords` after `iocInit` is unsupported.
 - **There is no `on_put`.** A callback would run arbitrary code inside
   `process()` while a lock set is held. Behaviour belongs in the record graph;
-  if you need a callback, use a tier 2 PV, which has no lock sets.
+  if you need a callback, use a builtin-store PV (`.ao()` and friends on the
+  builder), which has no lock sets.
 
 ## Two stores, one server
 
@@ -88,30 +89,27 @@ other sources interact:
 - **The two stores must be disjoint.** `build()` panics, naming every
   colliding record, if the builtin store and the engine store both claim
   the same name. A `.scan`, `.link`, or `on_put` callback that names an
-  engine record is the same class of mistake — those callbacks drive the
+  engine record is the same class of mistake (those callbacks drive the
   builtin store's direct-write semantics and would never fire against an
-  engine record — so `build()` panics on those too.
+  engine record), so `build()` panics on those too.
 - **Ordinary sources may legally shadow either store.** A source registered
   with `.source()` ahead of a store in resolution order can override one of
   its PVs on purpose; the registry logs a warning the first time a client
-  searches for the shadowed name, but does not fail. This is the difference
-  between the two tiers: stores are static, enumerable, and must be
-  disjoint from each other; sources are dynamic, ordered, and may legally
-  shadow.
+  searches for the shadowed name, but does not fail.
 - **Field PVs follow the winning store.** `<record>.<FIELD>` resolves
   through whichever store claims `<record>`, so a client cannot tell which
   store served a PV except by small differences in field coverage (each
   store has its own field table).
 
 Registration order is builtin at 0, the engine (if any) at 5, and the
-`record-fields` tier-2 (`SimplePvStore`) field source at 10.
+`record-fields` source (`RecordFieldSource`, serving `<record>.<FIELD>` for
+the builtin store's records) at 10.
 
 ## What it processes
 
-Sub-project A covers `ai`, `ao`, `bi`, `bo`, `longin` and `longout`. Loading
-a `.db` containing any other record type is an error naming the record —
-silently ignoring records is how a database appears to work while half of it
-does nothing.
+The engine processes `ai`, `ao`, `bi`, `bo`, `longin` and `longout`. Loading
+a `.db` containing any other record type is an error naming the record,
+rather than loading the file and leaving those records unprocessed.
 
 ## Lock sets
 
@@ -137,12 +135,12 @@ updated. `ioc.graph().lock_sets` shows the partitioning.
 
 ## Not yet implemented
 
-Channel-access links (`CA`, `CP`, `CPP`) are sub-project C, and every other
-record type is sub-project D.
+Channel-access links (`CA`, `CP`, `CPP`) and every record type beyond the
+six above are planned but not implemented.
 
 ## Scanning
 
-Scanning (sub-project B) is driven once the engine is registered with
+Scanning is driven once the engine is registered with
 `.ioc()`: when the server starts, `PINI` records process (in `PHAS` order)
 and then one OS thread per distinct `SCAN` period starts; records sharing a
 period share its thread. At most 64 distinct periods run at once
@@ -150,6 +148,6 @@ period share its thread. At most 64 distinct periods run at once
 scan list with a warning. `SCAN = Event` records process on
 `post_event`, through the engine's scanner registered as an event sink.
 Server shutdown stops the scan threads, waking any that are sleeping out a
-long period. Over the wire only `SCAN`, `EVNT` and `PHAS` are writable on
-this tier; a `SCAN` write that would need a 65th period is refused. An engine
+long period. Over the wire, `SCAN`, `EVNT` and `PHAS` are the only writable
+`<record>.<FIELD>` PVs on engine records; a `SCAN` write that would need a 65th period is refused. An engine
 used without a server is not scanned; call `process_pini()` yourself.
